@@ -4,39 +4,118 @@ sidebar_position: 1500
 
 # TcpOverUdpServer
 
-## 📖 معرفی کلی
+`TcpOverUdpServer` سمت سرور `TcpOverUdpClient` است. این نود datagramهای KCP را از سمت قبلی می‌گیرد، stream اصلی را بازسازی می‌کند و payload را مثل یک stream معمولی به نود بعدی می‌دهد. پاسخ‌های سمت بعدی دوباره داخل KCP packet می‌شوند و به سمت قبلی برمی‌گردند.
 
-| ویژگی              | مقدار                    | توضیح                                                     |
-|--------------------|--------------------------|-----------------------------------------------------------|
-| **نوع نود**        | تونل (تک‌جهته)          | جریان داده از چپ آغاز می‌شود و به راست پیش می‌رود         |
-| **لایه شبکه**      | لایه ۴ (Transport)       | کار با اتصال‌ها (TCP/UDP)، نه بسته‌های خام               |
-| **موقعیت در زنجیر**| میانه زنجیره             | فقط در میانه زنجیره قابل استفاده است                     |
-| **وابستگی**        | حداقل یک نود قبل و بعد   | برای دریافت و ارسال داده‌ها ضروری است                    |
+## جایگاه رایج
 
----
+```text
+UdpListener -> TcpOverUdpServer -> TcpConnector
+UdpListener -> TcpOverUdpServer -> MuxServer -> TcpConnector
+```
 
-## عملکرد
+سمت مقابل:
 
-این نود جفت نود «TcpOverUdpClient» است و برای کارکرد صحیح، حضور آن در سمت دیگر تونل الزامی است. توضیحات کامل دربارهٔ چرایی استفاده، سناریوهای کاربردی و نکات شبکه‌ای در مستند «[TcpOverUdpClient](./tcp-over-udp-client)» آمده است و در اینجا تکرار نمی‌شود؛ لطفاً ابتدا آن را مطالعه کنید.
+```text
+TcpListener -> TcpOverUdpClient -> UdpConnector
+```
 
-### نقش این نود
-- ایفای نقش همتا (Peer) در پروتکل KCP برای بازسازی جریان بایت قابل‌اعتماد از روی بسته‌های UDP.
-- تبدیل بسته‌های نامطمئن UDP به جریان مرتب، بدون تکرار و بدون افت، و قراردادن دادهٔ بازسازی‌شده در اتصال برای نود بعدی زنجیره.
-
----
-
-نمونه پیکربندی:
+## نمونه تنظیم بدون FEC
 
 ```json
 {
-    "name": "node_name",
-    "type": "TcpOverUdpServer",
-    "settings": {},
-    "next": "next_node_name"
+  "name": "tcp-over-udp-server",
+  "type": "TcpOverUdpServer",
+  "settings": {},
+  "next": "service-stream-node"
 }
 ```
 
-توجه: این نود حتماً به جفت خود نیاز دارد و باید در زنجیره، نود `TcpOverUdpClient` در سمت مقابل حضور داشته باشد.
+## نمونه تنظیم با FEC
 
+```json
+{
+  "name": "tcp-over-udp-server",
+  "type": "TcpOverUdpServer",
+  "settings": {
+    "fec": true,
+    "fec-data-shards": 10,
+    "fec-parity-shards": 3
+  },
+  "next": "service-stream-node"
+}
+```
 
+## تنظیمات
 
+| گزینه | پیش‌فرض | توضیح |
+|---|---:|---|
+| `fec` | `false` | فعال‌سازی Reed-Solomon FEC برای packetهای KCP |
+| `fec-data-shards` | `10` | تعداد data shardهای هر block |
+| `fec-parity-shards` | `3` | تعداد parity shardهای هر block |
+
+:::warning
+تنظیمات FEC باید دقیقا با سمت `TcpOverUdpClient` یکی باشد. اگر یک سمت FEC روشن و سمت دیگر خام باشد، یا shardها فرق کنند، traffic قابل decode نخواهد بود.
+:::
+
+## رفتار FEC در سمت server
+
+وقتی `fec` فعال است، `TcpOverUdpServer` packetهای قبلی را FEC-wrapped در نظر می‌گیرد:
+
+- data shardهای سالم را بلافاصله وارد KCP می‌کند.
+- parity shardها را برای بازسازی datagramهای گم‌شده استفاده می‌کند.
+- packetهای FEC نامعتبر را محافظه‌کارانه drop می‌کند.
+- در مسیر برگشت هم datagramهای KCP را با همان قالب FEC می‌فرستد و بعد از هر block، parity تولید می‌کند.
+
+اگر FEC خاموش باشد، مسیر همان KCP-only قدیمی است و هیچ framing اضافه FEC وجود ندارد.
+
+## مدل KCP
+
+وقتی line init می‌شود، `TcpOverUdpServer` session KCP می‌سازد، timer loop را شروع می‌کند و یک ping داخلی queue می‌کند. packetهای ورودی از سمت UDP وارد KCP می‌شوند. بعد از آماده شدن stream، payloadها با توجه به flag داخلی پردازش می‌شوند.
+
+## flagهای داخلی
+
+| flag | معنی |
+|---:|---|
+| `0x00` | data |
+| `0xF0` | ping |
+| `0xFF` | close |
+
+data frameها بعد از بایت flag، payload واقعی stream را دارند.
+
+## تنظیمات KCP فعلی
+
+این تنظیمات از JSON قابل تغییر نیستند:
+
+| گزینه KCP | مقدار |
+|---|---:|
+| `nodelay` | `1` |
+| `interval` | `10 ms` |
+| `resend` | `2` |
+| `flowctl` | `0` |
+| send window | `2048` |
+| receive window | `2048` |
+| ping interval | `3000 ms` |
+| no-receive timeout | `6000 ms` |
+
+MTU از `GLOBAL_MTU_SIZE` گرفته می‌شود و وقتی FEC روشن باشد overhead FEC از بودجه packet کم می‌شود.
+
+## جریان داده
+
+- مسیر packet به stream: `UdpListener` یا نود packet-preserving قبلی، datagramها را به `TcpOverUdpServer` می‌دهد. نود آنها را وارد KCP می‌کند و stream بازسازی‌شده را به `next` می‌دهد.
+- مسیر stream به packet: payload از `next` به KCP داده می‌شود، به datagram تبدیل می‌شود و به سمت previous برمی‌گردد.
+
+## close، timeout و backpressure
+
+- اگر close frame از peer برسد، state پاک می‌شود و هر دو جهت finish می‌شوند.
+- اگر نود بعدی finish بدهد، `TcpOverUdpServer` close frame را از طریق KCP می‌فرستد، flush می‌کند و سمت قبلی را finish می‌کند.
+- بعد از حدود `3000 ms` بدون receive activity، ping داخلی ارسال می‌شود.
+- بعد از حدود `6000 ms` بدون receive activity، line بسته می‌شود.
+- اگر queue ارسال KCP زیاد شود، نود بعدی pause می‌شود و بعد از پایین آمدن queue resume می‌گیرد.
+
+## نکته‌های عملی
+
+- این نود بدون `TcpOverUdpClient` سمت مقابل کاربرد ندارد.
+- previous side باید datagram boundary را حفظ کند.
+- اگر loss مسیر متوسط است، `fec=true` با مقدار پیش‌فرض `10/3` نقطه شروع خوبی است.
+- اگر bandwidth محدود است و loss کم دارید، FEC را خاموش یا parity را کمتر انتخاب کنید.
+- اگر loss خیلی شدید است، FEC ممکن است فقط مصرف bandwidth را بالا ببرد و مشکل اصلی مسیر را حل نکند.

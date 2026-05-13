@@ -4,56 +4,113 @@ sidebar_position: 900
 
 # MuxServer
 
-## 📖 معرفی کلی
-
-| ویژگی              | مقدار                         | توضیح                                                     |
-|--------------------|-------------------------------|-----------------------------------------------------------|
-| **نوع نود**        | Tunnel (یک‌طرفه)              | جریان کانکشن‌ها از چپ آغاز می‌شود و به راست پیش می‌رود   |
-| **لایه شبکه**      | لایه ۴ (Transport Layer)      | کار با کانکشن‌ها است، نه بسته‌های خام                    |
-| **جهت پشتیبانی**  | چپ به راست (Left to Right)    | دو‌جهته نیست؛ صرفاً یک‌طرفه                               |
-| **موقعیت در زنجیره**| میانه زنجیره                 | فقط در میانه زنجیره قابل استفاده است                    |
-| **وابستگی**        | حداقل یک نود قبلی و یک نود بعدی | برای دریافت و ارسال داده‌ها ضروری است                   |
-
----
+`MuxServer` سمت مقابل `MuxClient` است. این نود یک parent transport line را که frameهای MUX داخل آن آمده می‌خواند، برای frameهای `Open` child line جدید می‌سازد و هر child را مثل یک اتصال مستقل به نود بعدی تحویل می‌دهد.
 
 ```mermaid
 flowchart LR
-    in1((Mux Con 1)) --> M[MuxServer]
-
+    in1((Parent transport line)) --> M[MuxServer]
     M --> out1[Conn 1]
     M --> out2[Conn 2]
     M --> out3[Conn 3]
     M --> out4[Conn 4]
 
     style M stroke:#ff6b35,stroke-width:2px
-
     style out1 fill:transparent,stroke:transparent
     style out2 fill:transparent,stroke:transparent
     style out3 fill:transparent,stroke:transparent
     style out4 fill:transparent,stroke:transparent
 ```
 
+## جایگاه رایج
 
-## عملکرد
+```text
+TcpListener -> MuxServer -> TcpConnector
+TcpListener -> TlsServer -> HttpServer -> MuxServer -> TcpConnector
+```
 
-این نود مکمل نود MuxClient است و برای کارکرد صحیح Muxing الزامی است. نقش آن، خارج‌کردن جریان ورودی از حالت چندکاناله (Demultiplex) و تبدیل آن به چند کانکشن مستقل برای ارسال به نود بعدی است.
+قاعده اصلی این است که سمت قبلی باید همان transportی باشد که frameهای `MuxClient` را حمل می‌کند و سمت بعدی باید جایی باشد که هر اتصال منطقی جداگانه به آن برود.
 
-اگر در سمت کلاینت تونل برقرار کرده‌اید، این نود باید در پیکربندی سرور مقصد (خارج) قرار بگیرد.
-
-در سناریوهای سرورِ VPN نیز این نود روی سرور VPN قرار می‌گیرد؛ جایی که کانکشن‌ها از حالت Mux خارج شده، به جریان‌های اصلی خود تبدیل می‌شوند و سپس به نود بعدی در زنجیره تحویل داده می‌شوند.
-
----
-
-## ⚙️ راهنمای پیکربندی
+## نمونه تنظیم
 
 ```json
 {
-    "name": "node_name",
-    "type": "MuxServer",
-    "settings": {
-    },
-    "next": "next_node_name"
+  "name": "mux-server",
+  "type": "MuxServer",
+  "settings": {
+    "child-buffer-limit": 8388608
+  },
+  "next": "service-side-node"
 }
 ```
 
-این نود تنظیماتی ندارد؛ تمام پارامترهای مربوط به Muxing در نود MuxClient تعریف می‌شوند.
+## تنظیمات
+
+| گزینه | اجباری | پیش‌فرض | توضیح |
+|---|---|---|---|
+| `child-buffer-limit` | خیر | `8388608` | سقف صف داده برای هر child pause شده. باید بزرگ‌تر از `0` باشد. |
+
+تنظیمات mode مثل `timer`، `counter` و `fixed-connections-count` فقط در `MuxClient` هستند. `MuxServer` براساس frameهایی که از parent می‌گیرد childها را می‌سازد و به mode client کاری ندارد.
+
+## مدل parent و child
+
+- `parent line`: اتصال مشترک ورودی از سمت `MuxClient`.
+- `child line`: اتصال منطقی که `MuxServer` برای هر `cid` می‌سازد و به `next` می‌دهد.
+
+وقتی frame `Open` برسد:
+
+1. `MuxServer` یک line جدید روی همان worker می‌سازد.
+2. state child را initialize می‌کند.
+3. child را به parent وصل می‌کند.
+4. برای child به نود بعدی upstream `Init` می‌فرستد.
+
+بعد از آن frameهای `Data`، `FlowPause`، `FlowResume` و `Close` با همان `cid` به همان child مربوط می‌شوند.
+
+## frame داخلی MUX
+
+فرمت frame با `MuxClient` یکی است و header آن ۸ بایت است:
+
+| فیلد | اندازه | توضیح |
+|---|---:|---|
+| `length` | `uint16` | طول payload بعد از header |
+| `flags` | `uint8` | نوع frame |
+| `_pad1` | `uint8` | padding داخلی |
+| `cid` | `uint32` | شناسه child stream |
+
+flagها:
+
+| flag | معنی |
+|---:|---|
+| `0` | `Open` |
+| `1` | `Close` |
+| `2` | `FlowPause` |
+| `3` | `FlowResume` |
+| `4` | `Data` |
+
+## جریان داده
+
+- رفت از parent به سرویس: `MuxServer` header را حذف می‌کند و payload را به child درست می‌دهد.
+- برگشت از سرویس به parent: payload child دوباره header می‌گیرد و به parent سمت قبلی برمی‌گردد.
+
+از دید نود بعدی، هر child یک connection عادی WaterWall است. مثلا اگر بعد از `MuxServer` یک `TcpConnector` باشد، برای هر child یک اتصال جدا به مقصد ساخته می‌شود.
+
+## finish و close
+
+- اگر `Close` برای یک child برسد، child از parent جدا می‌شود، state خودش را پاک می‌کند، upstream finish به نود بعدی می‌فرستد و line داخلی child را destroy می‌کند.
+- اگر نود بعدی child را ببندد، `MuxServer` یک frame `Close` روی parent به سمت `MuxClient` می‌فرستد.
+- اگر خود parent transport بسته شود، همه childهای متصل به آن هم بسته می‌شوند.
+- اگر `Open` تکراری برای `cid` موجود برسد، نادیده گرفته می‌شود.
+
+## pause، resume و صف‌ها
+
+`MuxServer` backpressure هر child را جدا نگه می‌دارد:
+
+- `FlowPause` و `FlowResume` ورودی برای همان child به نود بعدی forward می‌شود.
+- اگر child pause باشد و payload بیشتری برای آن برسد، payload در صف child نگه داشته می‌شود.
+- وقتی صف child پایین‌تر از حدود `512 KB` آمد، `FlowResume` فرستاده می‌شود.
+- اگر صف child به `child-buffer-limit` برسد، parent موقتا pause می‌شود و بعد از پایین آمدن صف‌ها resume می‌گیرد.
+
+## محدودیت‌ها و نکته‌ها
+
+- buffer خواندن parent سقف فعلی `1 MB` دارد. عبور از این حد parent و childهایش را می‌بندد.
+- `MuxServer` را بدون `MuxClient` سمت مقابل استفاده نکنید؛ payload ورودی باید frame MUX معتبر باشد.
+- `UpStreamEst` و `DownStreamInit` در پیاده‌سازی فعلی مسیر عادی این نود نیستند؛ این نود endpoint عمومی نیست.

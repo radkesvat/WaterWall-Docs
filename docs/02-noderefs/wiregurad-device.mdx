@@ -1,186 +1,81 @@
 ---
-sidebar_position: 100800
+sidebar_position: 1800
 ---
 
 # WireGuardDevice
 
-## 📖 معرفی کلی
+`WireGuardDevice` پیاده‌سازی WireGuard داخل زنجیر WaterWall است. این نود pure packet tunnel است: نه socket UDP می‌سازد، نه interface سیستم‌عامل WireGuard ایجاد می‌کند. کار آن تبدیل بین packetهای IP داخلی و پیام‌های WireGuard handshake/transport است.
 
-| ویژگی              | مقدار                        | توضیح                                              |
-|--------------------|------------------------------|----------------------------------------------------|
-| نوع نود            | tunnel (تک جهته)             | از سمت چپ با tun device کار می کند و به سمت راست می فرستد که عموما با udp باید به peer برسد                                 |
-| لایه شبکه          | لایه  ۴                    | کار با بسته‌های UDP به‌صورت stateless (بدون اتصال) |
-| موقعیت در زنجیره    | ابتدا یا انتهای زنجیره        | فقط در ابتدا یا انتهای زنجیره قابل استفاده است    |
-| وابستگی            | نود قبل/بعد                  | برای دریافت/ارسال داده ضروری است                  |
+تقسیم مسئولیت معمول:
 
+- `UdpStatelessSocket` مالک UDP socket بیرونی است.
+- `WireGuardDevice` مالک crypto، peer state، routing، handshake، keepalive و rekey است.
+- `TunDevice`، `RawSocket`، `PacketsToConnection` یا نود packet دیگر سمت packet داخلی را فراهم می‌کند.
 
-## عملکرد
+## جایگاه رایج
 
-این نود پیاده‌سازی کاملی از پروتکل WireGuard است که به صورت دوطرفه کار می‌کند.
-
-### جهت ارسال (چپ به راست)
-- از سمت چپ، پکت‌های لایه ۳ را از TUN device دریافت می‌کند
-- این پکت‌ها را رمزنگاری کرده و در قالب UDP به سمت راست ارسال می‌کند
-- معمولاً از نود `UdpStatelessSocket` برای ارسال استفاده می‌شود
-
-### جهت دریافت (راست به چپ)  
-- پکت‌های UDP رمزنگاری شده را از peer خود دریافت می‌کند
-- آن‌ها را رمزگشایی کرده و به صورت پکت‌های لایه ۳ به سمت چپ ارسال می‌کند
-
-### ساختار عمومی
-WireGuard ساختار مشخصی دارد که مستقل از کلاینت یا سرور بودن است:
-
-
-```mermaid
-flowchart LR;
-    TunDevice --> PacketAsData --> WireGuardDevice --> UdpStateLessSocket
+```text
+TunDevice -> WireGuardDevice -> UdpStatelessSocket
+UdpStatelessSocket -> WireGuardDevice -> TunDevice
 ```
 
-یعنی حتی اگر تونل راه‌اندازی کنید، فایل‌های JSON در سرور ایران و خارج یکسان خواهند بود.
+در حالت امن و واضح، دقیقا یک همسایه `UdpStatelessSocket` کنار `WireGuardDevice` قرار دهید. اگر هر دو سمت یا هیچ‌کدام `UdpStatelessSocket` باشند، کد fallback دارد، اما معمولا config خوبی نیست.
 
-## استفاده از Bridge برای پردازش اضافی
-
-اگر نود لایه ۳ تک‌جهته‌ای (چپ به راست) دارید و می‌خواهید قبل از ارسال یا دریافت داده‌های UDP، پردازش اضافی روی پکت انجام دهید، می‌توانید از نود `Bridge` استفاده کنید:
-
-
-```mermaid
-flowchart LR;
-    TunDevice --> PacketAsData --> WireGuardDevice --> B1[Bridge]
-    
-    UdpStateLessSocket --> MyDesiredNode --> B2[Bridge]
-```
-
-در این مثال، `UdpStatelessSocket` پکت‌های دریافتی را به سمت راست می‌فرستد تا `MyDesiredNode` عملیات مورد نظر را روی داده‌های دریافت شده انجام دهد.
-
-## مثال کامل: WireGuard با رمزنگاری اضافی
-
-فرض کنیم می‌خواهیم بین سرور ایران و خارج، کانکشن WireGuard برقرار کنیم و علاوه بر رمزنگاری داخلی WireGuard، یک لایه رمزنگاری اضافی نیز داشته باشیم.
-
-برای این کار، دو نود فرضی زیر را در نظر می‌گیریم:
-
-- `ProtectorClient` → رمزنگاری داده‌ها
-- `ProtectorServer` → رمزگشایی داده‌ها
-
-این نودها نیز چپ به راست کار می‌کنند.
-
-### پیکربندی سرور ایران:
-
-```mermaid
-flowchart LR;
-    TunDevice --> PacketAsData --> WireGuardDevice --> ProtectorClient --> B1[Bridge]
-    
-    UdpStateLessSocket --> B2[Bridge]
-```
-
-### پیکربندی سرور خارج:
-
-```mermaid
-flowchart LR;
-    TunDevice --> PacketAsData --> WireGuardDevice --> B1[Bridge]
-    
-    UdpStateLessSocket --> ProtectorServer --> B2[Bridge]
-```
-
-با این مثال، مفهوم استفاده از `Bridge` با WireGuard روشن شده است. حتماً صفحه مستندات `Bridge` را نیز مطالعه کنید.
-
-## ⚙️ راهنمای پیکربندی
-
-### ساختار JSON
+## نمونه تنظیم
 
 ```json
 {
-  "name": "node_name",
+  "name": "wg-device",
   "type": "WireGuardDevice",
   "settings": {
-    "privatekey": "your_private_key_here",
-    "peers": {
-      "peer1": {
-        "publickey": "peer_public_key_here",
-        "presharedkey": "optional_preshared_key",
-        "endpoint": "1.2.3.4:51820",
-        "allowedips": "10.0.0.2/32, fd86:ea04:1115::2/128",
+    "privatekey": "<base64-32-byte-private-key>",
+    "peers": [
+      {
+        "publickey": "<base64-32-byte-peer-public-key>",
+        "allowedips": "10.44.0.2/32,10.44.1.0/24,fd00::2/128",
+        "endpoint": "vpn.example.com:51820",
+        "presharedkey": "<optional-base64-32-byte-psk>",
         "persistentkeepalive": 25
       }
-    }
+    ]
   },
-  "next": "next_node_name"
+  "next": "udp-edge"
 }
 ```
 
-### شرح پارامترهای تنظیمات
+## تنظیمات ضروری
 
-#### پارامترهای اصلی
+| گزینه | توضیح |
+|---|---|
+| `privatekey` | private key دستگاه، base64 و ۳۲ بایتی |
+| `peers` | آرایه peerها؛ باید غیرخالی باشد و حداکثر `32` peer دارد |
 
-| پارامتر | نوع | الزامی | توضیح |
-|---------|-----|--------|-------|
-| `name` | string | ✅ | نام یکتای نود در پیکربندی |
-| `type` | string | ✅ | نوع نود که باید `WireGuardDevice` باشد |
-| `next` | string | ✅ | نام نود بعدی در زنجیره |
+برای هر peer:
 
-#### تنظیمات WireGuard (`settings`)
+| گزینه | توضیح |
+|---|---|
+| `publickey` | public key peer، base64 و ۳۲ بایتی |
+| `allowedips` | یک یا چند CIDR جداشده با comma؛ IPv4 و IPv6 پشتیبانی می‌شود، حداکثر `16` entry |
+| `endpoint` | مقصد peer به شکل `host:port`، `ipv4:port` یا `[ipv6]:port` |
 
-| پارامتر | نوع | الزامی | توضیح |
-|---------|-----|--------|-------|
-| `privatekey` | string | ✅ | کلید خصوصی این دستگاه WireGuard (base64) |
-| `peers` | object | ✅ | لیست همتایان (peers) که با آن‌ها ارتباط برقرار می‌شود |
+## تنظیمات اختیاری peer
 
-#### تنظیمات هر Peer
+| گزینه | پیش‌فرض | توضیح |
+|---|---|---|
+| `presharedkey` | بدون PSK | کلید PSK اختیاری base64 و ۳۲ بایتی |
+| `persistentkeepalive` | `0` | ثانیه؛ بازه معتبر `0` تا `65535`، مقدار `0` یعنی غیرفعال |
 
-| پارامتر | نوع | الزامی | توضیح |
-|---------|-----|--------|-------|
-| `publickey` | string | ✅ | کلید عمومی peer مقصد (base64) |
-| `endpoint` | string | ❌ | آدرس IP و پورت peer (`IP:PORT`) |
-| `allowedips` | string | ✅ | محدوده IP هایی که از طریق این peer رد می‌شوند |
-| `presharedkey` | string | ❌ | کلید مشترک اضافی برای امنیت بیشتر (base64) |
-| `persistentkeepalive` | number | ❌ | فاصله زمانی ارسال پکت keep-alive (ثانیه) |
+## رفتار routing
 
-### توضیحات تکمیلی
+- outbound: مقصد packet داخلی با longest-prefix match روی `AllowedIPs` انتخاب peer را تعیین می‌کند.
+- inbound: بعد از decrypt، source IP packet داخلی باید با `AllowedIPs` همان peer سازگار باشد.
+- endpoint زنده peer با ترافیک authenticated inbound update می‌شود، بنابراین roaming شبیه WireGuard معمولی کار می‌کند.
 
-#### `privatekey`
-- **نوع**: رشته base64
-- **الزامی**: بله
-- **توضیح**: کلید خصوصی 32 بایتی که منحصر به این دستگاه است
-- **مثال**: می‌توانید با دستور `wg genkey` تولید کنید
+## کارهایی که انجام نمی‌دهد
 
-#### `publickey`
-- **نوع**: رشته base64  
-- **الزامی**: بله (برای هر peer)
-- **توضیح**: کلید عمومی peer که با کلید خصوصی آن متناظر است
-- **مثال**: از کلید خصوصی peer با `wg pubkey` قابل تولید
+- تنظیم `Address`، `ListenPort`، `MTU` یا routeهای سیستم‌عامل
+- اجرای `PostUp` یا `PostDown`
+- ساخت interface WireGuard سیستم‌عامل
+- bind کردن UDP socket
 
-#### `endpoint`
-- **نوع**: رشته
-- **الزامی**: خیر
-- **توضیح**: آدرس و پورت peer برای برقراری اتصال اولیه
-- **نکته**: اگر تعریف نشود، فقط اتصالات ورودی پذیرفته می‌شود
-- **فرمت**: `IP:PORT` یا `domain.com:PORT`
-
-:::caution
-اگه endpoint قرار ندهید ؛ این نود هندشیک را شروع نمیکنه ولی peer میتونه به ما هندشیک کنه و کانکشن را برقرار کنه.
-:::
-
-#### `allowedips`
-- **نوع**: رشته
-- **الزامی**: بله
-- **توضیح**: محدوده‌های IP که از طریق این peer مسیریابی می‌شوند
-- **فرمت**: می‌تواند چندین محدوده با کاما جدا شده باشد
-- **مثال**: `0.0.0.0/0` برای تمام ترافیک IPv4
-
-#### `presharedkey`
-- **نوع**: رشته base64
-- **الزامی**: خیر
-- **توضیح**: کلید 32 بایتی اضافی برای امنیت post-quantum
-- **نکته**: هر دو طرف باید همین کلید را داشته باشند
-
-#### `persistentkeepalive`
-- **نوع**: عدد صحیح
-- **الزامی**: خیر
-- **توضیح**: فاصله زمانی ارسال پکت‌های نگه‌دارنده اتصال (ثانیه)
-- **کاربرد**: برای حفظ اتصال در برابر NAT و فایروال
-- **پیشنهاد**: 25 ثانیه برای اتصالات پایدار
-
-### نکات مهم
-- همه کلیدها باید در فرمت base64 باشند
-- `allowedips` تعیین می‌کند چه ترافیکی از طریق هر peer عبور کند
-- `endpoint` فقط برای اتصال اولیه استفاده می‌شود
-- حداقل یک peer باید تعریف شود
+این کارها باید با نودهای دیگر WaterWall یا تنظیمات host انجام شوند.
