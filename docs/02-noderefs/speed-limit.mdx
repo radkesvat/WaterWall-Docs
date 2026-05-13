@@ -1,0 +1,76 @@
+---
+sidebar_position: 1400
+---
+
+# SpeedLimit
+
+`SpeedLimit` payload را با token bucket محدود می‌کند. این نود داده پروتکل را تغییر نمی‌دهد؛ فقط تعیین می‌کند هر payload چه زمانی اجازه عبور دارد یا در modeهای packet چه زمانی drop شود.
+
+## جایگاه رایج
+
+```text
+TcpListener -> SpeedLimit -> TcpConnector
+UdpListener -> SpeedLimit -> UdpConnector
+```
+
+## نمونه تنظیم
+
+```json
+{
+  "name": "limit",
+  "type": "SpeedLimit",
+  "settings": {
+    "kilo-bytes-per-sec": 256,
+    "limit-mode": "per-line",
+    "work-mode": "pause"
+  },
+  "next": "next-node"
+}
+```
+
+## تنظیمات ضروری
+
+| گزینه | توضیح |
+|---|---|
+| `bytes-per-sec` یا `kilo-bytes-per-sec` یا `mega-bytes-per-sec` | دقیقا یکی از این سه باید تنظیم شود |
+| `limit-mode` | یکی از modeهای `per-line`/`per-connection`، `all-lines`/`all-connections` یا `per-worker` |
+| `work-mode` | یکی از `pause` یا `drop` |
+| `token-recharge-rate` | اختیاری؛ فاصله refill شدن tokenها به میلی‌ثانیه، پیش‌فرض `10` |
+
+## معنی modeها
+
+- `per-line`: هر line محدودیت جدا دارد.
+- `all-lines`: همه lineهای این instance یک محدودیت مشترک دارند.
+- `per-worker`: هر worker محدودیت مشترک خودش را دارد؛ پس سقف کل می‌تواند تقریبا به تعداد workerها ضرب شود.
+- `pause`: برای stream مناسب است؛ payload اضافه نگه داشته و بعدا ارسال می‌شود.
+- `drop`: برای packet/UDP مناسب است؛ payload اضافه drop می‌شود.
+
+## token-recharge-rate
+
+این گزینه پهنای‌باند نیست؛ فاصله زمانی شارژ شدن bucket است. مثلا اگر limit برابر `1000 bytes-per-sec` و `token-recharge-rate` برابر `10` باشد، نود هر `10ms` مقداری token اضافه می‌کند.
+
+- مقدار کمتر معمولا خروجی نرم‌تر و burst کوچک‌تر می‌دهد.
+- مقدار بیشتر ممکن است traffic را burstyتر کند.
+- برای streamهای حساس به latency، پیش‌فرض `10ms` معمولا نقطه شروع خوبی است.
+
+## رفتار در pause mode
+
+در mode `pause`، اگر bucket token کافی نداشته باشد:
+
+- payload داخل خود tunnel صف می‌شود.
+- سمت source با callbackهای backpressure واتروال pause می‌شود.
+- وقتی tokenها دوباره شارژ شدند، داده صف‌شده به ترتیب آزاد می‌شود.
+- اگر buffer بزرگ باشد، ممکن است فقط بخشی از آن ارسال شود و بقیه برای refill بعدی بماند.
+
+این mode برای TCP و stream بهتر است، چون ordering حفظ می‌شود و داده دور ریخته نمی‌شود.
+
+## رفتار در drop mode
+
+در mode `drop`، تصمیم روی کل payload chunk گرفته می‌شود. اگر token کافی نباشد، همان packet یا datagram کامل drop می‌شود و برای بعد نگه داشته نمی‌شود. این mode برای packet tunnelها و UDP-style traffic امن‌تر است، چون صف کردن packetهای قدیمی معمولا رفتار شبکه را بدتر می‌کند.
+
+## نکته‌های عملی
+
+- محدودیت انتخاب‌شده برای هر bucket مجموع دو جهت را شامل می‌شود. مثلا یک bucket با `1 MB/s` بین upload و download همان bucket مشترک است.
+- محدودیت را بیش از حد پایین نگذارید؛ ممکن است باعث timeout نودهای دیگر شود.
+- برای stream معمولا `work-mode: "pause"` و برای packet معمولا `work-mode: "drop"` انتخاب بهتری است.
+- در packet chainها، packet line یک state مشترک worker است؛ بنابراین `per-line` روی packet line مثل limit worker-local عمل می‌کند، نه limit جدا برای هر flow واقعی.

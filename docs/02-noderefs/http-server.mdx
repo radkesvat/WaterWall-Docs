@@ -1,0 +1,130 @@
+---
+sidebar_position: 710
+---
+
+# HttpServer
+
+`HttpServer` سمت معکوس `HttpClient` است. درخواست HTTP را می‌خواند، فقط body را به نود بعدی می‌دهد و payload برگشتی را به response body تبدیل می‌کند. این نود HTTP/1.1، HTTP/2 مستقیم، h2c upgrade و WebSocket را پشتیبانی می‌کند.
+
+## جایگاه رایج
+
+```text
+TcpListener -> HttpServer -> SomeServiceTunnel
+TcpListener -> TlsServer -> HttpServer -> SomeServiceTunnel
+```
+
+اگر ترافیک ورودی HTTPS است، ابتدا باید با `TlsServer` باز شود و بعد به `HttpServer` برسد.
+
+## نمونه تنظیم
+
+```json
+{
+  "name": "http-server",
+  "type": "HttpServer",
+  "settings": {
+    "http-version": "both",
+    "upgrade": true,
+    "websocket": false,
+    "host": "example.com",
+    "path": "/api/upload",
+    "status": 200,
+    "headers": {
+      "server": "waterwall"
+    }
+  },
+  "next": "service"
+}
+```
+
+## تنظیمات مهم
+
+| گزینه | توضیح |
+|---|---|
+| `http-version` | انتخاب HTTP/1.1، HTTP/2 یا `both` |
+| `upgrade` | پذیرش h2c upgrade در حالت مناسب |
+| `upgrade-protocol` | token ارتقای HTTP/1.1؛ پیش‌فرض `h2c` |
+| `upgrade-request-headers` | headerهایی که در request ارتقا باید وجود داشته باشند |
+| `upgrade-response-headers` | headerهای اضافه برای پاسخ `101 Switching Protocols` |
+| `websocket` | پذیرش WebSocket handshake و frameهای binary |
+| `websocket-origin` | اگر تنظیم شود، مقدار `Origin` باید همین باشد |
+| `websocket-subprotocol` | subprotocol مورد انتظار که در پاسخ هم echo می‌شود |
+| `host` | اگر تنظیم شود، درخواست باید با host مورد انتظار سازگار باشد |
+| `path` | اگر تنظیم شود، path درخواست کنترل می‌شود |
+| `method` | محدود کردن متد مورد انتظار |
+| `status` | status code پاسخ |
+| `headers` | headerهای اضافه پاسخ |
+| `content-type` | Content-Type پاسخ |
+| `full-duplex` | کنترل اینکه پایان request چطور به finish واتروال تبدیل شود |
+| `http1-mode` | `single` یا `split` برای HTTP/1.1 |
+| `split` | تنظیمات pairing در حالت split |
+| `verbose` | log بیشتر برای تشخیص پروتکل و framing |
+| `no-split-upload-buffering-limit` | گزینه خاص تست برای محدود نکردن upload قبل از join شدن download |
+
+## HTTP/1.1 split mode
+
+در `http1-mode: "split"`، `HttpServer` دو اتصال HTTP/1.1 را به یک line واتروال تبدیل می‌کند:
+
+- upload request: body آن decode می‌شود و به نود بعدی می‌رود.
+- download request: response chunked را دریافت می‌کند و payload برگشتی از نود بعدی داخل آن نوشته می‌شود.
+
+دو نیمه با شناسه و جهت pair می‌شوند. این حالت باید با `HttpClient` split mode در سمت مقابل هماهنگ باشد.
+
+نمونه:
+
+```json
+{
+  "name": "http-server",
+  "type": "HttpServer",
+  "settings": {
+    "http-version": 1,
+    "http1-mode": "split",
+    "path": "/tunnel",
+    "split": {
+      "upload-method": "POST",
+      "download-method": "GET",
+      "id-placement": "query",
+      "id-name": "sid",
+      "direction-name": "part",
+      "token": "shared-edge-token",
+      "token-placement": "header",
+      "token-name": "X-Tunnel-Token"
+    },
+    "headers": {
+      "Cache-Control": "no-store"
+    }
+  },
+  "next": "service"
+}
+```
+
+فیلدهای رایج داخل `split`:
+
+| گزینه | پیش‌فرض | توضیح |
+|---|---|---|
+| `upload-method` | مقدار top-level `method` | متد سمت upload |
+| `download-method` | `GET` | متد سمت download |
+| `upload-path` | مقدار top-level `path` | path سمت upload |
+| `download-path` | مقدار top-level `path` | path سمت download |
+| `id-placement` | `query` | جای شناسه: `query`، `header`، `cookie` یا `path` |
+| `id-name` | `wwid` | نام شناسه مشترک |
+| `direction-placement` | `query` | جای marker جهت |
+| `direction-name` | `wwdir` | نام marker جهت |
+| `upload-value` / `download-value` | `upload` / `download` | مقدارهای جهت |
+| `token`, `token-placement`, `token-name` | - | token مشترک اختیاری که هر دو نیمه باید داشته باشند |
+
+:::warning
+Split mode فقط برای `http-version = 1` است و با `websocket` ترکیب نمی‌شود.
+:::
+
+## full-duplex
+
+در حالت پیش‌فرض، پایان request body می‌تواند به upstream `Finish` در واتروال تبدیل شود. اگر می‌خواهید HTTP مثل transport دوطرفه طولانی‌تر رفتار کند، `full-duplex: true` باعث می‌شود پایان request فقط در state داخلی ثبت شود و line سرویس تا بسته شدن transport واقعی باز بماند.
+
+## رفتار مهم
+
+- headerهای HTTP به نود بعدی داده نمی‌شوند؛ فقط body عبور می‌کند.
+- در HTTP/1.1 response معمولا به صورت chunked body تولید می‌شود.
+- در HTTP/2، DATA frameها روی یک stream منطقی استفاده می‌شوند.
+- اگر peer streamهای HTTP/2 اضافه باز کند، طراحی فعلی آن را به عنوان چند connection مستقل پشتیبانی نمی‌کند.
+- h2c upgrade همراه با request body برای طراحی فعلی مناسب نیست و باید محافظه‌کارانه استفاده شود.
+- اگر `upgrade-protocol` غیر از `h2c` باشد و upgrade موفق شود، مسیر بعد از `101` خام و bidirectional می‌شود.

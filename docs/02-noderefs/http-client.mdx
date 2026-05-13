@@ -1,0 +1,143 @@
+---
+sidebar_position: 700
+---
+
+# HttpClient
+
+`HttpClient` payload واتروال را داخل یک درخواست HTTP می‌فرستد و در مسیر برگشت فقط body پاسخ HTTP را به نود قبلی تحویل می‌دهد. این نود HTTP/1.1، HTTP/2 تک‌استریم و upgrade از HTTP/1.1 به `h2c` را پشتیبانی می‌کند. اگر `websocket` فعال باشد، HTTP فقط برای handshake استفاده می‌شود و بعد payloadها به صورت WebSocket binary frame جابه‌جا می‌شوند.
+
+## جایگاه رایج
+
+```text
+SomeTunnel -> HttpClient -> TcpConnector
+SomeTunnel -> HttpClient -> TlsClient -> TcpConnector
+```
+
+اگر می‌خواهید روی wire HTTPS داشته باشید، `TlsClient` را بعد از `HttpClient` قرار دهید. مقدار `scheme: "https"` به تنهایی TLS ایجاد نمی‌کند.
+
+## نمونه تنظیم
+
+```json
+{
+  "name": "http-client",
+  "type": "HttpClient",
+  "settings": {
+    "host": "example.com",
+    "path": "/api/upload",
+    "scheme": "https",
+    "port": 443,
+    "method": "POST",
+    "http-version": "both",
+    "upgrade": true,
+    "headers": {
+      "x-client-name": "waterwall"
+    }
+  },
+  "next": "tls-or-transport"
+}
+```
+
+## تنظیمات مهم
+
+| گزینه | پیش‌فرض | توضیح |
+|---|---|---|
+| `host` | اجباری | مقدار `Host` در HTTP/1.1 و `:authority` در HTTP/2 |
+| `path` | `/` | مسیر درخواست |
+| `scheme` | `https` | فقط metadata HTTP؛ TLS را فعال نمی‌کند |
+| `port` | بر اساس scheme | پورت مقصد در metadata |
+| `method` | `POST` | متد HTTP در حالت غیر WebSocket |
+| `user-agent` | `WaterWall/1.x` | User-Agent |
+| `http-version` | HTTP/2 | مقدارهایی مثل `1`, `2`, `http1`, `h2`, `both`, `auto` |
+| `upgrade` | وابسته به mode | در حالت `both` برای h2c upgrade استفاده می‌شود |
+| `upgrade-protocol` | `h2c` | token سفارشی برای HTTP/1.1 Upgrade |
+| `upgrade-request-headers` | - | headerهای اضافه فقط برای request ارتقا |
+| `upgrade-response-headers` | - | headerهایی که باید در پاسخ `101` وجود داشته باشند تا upgrade پذیرفته شود |
+| `headers` | - | headerهای اضافه؛ مقدارها باید string باشند |
+| `content-type` | - | Content-Type از جدول داخلی واتروال |
+| `websocket` | `false` | فعال‌سازی WebSocket |
+| `websocket-origin` | - | header `Origin` |
+| `websocket-subprotocol` | - | subprotocol در handshake |
+| `websocket-extensions` | - | اگر peer extension مذاکره کند، نسخه فعلی آن را نمی‌پذیرد |
+| `full-duplex` | `false` | برای symmetry با server؛ سمت client در HTTP/1.1 chunked body را تا upstream finish باز نگه می‌دارد |
+| `http1-mode` | `single` | حالت HTTP/1.1: `single` یا `split` |
+| `split` | - | تنظیمات حالت `http1-mode: "split"` |
+| `verbose` | `false` | log بیشتر برای انتخاب پروتکل، handshake و framing |
+
+## HTTP/1.1 split mode
+
+در حالت عادی HTTP/1.1، یک اتصال HTTP هم upload را حمل می‌کند و هم response body را برمی‌گرداند. اما با:
+
+```json
+{
+  "http-version": 1,
+  "http1-mode": "split"
+}
+```
+
+`HttpClient` برای هر line واتروال دو request جدا می‌سازد:
+
+- request سمت upload، معمولا `POST`، که body واتروال را به server می‌فرستد.
+- request سمت download، معمولا `GET`، که response body را از server می‌گیرد.
+
+این دو request با یک شناسه مشترک و marker جهت به هم وصل می‌شوند. این روش برای مسیرهایی مفید است که proxy/CDN یا middlebox با اتصال HTTP/1.1 دوطرفه طولانی رفتار خوبی ندارد، اما با upload و download جدا بهتر کنار می‌آید.
+
+نمونه:
+
+```json
+{
+  "name": "http-client",
+  "type": "HttpClient",
+  "settings": {
+    "host": "cdn.example",
+    "http-version": 1,
+    "http1-mode": "split",
+    "path": "/tunnel",
+    "split": {
+      "upload-method": "POST",
+      "download-method": "GET",
+      "id-placement": "query",
+      "id-name": "sid",
+      "direction-name": "part",
+      "upload-headers": {
+        "Cache-Control": "no-store"
+      },
+      "download-headers": {
+        "Accept": "application/octet-stream"
+      }
+    }
+  },
+  "next": "transport"
+}
+```
+
+فیلدهای رایج داخل `split`:
+
+| گزینه | پیش‌فرض | توضیح |
+|---|---|---|
+| `upload-method` | مقدار top-level `method` | متد request سمت upload |
+| `download-method` | `GET` | متد request سمت download |
+| `upload-path` | مقدار top-level `path` | path سمت upload |
+| `download-path` | مقدار top-level `path` | path سمت download |
+| `upload-headers` / `download-headers` | - | headerهای اضافه برای هر نیمه |
+| `id-placement` | `query` | جای شناسه: `query`، `header`، `cookie` یا `path` |
+| `id-name` | `wwid` | نام فیلد شناسه |
+| `direction-placement` | `query` | جای marker جهت |
+| `direction-name` | `wwdir` | نام فیلد جهت |
+| `upload-value` / `download-value` | `upload` / `download` | مقدار جهت |
+| `cache-bypass` | `true` | افزودن مقدار متغیر برای جلوگیری از cache شدن |
+| `cache-bypass-name` | `wwcb` | نام فیلد cache bypass |
+| `token`, `token-placement`, `token-name` | - | metadata مشترک اختیاری برای شناسایی/محافظت |
+
+در path template می‌توانید از `{id}`، `{direction}`، `{cache}` و `{token}` استفاده کنید.
+
+:::warning
+Split mode فقط با `http-version = 1` معتبر است و با `websocket` ترکیب نمی‌شود.
+:::
+
+## نکته‌های عملی
+
+- این نود headerها را مصرف می‌کند؛ نود قبلی HTTP خام نمی‌بیند، فقط body را می‌بیند.
+- در HTTP/2 طراحی فعلی تک‌استریم است و برای چند stream منطقی جداگانه ساخته نشده است.
+- upgrade با body در طراحی فعلی امن نیست؛ برای چنین حالتی از upgrade استفاده نکنید.
+- اگر `upgrade-protocol` چیزی غیر از `h2c` باشد، بعد از پاسخ موفق `101` تونل به raw bidirectional byte forwarding تبدیل می‌شود.
+- برای WebSocket، payload upstream به binary frame تبدیل می‌شود و close frame قبل از finish ارسال می‌شود.
