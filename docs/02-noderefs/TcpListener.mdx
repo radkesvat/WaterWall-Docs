@@ -1,0 +1,503 @@
+---
+sidebar_position: 100
+title: "TcpListener"
+sidebar_label: "TcpListener"
+description: "Reference documentation for the TcpListener node."
+---
+
+<!--
+Documentation version: 106
+Sync note: Any change to this file must also be applied to WaterWall/tunnels/TcpListener/description.md, and both files must keep the same documentation version.
+-->
+
+# TcpListener
+
+`TcpListener` is a TCP server adapter. It binds a local TCP address and port,
+accepts inbound client connections, creates one WaterWall line for each accepted
+socket, and passes that line upstream to the next node in the chain.
+
+Typical placement:
+
+```text
+client -> TcpListener -> ... -> TcpConnector -> remote service
+```
+
+This node is normally used as the beginning of a stream chain.
+
+## What It Does
+
+- Listens on one TCP port, several explicit TCP ports, or a contiguous TCP port
+  range.
+- Accepts inbound TCP clients.
+- Creates a WaterWall line for each accepted socket.
+- Sends client payload upstream to the next node.
+- Sends downstream payload from the chain back to the client socket.
+- Applies optional accept-time filters such as `whitelist`, `blacklist`, and
+  balance groups.
+
+`TcpListener` is a chain-head node. Connections are created by external TCP
+clients, not by a previous WaterWall tunnel.
+
+## Configuration Example
+
+```json
+{
+  "name": "inbound-listener",
+  "type": "TcpListener",
+  "settings": {
+    "address": "0.0.0.0",
+    "port": [
+      443,
+      80,
+      2083
+    ],
+    "nodelay": true,
+    "large-send-buffer": true,
+    "large-recv-buffer": true,
+    "interface": "eth0",
+    "fwmark": 10,
+    "balance-group": "public-443",
+    "balance-interval": 30000,
+    "initial-idle-timeout-ms": 5000,
+    "active-idle-timeout-ms": 300000,
+    "multiport-backend": "socket",
+    "whitelist": [
+      "192.168.1.0/24",
+      "2001:db8::/64"
+    ],
+    "blacklist": [
+      "192.168.1.50/32"
+    ]
+  },
+  "next": "next-node-name"
+}
+```
+
+## Required Fields
+
+Top-level fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | string | User-chosen node name. Must be unique inside the config file. |
+| `type` | string | Must be exactly `"TcpListener"`. |
+| `next` | string | Node that receives accepted TCP lines. |
+
+Required `settings` fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `address` | string | Local bind address, such as `"0.0.0.0"`, `"::"`, or a specific local IP. |
+| `port` or `port-range` | number, array, or range array | Listening port definition. Exactly one of these fields is required. |
+
+`settings` must be a non-empty object.
+
+## Port Configuration
+
+`TcpListener` supports three port modes.
+
+### Single Port
+
+```json
+{
+  "settings": {
+    "address": "0.0.0.0",
+    "port": 443
+  }
+}
+```
+
+### Explicit Port List
+
+```json
+{
+  "settings": {
+    "address": "0.0.0.0",
+    "port": [
+      443,
+      80,
+      2083
+    ]
+  }
+}
+```
+
+This listens only on the listed ports. It does not mean the range from `80` to
+`2083`.
+
+### Contiguous Port Range
+
+```json
+{
+  "settings": {
+    "address": "0.0.0.0",
+    "port-range": [
+      40000,
+      40100
+    ]
+  }
+}
+```
+
+`port-range` must be an array with exactly two positive integer ports:
+`[min, max]`. The minimum must be lower than or equal to the maximum.
+
+:::warning
+Do not use old string-style range examples such as `"40000-40100"`. The current
+parser expects `port-range` as a two-item array.
+:::
+
+Rules:
+
+| Rule | Behavior |
+| --- | --- |
+| Use both `port` and `port-range` | Startup fails. |
+| `port` number | Listens on one port. |
+| `port` array | Listens on the explicit ports in the array. |
+| `port-range` array | Listens on every port from minimum to maximum. |
+| Invalid, zero, negative, or above `65535` port | Startup fails. |
+
+## Optional Settings
+
+| Setting | Type | Default | Description |
+| --- | --- | --- | --- |
+| `nodelay` | boolean | `false` | Enables `TCP_NODELAY` on accepted sockets. |
+| `large-send-buffer` | boolean or positive integer | `false`, or `true` when mux is present and omitted | Sets `SO_SNDBUF` on accepted sockets. |
+| `large-recv-buffer` | boolean or positive integer | `false`, or `true` when mux is present and omitted | Sets `SO_RCVBUF` on accepted sockets. |
+| `interface` | string | not set | Restricts the listener to a local network interface. |
+| `fwmark` | integer | not set | Applies a Linux-style socket mark where supported. |
+| `balance-group` | string | not set | Groups same-port listeners for client distribution. |
+| `balance-interval` | integer, milliseconds | socket-manager default | Sticky interval for repeated clients in a balance group. |
+| `initial-idle-timeout-ms` | positive integer, milliseconds | `5000` | Timeout before listener-side payload activity is seen. |
+| `active-idle-timeout-ms` | positive integer, milliseconds | `300000` | Timeout after listener-side activity is seen. |
+| `multiport-backend` | string | runtime default for `port-range` | Backend for contiguous port ranges: `"iptables"` or `"socket"`. |
+| `whitelist` | array of strings | not set | Allowed client IPs or CIDR ranges. |
+| `blacklist` | array of strings | not set | Blocked client IPs or CIDR ranges. |
+
+### Socket Buffer Options
+
+`large-send-buffer` and `large-recv-buffer` accept:
+
+| Value | Meaning |
+| --- | --- |
+| `true` | Use WaterWall's default large socket buffer size, currently `4194304` bytes. |
+| `false` | Do not explicitly set this socket buffer; use the kernel default. |
+| positive integer | Request that many bytes directly. |
+
+If the option is omitted and the finalized chain contains `MuxClient` or
+`MuxServer`, `TcpListener` automatically uses the default large socket buffer
+size for the omitted buffer option.
+
+### Interface and `fwmark`
+
+`interface` restricts the listener to a local network device.
+
+On Linux, WaterWall uses `SO_BINDTODEVICE`. On platforms without device binding,
+WaterWall falls back to binding by the interface IPv4 address when possible.
+
+`fwmark` uses `SO_MARK` on platforms that provide it. It is platform-dependent
+and is not available on Windows.
+
+## Common Examples
+
+### Local Test Listener
+
+```json
+{
+  "name": "local-entry",
+  "type": "TcpListener",
+  "settings": {
+    "address": "127.0.0.1",
+    "port": 8080
+  },
+  "next": "outbound"
+}
+```
+
+This only accepts clients on the same machine.
+
+### Public VPS Listener
+
+```json
+{
+  "name": "public-entry",
+  "type": "TcpListener",
+  "settings": {
+    "address": "0.0.0.0",
+    "port": 443,
+    "nodelay": true,
+    "initial-idle-timeout-ms": 5000,
+    "active-idle-timeout-ms": 300000
+  },
+  "next": "tls-server"
+}
+```
+
+This accepts IPv4 clients on all local interfaces. The VPS firewall and provider
+firewall must also allow the selected port.
+
+### Multiport Listener
+
+```json
+{
+  "name": "multiport-entry",
+  "type": "TcpListener",
+  "settings": {
+    "address": "0.0.0.0",
+    "port": [
+      443,
+      8443,
+      2083
+    ],
+    "nodelay": true
+  },
+  "next": "router"
+}
+```
+
+Explicit `port` arrays use socket-per-port listening.
+
+### Port Range Listener
+
+```json
+{
+  "name": "range-entry",
+  "type": "TcpListener",
+  "settings": {
+    "address": "0.0.0.0",
+    "port-range": [
+      40000,
+      40100
+    ],
+    "multiport-backend": "socket"
+  },
+  "next": "router"
+}
+```
+
+For `port-range`, the runtime can either create one listening socket per port
+with the `socket` backend or use a main socket plus redirection rules with the
+`iptables` backend. Set `multiport-backend` explicitly when you need a specific
+backend.
+
+## Accept Path
+
+When a TCP client connects, `TcpListener`:
+
+1. attaches the accepted socket to a worker loop
+2. creates a new WaterWall line
+3. stores listener line state for that connection
+4. fills routing information from the accepted connection
+5. sends upstream `init` to the next node
+6. starts reading from the client socket
+
+The line source context is populated from the accepted connection. In the current
+implementation, the peer IP is recorded, and the local port that accepted the
+connection is stored in the source context port field.
+
+## Data Flow
+
+```text
+client socket -> TcpListener -> next node
+client socket <- TcpListener <- next node
+```
+
+Directionally:
+
+| Direction | Behavior |
+| --- | --- |
+| Client to chain | Socket read becomes upstream payload to `next`. |
+| Chain to client | Downstream payload is written to the accepted socket. |
+
+The next node should expect traffic from accepted clients and should send
+responses back downstream.
+
+## Backpressure and Write Queue
+
+`TcpListener` protects the process when a client socket is slow or temporarily
+not writable.
+
+Behavior:
+
+- If a write cannot complete immediately, outgoing buffers are queued.
+- Once the queued data grows beyond `1 KB`, the next node is paused.
+- When the socket becomes writable again, queued buffers are flushed and the next
+  node is resumed.
+- If the queued data grows beyond `16 MB`, the connection is closed.
+
+This prevents one slow client from causing unbounded memory growth.
+
+## Idle Timeout Behavior
+
+Every accepted connection is tracked in a worker-local idle table.
+
+| Phase | Default timeout |
+| --- | --- |
+| Newly accepted connection before listener-side payload activity | `5000 ms` |
+| Active connection after listener-side activity | `300000 ms` |
+
+If a connection expires, the socket and line are closed.
+
+The initial and active values are configured with:
+
+```json
+{
+  "settings": {
+    "initial-idle-timeout-ms": 5000,
+    "active-idle-timeout-ms": 300000
+  }
+}
+```
+
+For chains such as `TcpListener -> TlsServer`, listener-side activity is not the
+same thing as a completed TLS handshake. A client that sends a partial TLS record
+can move into the active timeout while `TlsServer` is still waiting for more
+handshake bytes. When tuning probe-resistant TLS fallback behavior, keep these
+timeouts consistent with the public service timing you want to resemble.
+
+## Balance Groups
+
+`balance-group` places this listener into a group with other compatible
+listeners on the same port.
+
+When multiple listeners share the same `balance-group` and port, the socket
+manager selects one listener for a new client and remembers that choice using a
+hash of the client IP. During `balance-interval`, later connections from the
+same client IP stay pinned to the same listener.
+
+Example:
+
+```json
+{
+  "settings": {
+    "address": "0.0.0.0",
+    "port": 443,
+    "balance-group": "public-443",
+    "balance-interval": 30000
+  }
+}
+```
+
+## Whitelist and Blacklist
+
+`whitelist` and `blacklist` accept arrays of IP or CIDR strings. Both IPv4 and
+IPv6 are supported.
+
+Example:
+
+```json
+{
+  "settings": {
+    "whitelist": [
+      "10.0.0.0/8",
+      "192.168.1.20/32",
+      "2001:db8::/64"
+    ],
+    "blacklist": [
+      "10.0.0.13/32"
+    ]
+  }
+}
+```
+
+Behavior:
+
+| Configuration | Result |
+| --- | --- |
+| No lists | No client IP filtering by this listener. |
+| `whitelist` present | Only matching client IPs are accepted by this listener. |
+| `blacklist` present | Matching client IPs are rejected by this listener. |
+| Both present | A client must match the whitelist, if any, and must not match the blacklist. |
+
+If multiple listeners are registered on the same port, another listener may
+still receive the same connection if its filter matches and this listener's
+filter does not.
+
+## Multiport Backend Notes
+
+For explicit `port` arrays, WaterWall treats every array entry as one explicit
+port and uses socket-per-port listening.
+
+For `port-range`, WaterWall can use:
+
+| Backend | Notes |
+| --- | --- |
+| `"socket"` | Creates one listening socket per port. Simple and easy to reason about. |
+| `"iptables"` | Uses redirection rules and can be useful for large ranges, but depends on the host environment and firewall rules. |
+
+For small ranges, `socket` is usually easier to debug. For large ranges,
+`iptables` can reduce socket count if your deployment controls the system rules.
+
+## Filter Priority and Default Paths
+
+When several `TcpListener` nodes cover the same local port, the socket manager
+does not treat every listener as equal. It evaluates more specific listener
+filters first. A listener with `whitelist` or `blacklist` has higher priority
+than an otherwise equivalent listener without IP filters.
+
+This lets you build a default-path pattern:
+
+```text
+same public port
+  ├─ matching filtered listener   -> special path
+  └─ unfiltered listener          -> default path
+```
+
+Example:
+
+```json
+{
+  "nodes": [
+    {
+      "name": "trusted-entry",
+      "type": "TcpListener",
+      "settings": {
+        "address": "0.0.0.0",
+        "port": 443,
+        "whitelist": [
+          "203.0.113.10/32",
+          "2001:db8:100::/48"
+        ]
+      },
+      "next": "trusted-path"
+    },
+    {
+      "name": "default-entry",
+      "type": "TcpListener",
+      "settings": {
+        "address": "0.0.0.0",
+        "port": 443
+      },
+      "next": "default-path"
+    }
+  ]
+}
+```
+
+In this shape, clients matching `trusted-entry.whitelist` are handled by
+`trusted-entry`. Other clients fall through to `default-entry`, because the
+unfiltered listener behaves like the default path for that port.
+
+You can use the same idea with `blacklist` to exclude a range from one path and
+let another listener receive the connection if its own filters match.
+
+`TcpListener` filters are IP/CIDR filters only. They do not support GeoIP names,
+domain categories, SNI, HTTP Host, or protocol sniffing. For country-based
+routing such as `geoip:ir`, route by a `Router` node after accepting the
+connection.
+
+If `balance-group` is used, matching balanced listeners are selected through the
+balance-group logic instead of acting as a simple first-match branch. Use the
+priority/default-path pattern with ordinary filtered listeners when you want
+deterministic IP-specific routing.
+
+## Notes and Caveats
+
+- `TcpListener` is designed as an inbound entry point.
+- The parser expects `port` as a number or an explicit array of port numbers.
+- The parser expects `port-range` as a two-item range array.
+- `multiport-backend` only matters for contiguous `port-range` listeners.
+- `fwmark` and device binding are platform-dependent.
+- A listener bound to `127.0.0.1` only accepts local clients.
+- A listener bound to `0.0.0.0` accepts on all IPv4 interfaces, subject to the
+  operating system and provider firewall.

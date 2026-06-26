@@ -1,0 +1,141 @@
+---
+sidebar_position: 515
+title: "UserController"
+sidebar_label: "UserController"
+description: "Reference documentation for the UserController node."
+---
+
+<!--
+Documentation version: 106
+Sync note: Any change to this file must also be applied to WaterWall/tunnels/Internals/UserController/description.md, and both files must keep the same documentation version.
+-->
+
+# UserController
+
+`UserController` is an advanced support node that enforces authenticated-user limits for traffic-serving chains.
+
+Normal users usually should not place it manually. Server-side nodes such as `Socks5Server`, `TrojanServer`, and `VlessServer` create an internal `UserController` when they run in authenticated database-backed mode. Configure those higher-level nodes first unless you are building a custom tunnel that calls `lineAddUser()` and understands WaterWall's user-handle lifecycle.
+
+## What It Does
+
+`UserController` sits after a node that has already authenticated a user and recorded a `user_handle_t` on the line. On each admitted authenticated line, it:
+
+- checks whether the user is enabled
+- checks expiry state
+- reserves a live outbound connection slot
+- reserves a source-IP slot when source IP is available
+- accounts upstream and downstream payload bytes
+- closes active lines when a user is disabled, expired, removed, or over traffic quota
+- releases connection/IP slots when the line finishes
+
+It does not parse login protocols and it does not store the authoritative user database. It depends on an existing `AuthenticationClient` node for user lookup, admission checks, and traffic accounting.
+
+## Typical Placement
+
+For normal authenticated server nodes, do not add it manually:
+
+```text
+TcpListener -> Socks5Server -> TcpConnector
+```
+
+In authenticated mode, `Socks5Server` inserts its own internal `UserController` between itself and the configured outbound node.
+
+Manual placement is for advanced custom chains where a previous node records an authenticated user handle:
+
+```text
+CustomAuthNode -> UserController -> TcpConnector
+```
+
+Lines without a valid current user handle are passed through without enforcement.
+
+## Basic Example
+
+```json
+{
+  "name": "user-controller",
+  "type": "UserController",
+  "settings": {
+    "auth-client-node-name": "auth-client",
+    "sweep-interval-ms": 1000,
+    "verbose": false
+  },
+  "next": "outbound"
+}
+```
+
+`auth-client` must be an `AuthenticationClient` node in the same config file. `UserController` only references that existing node; it does not create one.
+
+## Required Fields
+
+| Field | Type | Description |
+|---|---|---|
+| `type` | string | Must be `UserController`. |
+| `settings` | object | Must be a non-empty object. |
+| `settings.auth-client-node-name` | string | Name of an existing `AuthenticationClient` node. It must not point to `UserController` itself. |
+
+## Optional Settings
+
+| Field | Default | Description |
+|---|---|---|
+| `sweep-interval-ms` | `1000` | Per-worker interval for checking active managed lines even when they are idle. Must be `>= 1`. |
+| `verbose` | `false` | Enables more detailed warning context for rejected or closed managed lines. |
+
+## Enforced Limits
+
+`UserController` reads the user limit state from the local table maintained by `AuthenticationClient`.
+
+| Limit area | Behavior |
+|---|---|
+| `enabled` | Disabled users cannot open new managed lines; existing managed lines are closed by payload checks or the sweep timer. |
+| Time expiry | Expired users cannot open new managed lines; existing managed lines are closed. |
+| `traffic.up`, `traffic.down`, `traffic.total` | Payload bytes are added to cumulative counters. Over-quota users are rejected or closed. |
+| `connections-out` | Maximum simultaneous managed outbound lines for the user. |
+| `ips` | Maximum simultaneous distinct source IPs for the user. Reusing an already-counted IP is allowed. |
+
+`connections-in` is not enforced by this node. Bandwidth speed limiting is also not handled here; use `SpeedLimit` for bytes-per-second throttling.
+
+A zero or missing limit means unlimited for that field.
+
+## Runtime Flow
+
+On upstream `Init`:
+
+1. line state is initialized
+2. the current line user handle is read
+3. anonymous or invalid-handle lines are forwarded without enforcement
+4. authenticated lines are checked through `AuthenticationClient`
+5. accepted lines reserve connection/IP slots and are registered for sweep checks
+6. rejected lines finish back toward the previous side without opening the upstream side
+
+On upstream payload, byte count is treated as user upload. On downstream payload, byte count is treated as user download. If accounting says the user should close, the buffer is recycled and both directions are finished.
+
+On `Finish`, the node releases the reserved connection/IP accounting state, destroys its own line state, and propagates `Finish` only to the opposite side according to WaterWall's directional finish rules.
+
+## Sweep Timer
+
+Each worker gets a periodic sweep timer. The sweep checks registered managed lines so disabled, expired, removed, or over-quota users can be disconnected even when no new payload arrives.
+
+The sweep registry holds line references while lines are managed and releases them when the line closes or the worker stops.
+
+## Operational Notes
+
+- Manual placement requires a previous node that calls `lineAddUser()` with a valid user handle.
+- Authenticated `Socks5Server`, `TrojanServer`, and `VlessServer` create this node internally; do not manually place another `UserController` immediately after those nodes in that mode.
+- `UserController` never writes user configuration such as passwords, enabled state, or limits.
+- Live connection/IP counters are process-local runtime state held through `AuthenticationClient` helpers.
+- Cumulative traffic is added to normal user traffic stats.
+- This is a stream-style support node, not a packet tunnel.
+
+## Node Metadata
+
+| Property | Value |
+|---|---|
+| Intended audience | Advanced users and internal authenticated server composition |
+| Position | Middle stream support node |
+| Requires `AuthenticationClient` | Yes |
+| Layer group | Anything to anything |
+| Per-line state | Yes |
+| Creates lines | No |
+| Destroys lines | No |
+| Modifies payload | No |
+| Required left padding | `0` |

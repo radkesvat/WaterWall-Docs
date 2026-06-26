@@ -1,0 +1,240 @@
+---
+sidebar_position: 1500
+title: "TesterClient"
+sidebar_label: "TesterClient"
+description: "Reference documentation for the TesterClient node."
+---
+
+<!--
+Documentation version: 106
+Sync note: Any change to this file must also be applied to WaterWall/tunnels/TesterClient/description.md, and both files must keep the same documentation version.
+-->
+
+# TesterClient
+
+`TesterClient` is a synthetic chain-head validation node. It creates deterministic test traffic, sends it into the next node, verifies the deterministic response sequence that comes back, and aborts the process on any mismatch or timeout.
+
+Use it to validate tunnel composition, framing, packet handling, ordering, and payload integrity. It is not a production traffic adapter.
+
+## Typical Placement
+
+Stream-mode test:
+
+```text
+TesterClient -> SomeTunnel -> SomeTunnel -> TesterServer
+```
+
+Packet-mode test:
+
+```text
+TesterClient(packet-mode=true) -> PingClient -> Bridge
+TesterServer(packet-mode=true) -> PingServer -> Bridge
+```
+
+Datagram-sensitive stream test:
+
+```text
+TesterClient -> TcpOverUdpClient -> TcpOverUdpServer -> TesterServer
+```
+
+`TesterClient` must be the chain head. It is also a singleton node type, so a config should contain only one `TesterClient` instance.
+
+## Basic Examples
+
+Stream mode:
+
+```json
+{
+  "name": "tester-client",
+  "type": "TesterClient",
+  "next": "next-node"
+}
+```
+
+Packet mode:
+
+```json
+{
+  "name": "tester-client",
+  "type": "TesterClient",
+  "settings": {
+    "packet-mode": true
+  },
+  "next": "packet-node"
+}
+```
+
+Packet mode with synthetic IPv4 packets:
+
+```json
+{
+  "name": "tester-client",
+  "type": "TesterClient",
+  "settings": {
+    "packet-mode": true,
+    "packet-ipv4": {
+      "source-ip": "198.51.100.10",
+      "dest-ip": "203.0.113.20",
+      "transport": "udp",
+      "ttl": 64
+    }
+  },
+  "next": "packet-node"
+}
+```
+
+## Required Fields
+
+| Field | Type | Description |
+|---|---|---|
+| `name` | string | User-chosen node name. |
+| `type` | string | Must be `TesterClient`. |
+| `next` | string | Node that receives the synthetic stream line or packet line. |
+
+`settings` is optional. If omitted, stream-mode defaults are used.
+
+## Settings
+
+| Field | Default | Description |
+|---|---|---|
+| `packet-mode` | `false` | Use worker packet lines instead of normal stream lines. |
+| `packet-start-immediately` | `false` | Packet mode only. Start sending without waiting for downstream `Est`. |
+| `packet-start-delay-ms` | `0` | Packet mode only. Delay used by the immediate-start packet path. Must be non-negative. |
+| `allow-early-response` | `false` | Stream mode only. Accept downstream response bytes before the full request sequence has been sent. |
+| `packet-stateless` | `false` | Packet mode only. Allow response packets to arrive out of order and identify chunks by packet size. |
+| `chunk-count` | `11` | Use the first N chunks from the selected chunk table. Valid range is `1` through `11`. |
+| `max-payload-size` | `0` | Cap generated stream payload buffers or packet sizes. `0` means use the normal table/buffer size. |
+| `split-payload-delay-ms` | `1` | Stream mode only. Delay between split payload sends when `max-payload-size` is active. |
+| `split-payload-burst` | `1` | Stream mode only. Number of split buffers sent before applying `split-payload-delay-ms`. Must be positive. |
+| `dest-context` | unset | Optional initial destination routing context copied onto each synthetic line before upstream `Init`. |
+| `packet-ipv4` | unset | Packet mode only. Wrap each test packet in a synthetic IPv4 packet. |
+
+`packet-stateless` requires `packet-mode=true`. `max-payload-size` is not supported with `packet-stateless=true`.
+
+## Chunk Tables
+
+The tester sends deterministic request chunks and expects deterministic response chunks. `chunk-count` selects a prefix of the active table.
+
+Stream-mode chunk sizes:
+
+```text
+1, 2, 4, 32, 512, 1024, 4096, 32768, 32769, 1048576, 2097152
+```
+
+Packet-mode chunk sizes:
+
+```text
+1, 2, 4, 32, 64, 128, 256, 512, 1024, 1499, 1500
+```
+
+Packet-mode with raw IPv4 envelope:
+
+```text
+21, 22, 24, 52, 84, 148, 276, 532, 1044, 1499, 1500
+```
+
+Packet-mode with IPv4 plus `tcp`, `udp`, or `icmp` transport headers:
+
+```text
+41, 42, 44, 52, 84, 148, 276, 532, 1044, 1499, 1500
+```
+
+The byte pattern is deterministic and depends on chunk index, byte offset, flow id, and direction. The first request byte carries the flow id so a real transport hop can remap work to another worker without breaking verification.
+
+## Destination Context
+
+`dest-context` lets tests seed `line->routing_context.dest_ctx` before upstream `Init`. This is useful for testing routers, connectors, and packet/UDP adapters that read destination metadata from the line.
+
+```json
+{
+  "dest-context": {
+    "address": "example.com",
+    "port": 443,
+    "protocol": "tcp"
+  }
+}
+```
+
+Supported fields:
+
+| Field | Description |
+|---|---|
+| `address` | IP address or domain. Domains must fit in the address-context length limit. |
+| `port` | Destination port, `1` through `65535`. |
+| `protocol` | `tcp` or `udp`. |
+
+## Packet IPv4 Mode
+
+`packet-ipv4` is valid only with `packet-mode=true`. It turns each opaque packet payload into a complete synthetic IPv4 packet.
+
+Required fields:
+
+| Field | Description |
+|---|---|
+| `source-ip` | IPv4 source address for request packets. |
+| `dest-ip` | IPv4 destination address for request packets. |
+
+Optional fields:
+
+| Field | Default | Description |
+|---|---|---|
+| `transport` | `none` | Optional transport header: `tcp`, `udp`, `icmp`, `raw`, or `none`. |
+| `protocol` | `253` | IPv4 protocol number. If `transport` is `tcp`, `udp`, or `icmp`, this must match that transport. |
+| `ttl` | `64` | IPv4 TTL. |
+
+For response packets, source and destination addresses are reversed automatically. For `tcp`, `udp`, and `icmp`, deterministic transport headers are generated and verified. TCP and UDP use source port `40123` and destination port `40234` for requests, reversed for responses.
+
+When `packet-ipv4` is enabled, `max-payload-size` must still leave enough room for the configured IPv4 and transport headers.
+
+## Runtime Flow
+
+On startup, `TesterClient` schedules one task per chain worker after `100 ms`. Each worker task:
+
+1. uses the worker packet line in packet mode, or creates a normal stream line otherwise
+2. initializes this tunnel's line state
+3. optionally copies `dest-context` into the line
+4. sends upstream `Init` to the next tunnel
+5. arms a `30000 ms` watchdog
+
+In normal stream mode, the client waits for downstream `Est` before sending request chunks. In packet mode, `packet-start-immediately=true` can bypass that wait.
+
+Downstream `Pause` and `Resume` pause or resume request sending.
+
+## Verification
+
+Stream mode:
+
+- response bytes are buffered until each expected response chunk is complete
+- chunks are verified in order
+- extra bytes after the expected sequence fail the test
+- downstream `Finish` before full verification fails the test
+
+Packet mode:
+
+- every response packet must match an expected response chunk exactly
+- packet lines must stay alive during runtime
+- receiving `Finish` on a packet line is a failure
+- with `packet-stateless=true`, response chunks can arrive out of order, but each expected chunk must arrive exactly once
+
+When every worker completes verification, `TesterClient` logs success and terminates the program with exit code `0`. A mismatch, timeout, invalid lifecycle event, or packet-line death terminates the program with failure.
+
+## Node Metadata
+
+| Property | Value |
+|---|---|
+| Position | Chain head |
+| Singleton | Yes |
+| Normal line owner | Creates normal stream test lines |
+| Packet mode | Uses worker packet lines and must not destroy them |
+| Maximum workers | `254` |
+| Watchdog | `30000 ms` per worker |
+| Required left padding | `0` |
+
+## Common Mistakes
+
+- Using it in production. It is a validation node and may terminate the process intentionally.
+- Forgetting `next`. `TesterClient` is a chain head that sends into another node.
+- Enabling packet mode without any packet-layer node in the chain.
+- Expecting packet mode to close packet lines. Packet lines are persistent worker helper lines.
+- Combining `packet-stateless=true` with `max-payload-size`.
+- Using `packet-ipv4` without `packet-mode=true`.

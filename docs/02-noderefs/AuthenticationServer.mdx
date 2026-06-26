@@ -1,0 +1,538 @@
+---
+sidebar_position: 500
+title: "AuthenticationServer"
+sidebar_label: "AuthenticationServer"
+description: "Reference documentation for the AuthenticationServer node."
+---
+
+<!--
+Documentation version: 106
+Sync note: Any change to this file must also be applied to WaterWall/tunnels/AuthenticationServer/description.md, and both files must keep the same documentation version.
+-->
+
+# AuthenticationServer
+
+`AuthenticationServer` is a logical chain-end node for WaterWall user database
+management. It does not open sockets and does not perform direct network I/O.
+Instead, it owns an in-memory `users_t` database, loads and saves that database
+as JSON, and answers framed logical requests from `AuthenticationClient`.
+
+Typical placement:
+
+```text
+AuthenticationClient -> AuthenticationServer
+```
+
+This node is a chain end and must not have a `next` node.
+
+## What It Does
+
+- Loads users from `db-path` into an in-memory `users_t` table.
+- Falls back to `db-path.backup` if the primary JSON database cannot be loaded.
+- Rewrites the primary database after successful backup recovery.
+- Periodically saves the current in-memory database.
+- Writes `db-path.backup` before writing `db-path` during normal saves.
+- Can write hourly, daily, or weekly historical backup snapshots.
+- Accepts framed request messages from `AuthenticationClient`.
+- Supports multiple request frames inside one outer message.
+- Dispatches request frames to built-in authentication and user-management
+  modules.
+- Sends one downstream response message containing all response frames for the
+  processed request message.
+
+`AuthenticationServer` is the authority for users. Other traffic-serving nodes
+should communicate with it through `AuthenticationClient`, not by sending server
+protocol frames directly.
+
+## Configuration Example
+
+```json
+{
+  "name": "auth-db",
+  "type": "AuthenticationServer",
+  "settings": {
+    "db-path": "users.json",
+    "file-save-rate-ms": 10000,
+    "normal-backups": "daily",
+    "normal-backups-path": "backups/",
+    "normal-backups-count-limit": 10,
+    "session-idle-timeout-ms": 600000,
+    "verbose": false,
+    "auth-clients": [
+      {
+        "name": "edge-1",
+        "secret": "long-random-secret",
+        "allow-stats-push": true,
+        "allow-user-pull": true,
+        "allow-user-write": false,
+        "session-idle-timeout-ms": 600000
+      }
+    ]
+  }
+}
+```
+
+## Required Fields
+
+Top-level fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | string | User-chosen node name. Must be unique inside the config file. |
+| `type` | string | Must be exactly `"AuthenticationServer"`. |
+| `settings` | object | Database, save, backup, session, and auth-client settings. |
+
+Required `settings` fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `db-path` | string | Path to the users JSON database file. |
+| `file-save-rate-ms` | positive integer | Periodic save interval in milliseconds. |
+| `auth-clients` | non-empty array | Control-plane clients allowed to authenticate to this server. |
+
+`AuthenticationServer` rejects configurations that define a `next` node.
+
+## Optional Settings
+
+| Setting | Type | Default | Description |
+| --- | --- | --- | --- |
+| `session-idle-timeout-ms` | positive integer | `600000` | Default session inactivity timeout in milliseconds. |
+| `verbose` | boolean | `false` | Enables focused debug logs for auth flow, request parsing, permissions, and response flow. |
+| `normal-backups` | string | disabled | Historical backup mode: `"hourly"`, `"daily"`, or `"weekly"`. |
+| `normal-backups-path` | string | not set | Directory for historical backup snapshots. Required when `normal-backups` is set. |
+| `normal-backups-count-limit` | positive integer | `10` | Maximum historical backup files to keep for this database and backup mode. |
+
+`normal-backups` and `normal-backups-path` must be specified together. If
+`normal-backups-count-limit` is set without normal backups enabled, startup
+fails.
+
+`normal-backups-path` may be relative or absolute. The server creates the
+directory when it does not exist, and startup fails if the path exists but is not
+a directory.
+
+## Auth Clients
+
+`auth-clients` defines control-plane credentials for `AuthenticationClient`
+instances. These are not normal traffic users from the user database.
+
+Each entry must contain:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | non-empty string | Authentication client name. |
+| `secret` | non-empty string | Shared secret for that authentication client. |
+
+Optional per-client fields:
+
+| Field | Type | Default | Description |
+| --- | --- | --- | --- |
+| `allow-stats-push` | boolean | `false` | Allows traffic usage sync modules. |
+| `allow-user-pull` | boolean | `false` | Allows user lookup and full-table pull modules. |
+| `allow-user-write` | boolean | `false` | Allows user create/update modules. |
+| `session-idle-timeout-ms` | positive integer | top-level timeout | Overrides the default timeout for sessions created by this client. |
+
+Permission checks are session permissions, not user permissions:
+
+| Permission | Allows |
+| --- | --- |
+| `allow-user-pull` | `GetAllUsers`, user lookup by password, SHA-224, or SHA-256. |
+| `allow-stats-push` | `PushUserStats` and `UpdateUserTraficStatsDiff`. |
+| `allow-user-write` | `AddNewUser` and `UpdateUser`. |
+
+`Authenticate` is public. Every other module requires a valid session token.
+
+## Database Format
+
+The recommended on-disk format is an object with a `users` array:
+
+```json
+{
+  "users": [
+    {
+      "id": 1001,
+      "name": "alice",
+      "password": "alice:alice-secret",
+      "email": "alice@example.com",
+      "enabled": true,
+      "limit": {
+        "traffic": {
+          "up": 1073741824,
+          "down": 1073741824,
+          "total": 2147483648
+        },
+        "bandwidth": {
+          "up": 1048576,
+          "down": 1048576
+        },
+        "ips": 4,
+        "devices": 2,
+        "connections-in": 16,
+        "connections-out": 16
+      },
+      "time": {
+        "created-at-ms": 1735689600000,
+        "expire-at-ms": 1767225600000
+      },
+      "stats": {
+        "traffic": {
+          "up": 0,
+          "down": 0
+        },
+        "connections-in": 0,
+        "connections-out": 0
+      }
+    }
+  ]
+}
+```
+
+The loader accepts several input layouts:
+
+| Layout | Description |
+| --- | --- |
+| `null`, empty array, or empty object | Accepted as an empty user table. |
+| `[user, ...]` | Array of user objects. |
+| `{"users": [user, ...]}` | Recommended layout. |
+| `{"alice": user, "bob": user}` | Object map. The key is used as a username hint only when the user has no non-empty `name`. |
+| standalone user object | Accepted when it contains an `id` or `user-id`, plus `password` or `pass`. |
+
+The saver always rewrites the database as `{"users": [...]}`.
+
+## User Object
+
+A user object must contain:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `id` or `user-id` | non-zero unsigned integer | Durable logical user identity. Keep it unique and stable. |
+| `password` or `pass` | string | Password lookup key used to build SHA-224 and SHA-256 indexes. |
+
+Optional fields:
+
+| Field | Description |
+| --- | --- |
+| `name` | Human-readable username. Non-empty names must be unique. |
+| `email` | User email metadata. |
+| `notes` | Free-form operator notes. |
+| `gid` or `group-id` | Group identifier. |
+| `enabled` or `enable` | Defaults to `true`; set `false` to disable the user. |
+| `record-stat-interval-ms` | Statistics record interval. |
+| `limit` | User limits. Missing or zero values mean unlimited. |
+| `time` | User time metadata. |
+| `stats` | Runtime statistics, usually maintained by WaterWall. |
+
+For `Socks5Server`, store the final lookup key in `password` as
+`username:password`, for example `"alice:alice-secret"`.
+
+Passwords are stored as plaintext in the JSON database because exported users
+include the `password` field. Protect `db-path`, `db-path.backup`, and normal
+backup directories with filesystem permissions appropriate for secret material.
+
+## Limits, Time, and Stats
+
+`limit` may contain:
+
+| Field | Description |
+| --- | --- |
+| `traffic` | `up`, `down`, and `total` byte limits. `u` and `d` are accepted aliases. |
+| `bandwidth` | `up` and `down` byte-per-second limits. `u` and `d` are accepted aliases. |
+| `ips` or `ip` | Maximum IP count. |
+| `devices` | Maximum device count. |
+| `connections-in` or `cons-in` | Maximum inbound connection count. |
+| `connections-out` or `cons-out` | Maximum outbound connection count. |
+
+`time` may contain:
+
+| Field |
+| --- |
+| `created-at-ms` or `created_at_ms` |
+| `first-usage-at-ms` or `first_usage_at_ms` |
+| `expire-at-ms` or `expires-at-ms` |
+| `expire-after-first-usage-ms` or `expire-after-first-use-ms` |
+
+The same time fields are also accepted at the top level of the user object.
+Times are milliseconds since the Unix epoch, except
+`expire-after-first-usage-ms`, which is a duration.
+
+`stats` may contain:
+
+| Field | Description |
+| --- | --- |
+| `traffic` | `up` and `down` byte counters. `u` and `d` are accepted aliases. |
+| `speed` | `up` and `down` speed counters. `u` and `d` are accepted aliases. |
+| `ips` or `ip` | Runtime IP count. |
+| `devices` | Runtime device count. |
+| `connections-in` or `cons-in` | Runtime inbound connection count. |
+| `connections-out` or `cons-out` | Runtime outbound connection count. |
+
+Large numeric values may be written and read as decimal strings.
+
+## Save and Recovery
+
+Every normal save uses a backup-first write:
+
+1. Build JSON from the current in-memory users table.
+2. Write that JSON to `db-path.backup`.
+3. Write the same JSON to `db-path`.
+
+Startup recovery follows this order:
+
+1. Load and parse `db-path`.
+2. If that succeeds, use it as the in-memory database.
+3. If it fails, try `db-path.backup`.
+4. If backup loading succeeds, use it, remove the backup file, and rewrite
+   `db-path`.
+5. If both primary and backup fail, node creation fails.
+
+Normal backup snapshots are historical operator backups only. They are not used
+for startup recovery; recovery only uses `db-path.backup`.
+
+Avoid editing both the primary and backup files by hand while WaterWall is
+running. The periodic saver may overwrite manual edits with the current
+in-memory table.
+
+## Sessions and Revisions
+
+When an `AuthenticationClient` authenticates, the server creates an in-memory
+session with:
+
+- a 64-byte session token
+- the client name
+- permissions copied from the matching `auth-clients` entry
+- the client's session idle timeout
+- last activity timestamp
+- a private baseline copy of the current users table
+- baseline `config_revision` and `stats_revision`
+
+The server stores one authoritative users table and two store-level revision
+counters:
+
+| Revision | Bumped when |
+| --- | --- |
+| `config_revision` | User configuration or metadata changes, such as `AddNewUser` or `UpdateUser`. |
+| `stats_revision` | Usage-owned state changes, such as accepted traffic deltas or first-usage stamping. |
+
+Revisions start at `1`.
+
+Every authenticated request message refreshes the session activity timestamp.
+Worker `0` sweeps idle sessions every `60000` ms. Sessions are runtime state and
+are not persisted across process restarts.
+
+## Synchronization Model
+
+The intended `AuthenticationClient` sync flow is:
+
+1. Authenticate and store the returned token.
+2. Pull the full users table with `GetAllUsers`.
+3. Keep a local client-side users table for traffic-serving nodes.
+4. Let nodes such as `Socks5Server` update local runtime usage fields.
+5. Periodically push traffic-stat hints with `PushUserStats`.
+6. Pull the full table again when server revisions or `needs-pull` indicate the
+   local copy is stale.
+
+`PushUserStats` is a narrow traffic-stat merge path. It reads only the password
+lookup key and traffic counters from each hint; it does not accept arbitrary user
+metadata updates. User configuration changes must go through management modules
+guarded by `allow-user-write`.
+
+## Request and Response Framing
+
+Upstream bytes are buffered as a stream. The outer request envelope is:
+
+| Bytes | Field |
+| --- | --- |
+| `4` | Unsigned big-endian body size. |
+| `64` | Session token. |
+| remaining body | One or more request frames. |
+
+The body size includes the 64-byte token plus the request-frame payload. For an
+unauthenticated `Authenticate` request, the token may be all zero bytes. Every
+other request requires a valid token.
+
+Each request frame is:
+
+| Bytes | Field |
+| --- | --- |
+| `1` | Request type. |
+| `4` | Correlation ID. |
+| `4` | Unsigned big-endian request data length. |
+| variable | Request data bytes. |
+
+The response envelope is:
+
+| Bytes | Field |
+| --- | --- |
+| `4` | Unsigned big-endian body size. |
+| `8` | Unsigned big-endian `config_revision`. |
+| `8` | Unsigned big-endian `stats_revision`. |
+| remaining body | One or more response frames. |
+
+Each response frame is:
+
+| Bytes | Field |
+| --- | --- |
+| `1` | Response type. |
+| `4` | Correlation ID copied from the request. |
+| `4` | Unsigned big-endian response data length. |
+| variable | Response data bytes. |
+
+If a message has a valid session token, it must not contain `Authenticate`.
+Malformed envelopes, incomplete frames, oversized payloads, or trailing bytes
+smaller than a request header cause the logical connection to close safely.
+
+## Request Types
+
+| Type | Module | Permission | Request data | Success response |
+| --- | --- | --- | --- | --- |
+| `1` | `ping` | valid session | literal `ping` | type `1`, data `pong` |
+| `2` | `GetUserBySHA256Hex` | `allow-user-pull` | 64 hex chars | type `2`, user JSON |
+| `3` | `GetUserBySHA256Base64` | `allow-user-pull` | padded base64 SHA-256 digest | type `2`, user JSON |
+| `4` | `GetUserBySHA256` | `allow-user-pull` | raw 32-byte SHA-256 digest | type `2`, user JSON |
+| `5` | `GetUserByPassword` | `allow-user-pull` | plaintext password lookup key | type `2`, user JSON |
+| `6` | `AddNewUser` | `allow-user-write` | one user JSON object | type `0`, `user-added` |
+| `7` | `UpdateUser` | `allow-user-write` | full user JSON object | type `0`, `user-updated` |
+| `8` | `UpdateUserTraficStatsDiff` | `allow-stats-push` | full user JSON object | type `0`, `user-traffic-stats-updated` |
+| `9` | `GetAllUsers` | `allow-user-pull` | empty | type `3`, users JSON plus `server-time-ms` |
+| `10` | `Authenticate` | public | JSON with `name` and `secret` | type `4`, 64-byte token |
+| `11` | `PushUserStats` | `allow-stats-push` | stats hints JSON | type `0`, compact status JSON |
+| `12` | `GetUserBySHA224Hex` | `allow-user-pull` | 56 hex chars | type `2`, user JSON |
+| `13` | `GetUserBySHA224Base64` | `allow-user-pull` | padded base64 SHA-224 digest | type `2`, user JSON |
+| `14` | `GetUserBySHA224` | `allow-user-pull` | raw 28-byte SHA-224 digest | type `2`, user JSON |
+
+Response types:
+
+| Type | Meaning |
+| --- | --- |
+| `0` | ok |
+| `1` | pong |
+| `2` | user |
+| `3` | users database |
+| `4` | session token |
+| `255` | error |
+
+Unknown request types return an error response with `unknown-request-type`.
+
+## Module Notes
+
+### Authenticate
+
+`Authenticate` expects:
+
+```json
+{"name":"edge-1","secret":"long-random-secret"}
+```
+
+If credentials match `settings.auth-clients`, the server creates a session and
+returns a 64-byte token. The token is generated from 32 random bytes and encoded
+as 64 lowercase hexadecimal bytes. Token generation fails closed if secure
+random bytes are unavailable.
+
+### GetAllUsers
+
+`GetAllUsers` expects an empty payload. On success, it returns the normalized
+users JSON with response-only `server-time-ms` metadata:
+
+```json
+{"users":[],"server-time-ms":1767225600000}
+```
+
+`server-time-ms` is not written to the database. It helps
+`AuthenticationClient` project server-owned expiry fields onto the client's
+local clock.
+
+On success, the session baseline is replaced with the returned table and current
+server revisions.
+
+### AddNewUser
+
+`AddNewUser` expects one user JSON object. The submitted user must contain a
+non-zero unique `id` or `user-id`.
+
+The module rejects duplicate usernames, duplicate ids, duplicate SHA-224 lookup
+keys, and duplicate SHA-256 lookup keys. On success it saves the database
+immediately. If that save fails, it attempts to roll back the in-memory add and
+returns `database-save-failed`.
+
+### UpdateUser
+
+`UpdateUser` expects a full user JSON object. The password field is used only to
+find the existing user by SHA-256 password hash. This module does not update the
+password or password hashes.
+
+The submitted `id` or `user-id` must be present, non-zero, and match the
+existing user found by that password hash. Mutable metadata, limits, time info,
+stats, and record-stat interval may be updated in memory. Persistence happens on
+the normal periodic save timer.
+
+### UpdateUserTraficStatsDiff
+
+`UpdateUserTraficStatsDiff` expects a full user JSON object. It uses password
+and id only to identify and validate the existing user. It then adds only
+`stats.traffic.up` and `stats.traffic.down` as deltas. No other user fields are
+updated.
+
+If a non-zero traffic delta is accepted and the authoritative user has no
+`first-usage-at-ms`, the server stamps it with the current server time.
+
+### PushUserStats
+
+`PushUserStats` accepts one or more partial stats hints. Accepted layouts are:
+
+- an array of hint objects
+- an object with a `users` array
+- an object map whose values are hint objects
+- one standalone hint object
+
+Each hint must contain `password` or `pass`, and at least one traffic counter:
+
+- `stats.traffic.up`
+- `stats.traffic.u`
+- `stats.traffic.down`
+- `stats.traffic.d`
+
+Other fields are ignored. The server compares each present counter with the
+session baseline, rejects backwards counters, rejects unknown users, rejects
+duplicate hints for the same password/SHA-256 key, and applies only accepted
+traffic deltas to the authoritative table.
+
+On success, response data is compact JSON:
+
+```json
+{
+  "status": "stats-updated",
+  "applied-deltas": 2,
+  "needs-pull": false,
+  "config-revision": 1,
+  "stats-revision": 3
+}
+```
+
+When `needs-pull` is `true`, `AuthenticationClient` should call `GetAllUsers`
+to refresh its local users table.
+
+## Lifecycle Behavior
+
+On upstream `init`, `AuthenticationServer` initializes per-line buffer state and
+sends downstream `est` toward the previous tunnel.
+
+On upstream payload, it buffers bytes, extracts complete outer messages,
+processes each contained request frame, and sends one combined response message
+downstream with `tunnelPrevDownStreamPayload()`.
+
+On upstream `finish`, it destroys only its own per-line state. It does not call
+`lineDestroy()` because it did not create the line.
+
+If the server terminates a logical connection because of malformed or oversized
+data, it destroys its own line state first and then sends downstream `finish`
+toward the previous tunnel.
+
+## Notes and Caveats
+
+- The outer message payload limit is `16 MiB`.
+- The request data limit is `16 MiB`.
+- The response payload limit is `16 MiB`.
+- The queued response limit is `16 MiB`.
+- This node does not require left padding and does not prepend in-place.
+- This node is not a packet tunnel and does not use packet-line semantics.
+- The module name `UpdateUserTraficStatsDiff` intentionally follows the current
+  source spelling.

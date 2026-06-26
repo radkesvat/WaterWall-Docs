@@ -1,0 +1,218 @@
+---
+sidebar_position: 700
+title: "HttpClient"
+sidebar_label: "HttpClient"
+---
+
+# HttpClient
+
+`HttpClient` یک نود stream است که payload واتروال را داخل request سمت کلاینت HTTP قرار می‌دهد. در مسیر رفت، فریمینگ HTTP را می‌سازد و در مسیر برگشت، فریمینگ response را حذف می‌کند تا نود قبلی فقط body پاسخ را دریافت کند.
+
+این نود از HTTP/1.1، HTTP/2 مستقیم، ارتقای HTTP/1.1 به `h2c`، توکن upgrade سفارشی، حالت split برای HTTP/1.1 و WebSocket پشتیبانی می‌کند.
+
+`HttpClient` خودش TLS ایجاد نمی‌کند. اگر می‌خواهید روی wire ترافیک HTTPS داشته باشید، باید `TlsClient` را بعد از `HttpClient` قرار دهید.
+
+## جایگاه رایج
+
+```text
+SomeTunnel -> HttpClient -> TcpConnector
+SomeTunnel -> HttpClient -> TlsClient -> TcpConnector
+```
+
+نمونه همراه با mux و TLS:
+
+```text
+TcpListener -> MuxClient -> HttpClient -> TlsClient -> TcpConnector
+```
+
+## نمونه تنظیم
+
+```json
+{
+  "name": "http-client",
+  "type": "HttpClient",
+  "settings": {
+    "host": "example.com",
+    "path": "/api/tunnel",
+    "scheme": "https",
+    "port": 443,
+    "method": "POST",
+    "http-version": "both",
+    "upgrade": true,
+    "headers": {
+      "x-client-name": "waterwall"
+    }
+  },
+  "next": "tls-or-transport"
+}
+```
+
+## تنظیمات ضروری
+
+| فیلد | نوع | توضیح |
+|---|---|---|
+| `host` | string | اجباری است. در HTTP/1.1 به عنوان `Host` و در HTTP/2 به عنوان `:authority` استفاده می‌شود. |
+
+آبجکت `settings` باید وجود داشته باشد و خالی نباشد.
+
+## تنظیمات اختیاری
+
+| گزینه | پیش‌فرض | توضیح |
+|---|---|---|
+| `path` | `/` | مسیر request. |
+| `scheme` | `https` | فقط metadata مربوط به HTTP است و TLS را فعال نمی‌کند. |
+| `port` | برای `https` مقدار `443` و در غیر این صورت `80` | پورت داخل metadata HTTP. |
+| `method` | `POST` | متد request در حالت غیر WebSocket. |
+| `user-agent` | `WaterWall/1.x` | مقدار header مربوط به User-Agent. |
+| `http-version` | HTTP/2 | حالت پروتکل. مقدارهای عددی و aliasهای متنی را می‌پذیرد. |
+| `upgrade` | فقط در حالت `both` برابر `true` | در صورت امکان request را با HTTP/1.1 upgrade شروع می‌کند. |
+| `upgrade-protocol` | `h2c` | توکن upgrade. اگر غیر از `h2c` باشد، بعد از `101` مسیر به raw forwarding تبدیل می‌شود. |
+| `upgrade-request-headers` | ندارد | headerهای اضافه فقط برای request ارتقا. |
+| `upgrade-response-headers` | ندارد | headerهایی که باید در پاسخ `101` وجود داشته باشند. |
+| `headers` | ندارد | headerهای اضافه برای request. مقدارها باید string باشند. |
+| `content-type` | ندارد | مقدار Content-Type از جدول داخلی واتروال انتخاب می‌شود. |
+| `websocket` | `false` | بعد از handshake، payloadها را داخل WebSocket frame جابه‌جا می‌کند. |
+| `websocket-origin` | ندارد | مقدار اختیاری `Origin`. |
+| `websocket-subprotocol` | ندارد | subprotocol اختیاری. |
+| `websocket-extensions` | ندارد | ارسال header مربوط به extension. اگر peer extension را negotiate کند، اتصال رد می‌شود. |
+| `full-duplex` | `false` | بیشتر برای هماهنگی با `HttpServer` است؛ سمت client در HTTP/1.1 به صورت chunked دوطرفه stream می‌کند. |
+| `http1-mode` | `single` | شکل HTTP/1.1: مقدار `single` یا `split`. گزینه قدیمی `http1-split` هم پذیرفته می‌شود. |
+| `split` | مقادیر پیش‌فرض داخلی | تنظیمات حالت split. |
+| `verbose` | `false` | log بیشتر برای handshake، انتخاب پروتکل و framing. |
+
+برای `content-type`، واتروال مقدار را با جدول داخلی خودش match می‌کند. مقدارهای رایج مثل `application/json`، `text/plain` و `application/octet-stream` پشتیبانی می‌شوند. اگر مقدار کاملا سفارشی می‌خواهید، آن را داخل `headers` قرار دهید.
+
+## حالت‌های HTTP
+
+| مقدار `http-version` | معنی |
+|---|---|
+| `1`, `1.1`, `http1`, `http1.1` | اجبار به HTTP/1.1. |
+| `2`, `2.0`, `http2`, `h2` | اجبار به HTTP/2 مستقیم. |
+| `both`, `any`, `auto`, `1.1+2` | شروع با HTTP/1.1 و در صورت امکان ارتقا به `h2c`. |
+
+پیش‌فرض فعلی `HttpClient`، HTTP/2 مستقیم است.
+
+## حالت HTTP/1.1 معمولی
+
+در `http1-mode: "single"` یک اتصال HTTP/1.1 هر دو جهت را حمل می‌کند:
+
+- payload سمت upstream به request body تبدیل می‌شود
+- response body به payload واتروال تبدیل می‌شود
+- request با `Transfer-Encoding: chunked` ارسال می‌شود
+- هنگام upstream `Finish`، آخرین chunk یعنی `0` ارسال می‌شود و سپس Finish واتروال جلو می‌رود
+
+Parser پاسخ از chunked body، `Content-Length`، body تا زمان close و پاسخ‌هایی که body ندارند پشتیبانی می‌کند.
+
+## حالت HTTP/1.1 split
+
+در split mode، برای هر line واتروال دو request HTTP/1.1 ساخته می‌شود:
+
+- upload request برای ارسال payload به سمت server
+- download request برای دریافت payload برگشتی از server
+- هر دو نیمه با id، direction و token اختیاری pair می‌شوند
+
+این حالت زمانی مفید است که proxy، CDN یا middlebox با یک اتصال HTTP/1.1 دوطرفه طولانی خوب کار نمی‌کند، ولی با upload و download جداگانه سازگارتر است.
+
+```json
+{
+  "name": "http-client",
+  "type": "HttpClient",
+  "settings": {
+    "host": "cdn.example",
+    "http-version": 1,
+    "http1-mode": "split",
+    "path": "/tunnel",
+    "split": {
+      "upload-method": "POST",
+      "download-method": "GET",
+      "id-placement": "query",
+      "id-name": "sid",
+      "direction-name": "part",
+      "token": "shared-token",
+      "token-placement": "header",
+      "token-name": "X-Tunnel-Token"
+    }
+  },
+  "next": "transport"
+}
+```
+
+فیلدهای رایج داخل `split`:
+
+| گزینه | پیش‌فرض | توضیح |
+|---|---|---|
+| `upload-method` | متد top-level | متد request سمت upload. |
+| `download-method` | `GET` | متد request سمت download. |
+| `upload-path` | path اصلی | مسیر سمت upload. |
+| `download-path` | path اصلی | مسیر سمت download. |
+| `id-placement` | `query` | محل قرارگیری شناسه مشترک. |
+| `id-name` | `wwid` | نام فیلد شناسه. |
+| `direction-placement` | `query` | محل قرارگیری marker جهت. |
+| `direction-name` | `wwdir` | نام marker جهت. |
+| `upload-value` | `upload` | مقدار جهت برای upload. |
+| `download-value` | `download` | مقدار جهت برای download. |
+| `cache-bypass` | `true` | metadata متغیر برای کاهش احتمال cache شدن. |
+| `cache-bypass-name` | `wwcb` | نام فیلد cache bypass. |
+| `token` | ندارد | token مشترک اختیاری. |
+| `token-placement` | `header` | محل قرارگیری token. |
+| `token-name` | `X-Waterwall-Token` | نام فیلد token. |
+
+برای placement می‌توانید از `query`، `header`، `cookie` یا `path` استفاده کنید. در path template هم placeholderهای `{id}`، `{direction}`، `{cache}` و `{token}` قابل استفاده هستند.
+
+:::warning
+Split mode فقط با `http-version = 1` معتبر است و با `websocket` ترکیب نمی‌شود.
+:::
+
+## HTTP/2
+
+در حالت HTTP/2، این نود برای هر line واتروال یک stream منطقی باز می‌کند. طراحی فعلی برای چند stream مستقل در یک line ساخته نشده است.
+
+جزئیات مهم:
+
+- مقدار `MAX_CONCURRENT_STREAMS` برابر `1` است
+- window اولیه stream برابر 1 MiB است
+- بیشینه frame size برابر 32 KiB است
+- DATA frameهای دریافتی به payload واتروال تبدیل می‌شوند
+- upstream `Finish` به `END_STREAM` تبدیل می‌شود
+
+اگر multiplexing چند connection منطقی می‌خواهید، قبل از HTTP از `MuxClient` استفاده کنید.
+
+## Upgrade
+
+وقتی `http-version` برابر `both` و `upgrade` فعال باشد، request با HTTP/1.1 upgrade شروع می‌شود.
+
+در حالت پیش‌فرض `h2c`، request شامل این موارد است:
+
+- `Connection: Upgrade, HTTP2-Settings`
+- `Upgrade: h2c`
+- `HTTP2-Settings`
+
+اگر server پاسخ `101 Switching Protocols` بدهد، line وارد HTTP/2 می‌شود. اگر پاسخ معمولی غیر `101` برگردد، مسیر در HTTP/1.1 باقی می‌ماند و payload buffer شده به صورت chunked ارسال می‌شود.
+
+اگر `upgrade-protocol` یک توکن سفارشی غیر از `h2c` باشد، بعد از `101` مسیر به raw bidirectional forwarding تبدیل می‌شود.
+
+:::caution
+HTTP/1.1 upgrade همراه با request body برای طراحی تک‌استریم فعلی شکل امنی نیست؛ به آن تکیه نکنید.
+:::
+
+## WebSocket
+
+با `websocket: true`، HTTP فقط برای handshake استفاده می‌شود:
+
+- HTTP/1.1 از `GET` و پاسخ `101` استفاده می‌کند
+- HTTP/2 از extended `CONNECT` استفاده می‌کند
+- payloadهای upstream به binary frame تبدیل می‌شوند
+- text، binary و continuation frameهای peer به payload خام تبدیل می‌شوند
+- ping و pong داخل خود نود مدیریت می‌شوند
+- قبل از Finish، close frame ارسال می‌شود
+
+در HTTP/1.1 مقدار `Sec-WebSocket-Accept` اعتبارسنجی می‌شود و frameهای سمت server نباید masked باشند. اگر peer extension مذاکره کند، اتصال رد می‌شود چون extensionها داخل این نود پیاده‌سازی نشده‌اند.
+
+## نکته‌های مهم
+
+- `scheme: "https"` به معنی فعال شدن TLS نیست؛ باید `TlsClient` اضافه شود.
+- HTTP headerها به نود قبلی داده نمی‌شوند؛ فقط body عبور می‌کند.
+- HTTP/2 این نود multiplex عمومی نیست؛ برای آن از `MuxClient` استفاده کنید.
+- split mode فقط برای HTTP/1.1 است.
+- این نود قبل از Finish، final bytes مربوط به پروتکل مثل final chunk، `END_STREAM` یا WebSocket close frame را ارسال می‌کند.
+

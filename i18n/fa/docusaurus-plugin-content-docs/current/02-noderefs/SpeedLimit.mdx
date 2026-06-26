@@ -1,0 +1,212 @@
+---
+sidebar_position: 1400
+title: "SpeedLimit"
+sidebar_label: "SpeedLimit"
+---
+
+# SpeedLimit
+
+`SpeedLimit` یک tunnel عبوری است که payload را با token bucket محدود می‌کند. این نود داده پروتکل را تغییر نمی‌دهد، هدر
+اضافه یا حذف نمی‌کند، و destination context را عوض نمی‌کند. فقط تصمیم می‌گیرد یک payload همین الان عبور کند، منتظر
+بماند، یا drop شود.
+
+همان bucket برای هر دو جهت استفاده می‌شود. مثلا اگر یک bucket روی `1 MB/s` تنظیم شده باشد، upload و download همان bucket
+با هم همان `1 MB/s` را share می‌کنند.
+
+## جایگاه رایج
+
+برای stream:
+
+```text
+TcpListener -> SpeedLimit -> TcpConnector
+TcpListener -> TlsServer -> SpeedLimit -> TcpConnector
+```
+
+برای packet یا datagram:
+
+```text
+UdpListener -> SpeedLimit -> UdpConnector
+TunDevice -> SpeedLimit -> UdpStatelessSocket
+```
+
+برای ترافیک stream معمولا `pause` بهتر است، چون داده اضافی نگه داشته می‌شود. برای packet یا datagram معمولا `drop` بهتر
+است، چون نگه داشتن packetهای قدیمی اغلب رفتار شبکه را بدتر می‌کند.
+
+## نمونه stream
+
+در این نمونه هر connection یک bucket جدا با سرعت 256 KiB/s دارد.
+
+```json
+{
+  "name": "speed-limit",
+  "type": "SpeedLimit",
+  "settings": {
+    "kilo-bytes-per-sec": 256,
+    "limit-mode": "per-line",
+    "work-mode": "pause"
+  },
+  "next": "next-node"
+}
+```
+
+## نمونه limit مشترک
+
+در این نمونه همه lineهایی که از این instance عبور می‌کنند یک bucket مشترک 8 MiB/s دارند.
+
+```json
+{
+  "name": "global-speed-limit",
+  "type": "SpeedLimit",
+  "settings": {
+    "mega-bytes-per-sec": 8,
+    "limit-mode": "all-lines",
+    "token-recharge-rate": 20,
+    "work-mode": "pause"
+  },
+  "next": "next-node"
+}
+```
+
+## نمونه packet drop
+
+در این نمونه هر worker یک bucket مشترک 500000 bytes/s دارد و chunkهایی که token کافی ندارند drop می‌شوند.
+
+```json
+{
+  "name": "packet-speed-limit",
+  "type": "SpeedLimit",
+  "settings": {
+    "bytes-per-sec": 500000,
+    "limit-mode": "per-worker",
+    "work-mode": "drop"
+  },
+  "next": "next-node"
+}
+```
+
+## فیلدهای اجباری
+
+`settings` اجباری است و باید object غیرخالی باشد.
+
+دقیقا یکی از فیلدهای سرعت باید تنظیم شود:
+
+| فیلد | معنی |
+| --- | --- |
+| `bytes-per-sec` | بایت بر ثانیه. |
+| `kilo-bytes-per-sec` | کیبی‌بایت بر ثانیه، ضرب در `1024`. |
+| `mega-bytes-per-sec` | مبی‌بایت بر ثانیه، ضرب در `1024 * 1024`. |
+
+مقدار انتخاب‌شده باید number بزرگ‌تر از `0` باشد. اگر بیشتر از یک فیلد سرعت تنظیم شود، ساخت نود fail می‌شود.
+
+این فیلدها هم اجباری هستند:
+
+| فیلد | مقدارهای مجاز |
+| --- | --- |
+| `limit-mode` | `per-line`, `per-connection`, `all-lines`, `all-connections`, `per-worker` |
+| `work-mode` | `pause`, `drop` |
+
+در parser فعلی مقدارهای string به حروف کوچک و بزرگ حساس هستند.
+
+## فیلد اختیاری
+
+| فیلد | پیش‌فرض | توضیح |
+| --- | --- | --- |
+| `token-recharge-rate` | `10` | فاصله refill شدن tokenها به میلی‌ثانیه. باید بزرگ‌تر از `0` باشد. |
+
+`token-recharge-rate` پهنای‌باند نیست؛ فقط مشخص می‌کند هر چند میلی‌ثانیه token به bucket اضافه شود.
+
+مثلا با این تنظیم:
+
+- `bytes-per-sec: 1000`
+- `token-recharge-rate: 10`
+
+bucket تقریبا هر 10 ms به اندازه 10 byte token می‌گیرد. مقدار کمتر معمولا خروجی نرم‌تر می‌دهد. مقدار بزرگ‌تر می‌تواند
+traffic را burstyتر کند.
+
+## Limit modeها
+
+| mode | رفتار |
+| --- | --- |
+| `per-line` / `per-connection` | هر Waterwall line bucket خودش را دارد. دو line همزمان با `1 MB/s` می‌توانند مجموعا حدود `2 MB/s` مصرف کنند. |
+| `all-lines` / `all-connections` | همه lineهای این tunnel instance یک bucket مشترک atomic بین workerها دارند. `1 MB/s` یعنی کل نود همان `1 MB/s` را share می‌کند. |
+| `per-worker` | هر worker bucket مشترک خودش را دارد. با 4 worker و `1 MB/s`، سقف عملی کل می‌تواند حدود `4 MB/s` شود. |
+
+هر bucket در ابتدا full است و ظرفیت آن برابر تقریبا یک ثانیه از سرعت تنظیم‌شده است. بنابراین در شروع می‌تواند تا حدود
+یک ثانیه ترافیک را به صورت burst عبور دهد و بعد روی میانگین تنظیم‌شده قرار بگیرد.
+
+## Work modeها
+
+### `pause`
+
+`pause` برای traffic ترتیبی مثل TCP مناسب است.
+
+وقتی payload در bucket جا نشود:
+
+1. buffer داخل `SpeedLimit` queue می‌شود.
+2. سمت source با callbackهای `Pause` واتروال pause می‌شود.
+3. یک timer روی worker منتظر refill شدن tokenها می‌ماند.
+4. داده queue شده به ترتیب drain می‌شود.
+5. وقتی queue خالی شد، سمتی که به صورت local pause شده بود resume می‌شود.
+
+اگر یک buffer queue شده بزرگ‌تر از token موجود باشد، `SpeedLimit` می‌تواند قسمت اول buffer را ارسال کند و باقی آن را
+برای tick بعدی در queue نگه دارد. این کار ordering بایت‌ها را حفظ می‌کند و سرعت میانگین را شکل می‌دهد.
+
+`pause` می‌تواند bufferها را در حافظه نگه دارد. limit خیلی پایین، peer کند، یا ورودی زیاد می‌تواند memory usage و latency
+را بالا ببرد.
+
+### `drop`
+
+`drop` برای packet و datagram مناسب است.
+
+برای هر payload chunk:
+
+- اگر bucket به اندازه کل chunk token داشته باشد، chunk forward می‌شود
+- اگر token کافی نباشد، کل chunk drop می‌شود
+
+در `drop`، payload split نمی‌شود و برای بعد queue نمی‌شود.
+
+## جهت‌ها و backpressure
+
+Limiter در دو جهت متقارن است:
+
+- upstream و downstream از همان منطق bucket انتخاب‌شده استفاده می‌کنند
+- داده queue شده در upstream سمت قبلی را pause می‌کند
+- داده queue شده در downstream سمت بعدی را pause می‌کند
+- `Pause` و `Resume` خارجی حفظ می‌شوند تا `SpeedLimit` سمتی را که هنوز از بیرون pause است اشتباها resume نکند
+
+بنابراین `pause` mode با backpressure معمول Waterwall compose می‌شود و فقط داخل callback sleep نمی‌کند.
+
+## نکته packet-line
+
+packet lineهای Waterwall، lineهای helper و worker-local هستند و برای packetهای زیادی reuse می‌شوند. در packet chain،
+`per-line` یعنی bucket مربوط به همان packet line پایدار worker؛ به معنی per-flow یا per-client واقعی نیست. اگر limit
+بر اساس worker می‌خواهید، `per-worker` را صریح انتخاب کنید. اگر یک cap مشترک بین همه workerها می‌خواهید، `all-lines` را
+انتخاب کنید.
+
+برای chainهای packet یا UDP-style معمولا `work-mode: "drop"` انتخاب بهتری است، مگر اینکه عمدا delayed packet delivery و
+backpressure بخواهید.
+
+## رفتار Finish
+
+line state در `Init` ساخته می‌شود. هنگام `Finish`، نود state خودش را destroy می‌کند، timerهای drain را cancel می‌کند،
+bufferهای queue شده را آزاد می‌کند، و سپس `Finish` واتروال را در همان جهت forward می‌کند.
+
+این tunnel چیزی prepend نمی‌کند، پس `required_padding_left` برابر `0` است.
+
+## متادیتای نود
+
+| ویژگی | مقدار |
+| --- | --- |
+| flag | `kNodeFlagChainHead` |
+| previous node | مجاز |
+| next node | مجاز |
+| layer group | `kNodeLayerAnything` |
+| `required_padding_left` | `0` |
+
+## اشتباه‌های رایج
+
+- بیشتر از یک فیلد سرعت تنظیم نکنید.
+- برای packet chainها از `pause` استفاده نکنید مگر اینکه packetهای تاخیردار قابل قبول باشند.
+- از `per-worker` انتظار cap مشترک کل سیستم نداشته باشید؛ با تعداد workerها scale می‌شود.
+- در packet chainها `per-line` را per-client یا per-flow فرض نکنید.
+- `token-recharge-rate` خیلی بزرگ نگذارید مگر اینکه bursty شدن خروجی قابل قبول باشد.

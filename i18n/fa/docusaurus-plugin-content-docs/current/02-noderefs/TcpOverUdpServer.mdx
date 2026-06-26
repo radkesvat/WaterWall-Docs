@@ -1,0 +1,166 @@
+---
+sidebar_position: 1440
+title: "TcpOverUdpServer"
+sidebar_label: "TcpOverUdpServer"
+---
+
+# TcpOverUdpServer
+
+`TcpOverUdpServer` peer سمت server برای `TcpOverUdpClient` است. این نود datagramهای KCP را از نود قبلی می‌گیرد، stream
+اصلی را بازسازی می‌کند و payload را به نود بعدی می‌دهد. پاسخ‌های نود بعدی دوباره وارد KCP می‌شوند و به شکل datagram به
+سمت قبلی برمی‌گردند.
+
+این نود معمولا با `TcpOverUdpClient` در سمت مقابل استفاده می‌شود.
+
+## جایگاه رایج
+
+سمت server:
+
+```text
+UdpListener -> TcpOverUdpServer -> TcpConnector
+UdpListener -> TcpOverUdpServer -> MuxServer -> TcpConnector
+```
+
+سمت client:
+
+```text
+TcpListener -> TcpOverUdpClient -> UdpConnector
+TcpListener -> MuxClient -> TcpOverUdpClient -> UdpConnector
+```
+
+سمت قبلی `TcpOverUdpServer` باید datagram boundary را حفظ کند. سمت بعدی stream-facing است.
+
+## نمونه پایه
+
+```json
+{
+  "name": "tcp-over-udp-server",
+  "type": "TcpOverUdpServer",
+  "settings": {
+    "fec": false,
+    "kcp-send-window": 8192,
+    "kcp-recv-window": 8192,
+    "ping-interval-ms": 10000,
+    "no-recv-timeout-ms": 30000
+  },
+  "next": "service-out"
+}
+```
+
+## نمونه با FEC
+
+```json
+{
+  "name": "tcp-over-udp-server",
+  "type": "TcpOverUdpServer",
+  "settings": {
+    "fec": true,
+    "fec-data-shards": 10,
+    "fec-parity-shards": 3
+  },
+  "next": "service-out"
+}
+```
+
+تنظیمات FEC باید دقیقا با سمت `TcpOverUdpClient` یکسان باشد.
+
+## فیلدهای لازم
+
+`settings` اختیاری است و اگر object نباشد، defaultها استفاده می‌شوند.
+
+در استفاده معمول، `next` لازم است و باید به مسیر stream-side service اشاره کند.
+
+## تنظیمات اختیاری
+
+`TcpOverUdpServer` همان settingها و defaultهای سمت client را دارد.
+
+| فیلد | پیش‌فرض | اعتبارسنجی | توضیح |
+| --- | --- | --- | --- |
+| `fec` | `false` | boolean | فعال‌سازی Reed-Solomon FEC روی datagramهای KCP. |
+| `fec-data-shards` | `10` | positive و مجموع shardها حداکثر `255` | تعداد data shard در هر block. |
+| `fec-parity-shards` | `3` | positive و مجموع shardها حداکثر `255` | تعداد parity shard در هر block. |
+| `kcp-nodelay` | `true` | boolean | فعال‌سازی KCP nodelay. |
+| `kcp-interval-ms` | `10` | `10..5000` | فاصله update شدن KCP. |
+| `kcp-resend` | `2` | `>= 0` | fast-resend threshold در KCP. |
+| `kcp-no-congestion-control` | `true` | boolean | غیرفعال کردن congestion control در KCP. |
+| `kcp-send-window` | `8192` | `>= 1` | send window بر حسب segment. |
+| `kcp-recv-window` | `8192` | `>= 1` | receive window بر حسب segment. |
+| `kcp-initial-cwnd` | نصف `kcp-send-window` | `1..kcp-send-window` | congestion window اولیه. |
+| `kcp-rx-minrto-ms` | `30` | `>= 1` | حداقل retransmission timeout. |
+| `kcp-send-buffer-limit` | `0` | `>= 0` | آستانه backpressure. مقدار `0` یعنی local send window + remote window + `10`. |
+| `ping-interval-ms` | `10000` | `>= 1` | مدت idle receive قبل از ping داخلی. |
+| `no-recv-timeout-ms` | `30000` | بزرگ‌تر از `ping-interval-ms` | مدت idle receive قبل از بستن line. |
+
+## مدل KCP
+
+در upstream `Init`، server line state را initialize می‌کند، session KCP می‌سازد، timer KCP را شروع می‌کند، FEC state را در
+صورت نیاز می‌سازد، یک ping داخلی queue می‌کند، و سپس `Init` را به نود stream-side بعدی می‌فرستد.
+
+datagramهای ورودی از سمت قبلی وارد FEC decoder و KCP می‌شوند. payloadهای کامل‌شده از KCP خوانده می‌شوند، flag یک‌بایتی
+حذف می‌شود، و data frameها به شکل stream به نود بعدی داده می‌شوند.
+
+payloadهای برگشتی از نود بعدی به chunkهای مناسب MTU تقسیم می‌شوند، flag data می‌گیرند، وارد KCP می‌شوند، و خروجی KCP به
+سمت قبلی packet side ارسال می‌شود.
+
+## flagهای داخلی
+
+| Flag | معنی |
+| --- | --- |
+| `0x00` | data؛ byteهای بعد از flag همان payload واقعی stream هستند. |
+| `0xF0` | ping داخلی. |
+| `0xFF` | close داخلی. |
+
+## MTU و padding
+
+KCP MTU از `GLOBAL_MTU_SIZE` می‌آید. اگر FEC روشن باشد، 8 بایت header بیرونی FEC از MTU و بودجه write کم می‌شود.
+
+بودجه موثر payload برای write:
+
+```text
+GLOBAL_MTU_SIZE - 20 - 8 - 24 - 1 - fec_overhead
+```
+
+این نود `required_padding_left = 1` دارد تا بتواند flag داخلی را قبل از داده prepend کند.
+
+## رفتار FEC
+
+با `fec: true`، datagramهای KCP داخل packetهای Reed-Solomon FEC wrap می‌شوند. data shardها سریع ارسال می‌شوند و بعد از
+هر block parity shardها تولید می‌شوند.
+
+در receive، decoder packetهای معتبر را وارد KCP می‌کند، تلاش می‌کند datagramهای گم‌شده را از parity بازسازی کند، و packet
+نامعتبر را drop می‌کند.
+
+FEC در این pair symmetric است؛ آن را در هر دو peer با shard count یکسان تنظیم کنید.
+
+## Backpressure
+
+اگر queue ارسال KCP از `kcp-send-buffer-limit` بیشتر شود، server سمت stream بعدی را pause می‌کند. وقتی خروجی KCP پایین
+بیاید، resume ارسال می‌شود. این رفتار از رشد بی‌نهایت queue هنگام کند بودن packet side جلوگیری می‌کند.
+
+## Close و timeout
+
+اگر سمت stream بعدی finish شود، server یک close frame داخلی را با KCP می‌فرستد، KCP را flush می‌کند، state خودش را destroy
+می‌کند، و سمت packet قبلی را finish می‌کند.
+
+اگر close frame از peer برسد، server state خودش را destroy می‌کند و هر دو جهت را finish می‌کند.
+
+بعد از `ping-interval-ms` بدون receive activity، ping داخلی ارسال می‌شود. اگر تا `no-recv-timeout-ms` packetی نرسد، line
+بسته می‌شود.
+
+## متادیتای نود
+
+| ویژگی | مقدار |
+| --- | --- |
+| flag | `kNodeFlagNone` |
+| previous node | مجاز |
+| next node | مجاز؛ در استفاده معمول لازم |
+| layer group | `kNodeLayerAnything` |
+| `required_padding_left` | `1` |
+
+## اشتباه‌های رایج
+
+- previous side را stream-only نگذارید؛ باید packet boundary حفظ شود.
+- بدون `TcpOverUdpClient` سمت مقابل استفاده نکنید.
+- FEC را فقط در یک سمت روشن نکنید.
+- shard countهای FEC را mismatch نکنید.
+- `TcpOverUdpServer` را chain end فرض نکنید؛ stream بازسازی‌شده را به `next` می‌فرستد.

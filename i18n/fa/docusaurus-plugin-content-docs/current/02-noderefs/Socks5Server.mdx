@@ -1,0 +1,230 @@
+---
+sidebar_position: 1330
+title: "Socks5Server"
+sidebar_label: "Socks5Server"
+---
+
+# Socks5Server
+
+`Socks5Server` سمت server پروتکل SOCKS5 را داخل chain Waterwall پیاده می‌کند. این نود control traffic را از نود قبلی
+می‌گیرد، method negotiation انجام می‌دهد، از طریق `AuthenticationClient` یا حالت صریح `no-auth` احراز هویت می‌کند، و
+درخواست‌های SOCKS5 را به مسیرهای Waterwall تبدیل می‌کند.
+
+این نود از این موارد پشتیبانی می‌کند:
+
+- method negotiation در SOCKS5
+- username/password authentication از طریق `AuthenticationClient`
+- دستور `CONNECT`
+- دستور `UDP ASSOCIATE`
+- UDP relay association وابسته به احراز هویت
+
+دستور `BIND` پشتیبانی نمی‌شود و رد می‌شود.
+
+## جایگاه رایج
+
+برای TCP:
+
+```text
+TcpListener -> Socks5Server -> TcpConnector
+```
+
+برای TCP و UDP:
+
+```text
+TcpListener -> Socks5Server -> TcpConnector
+UdpListener -> Socks5Server -> UdpConnector
+```
+
+مسیر TCP، control connection پروتکل SOCKS5 را می‌گیرد. مسیر UDP فقط وقتی datagram را قبول می‌کند که client قبلا از طریق
+همان control connection یک UDP association معتبر ساخته باشد.
+
+در حالت authenticated، بعد از `Socks5Server` به صورت دستی `UserController` قرار ندهید. این نود خودش یک `UserController`
+داخلی می‌سازد و قبل از `next` قرار می‌دهد.
+
+## نمونه authenticated
+
+```json
+{
+  "name": "socks-server",
+  "type": "Socks5Server",
+  "settings": {
+    "auth-client-node-name": "auth-client",
+    "connect": true,
+    "udp": true,
+    "ipv4": "0.0.0.0",
+    "sweep-interval-ms": 1000,
+    "verbose": false
+  },
+  "next": "outbound"
+}
+```
+
+`auth-client` باید یک نود موجود از نوع `AuthenticationClient` در همان config باشد. `Socks5Server` آن را فقط مصرف می‌کند
+و خودش authentication client نمی‌سازد.
+
+## نمونه no-auth
+
+```json
+{
+  "name": "socks-server",
+  "type": "Socks5Server",
+  "settings": {
+    "no-auth": true,
+    "connect": true,
+    "udp": false
+  },
+  "next": "outbound"
+}
+```
+
+فقط یکی از دو حالت auth باید انتخاب شود: یا `auth-client-node-name` یا `no-auth: true`.
+
+## فیلدهای اجباری
+
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `settings` | object | اجباری است و نباید خالی باشد. |
+| `settings.auth-client-node-name` | string | اجباری است مگر اینکه `no-auth` صراحتا `true` باشد. باید به یک نود `AuthenticationClient` موجود اشاره کند. |
+| `settings.no-auth` | boolean | فقط وقتی لازم است که auth client ندارید؛ برای فعال شدن حالت بدون احراز هویت باید `true` باشد. |
+| `settings.ipv4` / `settings.udp-ipv4` | string | وقتی `udp` فعال است اجباری است. آدرس IPv4 که در پاسخ `UDP ASSOCIATE` اعلام می‌شود. |
+| `next` | string | اجباری است و به مسیر outbound واقعی اشاره می‌کند. |
+
+حداقل یکی از `connect` یا `udp` باید فعال باشد.
+
+## فیلدهای اختیاری
+
+| فیلد | پیش‌فرض | توضیح |
+| --- | --- | --- |
+| `settings.connect` | `true` | فعال‌سازی `CONNECT`. |
+| `settings.udp` | `false` | فعال‌سازی `UDP ASSOCIATE` و پردازش datagramهای UDP. |
+| `settings.verbose` | `false` | log بیشتر، از جمله دلیل رد شدن auth. |
+| `settings.sweep-interval-ms` | `1000` | به `UserController` داخلی در حالت authenticated پاس داده می‌شود. |
+
+تنظیمات قدیمی `username`, `password`, `users`, و `accounts` دیگر پذیرفته نمی‌شوند. اگر هرکدام از این کلیدها وجود داشته
+باشد، ساخت نود fail می‌شود. برای auth از `AuthenticationServer` همراه `AuthenticationClient` استفاده کنید، یا صریحا
+`no-auth: true` بگذارید.
+
+## مدل احراز هویت
+
+در حالت authenticated، client باید روش username/password را در SOCKS5 پیشنهاد کند. `Socks5Server` username و password
+را می‌گیرد و یک رشته lookup با این فرمت می‌سازد:
+
+```text
+username:password
+```
+
+سپس همین رشته را از طریق `AuthenticationClient` به عنوان password کاربر lookup می‌کند.
+
+برای userهایی که در `AuthenticationServer` مخصوص SOCKS5 می‌سازید، جفت credential را دقیقا با همین فرم
+`username:password` داخل فیلد `password` قرار دهید. فیلد `name` کاربر برای username روی پروتکل SOCKS5 استفاده نمی‌شود و
+می‌تواند صرفا metadata مدیریتی باشد.
+
+بعد از auth موفق:
+
+- `user_handle_t` برگشتی داخل line state ذخیره می‌شود
+- handle با `lineAddUser()` به line اضافه می‌شود
+- username/password خام هم روی line کپی می‌شود تا ruleهای downstream بتوانند روی username/password route کنند
+- `UserController` داخلی محدودیت‌های user مثل connectionهای زنده، IP، ترافیک، expiry و enabled بودن را قبل از رسیدن به
+  `next` enforce می‌کند
+
+در حالت `no-auth` یک handle خالی anonymous روی line ثبت می‌شود.
+
+username و password در حالت authenticated باید غیرخالی باشند. NUL داخلی رد می‌شود چون lookup نهایی به صورت C string
+انجام می‌شود.
+
+## رفتار CONNECT
+
+بعد از negotiation و authentication، درخواست `CONNECT` به یک مسیر stream عادی Waterwall تبدیل می‌شود:
+
+1. مقصد درخواستی SOCKS داخل `line->dest_ctx` کپی می‌شود.
+2. protocol مقصد TCP تنظیم می‌شود.
+3. `Init` به سمت نود بعدی ارسال می‌شود.
+4. payloadها تا established شدن سمت بعدی queue می‌شوند.
+5. وقتی `Est` از سمت بعدی برگشت، پاسخ موفق SOCKS5 به client فرستاده می‌شود.
+6. سپس `Est` به سمت نود قبلی ارسال می‌شود و payloadهای queue شده flush می‌شوند.
+
+اگر `connect` غیرفعال باشد، درخواست `CONNECT` با `command not supported` رد می‌شود.
+
+## رفتار UDP ASSOCIATE
+
+`UDP ASSOCIATE` یک association می‌سازد که مالک آن TCP control line است. این command از همان control line یک stream
+upstream عادی باز نمی‌کند.
+
+پاسخ UDP associate از این دو مقدار ساخته می‌شود:
+
+- آدرس `settings.ipv4` یا `settings.udp-ipv4`
+- پورت listener محلی TCP که control connection را قبول کرده است
+
+مثلا اگر control connection روی پورت local `443` پذیرفته شده باشد و `ipv4` برابر `0.0.0.0` باشد، پاسخ به client عملا
+`0.0.0.0:443` را اعلام می‌کند.
+
+hint مربوط به peer UDP در request، اگر concrete IP و port داشته باشد، در کلید association استفاده می‌شود. اگر address
+آن any باشد، IP مربوط به TCP control connection استفاده می‌شود.
+
+## مدل امنیتی UDP
+
+مسیر UDP یک open proxy آزاد نیست. یک datagram فقط وقتی پذیرفته می‌شود که:
+
+- sender با یک association ثبت‌شده match شود
+- association توسط یک TCP control line موفق ساخته شده باشد
+- entry مربوط به association هنوز وجود داشته باشد
+
+وقتی TCP control line بسته شود، UDP association همان لحظه unregister می‌شود و datagramهای بعدی رد می‌شوند.
+
+associationها در یک registry با 64 shard داخل tunnel state نگه داشته می‌شوند. entryها فقط metadata کپی‌شده دارند:
+
+- generation token
+- worker id مالک
+- `user_handle_t` احراز هویت‌شده
+- username/password خام کپی‌شده، در حالت authenticated
+
+در registry هیچ `line_t *` قابل استفاده‌ای ذخیره نمی‌شود. token باعث می‌شود یک control line قدیمی هنگام بسته شدن، یک
+association جدید با همان key را اشتباها حذف نکند.
+
+## رفتار UDP payload
+
+وقتی یک datagram SOCKS UDP برسد:
+
+1. association مربوط به sender lookup می‌شود.
+2. هدر SOCKS5 UDP validate می‌شود.
+3. اگر `FRAG != 0` باشد، datagram محافظه‌کارانه نادیده گرفته می‌شود.
+4. مقصد remote از هدر خوانده می‌شود.
+5. برای آن مقصد یک backend UDP line داخلی ساخته یا reuse می‌شود.
+6. هدر SOCKS5 UDP حذف می‌شود و فقط payload از backend line به سمت بالا ارسال می‌شود.
+
+وقتی پاسخ از نود بعدی برگردد، payload داخل یک هدر SOCKS5 UDP response wrap می‌شود. source address در این هدر همان remote
+destination مربوط به backend UDP line است، و datagram wrap شده به سمت client برمی‌گردد.
+
+backend UDP lineها lineهای عادی Waterwall هستند که پشت سمت UDP client ساخته می‌شوند. این طراحی association client-facing
+را از مقصدهای outbound جدا نگه می‌دارد و lifecycle معمول lineها را حفظ می‌کند.
+
+## رفتار Finish
+
+پیاده‌سازی ترتیب close در Waterwall را حفظ می‌کند:
+
+- line state محلی قبل از propagate شدن `Finish` واقعی destroy می‌شود
+- control line قبل از مرگ، association UDP خودش را unregister می‌کند
+- backend UDP lineهای داخلی قبل از بسته شدن از client line detach می‌شوند
+- اگر قبل از established شدن لازم باشد پاسخ failure SOCKS5 فرستاده شود، این کار از مسیر close محافظت‌شده در برابر
+  callbackهای re-entrant انجام می‌شود
+
+## متادیتای نود
+
+| ویژگی | مقدار |
+| --- | --- |
+| flag | `kNodeFlagChainHead` |
+| previous node | مجاز |
+| next node | اجباری |
+| layer group | `kNodeLayerAnything` |
+| `required_padding_left` | بدترین حالت هدر SOCKS5 UDP: `4 + 1 + 255 + 2` بایت |
+
+این padding برای prepend کردن هدر UDP reply لازم است. اگر buffer ظرفیت چپ کافی نداشته باشد، نود buffer جدید می‌گیرد و
+payload را قبل از اضافه کردن هدر کپی می‌کند.
+
+## اشتباه‌های رایج
+
+- `username`, `password`, `users`, یا `accounts` را تنظیم نکنید؛ این کلیدهای legacy رد می‌شوند.
+- همزمان `auth-client-node-name` و `no-auth: true` نگذارید.
+- UDP را بدون `ipv4` یا `udp-ipv4` فعال نکنید.
+- بعد از `Socks5Server` authenticated به صورت دستی `UserController` نگذارید.
+- انتظار پشتیبانی از `BIND` یا reassembly برای UDP fragmentation نداشته باشید.

@@ -1,0 +1,165 @@
+---
+sidebar_position: 100
+title: "TcpListener"
+sidebar_label: "TcpListener"
+---
+
+# TcpListener
+
+`TcpListener` نود سرور TCP است. روی یک آدرس و پورت یا بازه پورت گوش می‌دهد، برای هر client پذیرفته‌شده یک line جدید می‌سازد و آن line را به نود بعدی زنجیر تحویل می‌دهد.
+
+این نود معمولا ابتدای زنجیر قرار می‌گیرد:
+
+```text
+TcpListener -> ... -> TcpConnector
+```
+
+## نمونه تنظیم
+
+```json
+{
+  "name": "inbound-listener",
+  "type": "TcpListener",
+  "settings": {
+    "address": "0.0.0.0",
+    "port": 443,
+    "nodelay": true,
+    "interface": "eth0",
+    "fwmark": 10,
+    "balance-group": "public-443",
+    "balance-interval": 30000,
+    "multiport-backend": "socket",
+    "whitelist": [
+      "192.168.1.0/24",
+      "2001:db8::/64"
+    ]
+  },
+  "next": "next-node-name"
+}
+```
+
+## فیلدهای ضروری
+
+| فیلد | توضیح |
+|---|---|
+| `name` | نام دلخواه نود |
+| `type` | باید دقیقا `TcpListener` باشد |
+| `next` | نودی که lineهای پذیرفته‌شده را دریافت می‌کند |
+| `settings.address` | آدرس bind، مثل `0.0.0.0`، `::` یا IP مشخص |
+| `settings.port` | یک عدد مثل `443` یا آرایه دو عضوی مثل `[40000, 40100]` |
+
+در JSON واقعی این دو کلید داخل `settings` با نام‌های `address` و `port` نوشته می‌شوند.
+
+نسخه فعلی `port` را به شکل string مثل `"40000-40100"` parse نمی‌کند؛ برای بازه حتما از آرایه دو عضوی استفاده کنید.
+
+## تنظیمات اختیاری
+
+| گزینه | پیش‌فرض | توضیح |
+|---|---|---|
+| `nodelay` | `false` | فعال‌سازی `TCP_NODELAY` روی socketهای پذیرفته‌شده |
+| `interface` | - | محدود کردن listener به interface محلی. در Linux از `SO_BINDTODEVICE` استفاده می‌شود. |
+| `fwmark` | - | socket mark در سیستم‌هایی که `SO_MARK` دارند |
+| `balance-group` | - | قرار دادن چند listener هم‌پورت در یک گروه توزیع |
+| `balance-interval` | - | مدت sticky بودن client در گروه balance، به میلی‌ثانیه |
+| `multiport-backend` | وابسته به runtime | برای بازه پورت: `iptables` یا `socket` |
+| `whitelist` | - | لیست IP یا CIDR مجاز، IPv4 و IPv6 |
+| `blacklist` | - | لیست IP یا CIDR مسدود، IPv4 و IPv6 |
+
+:::info
+در سورس فعلی، هر دو فیلد `whitelist` و `blacklist` از JSON خوانده می‌شوند.
+:::
+
+## رفتار اتصال
+
+وقتی client وصل می‌شود، `TcpListener`:
+
+- socket را روی worker مناسب قرار می‌دهد.
+- یک line جدید می‌سازد.
+- routing context را از اتصال پذیرفته‌شده پر می‌کند.
+- به نود بعدی upstream `init` می‌فرستد.
+- خواندن از socket client را شروع می‌کند.
+
+مسیر داده:
+
+- client به زنجیر: خواندن از socket و ارسال upstream payload به `next`
+- زنجیر به client: دریافت downstream payload و نوشتن روی socket
+
+## backpressure و صف نوشتن
+
+اگر client کند باشد و write کامل نشود، bufferها صف می‌شوند. وقتی صف از حدود `1 KB` بزرگ‌تر شود نود بعدی pause می‌شود و وقتی socket دوباره writable شد resume می‌گیرد. اگر صف از حدود `16 MB` عبور کند اتصال بسته می‌شود تا حافظه بی‌نهایت مصرف نشود.
+
+## timeout و balance
+
+هر اتصال پذیرفته‌شده در جدول idle نگه داشته می‌شود. اتصال تازه ابتدا timeout کوتاه حدود `5s` دارد و بعد از فعالیت، حدود `300s` refresh می‌شود.
+
+اگر چند `TcpListener` با `balance-group` و port مشترک داشته باشید، socket manager براساس IP client یک listener انتخاب می‌کند و تا پایان `balance-interval` همان client را sticky نگه می‌دارد.
+
+## whitelist
+
+```json
+"whitelist": [
+  "10.0.0.0/8",
+  "192.168.1.20/32",
+  "2001:db8::/64"
+]
+```
+
+اگر whitelist وجود داشته باشد، فقط clientهایی که match می‌شوند توسط این listener پذیرفته می‌شوند. اگر چند listener روی یک پورت دارید، ممکن است listener دیگری با filter متفاوت همان اتصال را بگیرد.
+
+## انتخاب multiport backend
+
+- `socket`: برای هر پورت یک socket جدا ساخته می‌شود. ساده‌تر و مستقل‌تر است.
+- `iptables`: برای بازه‌های بزرگ می‌تواند منابع کمتری مصرف کند، اما به محیط و ruleهای سیستم وابسته است.
+
+برای بازه‌های کوچک، `socket` معمولا قابل فهم‌تر است. برای بازه‌های بزرگ، `iptables` می‌تواند کاربردی‌تر باشد، به شرطی که کنترل ruleهای سیستم را داشته باشید.
+
+## اولویت filterها و مسیر پیش‌فرض
+
+اگر چند `TcpListener` روی یک پورت مشترک داشته باشید، socket manager همه listenerها را با اولویت برابر بررسی نمی‌کند. listenerهایی که filterهایی مثل `whitelist` یا `blacklist` دارند از listener مشابه بدون filter اولویت بیشتری می‌گیرند.
+
+این یعنی می‌توانید یک مسیر خاص و یک مسیر پیش‌فرض روی یک پورت بسازید:
+
+```text
+same public port
+  ├─ matching filtered listener   -> special path
+  └─ unfiltered listener          -> default path
+```
+
+نمونه:
+
+```json
+{
+  "nodes": [
+    {
+      "name": "trusted-entry",
+      "type": "TcpListener",
+      "settings": {
+        "address": "0.0.0.0",
+        "port": 443,
+        "whitelist": [
+          "203.0.113.10/32",
+          "2001:db8:100::/48"
+        ]
+      },
+      "next": "trusted-path"
+    },
+    {
+      "name": "default-entry",
+      "type": "TcpListener",
+      "settings": {
+        "address": "0.0.0.0",
+        "port": 443
+      },
+      "next": "default-path"
+    }
+  ]
+}
+```
+
+در این حالت، اگر IP کلاینت با `trusted-entry.whitelist` match شود، همان listener اتصال را می‌گیرد. اگر match نشود، listener بدون filter مثل مسیر پیش‌فرض رفتار می‌کند و اتصال را می‌گیرد.
+
+برای `blacklist` هم می‌توانید از همین الگو استفاده کنید تا یک بازه از یک مسیر حذف شود و مسیر دیگری اتصال را دریافت کند.
+
+filterهای `TcpListener` فقط IP/CIDR هستند. برای GeoIP مثل `geoip:ir`، دسته‌بندی دامنه، SNI، HTTP Host یا protocol sniffing باید بعد از accept کردن اتصال از نود `Router` استفاده کنید.
+
+اگر `balance-group` فعال باشد، listenerهای match شده وارد منطق balance می‌شوند و مثل branch ساده first-match رفتار نمی‌کنند. برای routing قطعی بر اساس IP، از listenerهای filterدار معمولی و یک listener بدون filter به عنوان default path استفاده کنید.

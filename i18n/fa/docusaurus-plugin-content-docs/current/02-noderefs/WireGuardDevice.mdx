@@ -1,0 +1,174 @@
+---
+sidebar_position: 1800
+title: "WireGuardDevice"
+sidebar_label: "WireGuardDevice"
+---
+
+# WireGuardDevice
+
+`WireGuardDevice` پیاده‌سازی WireGuard داخل chain واتروال است. این نود بین IP packetهای داخلی و پیام‌های خام WireGuard مثل handshake، cookie و transport تبدیل انجام می‌دهد.
+
+این نود UDP socket نمی‌سازد و OS WireGuard interface هم ایجاد نمی‌کند. تقسیم مسئولیت معمول این است:
+
+- `TunDevice`، `RawSocket`، `PacketsToConnection` یا یک packet node دیگر سمت packet داخلی را فراهم می‌کند
+- `WireGuardDevice` مسئول crypto، peer state، allowed-IP routing، handshake، keepalive، rekey و endpoint roaming است
+- `UdpStatelessSocket` مسئول UDP socket بیرونی است
+
+## جایگاه رایج
+
+```text
+TunDevice -> WireGuardDevice -> UdpStatelessSocket
+UdpStatelessSocket -> WireGuardDevice -> TunDevice
+TesterClient(packet) -> WireGuardDevice -> UdpStatelessSocket
+```
+
+سمت transport می‌تواند `next` یا `prev` باشد. اگر topology واضح نیست، `transport-direction` را صریح تنظیم کنید.
+
+## نمونه تنظیم
+
+```json
+{
+  "name": "wg-device",
+  "type": "WireGuardDevice",
+  "settings": {
+    "privatekey": "<base64-32-byte-private-key>",
+    "transport-direction": "next",
+    "peers": [
+      {
+        "publickey": "<base64-32-byte-peer-public-key>",
+        "allowedips": "10.44.0.2/32,10.44.1.0/24,fd00::2/128",
+        "endpoint": "vpn.example.com:51820",
+        "presharedkey": "<optional-base64-32-byte-psk>",
+        "persistentkeepalive": 25
+      }
+    ]
+  },
+  "next": "udp-edge"
+}
+```
+
+## تنظیمات ضروری
+
+| فیلد | نوع | توضیح |
+|---|---|---|
+| `privatekey` | string | private key دستگاه WireGuard، به صورت base64 و 32 بایتی. |
+| `peers` | array | آرایه غیرخالی از peerها. حداکثر فعلی `32` peer است. |
+
+آبجکت `settings` باید وجود داشته باشد و خالی نباشد.
+
+## تنظیمات اختیاری
+
+| فیلد | پیش‌فرض | توضیح |
+|---|---|---|
+| `transport-direction` | تشخیص خودکار | مشخص می‌کند سمت پیام‌های UDP WireGuard کدام طرف است. مقدارهای `next`، `up`، `upstream`، `prev`، `down` و `downstream` پذیرفته می‌شوند. |
+
+اگر این گزینه تنظیم نشود، نود در دو جهت دنبال `UdpStatelessSocket` می‌گردد. اگر فقط در یک سمت پیدا شود، همان سمت transport می‌شود. اگر در هر دو سمت پیدا شود، startup fail می‌شود و باید `transport-direction` را مشخص کنید.
+
+## تنظیمات Peer
+
+فیلدهای ضروری هر peer:
+
+| فیلد | نوع | توضیح |
+|---|---|---|
+| `publickey` | string | public key peer به صورت base64 و 32 بایتی. |
+| `allowedips` | string | لیست CIDR جداشده با comma. IPv4 و IPv6 پشتیبانی می‌شوند. حداقل یک entry لازم است و حداکثر فعلی `16` entry برای هر peer است. |
+| `endpoint` | string | endpoint peer به شکل `host:port`، `ipv4:port` یا `[ipv6]:port`. hostname در زمان ساخت tunnel resolve می‌شود. |
+
+فیلدهای اختیاری هر peer:
+
+| فیلد | پیش‌فرض | توضیح |
+|---|---|---|
+| `presharedkey` | ندارد | PSK اختیاری WireGuard به صورت base64 و 32 بایتی. |
+| `persistentkeepalive` | `0` | فاصله keepalive بر حسب ثانیه. بازه معتبر `0` تا `65535` است؛ `0` یعنی غیرفعال. |
+
+داخل `allowedips` فاصله‌ها حذف می‌شوند، پس مقدارهایی مثل `10.0.0.2/32, 10.1.0.0/16` معتبر هستند.
+
+## چه چیزهایی را تنظیم نمی‌کند
+
+`WireGuardDevice` جایگزین `wg-quick` نیست و این موارد را مدیریت نمی‌کند:
+
+- `Address` interface
+- `ListenPort`
+- `MTU`
+- route table سیستم
+- `PostUp` یا `PostDown`
+- firewall، NAT یا forwarding
+- OS WireGuard interface
+
+برای address و route داخلی از `TunDevice`، برای UDP bind از `UdpStatelessSocket`، و برای firewall/NAT از تنظیمات host یا script استفاده کنید.
+
+## مسیر packet داخلی
+
+وقتی IP packet داخلی به `WireGuardDevice` برسد:
+
+1. packet باید IPv4 یا IPv6 باشد
+2. destination IP از packet خوانده می‌شود
+3. peer با longest-prefix match روی `AllowedIPs` انتخاب می‌شود
+4. packet به WireGuard transport-data message رمز می‌شود
+5. endpoint peer داخل destination routing context خط transport نوشته می‌شود
+6. پیام WireGuard به سمت UDP transport فرستاده می‌شود
+
+اگر destination داخلی با هیچ peer match نشود، packet drop می‌شود.
+
+## مسیر transport
+
+سمت transport پیام‌های خام WireGuard را حمل می‌کند. وقتی datagram از `UdpStatelessSocket` برسد:
+
+1. source IP و port از routing context خوانده می‌شود
+2. نوع پیام WireGuard تشخیص داده می‌شود
+3. handshake، cookie یا transport data پردازش می‌شود
+4. transport data معتبر decrypt می‌شود
+5. plaintext باید IPv4 یا IPv6 معتبر باشد
+6. source IP داخل plaintext باید با `AllowedIPs` همان peer match شود
+7. سپس packet داخلی به سمت packet side forward می‌شود
+
+پس `AllowedIPs` دو نقش دارد: برای outbound انتخاب peer بر اساس destination، و برای inbound اعتبارسنجی source بعد از decrypt.
+
+## Endpoint و Roaming
+
+هر peer یک endpoint تنظیم‌شده و یک endpoint زنده دارد. endpoint تنظیم‌شده از JSON می‌آید و در زمان ساخت resolve می‌شود. وقتی ترافیک inbound معتبر دریافت شود، endpoint زنده peer به آدرس و پورت فرستنده update می‌شود.
+
+این رفتار roaming معمول WireGuard را ممکن می‌کند. hostname endpointها پیوسته re-resolve نمی‌شوند و فقط در زمان ساخت tunnel resolve می‌شوند.
+
+## Startup و Lineها
+
+در start، نود:
+
+1. برای هر worker یک normal companion transport line می‌سازد
+2. peerهای تنظیم‌شده را با `wireguardifConnect()` فعال می‌کند
+3. loop دوره‌ای device را روی worker `0` شروع می‌کند
+4. loop هر `400 ms` اجرا می‌شود
+
+این loop مسئول handshake اولیه، keepalive، retry، rekey و cleanup sessionها است.
+
+سمت داخلی از worker packet lineهای chain استفاده می‌کند. سمت transport از lineهای معمولی‌ای استفاده می‌کند که خود `WireGuardDevice` مالک آن‌هاست تا nodeهای سمت UDP پیام‌های WireGuard را با packet line داخلی اشتباه نگیرند.
+
+## انتخاب جهت
+
+اگر transport side برابر `next` باشد:
+
+- upstream payload به عنوان packet داخلی encrypt می‌شود
+- downstream payload به عنوان transport data decrypt می‌شود
+
+اگر transport side برابر `prev` باشد:
+
+- upstream payload به عنوان transport data decrypt می‌شود
+- downstream payload به عنوان packet داخلی encrypt می‌شود
+
+برای topologyهای غیرمعمول، `transport-direction` را حتما صریح بگذارید.
+
+## Padding
+
+`WireGuardDevice` مقدار `16` بایت left padding لازم دارد. این فضا برای prepend کردن WireGuard transport-data header قبل از ارسال ciphertext به سمت UDP استفاده می‌شود.
+
+auth tag رمزنگاری در انتهای packet اضافه می‌شود.
+
+## خطاهای رایج
+
+- انتظار اینکه این نود UDP socket بسازد. برای آن از `UdpStatelessSocket` استفاده کنید.
+- انتظار اینکه OS WireGuard interface ساخته شود.
+- قرار دادن `UdpStatelessSocket` در هر دو سمت بدون `transport-direction`.
+- فراموش کردن اینکه در نسخه فعلی هر peer به `endpoint` نیاز دارد.
+- تنظیم نکردن `AllowedIPs` مطابق destinationهای داخلی مورد نیاز.
+- انتظار re-resolve شدن مداوم hostname endpointها.
+

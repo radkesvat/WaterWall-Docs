@@ -1,0 +1,338 @@
+---
+sidebar_position: 1630
+title: "VlessServer"
+sidebar_label: "VlessServer"
+---
+
+# VlessServer
+
+`VlessServer` تونل سمت server برای plain VLESS v0 در WaterWall است. این نود VLESS request header را از نود stream-facing
+قبلی parse می‌کند، UUID خام 16 بایتی را authenticate می‌کند، destination درخواستی TCP یا UDP را استخراج می‌کند، و traffic
+قبول‌شده را به `next` تنظیم‌شده forward می‌کند.
+
+این نود فقط base VLESS protocol handling را پیاده‌سازی می‌کند. TLS، REALITY، XTLS Vision، mux، reverse، XUDP یا wrapping
+اختصاصی transport را خودش ایجاد نمی‌کند.
+
+## جایگاه رایج
+
+VLESS server عادی:
+
+```text
+TcpListener -> TlsServer -> VlessServer -> TcpUdpConnector
+```
+
+خروجی فقط TCP:
+
+```text
+TcpListener -> TlsServer -> VlessServer -> TcpConnector
+```
+
+خروجی با پشتیبانی UDP:
+
+```text
+TcpListener -> TlsServer -> VlessServer -> TcpUdpConnector
+```
+
+`VlessServer` خودش TLS terminate نمی‌کند. برای deployment عمومی VLESS، قبل از آن `TlsServer` بگذارید. بدون TLS، UUID و
+metadata مقصد روی wire دیده می‌شوند.
+
+## نمونه Minimal
+
+```json
+[
+  {
+    "name": "tls-in",
+    "type": "TlsServer",
+    "settings": {
+      "cert-file": "/etc/waterwall/fullchain.pem",
+      "key-file": "/etc/waterwall/privkey.pem"
+    },
+    "next": "vless-server"
+  },
+  {
+    "name": "vless-server",
+    "type": "VlessServer",
+    "settings": {
+      "uuid": "5783a3e7-e373-51cd-8642-c83782b807c5",
+      "connect": true,
+      "udp": true,
+      "verbose": false
+    },
+    "next": "outbound"
+  },
+  {
+    "name": "outbound",
+    "type": "TcpUdpConnector",
+    "settings": {
+      "address": "dest_context->address",
+      "port": "dest_context->port"
+    }
+  }
+]
+```
+
+## چند User محلی
+
+```json
+{
+  "name": "vless-server",
+  "type": "VlessServer",
+  "settings": {
+    "users": [
+      "5783a3e7-e373-51cd-8642-c83782b807c5",
+      {
+        "username": "alice",
+        "id": "11111111-2222-3333-4444-555555555555"
+      }
+    ],
+    "connect": true,
+    "udp": true
+  },
+  "next": "outbound"
+}
+```
+
+در local allowlist mode، اگر object دارای `username` باشد، آن username روی line ثبت می‌شود. UUID canonical lowercase هم
+به عنوان password خط ثبت می‌شود تا ruleهای `Router` بتوانند credentials را حتی بدون users database match کنند.
+
+## حالت AuthenticationClient
+
+```json
+{
+  "name": "vless-server",
+  "type": "VlessServer",
+  "settings": {
+    "auth-client-node-name": "auth-client",
+    "connect": true,
+    "udp": true
+  },
+  "next": "outbound"
+}
+```
+
+در این mode، UUID روی wire به canonical lowercase dashed تبدیل می‌شود و به عنوان `password` کاربر از طریق
+`AuthenticationClient` authenticate می‌شود.
+
+نمونه user در database:
+
+```json
+{
+  "id": 2001,
+  "name": "vless-user",
+  "password": "5783a3e7-e373-51cd-8642-c83782b807c5",
+  "enabled": true
+}
+```
+
+وقتی `auth-client-node-name` تنظیم شود، تنظیمات local UUID reject می‌شوند. `VlessServer` به صورت داخلی یک `UserController`
+قبل از outbound تنظیم‌شده وارد می‌کند تا accounting و routing مبتنی بر user درست کار کند.
+
+## نمونه Fallback
+
+```json
+{
+  "name": "vless-server",
+  "type": "VlessServer",
+  "settings": {
+    "uuid": "5783a3e7-e373-51cd-8642-c83782b807c5",
+    "fallback-node-name": "fallback-service",
+    "fallback-intentional-delay-ms": 7,
+    "fallback-intentional-delay-jitter-ms": 1,
+    "connect": true,
+    "udp": true
+  },
+  "next": "outbound"
+}
+```
+
+Fallback برای مقاومت در برابر active probing است. traffic نامعتبر و unauthenticated می‌تواند به جای close فوری به یک
+نود تنظیم‌شده دیگر hand off شود.
+
+## فیلدهای لازم
+
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `name` | string | نام یکتای نود داخل config. |
+| `type` | string | باید دقیقا `"VlessServer"` باشد. |
+| `settings` | object | تنظیمات غیرخالی VLESS server. |
+| `next` | string | لازم است. traffic پذیرفته‌شده VLESS به این نود forward می‌شود. |
+
+دقیقا یکی از دو authentication mode را انتخاب کنید.
+
+## تنظیمات Authentication محلی
+
+برای authentication محلی، `auth-client-node-name` را حذف کنید و حداقل یک UUID تنظیم کنید.
+
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `uuid` | string | یک UUID. |
+| `id` | string | alias برای `uuid`. همزمان `uuid` و `id` را استفاده نکنید. |
+| `uuids` | array of strings | چند UUID. |
+| `users` | array | UUID string یا object با یکی از `uuid`، `id` یا `user-id`. object می‌تواند `username` داشته باشد. |
+| `clients` | array | alias برای `users`. همزمان `users` و `clients` را استفاده نکنید. |
+
+UUIDها می‌توانند RFC4122 dashed یا compact hex با 32 کاراکتر باشند. UUIDهای duplicate خطای fatal config هستند، حتی اگر
+username آنها متفاوت باشد.
+
+## تنظیمات Database Authentication
+
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `auth-client-node-name` | string | نام یک نود `AuthenticationClient` موجود در همان config. |
+
+در database mode، `uuid`، `id`، `uuids`، `users` و `clients` را تنظیم نکنید.
+
+## تنظیمات اختیاری
+
+| فیلد | پیش‌فرض | توضیح |
+| --- | --- | --- |
+| `connect` | `true` | VLESS TCP command `0x01` را فعال می‌کند. |
+| `udp` | `true` | VLESS UDP command `0x02` را فعال می‌کند. |
+| `verbose` | `false` | rejection و diagnostic logging اضافی را فعال می‌کند. |
+| `fallback-node-name` | تنظیم نشده | branch fallback برای probeهای invalid و unauthenticated. aliasها: `fallback-node` و `fallback`. |
+| `fallback-intentional-delay-ms` | `7` | delay برای upstream payloadهایی که به fallback می‌روند. مقدار `0` یعنی غیرفعال. |
+| `fallback-intentional-delay-jitter-ms` | `1` | jitter تصادفی برای scheduling payloadهای delayed fallback. وقتی delay برابر `0` باشد نادیده گرفته می‌شود. |
+
+حداقل یکی از `connect` یا `udp` باید فعال باشد.
+
+## قالب Request و Response
+
+request پذیرفته‌شده:
+
+```text
+version:      1 byte, must be 00
+user id:      16 raw UUID bytes
+addons len:   1 byte, must be 00
+command:      01 TCP or 02 UDP
+destination:  port first, then address
+body:         TCP raw stream or UDP length-prefixed packets
+```
+
+destination format:
+
+```text
+port:          2 bytes big-endian
+address type:  01 IPv4, 02 domain, 03 IPv6
+address body:  IPv4 4 bytes, domain length + bytes, or IPv6 16 bytes
+```
+
+response header:
+
+```text
+00 00
+```
+
+response header فقط بعد از established شدن مسیر upstream انتخاب‌شده ارسال می‌شود. برای TCP یعنی outbound path برقرار
+شده است. برای UDP یعنی backend UDP line داخلی از طریق نود بعدی initialize شده است.
+
+## رفتار Runtime در TCP
+
+برای command `0x01`، server:
+
+1. UUID را authenticate می‌کند
+2. destination درخواستی را parse می‌کند
+3. destination را داخل `line->routing_context.dest_ctx` می‌نویسد
+4. نود `next` تنظیم‌شده را initialize می‌کند
+5. TCP body bytes هم‌payload با request header را forward می‌کند
+6. بعد از established شدن upstream path، VLESS response header را می‌فرستد
+
+نود `next` معمولا `TcpConnector`، `TcpUdpConnector`، `Router` یا نودی است که destination context را می‌فهمد.
+
+## رفتار Runtime در UDP
+
+برای command `0x02`، destination داخل VLESS request اولیه برای همان VLESS line ثابت می‌ماند. frameهای UDP جداگانه آدرس
+per-packet ندارند.
+
+UDP frameها:
+
+```text
+length:   2 bytes big-endian
+payload:  length bytes
+```
+
+`VlessServer` برای target destination یک backend UDP line داخلی می‌سازد. VLESS UDP frameهای ورودی decode می‌شوند و به آن
+backend line فرستاده می‌شوند. پاسخ‌های backend line با همان length prefix دو بایتی wrap می‌شوند و downstream به client
+VLESS برمی‌گردند.
+
+UDP frame با length `0` نامعتبر است. buffering ورودی UDP تا 1 MiB محدود است.
+
+## رفتار Fallback
+
+Fallback فقط قبل از authentication موفق UUID استفاده می‌شود. وقتی UUID پذیرفته شد، addons نامعتبر، commandهای
+پشتیبانی‌نشده، destination خراب یا UDP frame بد باعث close شدن VLESS line می‌شود و bytes authenticated به fallback replay
+نمی‌شوند.
+
+Fallback ممکن است در این حالت‌ها انتخاب شود:
+
+- version byte نامعتبر
+- UUID که در اولین upstream payload split شده باشد
+- UUID lookup ناموفق
+- آماده نبودن `AuthenticationClient`
+
+وقتی fallback تنظیم شده باشد:
+
+- fallback branch بلافاصله `Init` می‌گیرد
+- bytes اولیه ذخیره‌شده و upstream payloadهای بعدی به fallback forward می‌شوند
+- upstream fallback payloadها می‌توانند با `fallback-intentional-delay-ms` به‌علاوه jitter delay شوند
+- upstream `Finish` تا تحویل payloadهای delayed fallback منتظر می‌ماند
+- پاسخ‌های downstream fallback عمدا delay نمی‌شوند
+
+کیفیت fallback بخشی از fingerprint عمومی است. fallback خراب، error generic، close فوری، content متفاوت یا timing متفاوت
+می‌تواند deployment را لو بدهد. delay و jitter را با رفتار public مورد نظر calibrate کنید؛ mitigation هستند، proof نیستند.
+
+## قانون First Payload برای Authentication
+
+credential کامل VLESS، یعنی version byte به‌علاوه UUID خام 16 بایتی، باید داخل اولین upstream payload callback حاضر باشد.
+
+اگر اولین payload credential کامل را نداشته باشد، line مثل probe نامعتبر unauthenticated رفتار می‌شود. اگر fallback تنظیم
+شده باشد، bytes به fallback می‌روند. بدون fallback، line بسته می‌شود. fieldهای بعد از UUID، بعد از حاضر بودن UUID، می‌توانند
+در payload callbackهای بعدی برسند.
+
+## رفتار Finish
+
+`VlessServer` قبل از propagation واقعی `Finish`، line state خودش را destroy می‌کند.
+
+برای TCP و fallback، finish را در صورت نیاز به branch انتخاب‌شده forward می‌کند. برای UDP، backend UDP line داخلی‌ای که
+خودش ساخته را مالک است و وقتی هر سمت بسته شود آن را safely می‌بندد.
+
+## Padding
+
+`VlessServer` ممکن است روی reply packetها VLESS UDP length prefix دو بایتی prepend کند، پس مقدار زیر را advertise می‌کند:
+
+```text
+required_padding_left = 2
+```
+
+## متادیتای نود
+
+| ویژگی | مقدار |
+| --- | --- |
+| Node flag | `kNodeFlagChainHead` |
+| previous node | مجاز، و در استفاده عادی لازم |
+| next node | لازم |
+| layer group | `kNodeLayerAnything` |
+| `required_padding_left` | `2` |
+| line state | auth state، phase، read stream، pending queues، backend UDP line |
+
+## قابلیت‌های پشتیبانی‌نشده
+
+implementation فعلی این موارد را reject می‌کند:
+
+- request addons length غیرصفر
+- XTLS Vision flow addons
+- mux command `0x03`
+- reverse command `0x04`
+- commandهای ناشناخته
+- XUDP و رفتار پیشرفته UDP/mux
+- VLESS روی transportهای non-stream
+
+probeهای invalid و unauthenticated ممکن است به fallback بروند. protocol data بد بعد از authentication بدون نوشتن response
+header دیگر close می‌شود.
+
+## اشتباه‌های رایج
+
+- `VlessServer` را بدون `TlsServer` مستقیم روی listener عمومی expose نکنید، مگر اینکه عمدا plain VLESS روی wire می‌خواهید.
+- local UUIDها را همراه `auth-client-node-name` تنظیم نکنید.
+- نود بعدی را دستی `UserController` نگذارید؛ database mode خودش `UserController` داخلی insert می‌کند.
+- انتظار نداشته باشید UDP frameها برای هر packet مقصد جدید انتخاب کنند؛ VLESS request اولیه UDP target را ثابت می‌کند.
+- به featureهای پشتیبانی‌نشده مثل Vision، flow، mux، reverse یا XUDP تکیه نکنید.

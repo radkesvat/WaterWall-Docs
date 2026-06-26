@@ -1,0 +1,280 @@
+---
+sidebar_position: 1800
+title: "WireGuardDevice"
+sidebar_label: "WireGuardDevice"
+description: "Reference documentation for the WireGuardDevice node."
+---
+
+<!--
+Documentation version: 106
+Sync note: Any change to this file must also be applied to WaterWall/tunnels/WireGuardDevice/description.md, and both files must keep the same documentation version.
+-->
+
+# WireGuardDevice
+
+`WireGuardDevice` is Waterwall's in-chain WireGuard implementation. It transforms between inner IP packets and raw WireGuard handshake, cookie, and transport messages.
+
+This node does not create a UDP socket and does not create an operating-system WireGuard interface. In a normal Waterwall layout:
+
+- `TunDevice`, `RawSocket`, `PacketsToConnection`, or another packet node owns the inner packet side
+- `WireGuardDevice` owns WireGuard crypto, peer state, allowed-IP routing, handshakes, keepalive, rekey, and endpoint roaming
+- `UdpStatelessSocket` owns the outer UDP socket
+
+## Typical Placement
+
+```text
+TunDevice -> WireGuardDevice -> UdpStatelessSocket
+UdpStatelessSocket -> WireGuardDevice -> TunDevice
+TesterClient(packet) -> WireGuardDevice -> UdpStatelessSocket
+```
+
+`WireGuardDevice` can work with the UDP transport side on either `next` or `prev`. If the topology is not obvious, set `transport-direction` explicitly.
+
+## Basic Example
+
+```json
+{
+  "name": "wg-device",
+  "type": "WireGuardDevice",
+  "settings": {
+    "privatekey": "<base64-32-byte-private-key>",
+    "transport-direction": "next",
+    "peers": [
+      {
+        "publickey": "<base64-32-byte-peer-public-key>",
+        "allowedips": "10.44.0.2/32,10.44.1.0/24,fd00::2/128",
+        "endpoint": "vpn.example.com:51820",
+        "presharedkey": "<optional-base64-32-byte-psk>",
+        "persistentkeepalive": 25
+      }
+    ]
+  },
+  "next": "udp-edge"
+}
+```
+
+## Required Settings
+
+| Field | Type | Description |
+|---|---|---|
+| `privatekey` | string | Base64-encoded 32-byte WireGuard private key for this device. |
+| `peers` | array | Non-empty array of peer objects. The current maximum is `32` peers. |
+
+The top-level `settings` object must exist and must not be empty.
+
+## Optional Settings
+
+| Field | Default | Description |
+|---|---|---|
+| `transport-direction` | auto-detected | Selects which side carries outer WireGuard UDP messages. Accepts `next`, `up`, `upstream`, `prev`, `down`, or `downstream`. |
+
+When `transport-direction` is omitted, the node searches both directions for `UdpStatelessSocket`. If it finds UDP stateless sockets on both sides, startup fails and you must set `transport-direction`. If it finds one side only, that side becomes the transport side. If no `UdpStatelessSocket` is found, it falls back to detecting a Layer 4 side and finally to the historical default of treating `next` as the transport side.
+
+## Peer Settings
+
+Required per-peer fields:
+
+| Field | Type | Description |
+|---|---|---|
+| `publickey` | string | Base64-encoded 32-byte WireGuard public key for the peer. |
+| `allowedips` | string | Comma-separated CIDR list. IPv4 and IPv6 are supported. At least one entry is required and the current maximum is `16` entries per peer. |
+| `endpoint` | string | Peer endpoint as `host:port`, `ipv4:port`, or `[ipv6]:port`. The host is resolved during tunnel creation. |
+
+Optional per-peer fields:
+
+| Field | Default | Description |
+|---|---|---|
+| `presharedkey` | none | Optional base64-encoded 32-byte WireGuard preshared key. |
+| `persistentkeepalive` | `0` | Keepalive interval in seconds. Valid range is `0` through `65535`; `0` disables persistent keepalive. |
+
+Spaces inside `allowedips` are stripped before parsing, so both `10.0.0.2/32,10.1.0.0/16` and `10.0.0.2/32, 10.1.0.0/16` are accepted.
+
+## What It Does Not Configure
+
+`WireGuardDevice` is not a `wg-quick` replacement. It does not parse or manage:
+
+- interface `Address`
+- interface `ListenPort`
+- interface `MTU`
+- system route `Table`
+- `PostUp` or `PostDown`
+- firewall, NAT, or forwarding rules
+- an OS WireGuard interface
+
+Use `TunDevice` for inner interface addressing and routing, `UdpStatelessSocket` for the UDP bind address and port, and host scripts or system configuration for firewall/NAT behavior.
+
+## Inner Packet Flow
+
+The inner side carries raw IP packets. When an inner packet reaches `WireGuardDevice`:
+
+1. the packet must be IPv4 or IPv6
+2. the destination IP is extracted from the inner packet
+3. the peer is selected by longest-prefix match over `AllowedIPs`
+4. the packet is encrypted into a WireGuard transport-data message
+5. the selected peer endpoint is written into the transport line destination routing context
+6. the WireGuard message is forwarded toward the UDP transport side
+
+If no peer matches the inner destination address, the packet is dropped.
+
+`AllowedIPs` therefore controls outbound cryptokey routing. More specific prefixes win.
+
+## Transport Packet Flow
+
+The transport side carries raw WireGuard UDP message bodies. When a UDP datagram reaches `WireGuardDevice` from `UdpStatelessSocket`:
+
+1. the source IP and port are read from the line source routing context
+2. the WireGuard message type is detected
+3. handshake initiation, handshake response, cookie reply, or transport data is processed
+4. valid transport data is decrypted
+5. the plaintext must be a valid IPv4 or IPv6 packet
+6. the plaintext source IP must match that peer's `AllowedIPs`
+7. only then is the inner packet forwarded to the packet side
+
+`AllowedIPs` is used in both directions:
+
+- outbound: destination-based peer selection
+- inbound: source-based validation after decryption
+
+## Endpoint And Roaming
+
+Each peer has a configured endpoint and a live endpoint. The configured endpoint comes from JSON and is resolved during tunnel creation. The live endpoint is updated when authenticated inbound traffic is received.
+
+That means the node supports normal WireGuard roaming behavior: after a peer sends valid traffic from a new address or port, future packets can be sent back to that learned endpoint. If the peer/session state is reset hard enough, the peer falls back to the configured endpoint.
+
+Hostname endpoints are resolved during tunnel creation. They are not continuously re-resolved by `WireGuardDevice`.
+
+## Startup And Worker Lines
+
+On start, `WireGuardDevice`:
+
+1. creates one normal companion transport line per worker
+2. marks each configured peer active with `wireguardifConnect()`
+3. starts a periodic device loop on worker `0`
+4. runs the loop every `400 ms`
+
+The periodic loop handles initial handshake attempts, keepalive sends, handshake retries, rekey scheduling, and session cleanup.
+
+`WireGuardDevice` is created with Waterwall's packet-tunnel API and has no per-line packet state. Its inner side uses the chain's worker packet lines. Its outer transport side uses the normal companion lines owned by `WireGuardDevice`, so transport-side nodes do not mistake WireGuard UDP messages for inner packet-line traffic.
+
+If the transport side is `prev`, the node may also send the needed worker packet-line initialization toward the `next` packet side at startup.
+
+## Direction Selection
+
+When the transport side is `next`:
+
+- upstream payload is treated as inner packet data and encrypted
+- downstream payload is treated as outer WireGuard transport data and decrypted
+- decrypted inner packets are forwarded downstream toward `prev`
+
+When the transport side is `prev`:
+
+- upstream payload is treated as outer WireGuard transport data and decrypted
+- downstream payload is treated as inner packet data and encrypted
+- decrypted inner packets are forwarded upstream toward `next`
+
+This is why `transport-direction` matters in unusual topologies.
+
+## Buffer Padding
+
+`WireGuardDevice` advertises `16` bytes of required left padding. It uses this space to prepend the WireGuard transport-data header before forwarding encrypted payload toward the UDP side.
+
+The encrypted authentication tag is appended at the tail.
+
+## Example Pair
+
+Client side:
+
+```json
+{
+  "name": "tun-client",
+  "type": "TunDevice",
+  "settings": {
+    "device-name": "tun0",
+    "device-ip": "10.44.0.1/24"
+  },
+  "next": "wg-client"
+}
+```
+
+```json
+{
+  "name": "wg-client",
+  "type": "WireGuardDevice",
+  "settings": {
+    "privatekey": "<client-private-key>",
+    "peers": [
+      {
+        "publickey": "<server-public-key>",
+        "allowedips": "10.44.0.2/32,10.55.0.0/16",
+        "endpoint": "198.51.100.20:51820",
+        "persistentkeepalive": 25
+      }
+    ]
+  },
+  "next": "udp-client"
+}
+```
+
+```json
+{
+  "name": "udp-client",
+  "type": "UdpStatelessSocket",
+  "settings": {
+    "listen-address": "0.0.0.0",
+    "listen-port": 51820
+  }
+}
+```
+
+Server side:
+
+```json
+{
+  "name": "udp-server",
+  "type": "UdpStatelessSocket",
+  "settings": {
+    "listen-address": "0.0.0.0",
+    "listen-port": 51820
+  },
+  "next": "wg-server"
+}
+```
+
+```json
+{
+  "name": "wg-server",
+  "type": "WireGuardDevice",
+  "settings": {
+    "privatekey": "<server-private-key>",
+    "peers": [
+      {
+        "publickey": "<client-public-key>",
+        "allowedips": "10.44.0.1/32",
+        "endpoint": "203.0.113.10:51820"
+      }
+    ]
+  },
+  "next": "tun-server"
+}
+```
+
+## Node Metadata
+
+| Property | Value |
+|---|---|
+| Runtime model | Pure packet tunnel plus owned companion transport lines |
+| Per-line packet state | none |
+| Required left padding | `16` |
+| Peer limit | `32` |
+| Allowed IP entries per peer | `16` |
+| Periodic loop interval | `400 ms` |
+
+## Common Mistakes
+
+- Expecting this node to open UDP sockets. Use `UdpStatelessSocket` for that.
+- Expecting it to create an OS WireGuard interface. Use `TunDevice` or host networking for interface behavior.
+- Putting `UdpStatelessSocket` on both sides without setting `transport-direction`.
+- Forgetting that each peer currently requires an `endpoint`.
+- Using `AllowedIPs` that do not cover the inner packet destinations you want to send.
+- Expecting hostname endpoints to be re-resolved continuously.
+

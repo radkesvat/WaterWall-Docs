@@ -1,0 +1,151 @@
+---
+sidebar_position: 1660
+title: "RealityClient"
+sidebar_label: "RealityClient"
+description: "Reference documentation for the RealityClient node."
+---
+
+<!--
+Documentation version: 106
+Sync note: Any change to this file must also be applied to WaterWall/tunnels/RealityClient/description.md, and both files must keep the same documentation version.
+-->
+
+# RealityClient
+
+`RealityClient` is the client-side WaterWall Reality tunnel. It starts each line with a real client TLS handshake through an internal `TlsClient`, takes over the established raw connection after the handshake, and then carries WaterWall payload inside TLS-like application-data records protected by AEAD.
+
+Use it when the first bytes on the wire must look like a normal TLS client session to a visitor domain, while accepted WaterWall payload is protected by a shared Reality password.
+
+## Typical Placement
+
+```text
+TcpListener -> RealityClient -> TcpConnector
+```
+
+The configured `next` node is the transport path to the Reality server. `RealityClient` does not open the remote socket by itself; put a connector or another transport node after it.
+
+## Basic Example
+
+```json
+{
+  "name": "reality-client",
+  "type": "RealityClient",
+  "settings": {
+    "sni": "www.example.com",
+    "verify": true,
+    "password": "replace-with-a-strong-secret",
+    "algorithm": "chacha20-poly1305"
+  },
+  "next": "server-tcp"
+}
+```
+
+Paired with a normal TCP transport:
+
+```json
+{
+  "name": "server-tcp",
+  "type": "TcpConnector",
+  "settings": {
+    "address": "203.0.113.10",
+    "port": 443
+  }
+}
+```
+
+## Required Fields
+
+| Field | Type | Description |
+|---|---|---|
+| `type` | string | Must be `RealityClient`. |
+| `next` | string | Node that carries the TLS and Reality record stream to the server. |
+| `settings` | object | Must be a non-empty object. |
+| `settings.sni` | string | Required by the internal `TlsClient`; this is the visitor TLS server name. |
+| `settings.password` | string | Non-empty shared Reality secret. Must match the server. |
+
+## Settings
+
+`RealityClient` passes the same settings object to its internal `TlsClient`, so TLS-facing options such as `sni`, `verify`, `ech-sni-trick`, and `x25519mlkem768` follow `TlsClient` behavior.
+
+| Field | Default | Description |
+|---|---|---|
+| `sni` | required | Visitor TLS SNI used by the internal `TlsClient`. |
+| `verify` | `true` | Certificate verification setting passed to the internal `TlsClient`. |
+| `ech-sni-trick` | unset | Optional TLS client trick passed to the internal `TlsClient`. |
+| `x25519mlkem768` | internal TLS default | Enables or disables the hybrid TLS group in the internal `TlsClient` when supported by that node. |
+| `password` | required | Shared Reality secret used for key derivation. |
+| `algorithm` | `chacha20-poly1305` | AEAD algorithm. Accepts `chacha20-poly1305`, `chacha20poly1305`, `aes-gcm`, `aes-256-gcm`, or `aes256gcm`. |
+| `method` | same as `algorithm` | Alias for `algorithm`. Used only when `algorithm` is absent. |
+| `salt` | `waterwall-reality` | Salt used in the password-based key derivation. Must match the server. |
+| `kdf-iterations` | `12000` | Key derivation rounds. Valid range is `1` through `1000000`. |
+| `max-frame-size` | `16356` | Maximum plaintext bytes per Reality record. Valid range is `1` through `16356`. Larger payload buffers are split into multiple records. |
+
+`aes-gcm` requires AES-GCM support in the active crypto backend. If it is unavailable, tunnel creation fails.
+
+## Runtime Flow
+
+On upstream `Init`, `RealityClient`:
+
+1. initializes its per-line state
+2. forwards `Init` into the internal `TlsClient`
+3. waits for the internal TLS handshake to complete
+
+Upstream payload that arrives before the TLS takeover is queued. When the internal `TlsClient` reports downstream `Est`, `RealityClient` deinitializes the internal TLS line without closing the underlying connection, marks the line as Reality-ready, flushes queued upstream payload as encrypted Reality records, and then emits downstream `Est` to the previous node.
+
+After takeover:
+
+| Direction | Behavior |
+|---|---|
+| Upstream payload | Cleartext payload from the previous node is encrypted and framed as TLS-like application-data records, then sent to `next`. |
+| Downstream payload | Reality records from `next` are parsed, authenticated, decrypted, and forwarded as cleartext to the previous node. |
+
+If downstream payload arrives before TLS takeover, if a Reality record is invalid, or if authentication fails, the node closes both directions for that line.
+
+## Record Format
+
+Reality records are shaped like TLS application-data records:
+
+```text
+TLS record header (5 bytes)
+nonce             (12 bytes)
+ciphertext
+AEAD tag          (16 bytes)
+```
+
+The TLS-like header uses:
+
+| Field | Value |
+|---|---|
+| Content type | `0x17` application data |
+| Version | `0x0303` |
+| Length | `12-byte nonce + ciphertext + 16-byte tag` |
+
+The TLS record header is authenticated as AEAD associated data. The nonce is random per record.
+
+## Buffer And Lifecycle Notes
+
+- `RealityClient` has per-line state for the downstream record parser, queued pre-handshake upstream payload, and TLS-ready flag.
+- It does not create or destroy the normal line. It only destroys its own line state when the line finishes or when it closes both directions after a Reality error.
+- The node advertises `17` bytes of required left padding: `5` bytes for the TLS-like record header and `12` bytes for the nonce prefix.
+- Empty payload buffers are recycled without sending a Reality record.
+- Payloads larger than `max-frame-size` are split into multiple encrypted records.
+
+## Operational Notes
+
+- `RealityClient` depends on `TlsClient`; the build requires `INCLUDE_TLS_CLIENT=ON`.
+- The first phase is a real TLS client handshake, so the `sni`, certificate verification behavior, and TLS fingerprinting options matter.
+- `password`, `salt`, `kdf-iterations`, and `algorithm` must match `RealityServer`.
+- This node is a stream tunnel, not a packet tunnel.
+
+## Node Metadata
+
+| Property | Value |
+|---|---|
+| Position | Middle stream tunnel |
+| Requires `next` | Yes |
+| Previous layer | Anything |
+| Next layer | Anything |
+| Per-line state | Yes |
+| Creates lines | No |
+| Destroys lines | No |
+| Required left padding | `17` |

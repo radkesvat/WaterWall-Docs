@@ -1,0 +1,214 @@
+---
+sidebar_position: 1430
+title: "TcpOverUdpClient"
+sidebar_label: "TcpOverUdpClient"
+description: "Reference documentation for the TcpOverUdpClient node."
+---
+
+<!--
+Documentation version: 106
+Sync note: Any change to this file must also be applied to WaterWall/tunnels/TcpOverUdpClient/description.md, and both files must keep the same documentation version.
+-->
+
+# TcpOverUdpClient
+
+`TcpOverUdpClient` carries a TCP-like byte stream over a packet-preserving UDP path by running KCP internally. It accepts
+stream payload from the previous node, wraps that byte stream into KCP segments, and forwards the resulting datagrams to
+the next node.
+
+It is normally paired with `TcpOverUdpServer` on the remote side.
+
+## Typical placement
+
+Client side:
+
+```text
+TcpListener -> TcpOverUdpClient -> UdpConnector
+TcpListener -> MuxClient -> TcpOverUdpClient -> UdpConnector
+```
+
+Server side:
+
+```text
+UdpListener -> TcpOverUdpServer -> TcpConnector
+UdpListener -> TcpOverUdpServer -> MuxServer -> TcpConnector
+```
+
+The node after `TcpOverUdpClient` must preserve datagram boundaries. A normal UDP-style path is the intended transport.
+
+## Basic example
+
+```json
+{
+  "name": "tcp-over-udp-client",
+  "type": "TcpOverUdpClient",
+  "settings": {
+    "fec": false,
+    "kcp-send-window": 8192,
+    "kcp-recv-window": 8192,
+    "ping-interval-ms": 10000,
+    "no-recv-timeout-ms": 30000
+  },
+  "next": "udp-out"
+}
+```
+
+Matching connector:
+
+```json
+{
+  "name": "udp-out",
+  "type": "UdpConnector",
+  "settings": {
+    "address": "198.51.100.10",
+    "port": 9000
+  }
+}
+```
+
+## FEC example
+
+```json
+{
+  "name": "tcp-over-udp-client",
+  "type": "TcpOverUdpClient",
+  "settings": {
+    "fec": true,
+    "fec-data-shards": 10,
+    "fec-parity-shards": 3
+  },
+  "next": "udp-out"
+}
+```
+
+FEC must be enabled on both `TcpOverUdpClient` and `TcpOverUdpServer` with matching shard settings. If one side uses FEC
+and the other side does not, or if the shard counts differ, the peer will not decode the packet stream correctly.
+
+## Required fields
+
+`settings` is optional. If it is absent or not an object, the node uses defaults.
+
+`next` is required in normal use. It should point to a packet-preserving transport or packet-preserving tunnel stack.
+
+## Optional settings
+
+| Field | Default | Validation | Description |
+| --- | --- | --- | --- |
+| `fec` | `false` | boolean | Enables Reed-Solomon forward error correction around KCP datagrams. |
+| `fec-data-shards` | `10` | positive, with total shards less than or equal to `255` | Number of data shards per FEC block. Used only when `fec` is enabled. |
+| `fec-parity-shards` | `3` | positive, with total shards less than or equal to `255` | Number of parity shards per FEC block. Used only when `fec` is enabled. |
+| `kcp-nodelay` | `true` | boolean | Enables KCP nodelay mode. |
+| `kcp-interval-ms` | `10` | `10..5000` | KCP update interval. |
+| `kcp-resend` | `2` | `>= 0` | KCP fast-resend threshold. |
+| `kcp-no-congestion-control` | `true` | boolean | Disables KCP congestion control. |
+| `kcp-send-window` | `8192` | `>= 1` | KCP send window in segments. |
+| `kcp-recv-window` | `8192` | `>= 1` | KCP receive window in segments. |
+| `kcp-initial-cwnd` | half of `kcp-send-window` | `1..kcp-send-window` | Initial KCP congestion window. |
+| `kcp-rx-minrto-ms` | `30` | `>= 1` | Minimum KCP retransmission timeout. |
+| `kcp-send-buffer-limit` | `0` | `>= 0` | Backpressure threshold. `0` derives the limit from local send window + remote window + `10`. |
+| `ping-interval-ms` | `10000` | `>= 1` | Idle receive interval before sending an internal ping frame. |
+| `no-recv-timeout-ms` | `30000` | greater than `ping-interval-ms` | Idle receive interval before closing the line. |
+
+## KCP transport model
+
+On upstream `Init`, the client initializes per-line state, creates a KCP session, starts the KCP timer loop, creates FEC
+state if enabled, queues an initial internal ping frame, and forwards upstream `Init` to the next node.
+
+When stream payload arrives from the previous node:
+
+1. The payload is split into chunks no larger than the effective KCP write MTU.
+2. Each chunk is prefixed with a one-byte internal frame flag.
+3. The framed chunk is sent through KCP.
+4. KCP output datagrams are forwarded upstream to the next node.
+
+When datagrams come back from the next node:
+
+1. FEC decoding is applied if enabled.
+2. KCP receives the datagram.
+3. Completed KCP payloads are drained.
+4. The one-byte internal frame flag is removed.
+5. Data frames are forwarded downstream to the previous node as reconstructed stream payload.
+
+## Internal frame flags
+
+Inside the KCP payload, `TcpOverUdpClient` uses a one-byte flag:
+
+| Flag | Meaning |
+| --- | --- |
+| `0x00` | Data frame. Bytes after the flag are real stream payload. |
+| `0xF0` | Ping frame. Used as an internal keepalive marker. |
+| `0xFF` | Close frame. Requests shutdown of the paired line. |
+
+Empty data frames are discarded.
+
+## MTU and padding
+
+The KCP MTU is based on `GLOBAL_MTU_SIZE`. When FEC is disabled, KCP uses `GLOBAL_MTU_SIZE` as the outer KCP MTU. When
+FEC is enabled, 8 bytes of FEC outer header are subtracted.
+
+The effective stream write payload budget is:
+
+```text
+GLOBAL_MTU_SIZE - 20 - 8 - 24 - 1 - fec_overhead
+```
+
+The `1` is the internal TcpOverUdp frame flag. The node advertises `required_padding_left = 1` so it can prepend this
+flag before handing data to KCP.
+
+## FEC behavior
+
+With `fec: true`, outbound KCP datagrams are wrapped in Reed-Solomon FEC packets. Data shards are emitted immediately.
+After each configured data-shard block, parity shards are emitted.
+
+On receive, the decoder:
+
+- accepts FEC-wrapped KCP datagrams
+- feeds valid data shards into KCP
+- tries to recover missing KCP datagrams from parity shards
+- drops invalid FEC packets conservatively
+
+FEC adds bandwidth overhead. With the default `10` data shards and `3` parity shards, a full block carries about 30
+percent extra parity traffic, plus FEC headers.
+
+## Backpressure
+
+If KCP queued send data grows beyond `kcp-send-buffer-limit`, the client schedules a downstream `Pause` toward the
+previous stream side. When KCP output drains below the threshold, the KCP output callback schedules a downstream
+`Resume`.
+
+This prevents unbounded memory growth when the UDP path is congested or the peer cannot receive quickly enough.
+
+## Close and timeout behavior
+
+If the previous stream side finishes, `TcpOverUdpClient`:
+
+1. marks downstream as closed so re-entrant callbacks are not reflected back toward the finished side
+2. sends an internal close frame through KCP
+3. flushes KCP output
+4. destroys local line state
+5. forwards upstream `Finish` to the packet side
+
+If a close frame is received from the remote peer, the client destroys local state, finishes the packet side, and then
+finishes the stream side if the line is still alive.
+
+If no receive activity happens for `ping-interval-ms`, a ping frame is sent. If receive inactivity exceeds
+`no-recv-timeout-ms`, the line is closed.
+
+## Node metadata
+
+| Property | Value |
+| --- | --- |
+| Node flag | `kNodeFlagNone` |
+| Previous node | Allowed |
+| Next node | Allowed, required in normal use |
+| Layer group | `kNodeLayerAnything` |
+| `required_padding_left` | `1` |
+
+## Common mistakes
+
+- Do not put a stream-only tunnel after `TcpOverUdpClient`; the next side must preserve packet boundaries.
+- Do not enable FEC on only one side.
+- Do not use mismatched FEC shard counts.
+- Do not assume KCP removes all loss; it retransmits, and optional FEC can help with moderate loss, but severe or bursty
+  loss still hurts.
+- Do not set `no-recv-timeout-ms` less than or equal to `ping-interval-ms`.

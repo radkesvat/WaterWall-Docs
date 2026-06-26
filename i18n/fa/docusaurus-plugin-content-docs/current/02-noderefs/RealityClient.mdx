@@ -1,0 +1,108 @@
+---
+sidebar_position: 1660
+title: "RealityClient"
+sidebar_label: "RealityClient"
+---
+
+# RealityClient
+
+`RealityClient` سمت client پیاده‌سازی Reality در WaterWall است. این نود ابتدا با یک `TlsClient` داخلی یک TLS handshake واقعی انجام می‌دهد، سپس بعد از کامل شدن handshake کنترل اتصال خام را می‌گیرد و payloadهای WaterWall را داخل recordهای شبیه TLS application-data با AEAD ارسال می‌کند.
+
+از این نود زمانی استفاده کنید که ابتدای traffic باید شبیه یک TLS client عادی به یک visitor domain دیده شود، اما payload واقعی WaterWall با secret مشترک Reality محافظت شود.
+
+## جایگاه رایج
+
+```text
+TcpListener -> RealityClient -> TcpConnector
+```
+
+نود `next` مسیر transport به سمت `RealityServer` است. `RealityClient` خودش socket مقصد را باز نمی‌کند؛ برای اتصال TCP معمولاً بعد از آن `TcpConnector` قرار می‌گیرد.
+
+## نمونه تنظیمات
+
+```json
+{
+  "name": "reality-client",
+  "type": "RealityClient",
+  "settings": {
+    "sni": "www.example.com",
+    "verify": true,
+    "password": "replace-with-a-strong-secret",
+    "algorithm": "chacha20-poly1305"
+  },
+  "next": "server-tcp"
+}
+```
+
+## فیلدهای اجباری
+
+| فیلد | نوع | توضیح |
+|---|---|---|
+| `type` | string | باید `RealityClient` باشد. |
+| `next` | string | نودی که stream مربوط به TLS و Reality recordها را به سمت server حمل می‌کند. |
+| `settings` | object | باید object غیرخالی باشد. |
+| `settings.sni` | string | برای `TlsClient` داخلی لازم است و visitor TLS server name است. |
+| `settings.password` | string | secret مشترک Reality. باید با server یکی باشد. |
+
+## تنظیمات
+
+`RealityClient` همان object تنظیمات را به `TlsClient` داخلی هم می‌دهد، بنابراین گزینه‌هایی مثل `sni`، `verify`، `ech-sni-trick` و `x25519mlkem768` طبق رفتار `TlsClient` استفاده می‌شوند.
+
+| گزینه | پیش‌فرض | توضیح |
+|---|---|---|
+| `sni` | اجباری | SNI مربوط به visitor domain. |
+| `verify` | `true` | تنظیم verification برای `TlsClient` داخلی. |
+| `ech-sni-trick` | تنظیم نشده | گزینه اختیاری TLS client trick. |
+| `x25519mlkem768` | پیش‌فرض داخلی TLS | فعال/غیرفعال کردن hybrid TLS group در صورت پشتیبانی. |
+| `password` | اجباری | secret مشترک برای key derivation. |
+| `algorithm` | `chacha20-poly1305` | یکی از `chacha20-poly1305`، `chacha20poly1305`، `aes-gcm`، `aes-256-gcm` یا `aes256gcm`. |
+| `method` | مثل `algorithm` | alias برای `algorithm`، وقتی `algorithm` وجود نداشته باشد. |
+| `salt` | `waterwall-reality` | salt برای key derivation. باید با server یکی باشد. |
+| `kdf-iterations` | `12000` | تعداد roundهای key derivation. بازه معتبر `1` تا `1000000`. |
+| `max-frame-size` | `16356` | حداکثر plaintext هر Reality record. بازه معتبر `1` تا `16356`. payload بزرگ‌تر split می‌شود. |
+
+اگر `aes-gcm` انتخاب شود ولی crypto backend فعلی AES-GCM را پشتیبانی نکند، ساخت tunnel fail می‌شود.
+
+## جریان اجرا
+
+در upstream `Init`، نود line state خودش را آماده می‌کند و `Init` را وارد `TlsClient` داخلی می‌کند. تا زمانی که TLS takeover کامل نشده باشد، payloadهای upstream در صف نگه داشته می‌شوند.
+
+وقتی `TlsClient` داخلی downstream `Est` بدهد، `RealityClient` state داخلی TLS را بدون بستن اتصال deinit می‌کند، line را Reality-ready می‌کند، payloadهای صف‌شده را به صورت Reality record رمزنگاری‌شده می‌فرستد و سپس downstream `Est` را به نود قبلی می‌دهد.
+
+بعد از takeover:
+
+| جهت | رفتار |
+|---|---|
+| Upstream payload | cleartext از نود قبلی رمزنگاری و به صورت TLS-like application-data record به `next` ارسال می‌شود. |
+| Downstream payload | Reality record از `next` parse، authenticate و decrypt می‌شود و cleartext به نود قبلی می‌رود. |
+
+اگر downstream payload قبل از takeover برسد، record نامعتبر باشد، یا authentication شکست بخورد، line از هر دو جهت بسته می‌شود.
+
+## قالب Record
+
+```text
+TLS record header (5 bytes)
+nonce             (12 bytes)
+ciphertext
+AEAD tag          (16 bytes)
+```
+
+header شبیه TLS application data با content type `0x17` و version `0x0303` است. header به عنوان AEAD associated data استفاده می‌شود و nonce برای هر record تصادفی است.
+
+## نکته‌های عملیاتی
+
+- `RealityClient` به `TlsClient` وابسته است و build باید `INCLUDE_TLS_CLIENT=ON` داشته باشد.
+- `password`، `salt`، `kdf-iterations` و `algorithm` باید با `RealityServer` یکی باشند.
+- این نود stream tunnel است، نه packet tunnel.
+- `required_padding_left` این نود `17` است.
+
+## مشخصات نود
+
+| ویژگی | مقدار |
+|---|---|
+| جایگاه | Middle stream tunnel |
+| نیاز به `next` | بله |
+| Per-line state | دارد |
+| ایجاد line | خیر |
+| destroy کردن line | خیر |
+| Required left padding | `17` |

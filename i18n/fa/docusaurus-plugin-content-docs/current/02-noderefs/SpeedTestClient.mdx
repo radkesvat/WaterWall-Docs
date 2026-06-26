@@ -1,0 +1,215 @@
+---
+sidebar_position: 1410
+title: "SpeedTestClient"
+sidebar_label: "SpeedTestClient"
+---
+
+# SpeedTestClient
+
+`SpeedTestClient` یک tunnel benchmark و chain-head است. این نود lineهای عادی Waterwall را می‌سازد، ترافیک framed
+speed-test را به نود بعدی می‌فرستد، frameهای برگشتی از `SpeedTestServer` را validate می‌کند، و گزارش interval و summary
+نهایی throughput را log می‌کند.
+
+این نود برای اندازه‌گیری یک مسیر Waterwall یا transport stack است. خودش socket باز نمی‌کند، application proxy نیست، و
+packet-line tunnel هم نیست.
+
+## جایگاه رایج
+
+`SpeedTestClient` باید اولین نود chain باشد.
+
+```text
+SpeedTestClient -> TcpConnector
+SpeedTestClient -> UdpConnector
+SpeedTestClient -> TlsClient -> TcpConnector
+SpeedTestClient -> EncryptionClient -> TcpConnector
+```
+
+سمت remote معمولا باید با `SpeedTestServer` تمام شود:
+
+```text
+TcpListener -> SpeedTestServer
+UdpListener -> SpeedTestServer
+TcpListener -> TlsServer -> SpeedTestServer
+TcpListener -> EncryptionServer -> SpeedTestServer
+```
+
+## نمونه TCP
+
+سمت client:
+
+```json
+[
+  {
+    "name": "speedtest-client",
+    "type": "SpeedTestClient",
+    "settings": {
+      "mode": "tcp",
+      "direction": "bidirectional",
+      "duration-ms": 10000,
+      "warmup-ms": 1000,
+      "report-interval-ms": 1000,
+      "connection-count": 4,
+      "payload-size": 131072,
+      "terminate-on-complete": true
+    },
+    "next": "speedtest-out"
+  },
+  {
+    "name": "speedtest-out",
+    "type": "TcpConnector",
+    "settings": {
+      "address": "198.51.100.10",
+      "port": 9000,
+      "nodelay": true
+    }
+  }
+]
+```
+
+سمت server:
+
+```json
+[
+  {
+    "name": "speedtest-listener",
+    "type": "TcpListener",
+    "settings": {
+      "address": "0.0.0.0",
+      "port": 9000,
+      "nodelay": true
+    },
+    "next": "speedtest-server"
+  },
+  {
+    "name": "speedtest-server",
+    "type": "SpeedTestServer",
+    "settings": {
+      "report-interval-ms": 1000,
+      "json-summary": true
+    }
+  }
+]
+```
+
+## نمونه UDP
+
+```json
+[
+  {
+    "name": "speedtest-client",
+    "type": "SpeedTestClient",
+    "settings": {
+      "mode": "udp",
+      "direction": "upload",
+      "duration-ms": 10000,
+      "warmup-ms": 1000,
+      "payload-size": 3800,
+      "udp-target-bits-per-sec": 10000000,
+      "terminate-on-complete": true
+    },
+    "next": "speedtest-udp-out"
+  },
+  {
+    "name": "speedtest-udp-out",
+    "type": "UdpConnector",
+    "settings": {
+      "address": "198.51.100.10",
+      "port": 9001
+    }
+  }
+]
+```
+
+سمت server آن معمولا `UdpListener -> SpeedTestServer` است.
+
+## فیلدهای لازم
+
+`SpeedTestClient` به `next` نیاز دارد. نود بعدی همان مسیری است که ترافیک benchmark تولیدشده را دریافت می‌کند.
+
+`settings` در عمل اختیاری است و اگر نباشد defaultها استفاده می‌شوند. وقتی mode، duration، direction، payload size،
+stream count، pacing یا خروجی خاصی می‌خواهید، `settings` را اضافه کنید.
+
+## تنظیمات اختیاری
+
+| فیلد | پیش‌فرض | توضیح |
+| --- | --- | --- |
+| `mode` | `tcp` | mode framing. مقدارهای مجاز: `tcp`, `TCP`, `udp`, `UDP`. |
+| `direction` | `upload` | جهت تست. مقدارهای مجاز: `upload`, `UPLOAD`, `send`, `download`, `DOWNLOAD`, `receive`, `bidirectional`, `both`, `BOTH`. |
+| `duration-ms` | `10000` | مدت اندازه‌گیری بعد از warmup. باید positive باشد. |
+| `warmup-ms` | `0` | مدت warmup. فریم‌های warmup ارسال و validate می‌شوند ولی در byte total اندازه‌گیری حساب نمی‌شوند. |
+| `report-interval-ms` | `1000` | فاصله گزارش interval. باید positive باشد. |
+| `start-delay-ms` | `50` | تاخیر شروع هر stream بعد از startup. باید non-negative باشد. |
+| `timeout-ms` | `warmup-ms + duration-ms + 30000` | watchdog هر stream. باید بزرگ‌تر از `warmup-ms + duration-ms` باشد. |
+| `connection-count` | `1` | تعداد lineهای عادی Waterwall که به صورت parallel ساخته می‌شوند. |
+| `payload-size` | TCP: `131072`, UDP: `3800` | تعداد byte داخل payload فریم `DATA`، بدون هدر 48 بایتی speed-test. |
+| `target-bits-per-sec` | TCP: `0` | pacing اختیاری بر حسب bit/sec. مقدار `0` یعنی تا جایی که backpressure اجازه دهد ارسال شود. |
+| `udp-target-bits-per-sec` | UDP: `10000000` | pacing مخصوص UDP بر حسب bit/sec. |
+| `target-megabits-per-sec` | تنظیم نشده | فرم جایگزین pacing بر حسب megabit/sec. |
+| `json-summary` | `false` | علاوه بر logهای معمول، یک summary compact JSON-style چاپ می‌کند. |
+| `terminate-on-complete` | `true` | بعد از پایان همه streamها Waterwall را خارج می‌کند؛ exit code موفق `0` و در صورت failure برابر `1` است. |
+
+فقط یکی از `target-bits-per-sec`, `udp-target-bits-per-sec`, و `target-megabits-per-sec` می‌تواند همزمان تنظیم شود.
+
+`payload-size` باید بین `1` و `16777216` باشد. در UDP حداکثر `64952` است، چون هر UDP payload یک فریم کامل speed-test با
+هدر 48 بایتی دارد.
+
+## جریان protocol
+
+| Frame | جهت | کاربرد |
+| --- | --- | --- |
+| `HELLO` | client به server | mode، direction، duration، warmup، report interval، payload size، pacing، stream count و stream id را اعلام می‌کند. |
+| `ACK` | server به client | تایید `HELLO`. در UDP client قبل از ارسال data منتظر آن می‌ماند. |
+| `DATA` | sender به receiver | payload deterministic برای upload یا download. |
+| `END` | sender به receiver | پایان یک جهت sender. |
+| `REPORT` | server به client | آمار final sender/receiver. |
+| `ERROR` | server به client | خطای protocol. |
+
+هدر هر frame برابر 48 بایت است. `payload-size` فقط payload فریم `DATA` را توصیف می‌کند.
+
+## Startup و مالکیت line
+
+در زمان start، client برای هر stream یک task شروع schedule می‌کند. هر stream:
+
+1. worker را با `stream_id % workers_count` انتخاب می‌کند
+2. یک `line_t` عادی می‌سازد
+3. line state خودش را initialize می‌کند
+4. `Init` را به سمت نود بعدی می‌فرستد
+5. watchdog مربوط به `timeout-ms` را arm می‌کند
+
+چون client این lineها را می‌سازد، خودش هم مالک destroy کردن آنهاست.
+
+## رفتار TCP و UDP
+
+در TCP، bytes دریافتی داخل stream buffer جمع می‌شوند و به frameهای speed-test decode می‌شوند. TCP به صورت default pacing
+ندارد و تا جایی که chain و backpressure اجازه دهند ارسال می‌کند، مگر اینکه target bandwidth تنظیم کنید.
+
+در UDP، هر Waterwall payload buffer دقیقا یک فریم speed-test است. client تا دریافت `ACK`، فریم `HELLO` را retry می‌کند.
+فاصله retry برابر کوچک‌تر از `report-interval-ms` و 250 ms است. فریم‌های final `END` در UDP سه بار ارسال می‌شوند.
+
+UDP به صورت default `udp-target-bits-per-sec: 10000000` دارد و loss، duplicate، out-of-order، validation error و jitter
+را گزارش می‌کند.
+
+## آمار
+
+سمت receiver این موارد را track می‌کند: bytes، packets، valid packets، lost packets، duplicate packets، out-of-order
+packets، validation errors و jitter estimate.
+
+payloadها pattern deterministic دارند که با stream id، sequence و direction ساخته می‌شود؛ بنابراین corruption یا ترتیب
+غیرمنتظره قابل تشخیص است.
+
+## متادیتای نود
+
+| ویژگی | مقدار |
+| --- | --- |
+| flag | `kNodeFlagChainHead` |
+| previous node | مجاز نیست |
+| next node | اجباری |
+| layer group | `kNodeLayer4` |
+| `required_padding_left` | `0` |
+
+## اشتباه‌های رایج
+
+- این نود را وسط chain ترافیک واقعی قرار ندهید؛ chain head است و خودش line می‌سازد.
+- بدون `SpeedTestServer` matching استفاده نکنید.
+- انتظار باز کردن socket مستقیم از آن نداشته باشید؛ بعد از آن connector یا transport stack بگذارید.
+- برای UDP payload خیلی بزرگ انتخاب نکنید مگر اینکه کل مسیر آن را بدون fragmentation/loss تحمل کند.

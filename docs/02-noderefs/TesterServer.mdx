@@ -1,0 +1,231 @@
+---
+sidebar_position: 1510
+title: "TesterServer"
+sidebar_label: "TesterServer"
+description: "Reference documentation for the TesterServer node."
+---
+
+<!--
+Documentation version: 106
+Sync note: Any change to this file must also be applied to WaterWall/tunnels/TesterServer/description.md, and both files must keep the same documentation version.
+-->
+
+# TesterServer
+
+`TesterServer` is the synthetic validation peer for `TesterClient`. It verifies the deterministic request sequence that reaches it, then sends the deterministic response sequence back on the same Waterwall line or packet path.
+
+Use it at the far end of test chains to prove that intermediate nodes preserve payload bytes, order, packet shape, and lifecycle expectations.
+
+## Typical Placement
+
+Stream-mode test:
+
+```text
+TesterClient -> SomeTunnel -> SomeTunnel -> TesterServer
+```
+
+Packet-mode bridged test:
+
+```text
+TesterClient(packet-mode=true) -> PingClient -> Bridge
+TesterServer(packet-mode=true) -> PingServer -> Bridge
+```
+
+`TesterServer` is normally the chain end. In packet mode, it can also have a `next` node so bridged packet paths can feed it from the next/downstream side.
+
+## Basic Examples
+
+Stream mode:
+
+```json
+{
+  "name": "tester-server",
+  "type": "TesterServer"
+}
+```
+
+Packet mode:
+
+```json
+{
+  "name": "tester-server",
+  "type": "TesterServer",
+  "settings": {
+    "packet-mode": true
+  }
+}
+```
+
+Packet mode with startup packet-line init:
+
+```json
+{
+  "name": "tester-server",
+  "type": "TesterServer",
+  "settings": {
+    "packet-mode": true,
+    "packet-init-on-start": true,
+    "packet-ipv4": {
+      "source-ip": "198.51.100.10",
+      "dest-ip": "203.0.113.20",
+      "transport": "udp",
+      "ttl": 64
+    }
+  }
+}
+```
+
+## Required Fields
+
+| Field | Type | Description |
+|---|---|---|
+| `name` | string | User-chosen node name. |
+| `type` | string | Must be `TesterServer`. |
+
+`settings` is optional. If omitted, stream-mode defaults are used.
+
+`next` is allowed only when `packet-mode=true`.
+
+## Settings
+
+| Field | Default | Description |
+|---|---|---|
+| `packet-mode` | `false` | Use worker packet lines instead of ordinary stream-line behavior. |
+| `packet-init-on-start` | `false` | Packet mode only. Initialize packet-line state once per worker during startup if no packet-side `Init` already did it. |
+| `streaming-response` | `false` | Stream mode only. Allow response chunks to send as matching request chunks are verified. |
+| `packet-stateless` | `false` | Packet mode only. Accept request packets out of order or as a subset, identifying chunks by packet size. |
+| `chunk-count` | `11` | Use the first N chunks from the selected chunk table. Valid range is `1` through `11`. |
+| `max-payload-size` | `0` | Cap generated stream response buffers or packet sizes. `0` means use the normal table/buffer size. |
+| `split-payload-delay-ms` | `1` | Stream mode only. Delay between split response payload sends when `max-payload-size` is active. |
+| `split-payload-burst` | `1` | Stream mode only. Number of split response buffers sent before applying `split-payload-delay-ms`. Must be positive. |
+| `packet-ipv4` | unset | Packet mode only. Treat request and response chunks as complete synthetic IPv4 packets. |
+
+`packet-init-on-start`, `packet-stateless`, and `packet-ipv4` require `packet-mode=true`. `max-payload-size` is not supported with `packet-stateless=true`.
+
+## Chunk Tables
+
+`TesterServer` uses the same deterministic tables as `TesterClient`. `chunk-count` selects a prefix of the active table.
+
+Stream-mode chunk sizes:
+
+```text
+1, 2, 4, 32, 512, 1024, 4096, 32768, 32769, 1048576, 2097152
+```
+
+Packet-mode chunk sizes:
+
+```text
+1, 2, 4, 32, 64, 128, 256, 512, 1024, 1499, 1500
+```
+
+Packet-mode with raw IPv4 envelope:
+
+```text
+21, 22, 24, 52, 84, 148, 276, 532, 1044, 1499, 1500
+```
+
+Packet-mode with IPv4 plus `tcp`, `udp`, or `icmp` transport headers:
+
+```text
+41, 42, 44, 52, 84, 148, 276, 532, 1044, 1499, 1500
+```
+
+The first request byte carries the client-selected flow id. `TesterServer` uses that id to verify request bytes and generate the matching response pattern, even if the request arrived on a different worker.
+
+## Packet IPv4 Mode
+
+`packet-ipv4` is valid only with `packet-mode=true`.
+
+Required fields:
+
+| Field | Description |
+|---|---|
+| `source-ip` | Expected IPv4 source address for request packets. |
+| `dest-ip` | Expected IPv4 destination address for request packets. |
+
+Optional fields:
+
+| Field | Default | Description |
+|---|---|---|
+| `transport` | `none` | Optional transport header: `tcp`, `udp`, `icmp`, `raw`, or `none`. |
+| `protocol` | `253` | IPv4 protocol number. If `transport` is `tcp`, `udp`, or `icmp`, this must match that transport. |
+| `ttl` | `64` | IPv4 TTL used when generating response packets. |
+
+Response packets reverse `source-ip` and `dest-ip` automatically. For `tcp`, `udp`, and `icmp`, deterministic transport headers are generated and verified. TCP and UDP use source port `40123` and destination port `40234` for requests, reversed for responses.
+
+## Runtime Flow
+
+On upstream `Init`, `TesterServer`:
+
+1. initializes its line state
+2. sends downstream `Est` toward the previous tunnel
+
+That `Est` is the normal signal that lets `TesterClient` begin sending.
+
+In packet mode, `packet-init-on-start=true` can initialize worker packet-line state at startup when a packet-side `Init` will not naturally reach `TesterServer`.
+
+## Request Verification
+
+Stream mode:
+
+- incoming request bytes are buffered
+- complete chunks are verified in order
+- extra bytes after the expected request sequence fail the test
+- full request verification makes the response side ready
+
+Packet mode:
+
+- each request packet must match an expected request chunk
+- with `packet-ipv4`, each packet must be a complete non-fragmented IPv4 packet with the configured source, destination, protocol, and transport header
+- each verified request packet queues a deterministic response packet
+- packet lines must remain alive during runtime
+
+With `packet-stateless=true`, request chunks are identified by packet size, so packet-mode requests may arrive out of order. This is useful for stateless packet paths that do not preserve ordering.
+
+## Response Sending
+
+Responses are sent downstream with `tunnelPrevDownStreamPayload()` in normal stream mode.
+
+In packet mode, the response direction depends on how the request arrived:
+
+- upstream request payloads receive downstream responses
+- downstream request payloads receive upstream responses toward `next`
+
+This is what makes bridged packet topologies possible.
+
+With `streaming-response=false`, stream responses are held until the full request sequence is verified. With `streaming-response=true`, response chunks can send as soon as the matching request chunks have been verified.
+
+Upstream `Pause` and `Resume` control response sending for backpressure.
+
+## Finish Behavior
+
+Stream mode:
+
+- `Finish` before full request verification is a failure
+- `Finish` before the full response sequence was sent is a failure
+- after a fully successful exchange, upstream `Finish` only destroys local tester state
+
+Packet mode:
+
+- runtime `Finish` on the packet line is a bug
+- packet lines are persistent worker helper lines and must not be destroyed during normal packet tests
+
+## Node Metadata
+
+| Property | Value |
+|---|---|
+| Normal position | Chain end |
+| Packet-mode position | Chain end or bridged packet-side participant |
+| `next` | Allowed only when `packet-mode=true` |
+| Normal line ownership | Does not create the client line |
+| Packet mode | Uses worker packet lines and must not destroy them |
+| Required left padding | `0` |
+
+## Common Mistakes
+
+- Using it as a production service. It is a validation peer and aborts on mismatch.
+- Adding `next` in stream mode. `next` is supported only with `packet-mode=true`.
+- Enabling packet mode without a packet-layer node in the chain.
+- Expecting packet mode to close packet lines.
+- Combining `packet-stateless=true` with `max-payload-size`.
+- Using `packet-ipv4` without `packet-mode=true`.

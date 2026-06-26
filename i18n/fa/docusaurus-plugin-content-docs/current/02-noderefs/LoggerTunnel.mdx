@@ -1,0 +1,176 @@
+---
+sidebar_position: 1900
+title: "LoggerTunnel"
+sidebar_label: "LoggerTunnel"
+---
+
+# LoggerTunnel
+
+`LoggerTunnel` یک نود شفاف برای مشاهده و ثبت payload است. این نود داده را تغییر نمی‌دهد، line جدید نمی‌سازد، line را destroy نمی‌کند و جهت lifecycle زنجیره را عوض نمی‌کند.
+
+از این نود زمانی استفاده کنید که می‌خواهید رفتار یک chain را بدون دخالت در مسیر اصلی traffic بررسی کنید.
+
+## جایگاه رایج
+
+چون `LoggerTunnel` فقط ناظر است، می‌تواند در ابتدای chain، وسط chain یا انتهای یک segment قرار بگیرد:
+
+```text
+TcpListener -> LoggerTunnel -> TcpConnector
+TunDevice -> LoggerTunnel -> IpManipulator
+UdpListener -> LoggerTunnel -> UdpConnector
+```
+
+این نود می‌تواند هم `prev` و هم `next` داشته باشد، اما نبودن یکی از طرف‌ها را هم تحمل می‌کند. اگر callback به سمتی برسد که وجود ندارد، نود فقط برمی‌گردد و lifecycle مصنوعی ایجاد نمی‌کند.
+
+## نمونه تنظیمات
+
+ثبت payload در network logger:
+
+```json
+{
+  "name": "trace-http",
+  "type": "LoggerTunnel",
+  "settings": {
+    "mode": "log",
+    "level": "info"
+  },
+  "next": "next-node"
+}
+```
+
+ذخیره raw payload در یک فایل جدا برای هر جهت:
+
+```json
+{
+  "name": "payload-dump",
+  "type": "LoggerTunnel",
+  "settings": {
+    "mode": "file",
+    "output-mode": "split-direction"
+  },
+  "next": "next-node"
+}
+```
+
+استخراج فقط payload مربوط به TCP از packetهای IPv4:
+
+```json
+{
+  "name": "tcp-body-dump",
+  "type": "LoggerTunnel",
+  "settings": {
+    "mode": "tcp-payload-file",
+    "output-mode": "per-payload"
+  },
+  "next": "next-node"
+}
+```
+
+## فیلدهای اجباری
+
+| فیلد | نوع | توضیح |
+|---|---|---|
+| `type` | string | باید `LoggerTunnel` باشد. |
+| `settings` | object | باید object غیرخالی باشد و `mode` داشته باشد. |
+
+فیلد `name` به شدت توصیه می‌شود، چون خروجی file از نام نود به عنوان prefix فایل استفاده می‌کند. اگر `name` خالی یا ناموجود باشد، پیاده‌سازی از `LoggerTunnel` به عنوان prefix استفاده می‌کند.
+
+## تنظیمات
+
+| گزینه | اجباری | پیش‌فرض | توضیح |
+|---|---|---|---|
+| `mode` | بله | ندارد | نوع خروجی. یکی از `log`، `file` یا `tcp-payload-file`. |
+| `level` | خیر، فقط برای log mode | `debug` | سطح network logger برای `mode: "log"`. یکی از `debug`، `info`، `warning`، `error` یا `fatal`. |
+| `output-mode` | خیر، فقط برای file modeها | `split-direction` | ساختار فایل برای `mode: "file"` و `mode: "tcp-payload-file"`. یکی از `per-payload`، `split-direction` یا `single-file`. |
+
+وقتی `mode` برابر `log` است، `output-mode` استفاده نمی‌شود. وقتی `mode` برابر `file` یا `tcp-payload-file` است، `level` استفاده نمی‌شود.
+
+## modeها
+
+| mode | چیزی که ثبت می‌شود | مقصد |
+|---|---|---|
+| `log` | طول payload و نمایش hex از کل payload buffer. | Waterwall network logger. |
+| `file` | دقیقاً همان bytes موجود در `sbuf_t` callback. | فایل‌ها در working directory فعلی. |
+| `tcp-payload-file` | فقط TCP transport payload استخراج‌شده از packet IPv4. | فایل‌ها در working directory فعلی. |
+
+## output-mode
+
+`output-mode` برای `file` و `tcp-payload-file` استفاده می‌شود.
+
+| مقدار | رفتار |
+|---|---|
+| `per-payload` | هر payload callback را در یک فایل جدا می‌نویسد: `<name>-up-1.txt`، `<name>-up-2.txt`، `<name>-down-1.txt` و ... . شمارنده upstream و downstream جداست. فایل‌ها با write mode باز می‌شوند، پس فایل هم‌نام از اجرای قبلی ممکن است overwrite شود. |
+| `split-direction` | همه bytesهای upstream را به `<name>-up.txt` و همه bytesهای downstream را به `<name>-down.txt` append می‌کند. |
+| `single-file` | هر دو جهت را به `<name>-all.txt` append می‌کند. |
+
+پسوند فایل‌ها `.txt` است، اما محتوای آن‌ها raw bytes است. separator، timestamp، طول packet یا frame marker اضافه نمی‌شود.
+
+## جریان اجرا
+
+`LoggerTunnel` قبل از forward کردن payload، آن را log یا ذخیره می‌کند.
+
+مسیر upstream:
+
+```text
+previous node -> LoggerTunnel logs payload -> next node
+```
+
+در upstream، اگر `next` وجود داشته باشد، payload با `tunnelNextUpStreamPayload()` forward می‌شود.
+
+مسیر downstream:
+
+```text
+next node -> LoggerTunnel logs payload -> previous node
+```
+
+در downstream، اگر `prev` وجود داشته باشد، payload با `tunnelPrevDownStreamPayload()` forward می‌شود.
+
+callbackهای غیر payload فقط pass-through هستند:
+
+| جهت callback | رفتار |
+|---|---|
+| Upstream `Init`, `Est`, `Finish`, `Pause`, `Resume` | اگر `next` وجود داشته باشد به نود بعدی forward می‌شود. |
+| Downstream `Init`, `Est`, `Finish`, `Pause`, `Resume` | اگر `prev` وجود داشته باشد به نود قبلی forward می‌شود. |
+
+این نود per-line state ندارد. state آن در سطح tunnel است و شامل mode، log level، مسیر فایل‌ها، شمارنده فایل‌ها و mutex برای serialize کردن file writeهاست.
+
+## استخراج TCP Payload
+
+در `tcp-payload-file`، هر payload buffer به عنوان یک packet کامل IPv4 بررسی می‌شود و فقط bytes بعد از headerهای IPv4 و TCP نوشته می‌شوند.
+
+packet در این حالت‌ها نادیده گرفته می‌شود:
+
+- کوتاه‌تر از header IPv4 باشد
+- IPv4 نباشد
+- protocol آن TCP نباشد
+- طول header یا total length معتبر نباشد
+- fragment شده باشد
+- طول header TCP معتبر نباشد
+- TCP segment هیچ transport payload نداشته باشد
+
+این mode فقط IPv4 را پشتیبانی می‌کند. packetهای IPv6 و غیر TCP skip می‌شوند.
+
+اگر یک packet معتبر بعد از IPv4 total length داده اضافه داشته باشد، آن bytes اضافه بخشی از TCP payload استخراج‌شده نیستند.
+
+## نکته‌های عملیاتی
+
+- `LoggerTunnel` محتوای واقعی traffic را ثبت می‌کند. برای password، token، private key، cookie، اطلاعات کاربر و traffic production با احتیاط استفاده کنید.
+- در `log` mode، کل payload به hex تبدیل می‌شود. در traffic زیاد یا payload بزرگ، log می‌تواند بسیار حجیم شود.
+- خروجی فایل نسبت به working directory فعلی پروسه Waterwall نوشته می‌شود.
+- `split-direction` و `single-file` به فایل‌های موجود append می‌کنند. در صورت نیاز فایل‌های قدیمی را rotate یا حذف کنید.
+- file writeها داخل state نود serialize می‌شوند، بنابراین چند worker هم‌زمان از مسیر خروجی فایل عبور نمی‌کنند.
+- در chainهای packet، `file` mode کل packet buffer رسیده به نود را ذخیره می‌کند. فقط وقتی از `tcp-payload-file` استفاده کنید که bufferها packetهای IPv4 باشند و هدف شما application bytes مربوط به TCP باشد.
+- خطا در log یا file write عمداً مسیر forwarding را تغییر نمی‌دهد. payload بدون تغییر از chain عبور می‌کند.
+
+## مشخصات نود
+
+| ویژگی | مقدار |
+|---|---|
+| جایگاه | Chain head، middle، chain end یا no-chain |
+| Layer group | Anything to anything |
+| Per-line state | ندارد |
+| ایجاد line | خیر |
+| destroy کردن line | خیر |
+| تغییر payload | خیر |
+| Required left padding | `0` |
+| File prefix | مقدار `name` نود، یا `LoggerTunnel` در صورت خالی بودن |

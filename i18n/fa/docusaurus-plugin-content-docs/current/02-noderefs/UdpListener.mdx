@@ -1,0 +1,150 @@
+---
+sidebar_position: 300
+title: "UdpListener"
+sidebar_label: "UdpListener"
+---
+
+# UdpListener
+
+`UdpListener` نود سرور UDP است. روی یک آدرس و پورت، چند پورت مشخص، یا یک بازه پورت گوش می‌دهد، datagramهای ورودی را بر اساس remote peer گروه‌بندی می‌کند، برای هر peer یک line می‌سازد و payloadها را به نود بعدی می‌فرستد.
+
+جایگاه رایج:
+
+```text
+UdpListener -> ... -> UdpConnector
+```
+
+## نمونه تنظیم
+
+```json
+{
+  "name": "udp-listener",
+  "type": "UdpListener",
+  "settings": {
+    "address": "0.0.0.0",
+    "port": [
+      5353,
+      853,
+      123
+    ],
+    "large-send-buffer": true,
+    "large-recv-buffer": true,
+    "interface": "eth0",
+    "fwmark": 10,
+    "balance-group": "udp-public",
+    "balance-interval": 30000,
+    "multiport-backend": "socket",
+    "whitelist": [
+      "192.168.1.0/24",
+      "2001:db8::/64"
+    ],
+    "blacklist": [
+      "192.168.1.50/32"
+    ]
+  },
+  "next": "next-node-name"
+}
+```
+
+## فیلدهای ضروری
+
+| فیلد | توضیح |
+|---|---|
+| `name` | نام دلخواه نود |
+| `type` | باید دقیقا `UdpListener` باشد |
+| `next` | نودی که lineها و payloadهای UDP را دریافت می‌کند |
+| `settings.address` | آدرس bind، مثل `0.0.0.0`، `::` یا IP مشخص |
+| `settings.port` یا `settings.port-range` | تعریف پورت گوش دادن |
+
+## تنظیم پورت
+
+`UdpListener` سه حالت پورت دارد.
+
+یک پورت:
+
+```json
+"port": 5353
+```
+
+لیست پورت‌های مشخص:
+
+```json
+"port": [5353, 853, 123]
+```
+
+این حالت فقط روی همین سه پورت گوش می‌دهد و بازه بین آن‌ها نیست.
+
+بازه پیوسته:
+
+```json
+"port-range": [20000, 20100]
+```
+
+برای بازه باید از `port-range` با آرایه دو عضوی `[min, max]` استفاده شود. همزمان نباید `port` و `port-range` را تنظیم کنید.
+
+## تنظیمات اختیاری
+
+| گزینه | پیش‌فرض | توضیح |
+|---|---:|---|
+| `large-send-buffer` | `true` | تنظیم `SO_SNDBUF` |
+| `large-recv-buffer` | `true` | تنظیم `SO_RCVBUF` |
+| `interface` | - | محدود کردن socket به interface محلی؛ در Linux از `SO_BINDTODEVICE` استفاده می‌شود |
+| `fwmark` | - | socket mark در سیستم‌هایی که `SO_MARK` دارند |
+| `balance-group` | - | گروه توزیع بین چند listener هم‌پورت |
+| `balance-interval` | مقدار socket manager | مدت sticky بودن peer در گروه balance، به میلی‌ثانیه |
+| `multiport-backend` | runtime default | برای `port-range`: مقدار `iptables` یا `socket` |
+| `whitelist` | - | IP یا CIDRهای مجاز، IPv4 و IPv6 |
+| `blacklist` | - | IP یا CIDRهای مسدود، IPv4 و IPv6 |
+
+`large-send-buffer` و `large-recv-buffer` می‌توانند `true`، `false` یا عدد مثبت باشند. مقدار `true` یعنی استفاده از buffer بزرگ پیش‌فرض WaterWall که فعلا `4194304` بایت است.
+
+## whitelist، blacklist و balance
+
+`whitelist` و `blacklist` در socket manager بررسی می‌شوند، قبل از اینکه datagram به `UdpListener` برسد.
+
+```json
+"whitelist": [
+  "10.0.0.0/8",
+  "203.0.113.10/32",
+  "2001:db8::/64"
+]
+```
+
+اگر whitelist تنظیم شود، فقط peerهای match شده وارد این listener می‌شوند. اگر blacklist هم تنظیم شود، peer نباید در blacklist match شود.
+
+`balance-group` برای پخش peerها بین چند listener سازگار روی یک port استفاده می‌شود. sticky بودن براساس peer انجام می‌شود تا datagramهای پشت سر هم یک peer بین چند مسیر پخش نشوند.
+
+## رفتار UDP
+
+UDP اتصال واقعی مثل TCP ندارد، اما `UdpListener` برای هر remote address/port یک line نگه می‌دارد. نتیجه:
+
+- datagramهای یک peer به همان line فرستاده می‌شوند.
+- پاسخ downstream به همان peer برگشت داده می‌شود.
+- peerهای idle بعد از timeout پاک می‌شوند.
+
+مسیر داده:
+
+- peer به زنجیر: datagram ورودی به upstream payload برای `next`
+- زنجیر به peer: downstream payload به datagram خروجی برای همان peer
+
+## pause و timeout
+
+اگر line در حالت pause باشد، `UdpListener` datagramهای ورودی آن peer را queue نمی‌کند و drop می‌کند.
+
+هر UDP peer line در جدول idle نگه داشته می‌شود:
+
+| وضعیت | timeout |
+|---|---|
+| line تازه ساخته‌شده | حدود `30s` |
+| peer فعال بعد از ادامه traffic | حدود `300s` |
+
+بعد از expire شدن، line finish و destroy می‌شود.
+
+## نکته‌ها
+
+- `UdpListener` chain head است و `next` لازم دارد.
+- `port` آرایه‌ای یعنی لیست پورت‌های مشخص، نه بازه.
+- برای بازه از `port-range` استفاده کنید.
+- در نسخه فعلی سورس، هم `whitelist` و هم `blacklist` parse می‌شوند.
+- `fwmark` و bind به interface platform-dependent هستند.
+- اگر به UDP کاملا stateless بر اساس routing context نیاز دارید، `UdpStatelessSocket` را بررسی کنید.
