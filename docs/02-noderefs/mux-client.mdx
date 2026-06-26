@@ -4,9 +4,13 @@ sidebar_position: 800
 
 # MuxClient
 
-`MuxClient` چندین اتصال منطقی WaterWall را روی تعداد کمتری اتصال transport مشترک حمل می‌کند. به جای اینکه برای هر line ورودی یک اتصال کامل تا سمت مقابل ساخته شود، `MuxClient` یک یا چند line والد به سمت `next` باز می‌کند و streamهای منطقی را داخل frameهای داخلی MUX روی همان والدها می‌فرستد.
+`MuxClient` multiplexes many logical WaterWall lines onto a smaller number of
+shared parent transport lines.
 
-در سمت مقابل باید `MuxServer` قرار بگیرد تا frameها را باز کند و دوباره lineهای مستقل بسازد.
+Instead of opening one full transport connection for every incoming child line,
+`MuxClient` creates or reuses a parent line toward `next`, attaches child lines
+to that parent, and sends each child's events as internal MUX frames. The remote
+side must use `MuxServer` to recreate independent child lines.
 
 ```mermaid
 flowchart LR
@@ -23,26 +27,48 @@ flowchart LR
     style in4 fill:transparent,stroke:transparent
 ```
 
-## جایگاه رایج
+`MuxClient` is not a listener or connector. The previous node creates the child
+lines, and the next node carries the shared parent transport.
+
+## Typical Placement
+
+Simple TCP transport:
 
 ```text
-TcpListener -> MuxClient -> TcpConnector
-TcpListener -> MuxClient -> HttpClient -> TlsClient -> TcpConnector
+client side: TcpListener -> MuxClient -> TcpConnector
+server side: TcpListener -> MuxServer -> TcpConnector
 ```
 
-در سمت دیگر مسیر:
+With an outer protocol stack:
 
 ```text
-TcpListener -> MuxServer -> TcpConnector
+client side: TcpListener -> MuxClient -> HttpClient -> TlsClient -> TcpConnector
+server side: TcpListener -> TlsServer -> HttpServer -> MuxServer -> TcpConnector
 ```
 
-`MuxClient` خودش listener یا connector نیست. نود قبلی باید lineهای child را بسازد و نود بعدی باید transport واقعی والد را فراهم کند.
+Use MUX when many short or medium-lived logical connections should share fewer
+outer transport connections.
 
-## نمونه تنظیم‌ها
+## What It Does
 
-### mode: timer
+- Accepts normal child lines from the previous node.
+- Creates parent transport lines toward `next`.
+- Reuses parent lines according to the selected concurrency mode.
+- Assigns each child a 32-bit connection id, or `cid`.
+- Encodes child payload, pause, resume, and finish events into MUX frames.
+- Decodes reply frames from `MuxServer` and routes them back to the matching
+  child.
+- Queues parent-delivered data when the local child write side is paused.
+- Reflects per-child backpressure with `FlowPause` and `FlowResume` frames.
+- Closes exhausted idle parent lines when their last child finishes.
 
-در این حالت هر parent line فقط تا مدت مشخصی child جدید قبول می‌کند. بعد از تمام شدن زمان، childهای جدید روی parent تازه می‌روند، اما childهای قبلی روی parent قدیمی تا پایان عمرشان ادامه می‌دهند.
+`MuxClient` creates parent `line_t` objects internally and is responsible for
+destroying those parent lines. It does not destroy child lines created by the
+previous node.
+
+## Configuration Examples
+
+Timer mode:
 
 ```json
 {
@@ -56,9 +82,7 @@ TcpListener -> MuxServer -> TcpConnector
 }
 ```
 
-### mode: counter
-
-در این حالت هر parent line تا تعداد مشخصی child می‌گیرد. وقتی ظرفیت پر شد، parent جدید ساخته می‌شود.
+Counter mode:
 
 ```json
 {
@@ -72,9 +96,7 @@ TcpListener -> MuxServer -> TcpConnector
 }
 ```
 
-### mode: fixed-connections-count
-
-این mode جدیدتر است و برای هر worker یک pool ثابت از parent lineها نگه می‌دارد. وقتی اولین child روی یک worker برسد، `MuxClient` به تعداد `per-worker-connections-count` parent line برای همان worker آماده می‌کند. childهای بعدی بین parentهای همان pool پخش می‌شوند و تا وقتی slotها زنده‌اند parent اضافی ساخته نمی‌شود.
+Fixed parent pool mode:
 
 ```json
 {
@@ -88,85 +110,178 @@ TcpListener -> MuxServer -> TcpConnector
 }
 ```
 
-## تنظیمات
+## Required Fields
 
-| گزینه | اجباری | توضیح |
-|---|---|---|
-| `mode` | بله | یکی از `timer`، `counter` یا `fixed-connections-count` |
-| `connection-duration-ms` | فقط در `timer` | مدت پذیرش child جدید روی هر parent، به میلی‌ثانیه. باید بزرگ‌تر از `60` باشد. |
-| `connection-capacity` | فقط در `counter` | حداکثر تعداد childهایی که روی یک parent قرار می‌گیرند. باید بزرگ‌تر از `0` باشد. |
-| `per-worker-connections-count` | فقط در `fixed-connections-count` | تعداد parent lineهای ثابت برای هر worker. باید بزرگ‌تر از `0` باشد. |
-| `child-buffer-limit` | خیر | سقف صف داده برای هر child pause شده. پیش‌فرض `8388608` بایت، یعنی `8 MB`. |
+Top-level fields:
 
-## مدل parent و child
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | string | User-chosen node name. Must be unique inside the config file. |
+| `type` | string | Must be exactly `"MuxClient"`. |
+| `settings` | object | Required. Must contain `mode` and the mode-specific required setting. |
+| `next` | string | Required. The next node carries parent transport lines. |
 
-`MuxClient` دو نوع line دارد:
+Required `settings` fields:
 
-- `child line`: اتصال منطقی که از سمت نود قبلی آمده است.
-- `parent line`: اتصال مشترکی که به سمت نود بعدی باز می‌شود و frameهای چند child را حمل می‌کند.
+| Setting | Required When | Description |
+| --- | --- | --- |
+| `mode` | always | One of `timer`, `counter`, or `fixed-connections-count`. |
+| `connection-duration-ms` | `mode: "timer"` | Milliseconds during which a parent line may accept new child lines. Must be greater than `60`. |
+| `connection-capacity` | `mode: "counter"` | Maximum child cids opened on one parent line. Must be greater than `0`. |
+| `per-worker-connections-count` | `mode: "fixed-connections-count"` | Number of parent lines maintained per worker. Must be greater than `0`. |
 
-هر child یک شناسه ۳۲ بیتی به نام `cid` می‌گیرد. این شناسه داخل frameهای MUX قرار می‌گیرد تا `MuxServer` در سمت مقابل بداند هر payload، pause، resume یا close متعلق به کدام stream منطقی است.
+## Optional Settings
 
-## تفاوت modeها در عمل
+| Setting | Type | Default | Description |
+| --- | --- | --- | --- |
+| `child-buffer-limit` | integer | `8388608` | Maximum queued bytes for one paused child. Must be greater than `0`. If reached, the child is closed with a MUX `Close` frame. |
+| `child-buffer-pause-tolerance` | integer | `524288` | Queue threshold where the child sends `FlowPause` and may pause parent reads. Must be `0` or greater. Values above `child-buffer-limit` are capped to the limit. |
+| `log-main-line-stats` | boolean | `false` | When enabled, parent lines log stats every `5000` ms. |
 
-| mode | parent جدید چه زمانی ساخته می‌شود؟ | مناسب برای |
-|---|---|---|
-| `timer` | وقتی parent فعلی از `connection-duration-ms` پیرتر شود | پخش اتصال‌ها در طول زمان و جلوگیری از خیلی بزرگ شدن parentهای قدیمی |
-| `counter` | وقتی تعداد childهای parent به `connection-capacity` برسد | کنترل ساده و قابل پیش‌بینی روی تعداد stream در هر parent |
-| `fixed-connections-count` | فقط برای پر کردن pool ثابت هر worker؛ parent اضافی ساخته نمی‌شود مگر slot بسته و بعدا دوباره نیاز شود | کنترل تعداد اتصال‌های بیرونی، رفتار پایدارتر، جلوگیری از رشد ناخواسته تعداد parentها |
+Stats include worker id, parent read/write pause state, child count, child
+read-pause count, and child write-pause count.
 
-در `timer` و `counter`، هر worker معمولا یک parent قابل استفاده فعلی دارد. در `fixed-connections-count`، هر worker چند parent ثابت دارد و child جدید به parent کم‌بارتر داده می‌شود؛ اگر چند parent هم‌بار باشند، tie-break به شکل round-robin انجام می‌شود.
+## Parent And Child Model
 
-## frame داخلی MUX
+`MuxClient` has two line roles:
 
-`MuxClient` و `MuxServer` از header ثابت ۸ بایتی استفاده می‌کنند:
+| Role | Meaning |
+| --- | --- |
+| child line | A logical WaterWall connection received from the previous node. |
+| parent line | A shared transport connection created by `MuxClient` toward `next`. |
 
-| فیلد | اندازه | توضیح |
-|---|---:|---|
-| `length` | `uint16` | طول payload بعد از header |
-| `flags` | `uint8` | نوع frame |
-| `_pad1` | `uint8` | padding داخلی |
-| `cid` | `uint32` | شناسه child stream |
+Each child receives a `cid`. The `cid` is local to one parent line and is used
+inside MUX frames so `MuxServer` can map payloads and control events back to the
+correct logical stream.
 
-نوع frameها:
+In timer and counter modes, each worker has one current reusable parent, called
+the unsatisfied line in the implementation. New children join it until it is
+exhausted.
 
-| flag | معنی |
-|---:|---|
-| `0` | `Open`، ساخت child در سمت مقابل |
-| `1` | `Close`، بستن child |
+In fixed parent pool mode, the first child on a worker causes `MuxClient` to
+create `per-worker-connections-count` parent lines for that worker. New children
+are assigned to the least-loaded parent in that worker's pool, with a
+round-robin tie break. No extra parent lines are created while the pool slots
+are alive.
+
+## Mode Behavior
+
+| Mode | Parent Stops Accepting New Children When | Useful When |
+| --- | --- | --- |
+| `timer` | parent age is greater than `connection-duration-ms` | You want parent transport lines to rotate over time. |
+| `counter` | parent `cid` reaches `connection-capacity` | You want a simple cap on logical streams per parent. |
+| `fixed-connections-count` | not exhausted by age or child count | You want a stable per-worker outer connection count. |
+
+An exhausted parent is not closed immediately. It stops accepting new children,
+but existing children continue until they finish. If an exhausted parent has no
+children, `MuxClient` closes and destroys it.
+
+There is also an absolute cid hard limit: when a parent reaches `4294967295`,
+it is exhausted.
+
+## Stream Opening Behavior
+
+Current code attaches a child during upstream `Init`:
+
+1. Select or create a parent line on the same worker.
+2. Initialize the child MUX line state.
+3. Link the child to the parent.
+4. Assign the next `cid`.
+5. Report downstream `Est` to the previous node for the child.
+
+The `Open` frame is not sent during `Init`. It is emitted with the first
+upstream payload as an `Open` frame followed by a `Data` frame in the same
+buffer. If the child finishes before sending any payload, `MuxClient` sends
+`Open` followed by `Close` so the peer observes a complete open/close sequence.
+
+## Frame Format
+
+`MuxClient` and `MuxServer` share an 8-byte packed frame header:
+
+| Field | Size | Description |
+| --- | ---: | --- |
+| `length` | `uint16` | Payload length after the header, stored big-endian. |
+| `flags` | `uint8` | Frame kind. |
+| `_pad1` | `uint8` | Internal padding byte. |
+| `cid` | `uint32` | Child stream id, stored big-endian. |
+
+Frame flags:
+
+| Flag | Meaning |
+| ---: | --- |
+| `0` | `Open` |
+| `1` | `Close` |
 | `2` | `FlowPause` |
 | `3` | `FlowResume` |
 | `4` | `Data` |
 
-این header توسط خود نودها مدیریت می‌شود و لازم نیست در config چیزی برای آن تنظیم کنید.
+The implementation rejects payloads larger than `0xFFFF - 8`, so one MUX data
+frame can carry at most `65527` payload bytes. `MuxClient` does not split a
+large child payload into multiple MUX frames; payloads reaching this node should
+already fit that limit.
 
-## جریان داده
+## Direction Behavior
 
-- مسیر رفت: child از سمت قبلی وارد `MuxClient` می‌شود، header MUX می‌گیرد و روی parent به `next` می‌رود.
-- مسیر برگشت: payload از parent برمی‌گردد، frame کامل خوانده می‌شود، header حذف می‌شود و payload به child درست تحویل داده می‌شود.
+| Incoming callback | Behavior |
+| --- | --- |
+| child upstream `Init` | Selects/creates a parent, links the child, assigns a `cid`, and reports `Est` to the previous node. |
+| child upstream `Payload` | Prepends `Open + Data` for the first payload, otherwise prepends `Data`, then sends to the parent toward `next`. |
+| child upstream `Pause` / `Resume` | Sends `FlowPause` / flushes queued data and possibly sends `FlowResume`. |
+| child upstream `Finish` | Sends `Close`, or `Open + Close` if no payload opened the stream yet; closes idle exhausted parent if needed. |
+| parent downstream `Payload` | Parses MUX frames from `MuxServer`, routes `Data`, `Close`, `FlowPause`, and `FlowResume` to the matching child. |
+| parent downstream `Pause` / `Resume` | Reflects parent write pressure to the most recent writer child, or to all children if no recent writer is known. |
+| parent downstream `Finish` | Marks the parent finishing, flushes/finishes all children toward the previous node, destroys parent state, and destroys the owned parent line. |
+| upstream `Est` | Disabled; reaching this callback is fatal. |
+| downstream `Init` | Disabled; reaching this callback is fatal. |
 
-وقتی child جدید attach شد و frame `Open` با موفقیت ارسال شد، `MuxClient` برای child به سمت قبلی `Est` گزارش می‌کند.
+Unknown frames, frames for missing cids, and unexpected `Open` frames arriving
+from the server side are dropped.
 
-## pause، resume و صف‌ها
+## Backpressure And Queues
 
-MUX فقط payload را قاطی نمی‌کند؛ backpressure هر child را هم جدا نگه می‌دارد.
+MUX keeps backpressure per child:
 
-- اگر child از سمت قبلی pause شود، `MuxClient` برای همان `cid` یک `FlowPause` به سمت `MuxServer` می‌فرستد.
-- وقتی child resume شود، `FlowResume` ارسال می‌شود.
-- اگر داده برگشتی برای یک child برسد ولی همان child فعلا pause باشد، داده در صف همان child نگه داشته می‌شود.
-- وقتی صف child به کمتر از حدود `512 KB` برسد، `FlowResume` زودتر فرستاده می‌شود تا سمت مقابل بتواند دوباره آرام‌آرام ارسال کند.
-- اگر صف یک child به `child-buffer-limit` برسد، ورودی parent موقتا pause می‌شود تا حافظه بی‌رویه مصرف نشود.
+- If a local child pauses, `MuxClient` sends `FlowPause` for that `cid`.
+- If peer `FlowPause` arrives, reads from the local child are paused.
+- If parent-delivered data arrives for a paused child, data is queued on that
+  child.
+- Once one child's queue reaches `child-buffer-pause-tolerance`, the child sends
+  `FlowPause` and parent input may be paused.
+- The same tolerance is also applied to aggregate queued child data on the
+  parent line.
+- Once queued data drops below `min(512 KiB, child-buffer-limit)`, `FlowResume`
+  and parent read resume can be sent.
+- If one child's queue reaches `child-buffer-limit`, the child is closed.
 
-## محدودیت‌ها و خطاها
+This lets one slow child stop its own stream without forcing every other child
+on the same parent to stop immediately.
 
-- buffer خواندن frameهای parent سقف فعلی `1 MB` دارد. اگر داده ناقص/خراب باعث عبور از این حد شود، parent بسته می‌شود و childهای متصل به آن finish می‌شوند.
-- وقتی parent در `timer` یا `counter` exhausted شد، فورا بسته نمی‌شود؛ فقط child جدید قبول نمی‌کند. بعد از بسته شدن آخرین child، parent هم بسته می‌شود.
-- اگر `cid` به سقف `4294967295` برسد، parent دیگر child جدید نمی‌گیرد.
-- `mode` در نسخه فعلی اجباری است؛ configهای قدیمی بدون mode معتبر نیستند.
+## Buffer And Padding Notes
 
-## انتخاب مقدارهای عملی
+`MuxClient` prepends MUX headers to outgoing parent payloads. Node metadata
+advertises:
 
-- برای شروع ساده، `counter` با مقدارهایی مثل `64` یا `128` قابل فهم است.
-- اگر می‌خواهید اتصال‌های بیرونی در طول زمان rotate شوند، `timer` انتخاب خوبی است.
-- اگر می‌خواهید تعداد parent connectionها دقیق‌تر کنترل شود، مخصوصا وقتی transport بیرونی گران یا حساس است، `fixed-connections-count` بهتر است.
-- اگر تعداد workerها در `core.json` بیشتر باشد، parentها به ازای هر worker ساخته می‌شوند. مثلا `per-worker-connections-count: 2` با ۴ worker می‌تواند تا ۸ parent فعال بسازد.
+```text
+required_padding_left = 16
+layer_group = kNodeLayerAnything
+```
+
+The 16 bytes are needed because the first child payload can prepend two headers:
+one `Open` header and one `Data` header. Later data and control frames use one
+8-byte header.
+
+Parent incoming bytes are accumulated in a read stream until a full MUX frame is
+available. If the parent read stream grows above `1 MiB`, the parent and all
+attached children are closed.
+
+## Practical Notes
+
+- `MuxClient` must be paired with `MuxServer`.
+- `mode` is mandatory in the current implementation.
+- `connection-duration-ms` only applies to timer mode.
+- `connection-capacity` only applies to counter mode.
+- `per-worker-connections-count` only applies to fixed parent pool mode.
+- With multiple workers, fixed parent pool mode scales by worker count. For
+  example, `per-worker-connections-count: 2` with 4 workers can create up to 8
+  parent transport lines.
+- `MuxClient` is a middle tunnel, not a generic endpoint.

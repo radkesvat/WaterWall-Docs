@@ -1,0 +1,178 @@
+---
+sidebar_position: 720
+---
+
+# HeaderClient
+
+`HeaderClient` روی اولین payload مسیر upstream هر line عادی layer-4، یک header
+دو بایتی port اضافه می‌کند.
+
+این نود معمولا با `HeaderServer` استفاده می‌شود. `HeaderServer` آن header را
+مصرف می‌کند و port خوانده‌شده را قبل از ادامه chain داخل destination routing
+context قرار می‌دهد.
+
+## جایگاه رایج
+
+نمونه روی دو سرور TCP:
+
+```text
+client side: TcpListener -> HeaderClient -> TcpConnector
+server side: TcpListener -> HeaderServer -> TcpConnector
+```
+
+هر نود stream که بین client و server قرار می‌گیرد باید دو بایت اولی را که
+`HeaderClient` اضافه می‌کند بدون تغییر عبور دهد.
+
+## عملکرد
+
+- `settings.data` مشخص می‌کند چه portی داخل header نوشته شود.
+- در upstream `Init`، state محلی line را مقداردهی می‌کند.
+- upstream `Init` را بلافاصله به `next` forward می‌کند.
+- فقط روی اولین upstream payload یک header دو بایتی prepend می‌کند.
+- port را با network byte order می‌نویسد.
+- payloadهای upstream بعدی را بدون تغییر عبور می‌دهد.
+- downstream payload، `Est`، `Pause` و `Resume` را بدون تغییر عبور می‌دهد.
+- قبل از forward کردن `Finish` در هر جهت، state محلی خودش را destroy می‌کند.
+
+`HeaderClient` یک tunnel معمولی layer-4 stream است. socket باز نمی‌کند، packet
+line نمی‌سازد و `line_t` ایجاد یا destroy نمی‌کند.
+
+## نمونه تنظیم
+
+استفاده از source port اتصال پذیرفته‌شده:
+
+```json
+{
+  "name": "header-client",
+  "type": "HeaderClient",
+  "settings": {
+    "data": "src_context->port"
+  },
+  "next": "transport"
+}
+```
+
+استفاده از port ثابت:
+
+```json
+{
+  "name": "header-client",
+  "type": "HeaderClient",
+  "settings": {
+    "data": 443
+  },
+  "next": "transport"
+}
+```
+
+## فیلدهای لازم
+
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `name` | string | نام دلخواه و یکتا برای node. |
+| `type` | string | باید دقیقا `"HeaderClient"` باشد. |
+| `settings` | object | اجباری است و باید `data` داشته باشد. |
+| `next` | string | نود layer-4 stream بعدی که stream دارای header را دریافت می‌کند. |
+
+فیلد لازم داخل `settings`:
+
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `data` | number یا string | portی که در اولین upstream payload encode می‌شود. |
+
+این نود باید هم نود قبلی داشته باشد و هم `next`. برای ابتدا یا انتهای chain نیست.
+
+## `settings.data`
+
+مقدارهای قابل قبول:
+
+| مقدار | معنی |
+| --- | --- |
+| `1` تا `65535` | همین port ثابت داخل header نوشته می‌شود. |
+| `"src_context->port"` | مقدار `line->routing_context.src_ctx.port` نوشته می‌شود. |
+| `"line->src_ctx->port"` | alias سازگار با `"src_context->port"`. |
+
+اگر `data` وجود نداشته باشد، string ناشناخته باشد، یا عدد خارج از بازه `1` تا
+`65535` باشد، startup شکست می‌خورد.
+
+## رفتار روی Wire
+
+اولین upstream payload از این حالت:
+
+```text
+payload
+```
+
+به این حالت تبدیل می‌شود:
+
+```text
+2-byte port header | payload
+```
+
+header یک port شانزده‌بیتی big-endian است و فقط یک بار برای هر line ارسال
+می‌شود. payloadهای upstream بعدی دقیقا بدون تغییر forward می‌شوند.
+
+اگر اولین upstream payload خالی باشد، همین callback اولین payload باز هم فقط
+header دو بایتی را ارسال می‌کند.
+
+## استفاده با HeaderServer
+
+`HeaderClient` را زمانی با `HeaderServer` استفاده کنید که server قرار است header
+ورودی را بخواند:
+
+```json
+{
+  "name": "header-server",
+  "type": "HeaderServer",
+  "settings": {
+    "override": "dest_context->port"
+  },
+  "next": "connector"
+}
+```
+
+اگر `HeaderServer.settings.override` عدد باشد، server در upstream `Init` یک port
+ثابت روی destination context می‌گذارد و هیچ headerی مصرف نمی‌کند. در آن حالت اگر
+قبلش `HeaderClient` بگذارید، header دو بایتی به عنوان application payload باقی
+می‌ماند.
+
+## رفتار جهت‌ها
+
+| جهت | رفتار |
+| --- | --- |
+| upstream `Init` | state محلی را initialize می‌کند و به `next` forward می‌کند. |
+| اولین upstream payload | header دو بایتی port را prepend می‌کند و به `next` می‌فرستد. |
+| payloadهای upstream بعدی | بدون تغییر به `next` می‌روند. |
+| upstream pause/resume | به `next` forward می‌شود. |
+| downstream payload | بدون تغییر به نود قبلی برمی‌گردد. |
+| downstream `Est` / pause / resume | به نود قبلی forward می‌شود. |
+
+callbackهای `UpStreamEst` و `DownStreamInit` برای این نود غیرفعال هستند.
+
+## Finish
+
+در upstream `Finish`، نود state محلی خودش را destroy می‌کند و finish را به `next`
+forward می‌کند.
+
+در downstream `Finish`، state محلی destroy می‌شود و finish به نود قبلی forward
+می‌شود.
+
+این tunnel چون line را خودش نمی‌سازد، `lineDestroy()` صدا نمی‌زند.
+
+## محدودیت‌ها و Padding
+
+| مقدار | اندازه |
+| --- | --- |
+| port header | `2 bytes` |
+| `required_padding_left` | `2 bytes` |
+
+این نود چون با `sbufShiftLeft()` header را prepend می‌کند، مقدار
+`required_padding_left = 2` دارد.
+
+## نکته‌ها
+
+- فقط در chainهای layer-4 stream استفاده شود.
+- نباید به عنوان state مشترک packet-line استفاده شود.
+- header فقط metadata داخلی WaterWall است، نه یک protocol عمومی.
+- مقدار port هنگام رسیدن اولین upstream payload خوانده می‌شود.
+- فقط اولین upstream payload تغییر می‌کند و مسیر response شفاف است.

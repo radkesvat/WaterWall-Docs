@@ -4,15 +4,62 @@ sidebar_position: 820
 
 # KeepAliveClient
 
-`KeepAliveClient` payload را با یک header سه‌بایتی قاب‌بندی می‌کند و روی هر line زنده ping داخلی می‌فرستد تا مسیر برای NAT، فایروال یا middleboxهای timeout محور فعال به نظر برسد. سمت مقابل آن باید `KeepAliveServer` باشد.
+`KeepAliveClient` is the client-side peer for `KeepAliveServer`. It wraps
+upstream payloads in a small keepalive frame format and periodically sends
+internal ping frames on every live line tracked by this tunnel.
 
-## جایگاه رایج
+Use it when a WaterWall path should keep producing traffic so timeout-based
+middleboxes, NAT devices, or firewalls are less likely to treat the connection
+as idle. The matching peer must be `KeepAliveServer`; otherwise the remote side
+will receive framed bytes instead of the original payload.
+
+`KeepAliveClient` is a normal composable tunnel. It does not create sockets,
+does not create or destroy `line_t` objects, and does not keep protocol state
+alive after a clean finish.
+
+## Typical Placement
+
+Direct in-process test:
 
 ```text
-TcpListener -> KeepAliveClient -> ... -> KeepAliveServer -> TcpConnector
+TesterClient -> KeepAliveClient -> KeepAliveServer -> TesterServer
 ```
 
-## نمونه تنظیم
+Two-server TCP layout:
+
+```text
+client side: TcpListener -> KeepAliveClient -> TcpConnector
+server side: TcpListener -> KeepAliveServer -> TcpConnector
+```
+
+Any tunnels between the client and server must preserve the keepalive frame
+bytes exactly.
+
+## What It Does
+
+- Initializes local line state on upstream `Init`.
+- Tracks initialized lines in a worker-aware list.
+- Starts one periodic timer per worker during tunnel startup.
+- Sends an empty ping frame every `ping-interval` milliseconds on each live
+  tracked line.
+- Encodes upstream payloads as normal keepalive frames and sends them to
+  `next`.
+- Splits upstream payloads larger than `65534` bytes into multiple normal
+  frames.
+- Buffers downstream framed bytes until complete frames are available.
+- Decodes downstream normal frames and forwards their payload to the previous
+  node.
+- Answers downstream ping frames by sending upstream pong frames.
+- Ignores downstream pong frames.
+- Drops empty normal frames and unknown frame kinds.
+- Untracks the line, destroys local line state, and forwards the received
+  directional `Finish`.
+
+The current implementation sends and answers ping/pong frames, but it does not
+enforce a missed-pong timeout and does not close a line just because a pong was
+not observed.
+
+## Configuration Example
 
 ```json
 {
@@ -21,33 +68,117 @@ TcpListener -> KeepAliveClient -> ... -> KeepAliveServer -> TcpConnector
   "settings": {
     "ping-interval": 60000
   },
-  "next": "next-node"
+  "next": "transport"
 }
 ```
 
-## قالب frame
+Matching server side:
 
-هر frame با این ساختار فرستاده می‌شود:
+```json
+{
+  "name": "ka-server",
+  "type": "KeepAliveServer",
+  "settings": {},
+  "next": "service"
+}
+```
 
-- دو بایت طول body به صورت big-endian
-- یک بایت نوع frame
+## Required Fields
 
-نوع frame:
+Top-level fields:
 
-| مقدار | معنی |
-|---:|---|
-| `1` | payload عادی |
-| `2` | ping |
-| `3` | pong |
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | string | User-chosen node name. Must be unique inside the config file. |
+| `type` | string | Must be exactly `"KeepAliveClient"`. |
+| `settings` | object | Optional. If omitted, the default ping interval is used. |
+| `next` | string | Required in normal use. The next node receives framed upstream data. |
 
-## تنظیمات
+`KeepAliveClient` must have a previous node and must reach a matching
+`KeepAliveServer` in the logical path.
 
-| گزینه | توضیح |
-|---|---|
-| `ping-interval` | فاصله ارسال ping به میلی‌ثانیه. پیش‌فرض نسخه فعلی `60000` است. |
+## Settings
 
-## نکته‌ها
+| Setting | Type | Default | Description |
+| --- | --- | --- | --- |
+| `ping-interval` | integer | `60000` | Periodic ping interval in milliseconds. Must be at least `1`; startup fails if the value is lower. |
 
-- این نود باید به `KeepAliveServer` برسد؛ در غیر این صورت payload طرف مقابل معنی‌دار نخواهد بود.
-- ping/pongها توسط جفت KeepAlive مصرف می‌شوند و به نودهای بیرونی تحویل داده نمی‌شوند.
-- مقدار interval را خیلی کم نگذارید؛ در مسیرهای شلوغ باعث سربار می‌شود.
+Avoid very small intervals unless you intentionally want high keepalive traffic.
+Each live line tracked by this client receives one ping frame per interval.
+
+## Frame Format
+
+Every frame starts with a 3-byte prefix:
+
+| Bytes | Field | Description |
+| --- | --- | --- |
+| `0..1` | body length | Unsigned 16-bit big-endian integer. This length includes the 1-byte frame kind plus any payload bytes. |
+| `2` | frame kind | `1` normal payload, `2` ping, or `3` pong. |
+
+Frame kinds:
+
+| Kind | Meaning | Body payload |
+| ---: | --- | --- |
+| `1` | normal payload | Original WaterWall payload bytes. |
+| `2` | ping | Empty in normal keepalive traffic. |
+| `3` | pong | Empty response to a ping frame. |
+
+Because the body length is 16-bit and includes the kind byte, the maximum
+payload carried by one normal frame is `65534` bytes. Larger upstream payloads
+are split into multiple frames.
+
+## Direction Behavior
+
+| Incoming callback | Behavior |
+| --- | --- |
+| upstream `Init` | Initializes the read buffer and tracking fields, tracks the line, then forwards `Init` to `next`. |
+| upstream `Payload` | Encodes the payload into one or more normal frames and forwards them to `next`. Empty payloads are recycled. |
+| upstream `Est` / `Pause` / `Resume` | Forwards to `next`. |
+| upstream `Finish` | Untracks the line, destroys local state, then forwards `Finish` to `next`. |
+| downstream `Payload` | Treats bytes as framed input from `KeepAliveServer`; forwards decoded normal payloads to the previous node. |
+| downstream `Est` / `Pause` / `Resume` | Forwards to the previous node. |
+| downstream `Finish` | Untracks the line, destroys local state, then forwards `Finish` to the previous node. |
+| downstream `Init` | Disabled; reaching this callback is treated as a fatal invalid chain flow. |
+
+## Framed Input Handling
+
+Downstream bytes are accumulated in a `buffer_stream_t`. This means a frame can
+arrive split across multiple payload callbacks, or multiple frames can arrive in
+one callback.
+
+The decoder behavior is conservative:
+
+- waits for more bytes when the prefix or full body has not arrived yet
+- clears the read stream when a frame body length smaller than `1` is seen
+- drops empty normal frames
+- drops unknown frame kinds
+- clears the read stream if buffered downstream input grows beyond `131074`
+  bytes
+
+## Buffer And Padding Notes
+
+`KeepAliveClient` prepends the 3-byte frame prefix while encoding, so its node
+metadata advertises:
+
+```text
+required_padding_left = 3
+layer_group = kNodeLayerAnything
+```
+
+If a frame buffer does not have enough left padding for the prefix, the frame is
+dropped and the buffer is recycled. In a correctly composed chain, WaterWall's
+chain padding calculation should reserve this space.
+
+When the current line is a worker packet line, the client checks that the framed
+output does not exceed `kMaxAllowedPacketLength`. If `payload + 3` would exceed
+that limit, the frame is dropped.
+
+## Practical Notes
+
+- Pair this node with `KeepAliveServer`; it is not useful by itself.
+- Ping and pong frames are internal to the KeepAlive pair and are not delivered
+  as payload to surrounding nodes.
+- This node keeps a path active; it is not an external health-check protocol.
+- This node does not encrypt, authenticate, compress, or rewrite payload bytes.
+- It is safest around datagram-preserving or stream-preserving transports that
+  keep the framed bytes intact between the client and server.

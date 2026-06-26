@@ -4,67 +4,165 @@ sidebar_position: 700
 
 # HalfDuplexClient
 
-## 📖 معرفی کلی
+`HalfDuplexClient` takes one normal full-duplex WaterWall line from the previous
+node and splits it into two outbound transport lines toward the same `next`
+node:
 
-| ویژگی              | مقدار                        | توضیح                                              |
-|--------------------|------------------------------|----------------------------------------------------|
-| **نوع نود**        | Tunnel (تک‌جهته)            | جهت کانکشن ها از چپ شروع و به راست پیش روی می‌کنند              |
-| **لایه شبکه**      | لایه ۴ (Transport Layer)     | کار با کانکشن‌ها، نه پکت‌های خام                   |
-| **موقعیت در زنجیر**| وسط زنجیر                 | فقط در وسط زنجیر قابل استفاده است               |
-| **وابستگی**        | نیاز به حداقل یک نود قبلی و بعدی     | برای دریافت داده‌ها ضروری است                      |
+- an upload line for client-to-server payload
+- a download line for server-to-client payload
 
-## عملکرد
+It is designed to be paired with `HalfDuplexServer`, which receives those two
+transport lines and reconstructs one normal logical line on the remote side.
+
+## Typical Placement
+
+Direct in-process pair:
+
+```text
+TesterClient -> HalfDuplexClient -> HalfDuplexServer -> TesterServer
+```
+
+Across a TCP transport:
+
+```text
+client side: TcpListener -> HalfDuplexClient -> TcpConnector
+server side: TcpListener -> HalfDuplexServer -> TcpConnector
+```
+
+Any stream tunnels between the client and server must preserve the bytes sent by
+the two half-connections. For example, placing `TlsClient` after
+`HalfDuplexClient` makes both the upload and download transport lines perform
+their own TLS handshakes.
+
+## What It Does
+
+- Accepts one upstream line from the previous node.
+- Creates two new outbound lines through `next`.
+- Sends a small internal intro on the first upstream payload so
+  `HalfDuplexServer` can pair the two transport lines.
+- Sends all later client-to-server payload on the upload line.
+- Receives server-to-client payload from the download line and forwards it to
+  the previous node.
+- Closes both transport-side lines when the original logical line closes.
 
 ```mermaid
 flowchart LR
-    A[Single] --> B[HalfDuplexClient]
-    B[HalfDuplexClient] --> C[Upload]
-    B[HalfDuplexClient] --> D[Download]
-    
-    style B stroke:#ff6b35,stroke-width:2px
-    style A fill:transparent,stroke:transparent
-    style C fill:transparent,stroke:transparent
-    style D fill:transparent,stroke:transparent
+    Main[main logical line] --> Client[HalfDuplexClient]
+    Client --> Upload[upload line]
+    Client --> Download[download line]
+
+    style Client stroke:#ff6b35,stroke-width:2px
+    style Main fill:transparent,stroke:transparent
+    style Upload fill:transparent,stroke:transparent
+    style Download fill:transparent,stroke:transparent
 ```
 
-این نود با کانکشن‌ها کار می‌کند.
+`HalfDuplexClient` is a middle stream tunnel. It does not create sockets itself,
+and it does not create packet lines.
 
-هر کانکشنی که از چپ شروع می‌شود، در این نود برایش ۲ کانکشن ساخته می‌شود که یکی برای آپلود و یکی برای دانلود استفاده می‌شود.
-
-این یعنی ۳ کانکشن می‌شود؛ با بسته شدن هرکدام از این ۳ کانکشن، کانکشن‌های جفت شده بسته می‌شوند.
-
-این نود به دیتای اولی که ازش رد میشه 8 بایت اضافه میکنه (به صورت تلفیق شده با دیتایی که از قبل اومده نه اینکه پکت جدا بفرسته)
-
-
-دیتایی که از قبل اومده وارد کانکشن آپلود شده و ارسال شده (به همراه اون ۸ بایت)
-
-و برای کانکشن دانلود فقط یه ۸ بایت به صورت خالی استفاده میشه
-
-شما میتوانید جلوی این نود مثلا یه TlsClient قرار بدید تا روی هر دوتا کانکشن هند شیک Tls داشته باشید و سایر ایده ها
-
----
-
-## ⚙️ راهنمای پیکربندی
+## Configuration Example
 
 ```json
 {
-    "name": "node_name",
-    "type": "HalfDuplexClient",
-    "settings": {},
-    "next": "next_node_name"
+  "name": "halfduplex-client",
+  "type": "HalfDuplexClient",
+  "settings": {},
+  "next": "outbound-transport"
 }
 ```
 
-این نود در حال حاضر تنظیماتی نیاز ندارد؛ هر دو کانکشن آپلود و دانلود به نود بعدی که با `next` مشخص شده در JSON ارسال می‌شود.
+## Required Fields
 
-در نسخه‌های بعدی WaterWall به این نود قابلیت ارسال به تونل‌های مجزا اضافه می‌شود که مثلاً بتوانید با آن کانکشن دانلود را به یک node و آپلود را به یک node دیگر بفرستید.
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | string | User-chosen node name. Must be unique inside the config file. |
+| `type` | string | Must be exactly `"HalfDuplexClient"`. |
+| `next` | string | Required. The next stream node receives both generated half-connections. |
 
-با این قابلیت می‌توانید تونل‌های مثلثی و پیشرفته‌تر درست کنید.
+`HalfDuplexClient` must also have a previous node in the chain. It is not a
+chain head or chain end.
 
----
+## Settings
 
-:::info توجه
+There are no required or optional tunnel-specific settings in the current
+implementation.
 
-شما باید جایی بعد از این نود، یک نود `HalfDuplexServer` داشته باشید تا هر دو کانکشن آپلود و دانلود به آن برسند و به هم پیوند بزند.
+Both generated half-connections go to the single node named by `next`. The
+current implementation does not have separate `upload-next` and `download-next`
+fields.
 
-:::
+## Pairing Intro
+
+The first upstream payload is special. On that payload, `HalfDuplexClient`
+generates an internal 8-byte identifier and sends it in two forms:
+
+| Line | Intro behavior |
+| --- | --- |
+| upload line | The 8-byte upload intro is prefixed to the user's first real payload. |
+| download line | The 8-byte download intro is sent by itself, with no user payload. |
+
+After this first payload:
+
+- all further upstream payload goes only through the upload line
+- downstream payload is expected to come back through the download line
+
+The intro is an internal protocol detail shared with `HalfDuplexServer`. It is
+not a user-configurable value and should not be treated as a stable public wire
+format.
+
+## Direction Behavior
+
+| Direction | Behavior |
+| --- | --- |
+| upstream payload from previous node | Send through the upload line after the first-payload intro handling. |
+| downstream payload from next node | Forward to the original main line toward the previous node. |
+| upstream pause/resume | Forward to the download line. |
+| downstream pause/resume | Forward to the original main line if it still exists. |
+
+The upload line is the normal client-to-server data path. The download line is
+the dedicated return path for server-to-client data.
+
+## Lifecycle Behavior
+
+On upstream `Init`, the client initializes line state for the original main line
+and creates two new lines on the same worker:
+
+1. upload line
+2. download line
+
+Both lines are initialized through `next`.
+
+If either transport-side half becomes established, the original main line is
+marked established toward the previous node. The previous node sees one logical
+connection even though the client tunnel created two transport lines behind it.
+
+On upstream `Finish` from the original line, the client finishes both generated
+transport lines, destroys their local line state, and destroys the generated
+lines it owns.
+
+If either generated half-line receives downstream `Finish` first, the client
+finishes the original main line and schedules the other half-line to close.
+
+`UpStreamEst` and `DownStreamInit` are disabled callbacks for this node.
+
+## Limits and Padding
+
+| Value | Size |
+| --- | --- |
+| internal intro | `8 bytes` |
+| `required_padding_left` | `0 bytes` |
+
+The node does not require left padding from the chain. For the first upload
+payload, it creates a new buffer with enough padding for the intro and the
+chain's existing padding budget. The download intro is sent in its own small
+buffer.
+
+## Notes and Caveats
+
+- Use it with a matching `HalfDuplexServer`.
+- One incoming logical connection creates two outbound transport connections.
+- Closing any member of the group closes the paired logical connection path.
+- The tunnel waits for the first upstream payload before sending the pairing
+  intro.
+- There are no separate upload/download next-node settings today; both halves
+  use the same `next`.

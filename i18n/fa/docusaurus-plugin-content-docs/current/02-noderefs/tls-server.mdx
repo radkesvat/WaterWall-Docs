@@ -1,0 +1,300 @@
+---
+sidebar_position: 1610
+---
+
+# TlsServer
+
+`TlsServer` wrapper سمت server برای TLS در WaterWall است و با OpenSSL کار می‌کند. این نود TLS recordهای encrypted را از
+نود قبلی می‌گیرد، server handshake واقعی انجام می‌دهد، application data را برای نود بعدی decrypt می‌کند، و cleartext
+downstream را دوباره به TLS record برای نود قبلی encrypt می‌کند.
+
+این نود شبیه یک TLS terminator عمومی مثل nginx `stream` رفتار می‌کند، نه nginx `http`. خودش HTTP، HTTP/2، Trojan، VLESS
+یا application protocol بعد از خودش را parse نمی‌کند.
+
+## جایگاه رایج
+
+زنجیره HTTP server:
+
+```text
+TcpListener -> TlsServer -> HttpServer
+```
+
+زنجیره proxy protocol:
+
+```text
+TcpListener -> TlsServer -> TrojanServer -> TcpUdpConnector
+TcpListener -> TlsServer -> VlessServer -> TcpUdpConnector
+```
+
+TLS termination عمومی قبل از routing:
+
+```text
+TcpListener -> TlsServer -> Router
+```
+
+نود بعدی cleartext application data دریافت می‌کند، نه TLS record.
+
+## نمونه Basic
+
+```json
+[
+  {
+    "name": "tls-server",
+    "type": "TlsServer",
+    "settings": {
+      "cert-file": "/etc/waterwall/fullchain.pem",
+      "key-file": "/etc/waterwall/privkey.pem",
+      "min-version": "TLSv1.2",
+      "max-version": "TLSv1.3",
+      "select-alpns": ["http/1.1"],
+      "session-cache": "none",
+      "session-tickets": true,
+      "verbose": false
+    },
+    "next": "http-server"
+  },
+  {
+    "name": "http-server",
+    "type": "HttpServer",
+    "settings": {},
+    "next": "service"
+  }
+]
+```
+
+## نمونه Fallback
+
+```json
+{
+  "name": "tls-server",
+  "type": "TlsServer",
+  "settings": {
+    "cert-file": "/etc/waterwall/fullchain.pem",
+    "key-file": "/etc/waterwall/privkey.pem",
+    "fallback-node-name": "nginx-fallback",
+    "fallback-intentional-delay-ms": 7,
+    "fallback-intentional-delay-jitter-ms": 1,
+    "select-alpns": ["http/1.1"]
+  },
+  "next": "protected-protocol"
+}
+```
+
+Fallback فقط قبل از commit شدن `TlsServer` به TLS استفاده می‌شود. این قابلیت برای probeهای plaintext یا malformed روی
+یک پورت عمومی TLS است، نه برای routing application بعد از authentication.
+
+## فیلدهای اجباری
+
+فیلدهای top-level:
+
+| Field | Type | توضیح |
+| --- | --- | --- |
+| `name` | string | نام دلخواه node. باید داخل config یکتا باشد. |
+| `type` | string | باید دقیقا `"TlsServer"` باشد. |
+| `settings` | object | تنظیمات TLS server و نباید خالی باشد. |
+| `next` | string | نودی که بعد از موفق شدن TLS، cleartext را دریافت می‌کند. در استفاده عادی required است. |
+
+فیلدهای اجباری داخل `settings`:
+
+| Field | Type | توضیح |
+| --- | --- | --- |
+| `cert-file` | string | مسیر فایل PEM certificate سرور. |
+| `key-file` | string | مسیر فایل PEM private key سرور. |
+
+هر دو فایل باید برای OpenSSL context معتبر باشند.
+
+## تنظیمات اختیاری
+
+| Field | Default | توضیح |
+| --- | --- | --- |
+| `sni` | تنظیم نشده | gate exact-match برای SNI. کلاینت‌هایی با SNI متفاوت reject می‌شوند. |
+| `select-alpns` | `["http/1.1"]` | لیست ALPN selection با ترتیب ترجیح server. |
+| `alpns` | تنظیم نشده | alias قدیمی برای ALPN selection. بهتر است `select-alpns` استفاده شود. |
+| `min-version` | `"TLSv1.2"` | حداقل TLS version. |
+| `max-version` | `"TLSv1.3"` | حداکثر TLS version. |
+| `ciphers` | `"HIGH:!aNULL:!MD5"` | OpenSSL cipher string برای TLS 1.2 و قدیمی‌تر. |
+| `prefer-server-ciphers` | `false` | server cipher preference را فعال می‌کند. |
+| `session-timeout` | `300` | عمر TLS session به ثانیه. |
+| `handshake-timeout-ms` | `60000` | deadline سخت برای کامل شدن TLS handshake. مقدار `0` یعنی غیرفعال. |
+| `session-cache` | `"none"` | mode مربوط به session cache. |
+| `session-cache-size` | `20480` | اندازه cache داخلی OpenSSL. |
+| `session-tickets` | `true` | TLS session ticketها را فعال می‌کند. |
+| `fallback-node-name` | تنظیم نشده | fallback branch برای input واضحا غیر TLS قبل از commit شدن TLS. aliasها: `fallback-node`, `fallback`. |
+| `fallback-intentional-delay-ms` | `7` | delay برای upstream payloadهای fallback. مقدار `0` یعنی غیرفعال. |
+| `fallback-intentional-delay-jitter-ms` | `1` | jitter تصادفی برای زمان‌بندی fallback payload. وقتی delay صفر باشد ignore می‌شود. |
+| `verbose` | `false` | لاگ کامل‌تر lifecycle مربوط به TLS را فعال می‌کند. |
+
+`sni` با fallback قابل ترکیب نیست. در غیر این صورت ممکن است یک ClientHello معتبر با SNI متفاوت به عنوان plaintext به
+fallback داده شود که fingerprintable است.
+
+## TLS Versionها
+
+مقادیر قابل قبول:
+
+```text
+TLSv1
+TLSv1.1
+TLSv1.2
+TLSv1.3
+TLS1.0
+TLS1.1
+TLS1.2
+TLS1.3
+1.0
+1.1
+1.2
+1.3
+```
+
+`min-version` نباید از `max-version` بزرگ‌تر باشد.
+
+## ALPN Selection
+
+`TlsServer` از ALPN به عنوان selection hint استفاده می‌کند، نه gate دسترسی.
+
+ترتیب array، ترتیب preference سمت server است:
+
+```json
+"select-alpns": ["h2", "http/1.1"]
+```
+
+اگر client هر دو را offer کند، `h2` انتخاب می‌شود. اگر client ALPN بفرستد ولی هیچ overlap وجود نداشته باشد، handshake
+بدون negotiated ALPN ادامه پیدا می‌کند. اگر client اصلا ALPN نفرستد، OpenSSL callback مربوط به selection را صدا نمی‌زند
+و handshake هم بدون ALPN ادامه می‌یابد.
+
+modeهای `select-alpns`:
+
+| Configuration | رفتار |
+| --- | --- |
+| omitted | از default `["http/1.1"]` استفاده می‌شود. |
+| `[]` | ALPN selection کاملا disable می‌شود. |
+| non-empty array | اولین مقدار configured که client هم offer کرده انتخاب می‌شود. |
+
+`alpns` هنوز parse می‌شود اما deprecated است. entryها می‌توانند string یا object با فیلد `value` باشند. دو تنظیم
+`alpns` و `select-alpns` را با مقادیر non-empty همزمان استفاده نکنید.
+
+ALPN به tunnelهای بعدی نمی‌گوید چه protocolی انتخاب شده است. اگر `h2` advertise می‌کنید، chain پشت `TlsServer` هم باید
+رفتار plausible برای HTTP/2 داشته باشد.
+
+## Session Cache
+
+مقادیر پشتیبانی‌شده برای `session-cache`:
+
+| Value | رفتار |
+| --- | --- |
+| `"none"` | OpenSSL server cache mode با internal lookup/store غیرفعال. default همین است. |
+| `"off"` | session cache را غیرفعال می‌کند. |
+| `"builtin"` | cache داخلی server در OpenSSL را با `session-cache-size` فعال می‌کند. |
+| `"builtin:SIZE"` | cache داخلی را فعال می‌کند و size را inline تنظیم می‌کند، مثلا `"builtin:4096"`. |
+
+`shared` در implementation فعلی پشتیبانی نمی‌شود.
+
+## رفتار Runtime
+
+در upstream `Init`، `TlsServer`:
+
+1. state مربوط به OpenSSL را برای line می‌سازد
+2. memory BIOها را allocate می‌کند
+3. SSL object را در server mode قرار می‌دهد
+4. handshake deadline را arm می‌کند، مگر اینکه `handshake-timeout-ms` برابر `0` باشد
+5. اگر fallback تنظیم نشده باشد، protected `next` branch را فورا شروع می‌کند
+6. اگر fallback تنظیم شده باشد، منتظر bytes اولیه می‌ماند تا TLS یا fallback را تشخیص دهد
+
+bytes encrypted upstream از نود قبلی وارد OpenSSL می‌شوند. بعد از کامل شدن TLS handshake، application bytes decrypt شده
+به `next` forward می‌شوند.
+
+cleartext downstream از `next` تا کامل شدن TLS handshake queue می‌شود. بعد از آن با `SSL_write()` encrypt شده و به صورت
+TLS record downstream ارسال می‌شود.
+
+## مفهوم Establishment
+
+در WaterWall، `Est` یعنی transport زیرین established شده، نه اینکه TLS handshake آماده است.
+
+`TlsServer` downstream `Est` را فقط یک بار forward می‌کند. این اتفاق ممکن است قبل از کامل شدن TLS handshake رخ دهد.
+آمادگی TLS به صورت internal و بعد از پایان handshake در OpenSSL مشخص می‌شود.
+
+## رفتار Fallback
+
+Fallback فقط قبل از commit شدن `TlsServer` به TLS انتخاب می‌شود.
+
+classifier به bytes اولیه upstream نگاه می‌کند:
+
+- bytes واضحا غیر TLS به fallback می‌روند
+- bytes شبیه TLS handshake، مثل `16 03`، روی مسیر TLS می‌مانند
+- وقتی OpenSSL یک ServerHello تولید کند، line به protected TLS branch commit شده است
+
+وقتی fallback شروع شود، `TlsServer` منابع TLS آن line را release می‌کند، fallback branch را initialize می‌کند، و bytes
+ذخیره‌شده را بعد از delay و jitter تنظیم‌شده بدون تغییر forward می‌کند. بعد از آن payloadها از fallback عبور می‌کنند و
+دیگر TLS encryption/decryption انجام نمی‌شود.
+
+handshakeهای TLS-looking ولی malformed، oversized، incomplete یا slow روی مسیر TLS بسته می‌شوند. بعد از classification
+به fallback route نمی‌شوند.
+
+fallback delay فقط روی upstream payloadها اعمال می‌شود. responseهای downstream عمدا delay نمی‌شوند. اگر upstream
+`Finish` هنگام وجود payloadهای delayed برسد، finish تا تحویل آن payloadها صبر می‌کند.
+
+برای camouflage عمومی، fallback بهتر است یک TLS service واقعی باشد، معمولا nginx، با certificate، SNI، ALPN، cipher،
+ticket و protocol-version نزدیک به همین `TlsServer`. fallback HTTP plain پشت پورت TLS معمولا راحت‌تر fingerprint می‌شود.
+
+## Handshake Timeout
+
+`handshake-timeout-ms` یک deadline سخت است که هنگام initialize شدن line شروع می‌شود. با دریافت bytes refresh نمی‌شود و
+از timeoutهای listener مثل `TcpListener` `initial-idle-timeout-ms` و `active-idle-timeout-ms` جداست.
+
+فقط وقتی `handshake-timeout-ms` را `0` بگذارید که عمدا deadline سخت برای TLS handshake نمی‌خواهید.
+
+## رفتار Finish
+
+برای downstream close تمیز، اگر TLS handshake کامل شده باشد `TlsServer` یک TLS `close_notify` alert می‌فرستد، آن را
+flush می‌کند، local TLS state را destroy می‌کند، و سپس WaterWall `Finish` را downstream propagate می‌کند.
+
+اگر peer یک TLS shutdown تمیز بفرستد، `TlsServer` آن را upstream finish به سمت نود بعدی در نظر می‌گیرد.
+
+خطاهای fatal در OpenSSL local state را destroy می‌کنند و directionهای لازم را می‌بندند. در fallback mode، finish از
+fallback branch عبور می‌کند و upstream finish در صورت نیاز پشت payloadهای delayed fallback صبر می‌کند.
+
+## Padding
+
+`TlsServer` خودش bytes را مستقیم به payloadهای WaterWall prepend نمی‌کند، بنابراین مقدار زیر را advertise می‌کند:
+
+```text
+required_padding_left = 0
+```
+
+ساخت TLS recordها از طریق memory BIOهای OpenSSL انجام می‌شود.
+
+## Metadata نود
+
+| Property | Value |
+| --- | --- |
+| Node flag | `kNodeFlagChainHead` |
+| Previous node | مجاز، در استفاده عادی required |
+| Next node | مجاز، در استفاده عادی required |
+| Layer group | `kNodeLayerAnything` |
+| `required_padding_left` | `0` |
+| Line state | OpenSSL SSL object، memory BIOها، handshake flagها، fallback state، pending downstream queue |
+
+## نکته‌های Nginx Matching
+
+defaultها برای شباهت به nginx `stream` TLS server با رفتار stock-like انتخاب شده‌اند. تغییر این تنظیمات ممکن است هنوز
+TLS معتبر بسازد، اما دیگر شبیه baseline نباشد:
+
+- `ciphers`
+- `min-version` یا `max-version`
+- `prefer-server-ciphers`
+- `session-cache`
+- `session-tickets`
+- ALPN selection
+- `sni`
+- fallback target و fallback timing
+
+اگر هدف شما wire-level similarity به nginx default است، defaultها را نگه دارید مگر اینکه با measurement دلیل مشخصی برای
+تغییر داشته باشید.
+
+## اشتباه‌های رایج
+
+- انتظار نداشته باشید `TlsServer` HTTP را parse کند؛ برای HTTP، `HttpServer` را بعد از آن بگذارید.
+- `sni` را با fallback ترکیب نکنید.
+- از ALPN به عنوان authentication یا rejection gate استفاده نکنید؛ no-overlap ALPN بدون negotiated ALPN ادامه می‌یابد.
+- `h2` را advertise نکنید مگر اینکه protected و fallback behavior بتوانند HTTP/2 را plausible جواب دهند.
+- از `shared` برای session cache استفاده نکنید؛ پیاده‌سازی نشده است.

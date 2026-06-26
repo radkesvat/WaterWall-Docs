@@ -1,0 +1,282 @@
+---
+sidebar_position: 1620
+---
+
+# VlessClient
+
+`VlessClient` is the client-side plain VLESS v0 tunnel for WaterWall. It writes a VLESS request header with a configured
+UUID and target destination, then carries TCP stream data or UDP datagrams through the next stream-facing node.
+
+This node implements only the base VLESS protocol. It does not create TLS, REALITY, XTLS Vision, flow addons, mux, XUDP,
+WebSocket, gRPC, or any other transport wrapper.
+
+## Typical Placement
+
+TCP VLESS client:
+
+```text
+TcpListener -> VlessClient -> TlsClient -> TcpConnector
+```
+
+UDP VLESS client:
+
+```text
+UdpListener -> VlessClient -> TlsClient -> TcpConnector
+```
+
+Dynamic destination from a proxy/router:
+
+```text
+Socks5Server -> VlessClient -> TlsClient -> TcpConnector
+SniffRouter -> VlessClient -> TlsClient -> TcpConnector
+```
+
+`VlessClient` does not create TLS by itself. For normal VLESS deployments, put `TlsClient` after `VlessClient`, and make
+the final `TcpConnector` connect to the VLESS server address and port. The real target service is encoded inside the
+VLESS request header.
+
+## TCP Example
+
+```json
+[
+  {
+    "name": "vless-client",
+    "type": "VlessClient",
+    "settings": {
+      "uuid": "5783a3e7-e373-51cd-8642-c83782b807c5",
+      "address": "example.com",
+      "port": 443,
+      "protocol": "tcp",
+      "domain-strategy": "do-not-resolve-domains",
+      "verbose": false
+    },
+    "next": "tls-client"
+  },
+  {
+    "name": "tls-client",
+    "type": "TlsClient",
+    "settings": {
+      "sni": "vless.example.net",
+      "verify": true
+    },
+    "next": "server-out"
+  },
+  {
+    "name": "server-out",
+    "type": "TcpConnector",
+    "settings": {
+      "address": "vless.example.net",
+      "port": 443,
+      "nodelay": true
+    }
+  }
+]
+```
+
+## Dynamic-Destination Example
+
+```json
+{
+  "name": "vless-client",
+  "type": "VlessClient",
+  "settings": {
+    "id": "5783a3e7-e373-51cd-8642-c83782b807c5",
+    "address": "dest_context->address",
+    "port": "dest_context->port",
+    "protocol": "dest_context->protocol"
+  },
+  "next": "tls-client"
+}
+```
+
+`id` and `user-id` are accepted aliases for `uuid`.
+
+## UDP Example
+
+```json
+{
+  "name": "vless-client-udp",
+  "type": "VlessClient",
+  "settings": {
+    "uuid": "5783a3e7-e373-51cd-8642-c83782b807c5",
+    "address": "dest_context->address",
+    "port": "dest_context->port",
+    "protocol": "udp"
+  },
+  "next": "tls-client"
+}
+```
+
+In UDP mode, the previous side remains UDP-facing. `VlessClient` creates one internal TCP carrier line for that UDP
+application line, sends a VLESS UDP request over the carrier, and wraps each UDP payload as a 2-byte big-endian length
+plus payload.
+
+## Required Fields
+
+Top-level fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | string | User-chosen node name. Must be unique inside the config file. |
+| `type` | string | Must be exactly `"VlessClient"`. |
+| `settings` | object | Non-empty VLESS client settings. |
+| `next` | string | The stream-facing node that carries VLESS bytes. Required in normal use. |
+
+Required `settings` fields:
+
+| Field | Accepted names | Description |
+| --- | --- | --- |
+| UUID | `uuid`, `id`, `user-id` | VLESS user ID. The value can be dashed RFC4122 form or compact 32-character hex. It is sent as 16 raw bytes. |
+| target address | `target-address`, `address`, `target` | Final target host or IP encoded in the VLESS request, or `"dest_context->address"`. |
+| target port | `port` | Final target port, or `"dest_context->port"`. Constant numeric ports must be in `1..65535`. |
+
+The UUID is serialized in RFC4122 text byte order, not as ASCII and not as a platform GUID memory layout.
+
+## Optional Settings
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `protocol` | `"tcp"` | Selects VLESS command. Also accepts `proto`. |
+| `verbose` | `false` | Enables extra tunnel logging. |
+| `domain-strategy` | `"do-not-resolve-domains"` | Controls whether domain targets are resolved locally before the request is written. |
+
+Supported `protocol` values:
+
+| Value | Behavior |
+| --- | --- |
+| `"tcp"` or `"connect"` | Send VLESS TCP command `0x01`. |
+| `"udp"` or `"udp-associate"` | Send VLESS UDP command `0x02` and carry UDP datagrams through an internal TCP carrier line. |
+| `"dest_context->protocol"` or `"line->dest_ctx->protocol"` | Use the incoming destination context protocol. Exact TCP selects command `0x01`; exact UDP selects command `0x02`. |
+
+If `dest_context->protocol` is selected but the incoming protocol is missing, ambiguous, or not TCP/UDP, the client logs
+a warning and falls back to TCP.
+
+## Domain Strategy
+
+`domain-strategy` controls the final target address encoded in the VLESS request.
+
+| Value | Behavior |
+| --- | --- |
+| `"do-not-resolve-domains"` | Keep domain targets as domains in the request. The VLESS server side resolves the target. |
+| `"resolve-domains-and-accept-dns-returned-order"` | Resolve locally and use the first usable DNS result. |
+| `"resolve-domains-and-prefer-ipv4"` | Resolve locally, prefer IPv4, and fall back to IPv6. |
+| `"resolve-domains-and-prefer-ipv6"` | Resolve locally, prefer IPv6, and fall back to IPv4. |
+| `"resolve-domains-and-use-only-ipv4"` | Resolve locally and require an IPv4 result. If none exists, close the line. |
+| `"resolve-domains-and-use-only-ipv6"` | Resolve locally and require an IPv6 result. If none exists, close the line. |
+| `"resolve-domains-with-core-settings"` | Resolve locally using the `dns` settings from `core.json`. |
+
+When local resolution is enabled, `VlessClient` inserts an internal `DomainResolver` into its chain. It also inserts an
+internal domain-setup tunnel before itself to copy or overwrite the line destination context before DNS resolution. This
+works for both fixed JSON targets and `"dest_context->address"`.
+
+Literal IP addresses are not resolved.
+
+## Request And Response Format
+
+Request header:
+
+```text
+version:      00
+uuid:         16 raw bytes
+addons len:   00
+command:      01 TCP or 02 UDP
+destination:  port first, then address
+```
+
+Destination format:
+
+```text
+port:          2 bytes big-endian
+address type:  01 IPv4, 02 domain, 03 IPv6
+address body:  IPv4 4 bytes, domain length + bytes, or IPv6 16 bytes
+```
+
+Response header:
+
+```text
+00 00
+```
+
+The client accepts a non-empty response addons section for interoperability, logs a warning, skips those addon bytes, and
+then delivers body bytes. It does not act on any response addon.
+
+## TCP Runtime Behavior
+
+On upstream `Init`, the internal setup path prepares the target context and optional DNS resolution. `VlessClient` then
+initializes its per-line state and forwards `Init` to the next node.
+
+When the downstream transport establishes, `VlessClient`:
+
+1. forwards downstream `Est` to the previous node
+2. sends the VLESS request header upstream
+3. flushes queued upstream application payload immediately after the header
+
+It does not wait for the VLESS response header before sending upstream application bytes. Downstream body bytes are still
+held until the response header is parsed and validated.
+
+## UDP Runtime Behavior
+
+In UDP mode, the application line and carrier line are separate:
+
+| Line | Purpose |
+| --- | --- |
+| UDP app line | The line visible to the previous UDP-facing node. |
+| TCP carrier line | An internal line created by `VlessClient` and sent to the next stream-facing node. |
+
+The carrier line sends a VLESS UDP request for one fixed destination. After that:
+
+- each upstream UDP payload is encoded as `uint16_be length + payload`
+- each downstream VLESS UDP frame is length-decoded and returned to the app line as raw UDP payload
+- UDP payloads with length `0` or length greater than `65535` are dropped locally
+
+The client queues up to 1 MiB of pending upstream data while waiting for the carrier/request path. Downstream response
+bytes are also capped at 1 MiB while waiting for a valid response header or complete UDP frames.
+
+## Finish Behavior
+
+`VlessClient` destroys its own line state before propagating real `Finish` callbacks. It does not call `lineDestroy()` on
+normal external lines.
+
+In UDP mode, it owns the internal carrier line that it created. When the app line or carrier line closes, it closes the
+paired side and destroys the owned carrier line safely.
+
+## Padding
+
+`VlessClient` may prepend the 2-byte VLESS UDP length prefix, so it advertises:
+
+```text
+required_padding_left = 2
+```
+
+## Node Metadata
+
+| Property | Value |
+| --- | --- |
+| Node flag | `kNodeFlagNone` |
+| Previous node | Allowed, required in normal use |
+| Next node | Allowed, required in normal use |
+| Layer group | `kNodeLayerAnything` |
+| `required_padding_left` | `2` |
+| Line state | target context, phase, read stream, pending queue, UDP app/carrier links |
+
+## Unsupported Features
+
+This implementation does not support:
+
+- TLS or REALITY creation inside the VLESS node
+- XTLS Vision or flow addons
+- VLESS mux
+- reverse
+- XUDP
+- WebSocket, HTTP, gRPC, or other transport wrappers
+
+Use separate WaterWall nodes such as `TlsClient`, `HttpClient`, `MuxClient`, or `TcpConnector` when you need those layers.
+
+## Common Mistakes
+
+- Do not expect `VlessClient` to connect to the VLESS server by itself; put a stream transport after it.
+- Do not omit `TlsClient` for public VLESS deployments unless you intentionally want plain VLESS on the wire.
+- Do not confuse the VLESS server address with the final target address. `TcpConnector` connects to the server; the VLESS
+  request header carries the final target.
+- Do not use UDP mode with a next node that is not stream-facing.
+- Do not rely on unsupported VLESS features such as Vision, flow, mux, or XUDP.

@@ -1,0 +1,194 @@
+---
+sidebar_position: 730
+---
+
+# HeaderServer
+
+`HeaderServer` یا header دو بایتی port ساخته‌شده توسط `HeaderClient` را مصرف
+می‌کند، یا در upstream `Init` یک destination port ثابت تنظیم می‌کند.
+
+در حالت dynamic header، این نود header را می‌خواند، port decode شده را داخل
+`line->routing_context.dest_ctx.port` می‌نویسد و بعد نود upstream بعدی را
+initialize می‌کند.
+
+## جایگاه رایج
+
+استفاده همراه با `HeaderClient`:
+
+```text
+client side: TcpListener -> HeaderClient -> TcpConnector
+server side: TcpListener -> HeaderServer -> TcpConnector
+```
+
+حالت constant override، بدون `HeaderClient`:
+
+```text
+TcpListener -> HeaderServer -> TcpConnector
+```
+
+## عملکرد
+
+- `settings.override` مشخص می‌کند نود در dynamic-header mode باشد یا constant
+  mode.
+- در dynamic-header mode، upstream `Init` به `next` تا زمان دریافت header دو
+  بایتی delay می‌شود.
+- تا زمان دریافت header، byteهای upstream buffer می‌شوند.
+- header دو بایتی می‌تواند بین چند payload callback split شده باشد.
+- port decode شده داخل destination routing context نوشته می‌شود.
+- payload باقی‌مانده بعد از header به `next` forward می‌شود.
+- در constant mode، port مقصد در همان upstream `Init` تنظیم می‌شود و هیچ byteی از
+  payload مصرف نمی‌شود.
+- lifecycle callbacks فقط بعد از established شدن line به سمت `next` forward
+  می‌شوند.
+
+`HeaderServer` یک tunnel معمولی layer-4 stream است. socket باز نمی‌کند، packet
+line نمی‌سازد و `line_t` ایجاد یا destroy نمی‌کند.
+
+## نمونه تنظیم
+
+مصرف header ارسال‌شده از `HeaderClient`:
+
+```json
+{
+  "name": "header-server",
+  "type": "HeaderServer",
+  "settings": {
+    "override": "dest_context->port"
+  },
+  "next": "connector"
+}
+```
+
+تنظیم port ثابت:
+
+```json
+{
+  "name": "header-server",
+  "type": "HeaderServer",
+  "settings": {
+    "override": 443
+  },
+  "next": "connector"
+}
+```
+
+## فیلدهای لازم
+
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `name` | string | نام دلخواه و یکتا برای node. |
+| `type` | string | باید دقیقا `"HeaderServer"` باشد. |
+| `settings` | object | اجباری است و باید `override` داشته باشد. |
+| `next` | string | نود layer-4 stream بعدی که line route شده را دریافت می‌کند. |
+
+فیلد لازم داخل `settings`:
+
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `override` | number یا string | رفتار override کردن destination port را انتخاب می‌کند. |
+
+این نود باید هم نود قبلی داشته باشد و هم `next`. برای ابتدا یا انتهای chain نیست.
+
+## `settings.override`
+
+مقدارهای قابل قبول:
+
+| مقدار | معنی |
+| --- | --- |
+| `"dest_context->port"` | header دو بایتی upstream خوانده می‌شود و `dest_ctx.port` از آن تنظیم می‌شود. |
+| `"line->dest_ctx->port"` | alias سازگار با `"dest_context->port"`. |
+| `1` تا `65535` | این destination port ثابت در upstream `Init` تنظیم می‌شود. |
+
+اگر `override` وجود نداشته باشد، string ناشناخته باشد، یا عدد خارج از بازه `1`
+تا `65535` باشد، startup شکست می‌خورد.
+
+## Dynamic Header Mode
+
+وقتی `override` برابر `"dest_context->port"` یا `"line->dest_ctx->port"` باشد،
+هر line در phase انتظار header شروع می‌شود.
+
+upstream `Init` فقط state محلی را initialize می‌کند و هنوز به `next` forward
+نمی‌شود. نود منتظر payload upstream می‌ماند، byteها را داخل `buffer_stream_t`
+نگه می‌دارد و دو byte اول را به عنوان port header big-endian می‌خواند.
+
+بعد از decode شدن header:
+
+1. port decode شده داخل `line->routing_context.dest_ctx.port` نوشته می‌شود
+2. phase line به established تغییر می‌کند
+3. upstream `Init` به `next` forward می‌شود
+4. اگر بعد از header payload باقی مانده باشد، upstream forward می‌شود
+
+به همین دلیل `HeaderServer` می‌تواند headerی را که بین چند payload callback split
+شده است هم بخواند.
+
+portهای decode شده کمتر از `10` نامعتبر هستند. در این حالت server داده buffer
+شده را recycle می‌کند، state محلی را destroy می‌کند و line را به سمت نود قبلی
+می‌بندد. اگر سمت `next` قبلا initialize شده باشد، آن سمت هم بسته می‌شود.
+
+## Constant Override Mode
+
+وقتی `override` عدد باشد، `HeaderServer` هیچ headerی از payload نمی‌خواند یا حذف
+نمی‌کند.
+
+در upstream `Init` این مقدار تنظیم می‌شود:
+
+```text
+line->routing_context.dest_ctx.port = configured port
+```
+
+سپس upstream `Init` بلافاصله به `next` forward می‌شود و تمام upstream payloadها
+بدون تغییر عبور می‌کنند.
+
+در این mode، قبل از `HeaderServer` از `HeaderClient` استفاده نکنید مگر اینکه
+عمدا بخواهید header دو بایتی به عنوان application payload باقی بماند.
+
+## رفتار جهت‌ها
+
+| جهت | رفتار در dynamic-header mode |
+| --- | --- |
+| upstream `Init` | state محلی initialize می‌شود، اما init به `next` تا زمان decode header delay می‌شود. |
+| upstream payload قبل از header | تا رسیدن حداقل ۲ byte buffer می‌شود. |
+| upstream payload بعد از header | به `next` forward می‌شود. |
+| upstream pause/resume قبل از header | ignore می‌شود؛ هنوز سمت `next` initialize نشده است. |
+| upstream pause/resume بعد از header | به `next` forward می‌شود. |
+| downstream `Est` / pause / resume قبل از header | ignore می‌شود. |
+| downstream payload قبل از header | recycle می‌شود و سمت قبلی بسته می‌شود. |
+| downstream callbacks بعد از header | به نود قبلی forward می‌شود. |
+
+در constant mode، line در upstream `Init` established می‌شود؛ بنابراین callbackهای
+upstream و downstream به شکل معمول و جهت‌دار forward می‌شوند.
+
+callbackهای `UpStreamEst` و `DownStreamInit` برای این نود غیرفعال هستند.
+
+## Finish
+
+در upstream `Finish`، `HeaderServer` state محلی را destroy می‌کند. finish فقط وقتی
+به `next` forward می‌شود که routing header کامل شده و سمت `next` قبلا initialize
+شده باشد.
+
+در downstream `Finish`، state محلی destroy می‌شود و finish به نود قبلی forward
+می‌شود.
+
+در protocol error، state محلی destroy می‌شود، اگر `next` قبلا initialize شده باشد
+آن سمت بسته می‌شود، و سمت قبلی هم بسته می‌شود.
+
+این tunnel چون line را خودش نمی‌سازد، `lineDestroy()` صدا نمی‌زند.
+
+## محدودیت‌ها و Padding
+
+| مقدار | اندازه |
+| --- | --- |
+| header مصرف‌شده | `2 bytes` |
+| حداقل port قابل قبول از header | `10` |
+| `required_padding_left` | `0 bytes` |
+
+server فقط در dynamic-header mode header مصرف می‌کند. این نود byte جدید prepend
+نمی‌کند و به padding چپ نیاز ندارد.
+
+## نکته‌ها
+
+- dynamic-header mode را همراه با `HeaderClient` استفاده کنید.
+- constant mode برای زمانی است که فقط می‌خواهید destination port ثابت شود.
+- مقدار header با network byte order encode شده است.
+- تا قبل از دریافت header، `HeaderServer` نود بعدی را initialize نکرده است.
+- نباید به عنوان state مشترک packet-line استفاده شود.

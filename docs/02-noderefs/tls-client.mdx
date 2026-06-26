@@ -4,76 +4,278 @@ sidebar_position: 1600
 
 # TlsClient
 
-`TlsClient` یک wrapper سمت client برای TLS است و روی BoringSSL موجود در سورس WaterWall ساخته شده است. این نود payload خام را از نود قبلی می‌گیرد، آن را به TLS record برای نود بعدی تبدیل می‌کند و در مسیر برگشت TLS recordها را decrypt می‌کند.
+`TlsClient` is the client-side TLS wrapper for WaterWall. It is built on the bundled BoringSSL code in the repository.
+It receives cleartext from the previous tunnel, encrypts it into TLS records for the next tunnel, and decrypts downstream
+TLS records back into cleartext.
 
-جایگاه رایج:
+This node performs a real TLS client handshake. Its handshake is shaped to stay close to modern Chrome behavior, including
+Chrome-like ALPN, ALPS, GREASE, extension permutation, certificate compression support, and the optional
+`X25519MLKEM768` hybrid group.
+
+## Typical Placement
+
+HTTPS-style client chain:
 
 ```text
 HttpClient -> TlsClient -> TcpConnector
-SomeTunnel -> TlsClient -> TcpConnector
 ```
 
-این نود TLS واقعی انجام می‌دهد و برای شبیه‌تر شدن به رفتار Chrome شکل handshake را تنظیم می‌کند. با این حال، TLS را خودش روی socket نمی‌فرستد؛ برای حمل byteها معمولا بعد از آن `TcpConnector` قرار می‌گیرد.
+Proxy-protocol client chain:
 
-## نمونه تنظیم
+```text
+TrojanClient -> TlsClient -> TcpConnector
+VlessClient -> TlsClient -> TcpConnector
+```
+
+`TlsClient` does not open sockets by itself. Put a transport such as `TcpConnector` after it. The connector carries the
+encrypted TLS bytes to the remote server.
+
+## Example
 
 ```json
-{
-  "name": "tls-client",
-  "type": "TlsClient",
-  "settings": {
-    "sni": "example.com",
-    "verify": true,
-    "ech-sni-trick": "example.net",
-    "x25519mlkem768": true
+[
+  {
+    "name": "tls-client",
+    "type": "TlsClient",
+    "settings": {
+      "sni": "example.com",
+      "verify": true,
+      "ech-sni-trick": "example.net",
+      "x25519mlkem768": true,
+      "verbose": false
+    },
+    "next": "server-out"
   },
-  "next": "tcp-connector"
-}
+  {
+    "name": "server-out",
+    "type": "TcpConnector",
+    "settings": {
+      "address": "example.com",
+      "port": 443,
+      "nodelay": true
+    }
+  }
+]
 ```
 
-## تنظیمات
+## Required Fields
 
-| گزینه | اجباری | پیش‌فرض | توضیح |
-|---|---|---|---|
-| `sni` | بله | - | SNI مقصد. مقدار خالی یا حذف‌شده reject می‌شود. |
-| `verify` | خیر | `true` | کنترل verify شدن certificate chain با CA bundle داخلی |
-| `ech-sni-trick` | خیر | - | ساخت fake ClientHello و قرار دادن آن داخل GREASE `encrypted_client_hello` برای هماهنگی با ترفندهای packet-side |
-| `x25519mlkem768` | خیر | `true` | تبلیغ گروه hybrid `X25519MLKEM768` برای رفتار نزدیک‌تر به Chrome |
+Top-level fields:
 
-:::info
-فیلدی به نام `alpn` در بعضی بخش‌های سورس دیده می‌شود، اما create path فعلی مقدار JSON برای ALPN را استفاده نمی‌کند. ALPN داخلی فعلی روی رفتار Chrome-like متمرکز است.
-:::
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | string | User-chosen node name. Must be unique inside the config file. |
+| `type` | string | Must be exactly `"TlsClient"`. |
+| `settings` | object | TLS client settings. |
+| `next` | string | Stream-facing node that carries encrypted TLS records. Required in normal use. |
 
-## رفتار handshake
+Required `settings` field:
 
-در upstream `Init`، نود state TLS می‌سازد، SNI را تنظیم می‌کند، init را به نود بعدی می‌فرستد و بلافاصله `SSL_connect()` را اجرا می‌کند تا ClientHello و بایت‌های handshake تولید شوند. اگر transport بعدی مثل `TcpConnector` هنوز در حال connect باشد، می‌تواند این بایت‌ها را طبق رفتار خودش buffer کند.
+| Field | Type | Description |
+| --- | --- | --- |
+| `sni` | string | TLS Server Name Indication. Missing or empty `sni` is rejected. |
 
-`Est` در WaterWall یعنی transport زیرین برقرار شده است، نه اینکه handshake TLS حتما تمام شده باشد. اگر payload زود برسد، `TlsClient` آن را تا پایان handshake نگه می‌دارد.
+`sni` is also the hostname used by BoringSSL for certificate verification when `verify` is enabled.
 
-## verify certificate
+## Optional Settings
 
-اگر `verify` روی `true` بماند:
+| Field | Default | Description |
+| --- | --- | --- |
+| `verify` | `true` | Enables BoringSSL peer certificate verification. |
+| `ech-sni-trick` | not set | Generates a fake inner ClientHello with this hostname and embeds it as GREASE ECH payload. |
+| `x25519mlkem768` | `true` | Advertises the `X25519MLKEM768` hybrid group for Chrome-like behavior. |
+| `verbose` | `false` | Enables extra TLS state logging. |
 
-- peer verification فعال است.
-- CA bundle داخلی WaterWall بارگذاری می‌شود.
-- خطای chain می‌تواند handshake را fail کند.
+When `verify` is `true`, `TlsClient` loads the built-in CA bundle from `utils/cacert.h` into the BoringSSL context. When
+`verify` is `false`, the TLS handshake is still real, but certificate-chain verification is disabled for this tunnel
+instance.
 
-اگر `verify` را `false` کنید:
+`ech-sni-trick` must be a non-empty string when provided. It does not change the outer cleartext SNI; the outer SNI
+remains `settings.sni`.
 
-- handshake TLS همچنان واقعی است.
-- BoringSSL peer verification را انجام نمی‌دهد.
-- این حالت برای تست یا مسیرهای کنترل‌شده است؛ برای اتصال به سرویس عمومی معمولا توصیه نمی‌شود.
+`x25519mlkem768` should usually stay enabled. Disabling it makes the ClientHello smaller, but also makes it less close to
+current Chrome behavior.
 
-## ech-sni-trick
+## ALPN And Chrome-Like Defaults
 
-`ech-sni-trick` برای هماهنگی با ترفندهای `IpManipulator` طراحی شده است. outer SNI همان `settings.sni` می‌ماند، اما یک fake ClientHello با hostname تنظیم‌شده ساخته و در payload GREASE ECH قرار داده می‌شود تا بایت‌هایی که TLS hash می‌کند با بایت‌های روی wire هماهنگ باشند.
+The active create path does not use a JSON ALPN setting.
 
-## API داخلی
+`TlsClient` always advertises this ALPN list:
 
-این نود API زیر را می‌پذیرد:
+```text
+h2
+http/1.1
+```
+
+The source still contains older helper code for a single `alpn` string, but that path is not active in normal node
+creation. Do not rely on a JSON `alpn` setting for this node.
+
+The TLS context is configured with:
+
+| Behavior | Current value |
+| --- | --- |
+| Minimum TLS version | TLS 1.2 |
+| Maximum TLS version | TLS 1.3 |
+| Session cache | client session cache enabled |
+| Session timeout | 7200 seconds |
+| GREASE | enabled |
+| Extension permutation | enabled |
+| Certificate compression | Brotli decompression support |
+| Signed certificate timestamps | enabled |
+| OCSP stapling request | enabled per line |
+
+Supported groups are:
+
+```text
+X25519MLKEM768:X25519:P-256:P-384:P-521
+```
+
+When `x25519mlkem768` is `false`, the first group is removed:
+
+```text
+X25519:P-256:P-384:P-521
+```
+
+Signature algorithms are pinned in Chrome-like order, and the bundled BoringSSL copy includes local handshake shaping
+work for cipher ordering and ClientHello layout.
+
+## ALPS Handling
+
+`TlsClient` adds ALPS application settings for both advertised protocols:
+
+| Protocol | ALPS payload |
+| --- | --- |
+| `h2` | fixed Chrome payload `02 68 32` |
+| `http/1.1` | empty payload |
+
+The `h2` ALPS value is the raw Chrome payload, not a serialized HTTP/2 `SETTINGS` frame. BoringSSL builds the final ALPS
+wire representation after the per-protocol values are registered.
+
+## ECH SNI Trick
+
+When `ech-sni-trick` is set, `TlsClient` creates a second, fake ClientHello using that hostname. The fake ClientHello is
+embedded as the GREASE `encrypted_client_hello` payload of the real outer ClientHello.
+
+Important details:
+
+- the outer SNI remains `settings.sni`
+- the embedded fake ClientHello uses the same hardcoded ALPN list
+- the embedded fake ClientHello disables `x25519mlkem768` to keep the payload smaller
+- this is meant to coordinate with packet-side tricks such as `IpManipulator`
+
+The purpose is byte consistency: the ClientHello bytes BoringSSL hashes should match the bytes that packet-level logic
+places on the wire.
+
+## Runtime Behavior
+
+On upstream `Init`, `TlsClient`:
+
+1. initializes per-line BoringSSL state
+2. creates memory BIOs
+3. switches the SSL object into client mode
+4. sets the configured SNI
+5. forwards upstream `Init` to the next tunnel
+6. calls `SSL_connect()` to generate the first ClientHello flight
+7. forwards generated TLS handshake bytes upstream
+
+This is why `TlsClient` works naturally before `TcpConnector`: the connector can buffer the ClientHello until the real
+socket connection completes.
+
+## Establishment Semantics
+
+WaterWall `Est` is transport establishment, not TLS readiness.
+
+In normal mode, downstream `Est` from the next node is forwarded to the previous node immediately. The TLS handshake may
+finish later when downstream TLS records arrive. If the previous tunnel sends application payload before the TLS handshake
+is complete, `TlsClient` queues it and flushes it through `SSL_write()` after the handshake finishes.
+
+In handshake-takeover mode, `TlsClient` suppresses the normal downstream `Est` until the TLS handshake completes.
+
+## Payload Flow
+
+Upstream cleartext:
+
+- before handshake completion, payload is queued
+- after handshake completion, payload is passed to `SSL_write()`
+- generated TLS records are read from the write BIO and sent to the next node
+
+Downstream TLS records:
+
+- encrypted bytes are written into the read BIO
+- `SSL_connect()` advances the handshake while needed
+- generated protocol bytes are flushed upstream
+- decrypted application bytes from `SSL_read()` are forwarded to the previous node
+
+Certificate verification failures are logged with the BoringSSL verify result and reason.
+
+## Tunnel API
+
+`TlsClient` exposes a small API for generating a raw ClientHello buffer:
 
 ```text
 generateTlsHello:<sni>
 ```
 
-خروجی، buffer خام ClientHello براساس تنظیمات instance است. اگر `x25519mlkem768` غیرفعال باشد، ClientHello کوچک‌تر ولی کمتر شبیه Chrome فعلی می‌شود.
+The generated ClientHello uses this tunnel instance's configured behavior, including `x25519mlkem768` and any configured
+`ech-sni-trick`.
+
+## Handshake Takeover API
+
+Internal WaterWall code can use `TlsClient` in handshake-takeover mode:
+
+| API | Purpose |
+| --- | --- |
+| `tlsclientTunnelEnableHandshakeTakeover()` | Enables takeover behavior on the tunnel. |
+| `tlsclientTunnelIsHandshakeCompleted()` | Checks whether a line has completed TLS handshake. |
+| `tlsclientTunnelDeinitAfterHandshake()` | Releases BoringSSL state after handshake and turns the line into raw pass-through. |
+
+This is an internal integration path. In normal configuration usage, `TlsClient` remains a TLS wrapper for the whole line.
+
+## Finish Behavior
+
+`TlsClient` destroys its own per-line TLS state before propagating `Finish`.
+
+For ordinary directional finishes, it propagates finish in the corresponding direction. For fatal BoringSSL read/write
+errors, it destroys local state and closes both directions. It does not own normal external lines and does not call
+`lineDestroy()` for them.
+
+## Padding
+
+`TlsClient` does not prepend WaterWall payload bytes directly, so it advertises:
+
+```text
+required_padding_left = 0
+```
+
+TLS record construction happens through BoringSSL memory BIO output buffers.
+
+## Node Metadata
+
+| Property | Value |
+| --- | --- |
+| Node flag | `kNodeFlagChainHead` |
+| Previous node | Allowed, required in normal use |
+| Next node | Allowed, required in normal use |
+| Layer group | `kNodeLayerAnything` |
+| `required_padding_left` | `0` |
+| Line state | BoringSSL SSL object, memory BIOs, handshake flags, queued upstream payloads |
+
+## Unsupported Features
+
+This implementation does not support:
+
+- JSON-configured ALPN selection
+- server-side TLS termination
+- dynamic certificate selection
+- TLS over packet lines
+- non-TLS transport wrapping such as WebSocket or HTTP by itself
+
+Use separate WaterWall nodes for those layers.
+
+## Common Mistakes
+
+- Do not expect `TlsClient` to connect to the remote server by itself; put a connector after it.
+- Do not assume WaterWall `Est` means the TLS handshake has completed.
+- Do not configure `alpn` expecting it to change the active ALPN list.
+- Do not disable `verify` for public connections unless you intentionally want to skip certificate validation.
+- Do not disable `x25519mlkem768` if your goal is the closest current Chrome-like handshake.

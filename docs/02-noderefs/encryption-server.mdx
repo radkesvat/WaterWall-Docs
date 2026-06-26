@@ -4,40 +4,218 @@ sidebar_position: 310
 
 # EncryptionServer
 
-`EncryptionServer` سمت سرور `EncryptionClient` است. upstream ورودی رمز‌شده را decrypt می‌کند و downstream خام را دوباره برای برگشت رمز می‌کند.
+`EncryptionServer` is the server-side peer for `EncryptionClient`. It decrypts
+upstream TLS-like application-data records from the client side and encrypts
+downstream payloads in the reverse direction.
 
-## جایگاه رایج
+Use it as the matching server node for a WaterWall encrypted stream path.
+
+:::warning
+`EncryptionServer` is not `TlsServer`. It does not perform a TLS handshake, does
+not present certificates, and does not negotiate TLS parameters. It only uses a
+TLS-like record shape for AEAD-encrypted payload framing.
+:::
+
+## Typical Placement
+
+Direct in-process pair:
 
 ```text
-TcpListener -> EncryptionClient -> TcpConnector
-TcpListener -> EncryptionServer -> TcpConnector
+TesterClient -> EncryptionClient -> EncryptionServer -> TesterServer
 ```
 
-## نمونه تنظیم
+Two-server TCP tunnel:
+
+```text
+client side: TcpListener -> EncryptionClient -> TcpConnector
+server side: TcpListener -> EncryptionServer -> TcpConnector
+```
+
+The client and server settings must match. Any stream tunnels between them must
+preserve the encrypted record bytes end to end.
+
+## What It Does
+
+- Derives one 32-byte AEAD key from `password`, `salt`, and `kdf-iterations`.
+- Buffers upstream encrypted bytes until complete records are available.
+- Validates upstream record headers and body lengths.
+- Decrypts upstream records and forwards recovered plaintext to `next`.
+- Encrypts downstream payloads.
+- Splits downstream plaintext larger than `max-frame-size` into multiple
+  records.
+- Sends encrypted downstream records to the previous node.
+- Closes both directions on malformed records, read-buffer overflow, or AEAD
+  authentication failure.
+
+`EncryptionServer` is a middle stream tunnel. It does not create sockets and it
+does not create packet lines.
+
+## Configuration Example
 
 ```json
 {
   "name": "enc-server",
   "type": "EncryptionServer",
   "settings": {
-    "password": "change-me",
-    "algorithm": "chacha20-poly1305"
+    "algorithm": "chacha20-poly1305",
+    "password": "replace-with-a-strong-secret",
+    "salt": "chain-a",
+    "kdf-iterations": 20000,
+    "max-frame-size": 16356
   },
   "next": "service"
 }
 ```
 
-## تنظیمات
+Matching client-side settings:
 
-| گزینه | اجباری | پیش‌فرض | توضیح |
-|---|---|---|---|
-| `password` | بله | - | secret مشترک با `EncryptionClient` |
-| `algorithm` | خیر | `chacha20-poly1305` | `chacha20-poly1305` یا `aes-gcm` |
-| `salt` | خیر | `waterwall-encryption` | salt مشترک دو سمت |
-| `kdf-iterations` | خیر | `12000` | تعداد دورهای KDF |
-| `max-frame-size` | خیر | `65535` | حداکثر plaintext frame |
+```json
+{
+  "name": "enc-client",
+  "type": "EncryptionClient",
+  "settings": {
+    "algorithm": "chacha20-poly1305",
+    "password": "replace-with-a-strong-secret",
+    "salt": "chain-a",
+    "kdf-iterations": 20000,
+    "max-frame-size": 16356
+  },
+  "next": "transport"
+}
+```
 
-## نکته‌ها
+## Required Fields
 
-- تنظیمات رمزنگاری دو سمت باید دقیقا سازگار باشد.
-- این نود فقط payload زنجیر را رمز می‌کند و خودش اتصال شبکه نمی‌سازد.
+Top-level fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | string | User-chosen node name. Must be unique inside the config file. |
+| `type` | string | Must be exactly `"EncryptionServer"`. |
+| `next` | string | Required. The next stream node receives decrypted upstream payload. |
+| `settings` | object | Required. Must contain at least `password`. |
+
+Required `settings` fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `password` | non-empty string | Shared secret used to derive the AEAD key. Must match the client side. |
+
+`EncryptionServer` must also have a previous node in the chain. It is not a
+chain head or chain end.
+
+## Optional Settings
+
+| Setting | Type | Default | Description |
+| --- | --- | --- | --- |
+| `algorithm` | string or numeric enum | `chacha20-poly1305` | AEAD algorithm. `method` is accepted as a compatibility alias when `algorithm` is absent. |
+| `salt` | string | `waterwall-encryption` | Salt input for the WaterWall key derivation process. Must match the client side. |
+| `kdf-iterations` | integer | `12000` | Key derivation rounds. Must be in range `1` through `1000000`. |
+| `max-frame-size` | integer | `16356` | Maximum plaintext bytes per encrypted record. Must be in range `1` through `16356`. |
+
+Accepted algorithm strings:
+
+| Algorithm | Accepted values |
+| --- | --- |
+| ChaCha20-Poly1305 | `chacha20-poly1305`, `chacha20poly1305`, `chacha20`, `chacha` |
+| AES-256-GCM | `aes-gcm`, `aes256gcm`, `aes-256-gcm`, `aes256-gcm` |
+
+Numeric algorithm values are also accepted by the parser for compatibility with
+WaterWall's dynamic-value enum, but string values are clearer and recommended.
+
+If AES-GCM is selected and the active crypto backend does not provide AES-GCM,
+startup fails.
+
+## Key Derivation
+
+Both peers derive the same 32-byte key from:
+
+- `password`
+- `salt`
+- `kdf-iterations`
+
+The implementation uses a WaterWall-specific BLAKE2s-based derivation loop, not
+PBKDF2 or Argon2. The derived key is stored in tunnel state and zeroed when the
+tunnel instance is destroyed.
+
+For the encrypted path to work, both sides must use the same `password`, `salt`,
+`kdf-iterations`, and compatible `algorithm`.
+
+## Wire Format
+
+Each encrypted payload chunk is encoded as:
+
+```text
+5-byte TLS-like header | 12-byte nonce | AEAD ciphertext | 16-byte tag
+```
+
+Header fields:
+
+| Field | Value |
+| --- | --- |
+| record type | `0x17`, TLS application data |
+| version | `0x0303` |
+| body length | Big-endian 16-bit length of `nonce + ciphertext + tag` |
+
+The 5-byte header is used as AEAD associated data. The selected algorithm is not
+sent in the record header; it must be configured consistently on both peers.
+
+## Limits and Padding
+
+| Value | Size |
+| --- | --- |
+| TLS-like header | `5` bytes |
+| nonce | `12` bytes |
+| AEAD tag | `16` bytes |
+| maximum TLS-like record body | `16384` bytes |
+| maximum plaintext per record | `16356` bytes |
+| required left padding | `17` bytes |
+
+`required_padding_left` is `17`, enough for the 5-byte header and 12-byte nonce
+that are prepended before encryption.
+
+If a downstream plaintext payload is larger than `max-frame-size`, the server
+splits it into multiple encrypted records. Zero-length payload buffers are
+recycled and not forwarded.
+
+## Direction Behavior
+
+| Direction | Behavior |
+| --- | --- |
+| upstream payload | Buffer, parse, decrypt, and send plaintext to `next`. |
+| downstream payload | Encrypt, frame, and send to `prev`. |
+
+Complete upstream frames may arrive split across multiple payload callbacks or
+several frames may arrive in one callback. The read stream keeps buffered bytes
+until complete records can be parsed.
+
+If the buffered encrypted data grows beyond roughly two maximum records, the
+line is closed.
+
+## Lifecycle Behavior
+
+On upstream `Init`, the server initializes its per-line read stream and forwards
+upstream `Init` to `next`.
+
+On upstream `Finish`, it destroys local line state and forwards upstream
+`Finish` to `next`. On downstream `Finish`, it destroys local line state and
+forwards downstream `Finish` to `prev`.
+
+Pause and resume are forwarded directionally:
+
+| Callback | Forwarded to |
+| --- | --- |
+| upstream pause/resume | next tunnel upstream |
+| downstream pause/resume | previous tunnel downstream |
+
+Upstream `Est` and downstream `Init` are disabled callbacks for this node.
+
+## Notes and Caveats
+
+- Use it with a matching `EncryptionClient`.
+- This node protects payload bytes, but it does not hide that data is flowing
+  inside WaterWall's TLS-like record format.
+- `password` should be long, random, and kept out of public configs.
+- `max-frame-size` should normally match on both sides. A receiver rejects
+  records larger than its configured maximum.
+- Use `TlsClient`/`TlsServer` when you need real TLS semantics.

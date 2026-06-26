@@ -1,0 +1,204 @@
+---
+sidebar_position: 1300
+---
+
+# UdpOverTcpServer
+
+`UdpOverTcpServer` peer سمت مقابل برای `UdpOverTcpClient` است. این نود stream طول‌گذاری‌شده را از نود stream-facing قبلی
+می‌گیرد، مرز packetها را بازسازی می‌کند، و payloadهای recoverشده را به نود بعدی می‌دهد.
+
+پاسخ‌های نود بعدی با همان length prefix دو بایتی frame می‌شوند و downstream از مسیر stream به سمت قبلی برمی‌گردند.
+
+## جایگاه رایج
+
+سمت server:
+
+```text
+TcpListener -> UdpOverTcpServer -> UdpConnector
+TcpListener -> TlsServer -> UdpOverTcpServer -> UdpConnector
+TcpListener -> EncryptionServer -> UdpOverTcpServer -> UdpConnector
+```
+
+سمت client matching:
+
+```text
+UdpListener -> UdpOverTcpClient -> TcpConnector
+UdpListener -> UdpOverTcpClient -> TlsClient -> TcpConnector
+TcpUdpListener -> UdpOverTcpClient -> TcpConnector
+```
+
+سمت قبلی `UdpOverTcpServer` باید مسیر stream باشد. سمت بعدی packet payloadهای بازسازی‌شده را می‌گیرد.
+
+## نمودار جریان
+
+```mermaid
+flowchart LR
+    subgraph ClientSide["Client side"]
+      UL[UdpListener] --> UOTC[UdpOverTcpClient] --> TC[TcpConnector]
+    end
+
+    TC --> NET["TCP-style transport"]
+
+    subgraph ServerSide["Server side"]
+      TL[TcpListener] --> UOTS[UdpOverTcpServer] --> UC[UdpConnector]
+    end
+```
+
+## نمونه ساده
+
+```json
+[
+  {
+    "name": "stream-in",
+    "type": "TcpListener",
+    "settings": {
+      "address": "0.0.0.0",
+      "port": 443,
+      "nodelay": true
+    },
+    "next": "udp-over-tcp-server"
+  },
+  {
+    "name": "udp-over-tcp-server",
+    "type": "UdpOverTcpServer",
+    "settings": {},
+    "next": "udp-out"
+  },
+  {
+    "name": "udp-out",
+    "type": "UdpConnector",
+    "settings": {
+      "address": "127.0.0.1",
+      "port": 51820
+    }
+  }
+]
+```
+
+## فیلدهای لازم
+
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `name` | string | نام یکتای نود داخل config. |
+| `type` | string | باید دقیقا `"UdpOverTcpServer"` باشد. |
+| `next` | string | نودی که packet payloadهای بازسازی‌شده را می‌گیرد. در استفاده عادی لازم است. |
+
+`settings` می‌تواند `{}` باشد. پیاده‌سازی فعلی setting اختصاصی برای این tunnel نمی‌خواند.
+
+## تنظیمات اختیاری
+
+این نود در نسخه فعلی setting اختصاصی ندارد.
+
+رفتار transport، destination، socket، TLS، encryption یا routing مربوط به نودهای اطراف است؛ مثل `TcpListener`،
+`TlsServer`، `EncryptionServer`، `UdpConnector` یا `TcpUdpConnector`.
+
+## مدل Framing
+
+server انتظار دارد frameهای عادی این قالب را داشته باشند:
+
+```text
+2-byte unsigned big-endian payload length + packet payload
+```
+
+bytes ورودی از stream side قبلی تا کامل شدن یک frame جمع می‌شوند. سپس header دو بایتی حذف می‌شود و packet بازسازی‌شده
+upstream به نود بعدی ارسال می‌شود.
+
+پاسخ‌های نود بعدی برعکس همین مسیر هستند: server length دو بایتی را prepend می‌کند و bytes فریم‌شده را downstream به
+سمت stream قبلی می‌فرستد.
+
+## Init با تاخیر برای نود بعدی
+
+`UdpOverTcpServer` در upstream `Init` فقط line state خودش را initialize می‌کند و بلافاصله نود بعدی را initialize نمی‌کند.
+این نود صبر می‌کند تا protocol destination را از stream ورودی بفهمد.
+
+دو حالت وجود دارد:
+
+| اولین item فریم‌شده | رفتار server |
+| --- | --- |
+| protocol marker با طول `0` | protocol byte بعدی خوانده می‌شود، `line->routing_context.dest_ctx` روی TCP یا UDP تنظیم می‌شود، سپس نود بعدی initialize می‌شود. |
+| data frame عادی | UDP فرض می‌شود، destination protocol روی UDP تنظیم می‌شود، نود بعدی initialize می‌شود، و packet recoverشده forward می‌شود. |
+
+تا وقتی نود بعدی initialize نشده، upstream `Pause` و `Resume` نادیده گرفته می‌شوند و upstream `Finish` به `next` forward
+نمی‌شود.
+
+## Protocol Marker
+
+protocol marker یک frame رزرو‌شده است:
+
+```text
+00 00 <protocol-byte>
+```
+
+فقط `IP_PROTO_TCP` و `IP_PROTO_UDP` پذیرفته می‌شوند. marker نامعتبر log می‌شود، read stream empty می‌شود و line از آن
+marker به upstream initialize نمی‌شود.
+
+این marker توسط `UdpOverTcpClient` زمانی ساخته می‌شود که لازم است server protocol metadata را برای chainهای
+mixed-protocol حفظ کند. در حالت معمول UDP-only، marker ارسال نمی‌شود و server با اولین frame عادی UDP را فرض می‌کند.
+
+## محدودیت اندازه Packet
+
+حداکثر payload قابل قبول در پیاده‌سازی فعلی:
+
+```text
+65535 - 20 - 8 - 2 = 65505 bytes
+```
+
+packetهای بزرگ‌تر در مسیر reply framing log و drop می‌شوند. payload خالی در debug build نامعتبر در نظر گرفته می‌شود.
+
+## Buffering و Overflow
+
+bytes ورودی stream تا کامل شدن frameها buffer می‌شوند. آستانه overflow فعلی:
+
+```text
+2 * kMaxAllowedUDPPacketLength
+```
+
+اگر buffer از این حد بزرگ‌تر شود، implementation warning log می‌کند و read stream را empty می‌کند. فقط به خاطر این
+overflow، line بسته نمی‌شود.
+
+## رفتار Lifecycle
+
+در upstream `Init`، server read stream خودش را initialize می‌کند و منتظر protocol marker یا اولین data frame می‌ماند.
+
+در upstream payload:
+
+1. bytes به read stream اضافه می‌شوند
+2. وقتی protocol مشخص شد، نود بعدی initialize می‌شود
+3. frameهای کامل decode می‌شوند
+4. packet payloadهای recoverشده upstream به نود بعدی forward می‌شوند
+
+در downstream payload از نود بعدی، packet با length prefix دو بایتی frame می‌شود و downstream به سمت stream قبلی می‌رود.
+
+در downstream `Finish`، state محلی destroy می‌شود و downstream `Finish` به سمت قبلی forward می‌شود.
+
+در upstream `Finish`، state محلی destroy می‌شود. upstream `Finish` فقط وقتی به نود بعدی forward می‌شود که نود بعدی قبلا
+initialize شده باشد.
+
+`UpStreamEst` و `DownStreamInit` در implementation فعلی disabled هستند.
+
+## Padding
+
+این نود در مسیر reply header دو بایتی frame را با `sbufShiftLeft()` prepend می‌کند، پس مقدار زیر را advertise می‌کند:
+
+```text
+required_padding_left = 2
+```
+
+## متادیتای نود
+
+| ویژگی | مقدار |
+| --- | --- |
+| Node flag | `kNodeFlagNone` |
+| previous node | مجاز، و در استفاده عادی لازم |
+| next node | مجاز، و در استفاده عادی لازم |
+| layer group | `kNodeLayerAnything` |
+| `required_padding_left` | `2` |
+| line state | read stream buffer و upstream-initialized flag |
+
+## اشتباه‌های رایج
+
+- بدون `UdpOverTcpClient` در سمت مقابل از این نود استفاده نکنید.
+- آن را مستقیم بعد از packet-only node نگذارید؛ سمت قبلی باید stream bytes فریم‌شده فراهم کند.
+- انتظار نداشته باشید خودش TCP listen کند؛ قبل از آن `TcpListener` یا adapter stream-facing دیگری بگذارید.
+- بعد از آن stream-only node نگذارید مگر اینکه عمدا از protocol marker path استفاده می‌کنید و نود بعدی metadata را می‌فهمد.
+- packet بزرگ‌تر از `65505` bytes نفرستید.

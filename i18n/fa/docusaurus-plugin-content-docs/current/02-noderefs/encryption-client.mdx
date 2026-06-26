@@ -1,0 +1,123 @@
+---
+sidebar_position: 300
+---
+
+# EncryptionClient
+
+`EncryptionClient` سمت client برای `EncryptionServer` است. این نود payloadهای
+upstream را با AEAD رمز می‌کند و آن‌ها را داخل recordهای شبیه TLS application
+data می‌فرستد. در مسیر downstream، recordهای رمز شده را decrypt می‌کند و payload
+خام را به نود قبلی برمی‌گرداند.
+
+:::warning
+این نود `TlsClient` نیست. TLS handshake انجام نمی‌دهد، certificate را verify
+نمی‌کند و SNI/ALPN ندارد. فقط از شکل record شبیه TLS برای framing payload
+رمزشده استفاده می‌کند.
+:::
+
+## جایگاه رایج
+
+```text
+client side: TcpListener -> EncryptionClient -> TcpConnector
+server side: TcpListener -> EncryptionServer -> TcpConnector
+```
+
+تنظیمات دو سمت باید با هم سازگار باشند و تونل‌های بین دو سمت باید byteهای record
+رمزشده را بدون تغییر عبور دهند.
+
+## نمونه تنظیم
+
+```json
+{
+  "name": "enc-client",
+  "type": "EncryptionClient",
+  "settings": {
+    "algorithm": "chacha20-poly1305",
+    "password": "replace-with-a-strong-secret",
+    "salt": "chain-a",
+    "kdf-iterations": 20000,
+    "max-frame-size": 16356
+  },
+  "next": "transport"
+}
+```
+
+## فیلدهای لازم
+
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `name` | string | نام node در config. |
+| `type` | string | باید `"EncryptionClient"` باشد. |
+| `next` | string | نود بعدی که recordهای رمز شده را دریافت می‌کند. |
+| `settings` | object | اجباری است و باید حداقل `password` داشته باشد. |
+| `settings.password` | non-empty string | secret مشترک برای ساخت کلید AEAD. |
+
+این نود باید هم نود قبلی داشته باشد و هم `next`. chain head یا chain end نیست.
+
+## تنظیمات اختیاری
+
+| گزینه | نوع | پیش‌فرض | توضیح |
+| --- | --- | --- | --- |
+| `algorithm` | string یا numeric enum | `chacha20-poly1305` | الگوریتم AEAD. اگر `algorithm` نباشد، `method` هم به عنوان alias پذیرفته می‌شود. |
+| `salt` | string | `waterwall-encryption` | ورودی salt برای key derivation. |
+| `kdf-iterations` | integer | `12000` | تعداد دورهای KDF. بازه معتبر `1` تا `1000000` است. |
+| `max-frame-size` | integer | `16356` | حداکثر plaintext هر record. بازه معتبر `1` تا `16356` است. |
+
+مقدارهای قابل قبول برای `algorithm`:
+
+| الگوریتم | مقدارها |
+| --- | --- |
+| ChaCha20-Poly1305 | `chacha20-poly1305`, `chacha20poly1305`, `chacha20`, `chacha` |
+| AES-256-GCM | `aes-gcm`, `aes256gcm`, `aes-256-gcm`, `aes256-gcm` |
+
+اگر AES-GCM انتخاب شود ولی backend فعال crypto آن را پشتیبانی نکند، startup شکست
+می‌خورد.
+
+## فرمت record
+
+هر chunk رمزشده به این شکل ارسال می‌شود:
+
+```text
+5-byte TLS-like header | 12-byte nonce | AEAD ciphertext | 16-byte tag
+```
+
+| بخش | مقدار |
+| --- | --- |
+| record type | `0x17` |
+| version | `0x0303` |
+| body length | طول `nonce + ciphertext + tag` به صورت big-endian |
+
+هدر ۵ بایتی به عنوان AEAD associated data استفاده می‌شود. الگوریتم داخل record
+نوشته نمی‌شود و باید در دو سمت config یکسان باشد.
+
+## محدودیت‌ها
+
+| مقدار | اندازه |
+| --- | --- |
+| TLS-like header | `5 bytes` |
+| nonce | `12 bytes` |
+| AEAD tag | `16 bytes` |
+| حداکثر body هر record | `16384 bytes` |
+| حداکثر plaintext هر record | `16356 bytes` |
+| `required_padding_left` | `17 bytes` |
+
+اگر upstream payload از `max-frame-size` بزرگ‌تر باشد، client آن را به چند record
+تقسیم می‌کند. payload با طول صفر recycle می‌شود و forward نمی‌شود.
+
+## رفتار جهت‌ها
+
+| جهت | رفتار |
+| --- | --- |
+| upstream payload | encrypt و frame می‌شود و به `next` می‌رود. |
+| downstream payload | buffer، parse و decrypt می‌شود و plaintext به `prev` می‌رود. |
+
+اگر record نامعتبر باشد، طول body معتبر نباشد، decrypt شکست بخورد یا read buffer
+بیش از حدود دو record کامل شود، line بسته می‌شود.
+
+## نکته‌ها
+
+- باید با `EncryptionServer` استفاده شود.
+- `password`، `salt`، `kdf-iterations`، `algorithm` و معمولاً `max-frame-size`
+  دو سمت باید سازگار باشند.
+- برای TLS واقعی از `TlsClient` و `TlsServer` استفاده کنید.
+- upstream `Est` و downstream `Init` برای این نود غیرفعال هستند.

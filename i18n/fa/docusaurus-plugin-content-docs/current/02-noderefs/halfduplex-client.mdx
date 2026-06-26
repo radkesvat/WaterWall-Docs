@@ -1,0 +1,150 @@
+---
+sidebar_position: 700
+---
+
+# HalfDuplexClient
+
+`HalfDuplexClient` یک line عادی و full-duplex را از نود قبلی می‌گیرد و آن را به
+دو line خروجی جداگانه به سمت همان `next` تبدیل می‌کند:
+
+- یک line برای upload، یعنی payload از client به server
+- یک line برای download، یعنی payload از server به client
+
+این نود باید در سمت مقابل با `HalfDuplexServer` استفاده شود تا آن دو اتصال
+دوباره به یک اتصال منطقی عادی تبدیل شوند.
+
+## جایگاه رایج
+
+نمونه مستقیم داخل یک chain:
+
+```text
+TesterClient -> HalfDuplexClient -> HalfDuplexServer -> TesterServer
+```
+
+نمونه روی TCP:
+
+```text
+client side: TcpListener -> HalfDuplexClient -> TcpConnector
+server side: TcpListener -> HalfDuplexServer -> TcpConnector
+```
+
+هر نود stream که بین client و server قرار می‌گیرد باید byteهای دو half-connection
+را بدون تغییر عبور دهد. برای مثال اگر بعد از `HalfDuplexClient` یک `TlsClient`
+بگذارید، هر دو اتصال upload و download handshake جداگانه TLS خواهند داشت.
+
+## عملکرد
+
+```mermaid
+flowchart LR
+    Main[main logical line] --> Client[HalfDuplexClient]
+    Client --> Upload[upload line]
+    Client --> Download[download line]
+
+    style Client stroke:#ff6b35,stroke-width:2px
+    style Main fill:transparent,stroke:transparent
+    style Upload fill:transparent,stroke:transparent
+    style Download fill:transparent,stroke:transparent
+```
+
+هر اتصال ورودی به این نود باعث ساخته شدن دو اتصال خروجی می‌شود. یعنی در عمل یک
+اتصال منطقی اصلی و دو اتصال transport-side داریم. با بسته شدن هر کدام از این
+مسیرها، مسیرهای جفت‌شده هم بسته می‌شوند.
+
+این نود socket باز نمی‌کند و packet line هم نمی‌سازد؛ فقط روی lineهای stream در
+وسط chain کار می‌کند.
+
+## نمونه تنظیم
+
+```json
+{
+  "name": "halfduplex-client",
+  "type": "HalfDuplexClient",
+  "settings": {},
+  "next": "outbound-transport"
+}
+```
+
+## فیلدهای لازم
+
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `name` | string | نام دلخواه و یکتا برای node. |
+| `type` | string | باید دقیقا `"HalfDuplexClient"` باشد. |
+| `next` | string | نودی که هر دو half-connection خروجی را دریافت می‌کند. |
+
+این نود باید هم نود قبلی داشته باشد و هم `next`. برای ابتدا یا انتهای chain
+نیست.
+
+## تنظیمات
+
+در پیاده‌سازی فعلی هیچ تنظیم اختصاصی اجباری یا اختیاری ندارد.
+
+هر دو اتصال upload و download به همان نودی می‌روند که در `next` آمده است. نسخه
+فعلی فیلد جداگانه‌ای مثل `upload-next` یا `download-next` ندارد.
+
+## Intro برای Pairing
+
+اولین payload در مسیر upstream حالت ویژه دارد. در همان payload،
+`HalfDuplexClient` یک شناسه داخلی ۸ بایتی تولید می‌کند:
+
+| Line | رفتار intro |
+| --- | --- |
+| upload line | intro هشت‌بایتی به ابتدای اولین payload واقعی کاربر اضافه می‌شود. |
+| download line | فقط intro هشت‌بایتی، بدون payload کاربر، ارسال می‌شود. |
+
+بعد از اولین payload:
+
+- همه payloadهای upstream فقط از upload line ارسال می‌شوند
+- payloadهای downstream باید از download line برگردند
+
+این intro جزئیات داخلی پروتکل بین `HalfDuplexClient` و `HalfDuplexServer` است و
+تنظیم کاربر محسوب نمی‌شود.
+
+## رفتار جهت‌ها
+
+| جهت | رفتار |
+| --- | --- |
+| upstream payload از نود قبلی | بعد از intro اولین payload، روی upload line به `next` فرستاده می‌شود. |
+| downstream payload از نود بعدی | به main line اصلی و نود قبلی برگردانده می‌شود. |
+| upstream pause/resume | به download line forward می‌شود. |
+| downstream pause/resume | اگر main line هنوز وجود داشته باشد، به آن برگردانده می‌شود. |
+
+upload line مسیر اصلی داده از client به server است. download line مسیر برگشت
+داده از server به client است.
+
+## Lifecycle
+
+در upstream `Init`، نود state مربوط به main line را مقداردهی می‌کند و دو line
+جدید روی همان worker می‌سازد:
+
+1. upload line
+2. download line
+
+هر دو line از طریق `next` initialize می‌شوند.
+
+اگر هر کدام از half-connectionها established شوند، main line اصلی هم به سمت نود
+قبلی established اعلام می‌شود. بنابراین نود قبلی فقط یک اتصال منطقی می‌بیند.
+
+اگر main line اصلی `Finish` شود، هر دو half-connection خروجی هم بسته می‌شوند.
+اگر یکی از half-connectionها زودتر بسته شود، main line اصلی بسته می‌شود و بستن
+half دیگر schedule می‌شود.
+
+callbackهای `UpStreamEst` و `DownStreamInit` برای این نود غیرفعال هستند.
+
+## محدودیت‌ها و Padding
+
+| مقدار | اندازه |
+| --- | --- |
+| intro داخلی | `8 bytes` |
+| `required_padding_left` | `0 bytes` |
+
+این نود padding چپ از chain درخواست نمی‌کند. برای اولین payload آپلود، یک buffer
+جدید با فضای کافی برای intro و padding کلی chain ساخته می‌شود. intro مربوط به
+download هم داخل یک buffer کوچک جداگانه ارسال می‌شود.
+
+## نکته‌ها
+
+- باید با `HalfDuplexServer` استفاده شود.
+- هر اتصال منطقی ورودی، دو اتصال خروجی می‌سازد.
+- intro فقط بعد از رسیدن اولین payload upstream ارسال می‌شود.
+- در حال حاضر مسیرهای upload و download هر دو از همان `next` استفاده می‌کنند.
