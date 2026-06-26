@@ -1,0 +1,469 @@
+---
+sidebar_position: 500
+title: "AuthenticationServer"
+sidebar_label: "AuthenticationServer"
+description: "مستندات مرجع نود AuthenticationServer."
+---
+
+# AuthenticationServer
+
+`AuthenticationServer` یک logical chain-end node برای مدیریت دیتابیس کاربران WaterWall است. socket باز نمی‌کند و I/O شبکه مستقیم انجام نمی‌دهد. در عوض، یک دیتابیس `users_t` in-memory داراست، آن را به عنوان JSON بارگذاری و ذخیره می‌کند و درخواست‌های framed منطقی از `AuthenticationClient` را پاسخ می‌دهد.
+
+## جایگاه رایج
+
+```text
+AuthenticationClient -> AuthenticationServer
+```
+
+این نود chain end است و نباید `next` داشته باشد.
+
+## این نود چه می‌کند؟
+
+- کاربران را از `db-path` به یک جدول `users_t` in-memory بارگذاری می‌کند.
+- اگر دیتابیس JSON اصلی قابل بارگذاری نباشد، به `db-path.backup` fallback می‌کند.
+- بعد از recovery موفق backup، دیتابیس اصلی را بازنویسی می‌کند.
+- دیتابیس فعلی in-memory را به صورت دوره‌ای ذخیره می‌کند.
+- `db-path.backup` را قبل از نوشتن `db-path` در ذخیره‌سازی‌های عادی می‌نویسد.
+- می‌تواند snapshot های backup تاریخی hourly، daily یا weekly بنویسد.
+- پیام‌های request framed از `AuthenticationClient` را قبول می‌کند.
+- چندین request frame را داخل یک outer message پشتیبانی می‌کند.
+- request frameها را به ماژول‌های built-in authentication و مدیریت کاربر dispatch می‌کند.
+- یک response message ترکیبی حاوی تمام response frameها برای request message پردازش‌شده را downstream می‌فرستد.
+
+`AuthenticationServer` مرجع اصلی برای کاربران است. سایر نودهای serving traffic باید از طریق `AuthenticationClient` با آن ارتباط برقرار کنند، نه با فرستادن مستقیم server protocol frames.
+
+## نمونه تنظیم
+
+```json
+{
+  "name": "auth-db",
+  "type": "AuthenticationServer",
+  "settings": {
+    "db-path": "users.json",
+    "file-save-rate-ms": 10000,
+    "normal-backups": "daily",
+    "normal-backups-path": "backups/",
+    "normal-backups-count-limit": 10,
+    "session-idle-timeout-ms": 600000,
+    "verbose": false,
+    "auth-clients": [
+      {
+        "name": "edge-1",
+        "secret": "long-random-secret",
+        "allow-stats-push": true,
+        "allow-user-pull": true,
+        "allow-user-write": false,
+        "session-idle-timeout-ms": 600000
+      }
+    ]
+  }
+}
+```
+
+## فیلدهای اجباری
+
+فیلدهای top-level:
+
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `name` | string | نام نود انتخابی. باید داخل config یکتا باشد. |
+| `type` | string | باید دقیقاً `"AuthenticationServer"` باشد. |
+| `settings` | object | تنظیمات دیتابیس، ذخیره‌سازی، backup، session و auth-client. |
+
+فیلدهای اجباری داخل `settings`:
+
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `db-path` | string | مسیر فایل دیتابیس JSON کاربران. |
+| `file-save-rate-ms` | عدد مثبت | بازه ذخیره دوره‌ای به میلی‌ثانیه. |
+| `auth-clients` | آرایه غیرخالی | clientهای control-plane که مجاز به authenticate شدن به این server هستند. |
+
+`AuthenticationServer` configهایی که `next` تعریف کرده‌اند را رد می‌کند.
+
+## تنظیمات اختیاری
+
+| گزینه | نوع | پیش‌فرض | توضیح |
+| --- | --- | --- | --- |
+| `session-idle-timeout-ms` | عدد مثبت | `600000` | timeout پیش‌فرض عدم-فعالیت session به میلی‌ثانیه. |
+| `verbose` | boolean | `false` | logهای debug متمرکز برای auth flow، request parsing، permissions و response flow را فعال می‌کند. |
+| `normal-backups` | string | غیرفعال | حالت backup تاریخی: `"hourly"`، `"daily"` یا `"weekly"`. |
+| `normal-backups-path` | string | تنظیم نشده | دایرکتوری برای snapshot های backup تاریخی. وقتی `normal-backups` تنظیم شده، اجباری است. |
+| `normal-backups-count-limit` | عدد مثبت | `10` | حداکثر فایل‌های backup تاریخی که برای این دیتابیس و حالت backup نگه داشته می‌شوند. |
+
+`normal-backups` و `normal-backups-path` باید با هم تنظیم شوند. اگر `normal-backups-count-limit` بدون فعال بودن normal backups تنظیم شود، startup شکست می‌خورد.
+
+`normal-backups-path` می‌تواند relative یا absolute باشد. server دایرکتوری را وقتی وجود ندارد می‌سازد؛ startup شکست می‌خورد اگر مسیر وجود داشته باشد اما دایرکتوری نباشد.
+
+## Auth Clients
+
+`auth-clients` اعتبارنامه‌های control-plane برای instanceهای `AuthenticationClient` تعریف می‌کند. اینها traffic user معمولی از دیتابیس کاربران نیستند.
+
+هر entry باید داشته باشد:
+
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `name` | non-empty string | نام authentication client. |
+| `secret` | non-empty string | secret مشترک برای آن authentication client. |
+
+فیلدهای اختیاری per-client:
+
+| فیلد | نوع | پیش‌فرض | توضیح |
+| --- | --- | --- | --- |
+| `allow-stats-push` | boolean | `false` | ماژول‌های traffic usage sync را مجاز می‌کند. |
+| `allow-user-pull` | boolean | `false` | ماژول‌های user lookup و full-table pull را مجاز می‌کند. |
+| `allow-user-write` | boolean | `false` | ماژول‌های ایجاد/به‌روزرسانی کاربر را مجاز می‌کند. |
+| `session-idle-timeout-ms` | عدد مثبت | timeout سطح بالا | timeout پیش‌فرض را برای sessionهای ساخته‌شده توسط این client override می‌کند. |
+
+بررسی‌های permission، session permission هستند، نه user permission:
+
+| Permission | مجاز می‌کند |
+| --- | --- |
+| `allow-user-pull` | `GetAllUsers`، user lookup با password، SHA-224 یا SHA-256. |
+| `allow-stats-push` | `PushUserStats` و `UpdateUserTraficStatsDiff`. |
+| `allow-user-write` | `AddNewUser` و `UpdateUser`. |
+
+`Authenticate` عمومی است. هر ماژول دیگری نیاز به یک session token معتبر دارد.
+
+## فرمت دیتابیس
+
+فرمت توصیه‌شده روی دیسک یک object با آرایه `users` است:
+
+```json
+{
+  "users": [
+    {
+      "id": 1001,
+      "name": "alice",
+      "password": "alice:alice-secret",
+      "email": "alice@example.com",
+      "enabled": true,
+      "limit": {
+        "traffic": {
+          "up": 1073741824,
+          "down": 1073741824,
+          "total": 2147483648
+        },
+        "bandwidth": {
+          "up": 1048576,
+          "down": 1048576
+        },
+        "ips": 4,
+        "devices": 2,
+        "connections-in": 16,
+        "connections-out": 16
+      },
+      "time": {
+        "created-at-ms": 1735689600000,
+        "expire-at-ms": 1767225600000
+      },
+      "stats": {
+        "traffic": {
+          "up": 0,
+          "down": 0
+        },
+        "connections-in": 0,
+        "connections-out": 0
+      }
+    }
+  ]
+}
+```
+
+loader چندین layout ورودی را قبول می‌کند:
+
+| Layout | توضیح |
+| --- | --- |
+| `null`، آرایه خالی، یا object خالی | به عنوان جدول کاربران خالی قبول می‌شود. |
+| `[user, ...]` | آرایه‌ای از object های کاربر. |
+| `{"users": [user, ...]}` | layout توصیه‌شده. |
+| `{"alice": user, "bob": user}` | Object map. کلید فقط به عنوان username hint استفاده می‌شود وقتی کاربر `name` غیرخالی ندارد. |
+| standalone user object | وقتی حاوی `id` یا `user-id` به اضافه `password` یا `pass` باشد قبول می‌شود. |
+
+saver همیشه دیتابیس را به صورت `{"users": [...]}` بازنویسی می‌کند.
+
+## Object کاربر
+
+یک object کاربر باید داشته باشد:
+
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `id` یا `user-id` | unsigned integer غیرصفر | هویت منطقی دائمی کاربر. باید یکتا و ثابت باشد. |
+| `password` یا `pass` | string | کلید جستجوی password که برای ساخت indexهای SHA-224 و SHA-256 استفاده می‌شود. |
+
+فیلدهای اختیاری:
+
+| فیلد | توضیح |
+| --- | --- |
+| `name` | نام کاربری قابل‌خواندن. نام‌های غیرخالی باید یکتا باشند. |
+| `email` | metadata ایمیل کاربر. |
+| `notes` | یادداشت‌های آزاد operator. |
+| `gid` یا `group-id` | شناسه گروه. |
+| `enabled` یا `enable` | پیش‌فرض `true`؛ برای غیرفعال کردن کاربر `false` بگذارید. |
+| `record-stat-interval-ms` | بازه record آمار. |
+| `limit` | محدودیت‌های کاربر. مقادیر مفقود یا صفر به معنی نامحدود است. |
+| `time` | metadata زمان کاربر. |
+| `stats` | آمار runtime که معمولاً توسط WaterWall نگه‌داری می‌شود. |
+
+برای `Socks5Server`، کلید جستجوی نهایی را در `password` به صورت `username:password` ذخیره کنید، مثلاً `"alice:alice-secret"`.
+
+passwordها به صورت plaintext در دیتابیس JSON ذخیره می‌شوند چون کاربران exported شامل فیلد `password` هستند. `db-path`، `db-path.backup` و دایرکتوری‌های backup عادی را با filesystem permissions مناسب برای مواد secret محافظت کنید.
+
+## محدودیت‌ها، زمان و آمار
+
+`limit` می‌تواند داشته باشد:
+
+| فیلد | توضیح |
+| --- | --- |
+| `traffic` | محدودیت‌های bytes برای `up`، `down` و `total`. `u` و `d` به عنوان alias قبول می‌شوند. |
+| `bandwidth` | محدودیت‌های byte-per-second برای `up` و `down`. `u` و `d` به عنوان alias قبول می‌شوند. |
+| `ips` یا `ip` | حداکثر تعداد IP. |
+| `devices` | حداکثر تعداد device. |
+| `connections-in` یا `cons-in` | حداکثر تعداد اتصال inbound. |
+| `connections-out` یا `cons-out` | حداکثر تعداد اتصال outbound. |
+
+`time` می‌تواند داشته باشد:
+
+| فیلد |
+| --- |
+| `created-at-ms` یا `created_at_ms` |
+| `first-usage-at-ms` یا `first_usage_at_ms` |
+| `expire-at-ms` یا `expires-at-ms` |
+| `expire-after-first-usage-ms` یا `expire-after-first-use-ms` |
+
+همان فیلدهای زمانی در سطح top-level object کاربر هم قبول می‌شوند. زمان‌ها میلی‌ثانیه از Unix epoch هستند، به جز `expire-after-first-usage-ms` که یک duration است.
+
+`stats` می‌تواند داشته باشد:
+
+| فیلد | توضیح |
+| --- | --- |
+| `traffic` | countersهای bytes برای `up` و `down`. `u` و `d` به عنوان alias قبول می‌شوند. |
+| `speed` | countersهای سرعت برای `up` و `down`. `u` و `d` به عنوان alias قبول می‌شوند. |
+| `ips` یا `ip` | تعداد IP runtime. |
+| `devices` | تعداد device runtime. |
+| `connections-in` یا `cons-in` | تعداد اتصال inbound runtime. |
+| `connections-out` یا `cons-out` | تعداد اتصال outbound runtime. |
+
+مقادیر عددی بزرگ ممکن است به صورت decimal string نوشته و خوانده شوند.
+
+## ذخیره‌سازی و Recovery
+
+هر ذخیره عادی از یک نوشتن backup-first استفاده می‌کند:
+
+1. JSON از جدول کاربران فعلی in-memory ساخته می‌شود.
+2. آن JSON به `db-path.backup` نوشته می‌شود.
+3. همان JSON به `db-path` نوشته می‌شود.
+
+Recovery هنگام startup این ترتیب را دنبال می‌کند:
+
+1. `db-path` بارگذاری و parse می‌شود.
+2. اگر موفق باشد، به عنوان دیتابیس in-memory استفاده می‌شود.
+3. اگر شکست بخورد، `db-path.backup` امتحان می‌شود.
+4. اگر بارگذاری backup موفق باشد، از آن استفاده می‌شود، فایل backup حذف می‌شود و `db-path` بازنویسی می‌شود.
+5. اگر هر دو primary و backup شکست بخورند، ایجاد نود شکست می‌خورد.
+
+snapshot های backup عادی فقط backup های تاریخی operator هستند. برای startup recovery استفاده نمی‌شوند؛ recovery فقط از `db-path.backup` استفاده می‌کند.
+
+از ویرایش دستی هم فایل primary و هم backup در حین اجرای WaterWall خودداری کنید. periodic saver ممکن است تغییرات دستی را با جدول فعلی in-memory overwrite کند.
+
+## Sessions و Revisionها
+
+وقتی یک `AuthenticationClient` authenticate می‌کند، server یک session in-memory می‌سازد با:
+
+- یک session token 64 بایتی
+- نام client
+- permissionهای کپی‌شده از entry متناظر `auth-clients`
+- session idle timeout client
+- timestamp آخرین فعالیت
+- یک نسخه baseline خصوصی از جدول کاربران فعلی
+- baseline `config_revision` و `stats_revision`
+
+server یک جدول کاربران authoritative و دو revision counter سطح store نگه می‌دارد:
+
+| Revision | چه زمانی افزایش می‌یابد |
+| --- | --- |
+| `config_revision` | تغییرات پیکربندی یا metadata کاربر، مثل `AddNewUser` یا `UpdateUser`. |
+| `stats_revision` | تغییرات حالت usage-owned، مثل delta های ترافیک پذیرفته‌شده یا first-usage stamping. |
+
+Revisionها از `1` شروع می‌کنند.
+
+هر request message authenticated، session activity timestamp را refresh می‌کند. Worker `0` idle sessionها را هر `60000` ms sweep می‌کند. Sessionها runtime state هستند و در فرایند restart ذخیره نمی‌شوند.
+
+## مدل همگام‌سازی
+
+جریان sync در نظرگرفته‌شده برای `AuthenticationClient`:
+
+1. Authenticate و token بازگشتی را ذخیره کنید.
+2. جدول کاربران کامل را با `GetAllUsers` دریافت کنید.
+3. یک جدول کاربران client-side محلی برای نودهای serving traffic نگه دارید.
+4. به نودهایی مثل `Socks5Server` اجازه دهید runtime usage fields محلی را به‌روز کنند.
+5. به صورت دوره‌ای traffic-stat hints را با `PushUserStats` push کنید.
+6. وقتی server revisions یا `needs-pull` نشان می‌دهد نسخه محلی stale است، جدول کامل را دوباره دریافت کنید.
+
+`PushUserStats` یک مسیر traffic-stat merge محدود است. فقط کلید password lookup و countersهای ترافیک را از هر hint می‌خواند؛ به‌روزرسانی‌های دلخواه user metadata را قبول نمی‌کند. تغییرات پیکربندی کاربر باید از ماژول‌های مدیریتی محافظت‌شده با `allow-user-write` عبور کنند.
+
+## Request و Response Framing
+
+bytes upstream به عنوان stream buffer می‌شوند. outer request envelope:
+
+| Bytes | فیلد |
+| --- | --- |
+| `4` | Unsigned big-endian body size. |
+| `64` | Session token. |
+| بقیه body | یک یا چند request frame. |
+
+body size شامل token 64 بایتی به اضافه request-frame payload است. برای یک `Authenticate` request unauthenticated، token ممکن است تمام bytes صفر باشد. هر درخواست دیگری نیاز به token معتبر دارد.
+
+هر request frame:
+
+| Bytes | فیلد |
+| --- | --- |
+| `1` | Request type. |
+| `4` | Correlation ID. |
+| `4` | Unsigned big-endian request data length. |
+| variable | Request data bytes. |
+
+response envelope:
+
+| Bytes | فیلد |
+| --- | --- |
+| `4` | Unsigned big-endian body size. |
+| `8` | Unsigned big-endian `config_revision`. |
+| `8` | Unsigned big-endian `stats_revision`. |
+| بقیه body | یک یا چند response frame. |
+
+هر response frame:
+
+| Bytes | فیلد |
+| --- | --- |
+| `1` | Response type. |
+| `4` | Correlation ID کپی‌شده از request. |
+| `4` | Unsigned big-endian response data length. |
+| variable | Response data bytes. |
+
+اگر یک پیام session token معتبر داشته باشد، نباید حاوی `Authenticate` باشد. envelopeهای malformed، frameهای ناقص، payloadهای oversized یا bytes trailing کمتر از یک request header، باعث بسته شدن ایمن اتصال منطقی می‌شوند.
+
+## نوع‌های Request
+
+| نوع | ماژول | Permission | داده request | response موفق |
+| --- | --- | --- | --- | --- |
+| `1` | `ping` | valid session | literal `ping` | نوع `1`، data `pong` |
+| `2` | `GetUserBySHA256Hex` | `allow-user-pull` | 64 کاراکتر hex | نوع `2`، user JSON |
+| `3` | `GetUserBySHA256Base64` | `allow-user-pull` | padded base64 SHA-256 digest | نوع `2`، user JSON |
+| `4` | `GetUserBySHA256` | `allow-user-pull` | raw 32-byte SHA-256 digest | نوع `2`، user JSON |
+| `5` | `GetUserByPassword` | `allow-user-pull` | کلید جستجوی password plaintext | نوع `2`، user JSON |
+| `6` | `AddNewUser` | `allow-user-write` | یک user JSON object | نوع `0`، `user-added` |
+| `7` | `UpdateUser` | `allow-user-write` | full user JSON object | نوع `0`، `user-updated` |
+| `8` | `UpdateUserTraficStatsDiff` | `allow-stats-push` | full user JSON object | نوع `0`، `user-traffic-stats-updated` |
+| `9` | `GetAllUsers` | `allow-user-pull` | خالی | نوع `3`، users JSON به اضافه `server-time-ms` |
+| `10` | `Authenticate` | عمومی | JSON با `name` و `secret` | نوع `4`، token 64 بایتی |
+| `11` | `PushUserStats` | `allow-stats-push` | stats hints JSON | نوع `0`، compact status JSON |
+| `12` | `GetUserBySHA224Hex` | `allow-user-pull` | 56 کاراکتر hex | نوع `2`، user JSON |
+| `13` | `GetUserBySHA224Base64` | `allow-user-pull` | padded base64 SHA-224 digest | نوع `2`، user JSON |
+| `14` | `GetUserBySHA224` | `allow-user-pull` | raw 28-byte SHA-224 digest | نوع `2`، user JSON |
+
+نوع‌های response:
+
+| نوع | معنی |
+| --- | --- |
+| `0` | ok |
+| `1` | pong |
+| `2` | user |
+| `3` | users database |
+| `4` | session token |
+| `255` | error |
+
+نوع‌های request ناشناخته یک error response با `unknown-request-type` برمی‌گردانند.
+
+## یادداشت‌های ماژول
+
+### Authenticate
+
+`Authenticate` انتظار دارد:
+
+```json
+{"name":"edge-1","secret":"long-random-secret"}
+```
+
+اگر اعتبارنامه‌ها با `settings.auth-clients` تطابق داشته باشند، server یک session می‌سازد و یک token 64 بایتی برمی‌گرداند. token از 32 byte تصادفی generate می‌شود و به صورت 64 byte hexadecimal lowercase encode می‌شود. اگر bytes تصادفی امن در دسترس نباشند، token generation شکست می‌خورد.
+
+### GetAllUsers
+
+`GetAllUsers` انتظار payload خالی دارد. در صورت موفقیت، normalized users JSON را با metadata response-only `server-time-ms` برمی‌گرداند:
+
+```json
+{"users":[],"server-time-ms":1767225600000}
+```
+
+`server-time-ms` به دیتابیس نوشته نمی‌شود. به `AuthenticationClient` کمک می‌کند فیلدهای انقضای server-owned را روی ساعت محلی client project کند.
+
+در صورت موفقیت، session baseline با جدول بازگشتی و server revisionهای فعلی جایگزین می‌شود.
+
+### AddNewUser
+
+`AddNewUser` انتظار یک user JSON object دارد. کاربر ارسال‌شده باید حاوی یک `id` یا `user-id` غیرصفر یکتا باشد.
+
+ماژول نام‌های تکراری، idهای تکراری، کلیدهای SHA-224 lookup تکراری و کلیدهای SHA-256 lookup تکراری را رد می‌کند. در صورت موفقیت، دیتابیس را فوراً ذخیره می‌کند. اگر آن ذخیره شکست بخورد، rollback in-memory add را امتحان می‌کند و `database-save-failed` برمی‌گرداند.
+
+### UpdateUser
+
+`UpdateUser` انتظار یک full user JSON object دارد. فیلد password فقط برای پیدا کردن کاربر موجود با SHA-256 password hash استفاده می‌شود. این ماژول password یا password hash را به‌روز نمی‌کند.
+
+`id` یا `user-id` ارسال‌شده باید موجود، غیرصفر و با کاربر موجود پیدا شده با آن password hash تطابق داشته باشد. metadata قابل تغییر، محدودیت‌ها، time info، stats و record-stat interval می‌توانند in-memory به‌روز شوند. Persistence روی normal periodic save timer اتفاق می‌افتد.
+
+### UpdateUserTraficStatsDiff
+
+`UpdateUserTraficStatsDiff` انتظار یک full user JSON object دارد. فقط از password و id برای شناسایی و validate کردن کاربر موجود استفاده می‌کند. سپس فقط `stats.traffic.up` و `stats.traffic.down` را به عنوان delta اضافه می‌کند. هیچ فیلد کاربری دیگری به‌روز نمی‌شود.
+
+اگر یک traffic delta غیرصفر پذیرفته شود و کاربر authoritative `first-usage-at-ms` نداشته باشد، server آن را با ساعت فعلی server stamp می‌کند.
+
+### PushUserStats
+
+`PushUserStats` یک یا چند stats hint جزئی قبول می‌کند. layoutهای قبول‌شده:
+
+- یک آرایه از hint objectها
+- یک object با آرایه `users`
+- یک object map که مقادیرش hint object هستند
+- یک standalone hint object
+
+هر hint باید `password` یا `pass` داشته باشد، و حداقل یک traffic counter:
+
+- `stats.traffic.up`
+- `stats.traffic.u`
+- `stats.traffic.down`
+- `stats.traffic.d`
+
+سایر فیلدها نادیده گرفته می‌شوند. سرور هر counter موجود را با session baseline مقایسه می‌کند، counterهای backwards را رد می‌کند، کاربران ناشناخته را رد می‌کند، hintهای تکراری برای همان کلید password/SHA-256 را رد می‌کند و فقط traffic deltaهای پذیرفته‌شده را به جدول authoritative اعمال می‌کند.
+
+در صورت موفقیت، response data compact JSON است:
+
+```json
+{
+  "status": "stats-updated",
+  "applied-deltas": 2,
+  "needs-pull": false,
+  "config-revision": 1,
+  "stats-revision": 3
+}
+```
+
+وقتی `needs-pull` مقدار `true` داشته باشد، `AuthenticationClient` باید `GetAllUsers` را صدا بزند تا جدول کاربران محلیش را refresh کند.
+
+## رفتار Lifecycle
+
+در upstream `init`، `AuthenticationServer` per-line buffer state را initialize می‌کند و downstream `est` را به سمت tunnel قبلی می‌فرستد.
+
+در upstream payload، bytes را buffer می‌کند، outer message های کامل را استخراج می‌کند، هر request frame داخل را پردازش می‌کند و یک combined response message downstream با `tunnelPrevDownStreamPayload()` می‌فرستد.
+
+در upstream `finish`، فقط per-line state خودش را destroy می‌کند. `lineDestroy()` را صدا نمی‌زند چون line را نساخته است.
+
+اگر server به دلیل داده malformed یا oversized یک اتصال منطقی را قطع کند، ابتدا line state خودش را destroy می‌کند و سپس downstream `finish` را به سمت tunnel قبلی می‌فرستد.
+
+## نکته‌ها
+
+- محدودیت outer message payload برابر `16 MiB` است.
+- محدودیت request data برابر `16 MiB` است.
+- محدودیت response payload برابر `16 MiB` است.
+- محدودیت queued response برابر `16 MiB` است.
+- این نود به left padding نیاز ندارد و in-place prepend نمی‌کند.
+- این نود packet tunnel نیست و از packet-line semantics استفاده نمی‌کند.
+- نام ماژول `UpdateUserTraficStatsDiff` عمداً از spelling فعلی source پیروی می‌کند.

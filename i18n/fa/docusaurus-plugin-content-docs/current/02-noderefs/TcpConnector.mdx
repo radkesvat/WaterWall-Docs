@@ -2,15 +2,34 @@
 sidebar_position: 200
 title: "TcpConnector"
 sidebar_label: "TcpConnector"
+description: "مستندات مرجع نود TcpConnector."
 ---
 
 # TcpConnector
 
-`TcpConnector` نود خروجی TCP است. این نود در upstream `Init` مقصد را از تنظیمات خودش یا از routing context خط انتخاب می‌کند، socket TCP می‌سازد، به مقصد connect می‌کند و payload را بین نود قبلی و remote server جابه‌جا می‌کند.
+`TcpConnector` آداپتور خروجی TCP است. یک line از نود قبلی دریافت می‌کند، مقصد را از تنظیمات خودش یا از routing context line انتخاب می‌کند، یک اتصال TCP باز می‌کند و payloadها را بین chain و سرور راه دور جابه‌جا می‌کند.
 
-این نود معمولا انتهای زنجیر است و `next` لازم ندارد.
+جایگاه رایج:
 
-## نمونه تنظیم ساده
+```text
+TcpListener -> ... -> TcpConnector -> سرویس TCP راه دور
+```
+
+این نود معمولاً انتهای یک stream chain است.
+
+## قابلیت‌ها
+
+- انتخاب آدرس و پورت مقصد برای هر line.
+- Resolve کردن domain name از طریق یک `DomainResolver` داخلی async.
+- باز کردن یک socket TCP خروجی.
+- نوشتن payloadهای upstream از نود قبلی روی socket راه دور.
+- ارسال داده‌های خوانده‌شده از socket راه دور به عنوان payload downstream به نود قبلی.
+- ارسال downstream `est` بعد از موفقیت اتصال TCP خروجی.
+- اعمال تنظیمات اختیاری socket مثل `TCP_NODELAY`، `TCP_FASTOPEN`، `SO_REUSEADDR`، socket bufferها، `SO_MARK`، device binding و source-IP binding در صورت پشتیبانی platform.
+
+`TcpConnector` مثل یک chain end رفتار می‌کند. توسط upstream `init` شروع می‌شود و به نود `next` نیاز ندارد.
+
+## نمونه تنظیم
 
 ```json
 {
@@ -22,6 +41,8 @@ sidebar_label: "TcpConnector"
     "nodelay": true,
     "fastopen": false,
     "reuseaddr": false,
+    "large-send-buffer": true,
+    "large-recv-buffer": 4194304,
     "fwmark": 10,
     "interface": "eth0",
     "source-ip": "192.0.2.10",
@@ -41,127 +62,356 @@ sidebar_label: "TcpConnector"
       {
         "address": "192.0.2.10",
         "port": 443,
-        "weight": 5
+        "weight": 5,
+        "nodelay": true,
+        "interface": "eth0",
+        "domain-strategy": "prefer-ipv4"
       },
       {
-        "address": "198.51.100.20",
+        "address": "example.org",
         "port": "dest_context->port",
-        "weight": 1
+        "weight": 1,
+        "source-ip": "198.51.100.10",
+        "domain-strategy": "only-ipv4"
+      },
+      {
+        "address": "2001:db8:1::/64",
+        "port": 443,
+        "weight": 1,
+        "interface": null,
+        "source-ip": null,
+        "domain-strategy": "only-ipv6"
       }
     ],
-    "nodelay": true
+    "nodelay": true,
+    "fastopen": false,
+    "reuseaddr": false,
+    "large-send-buffer": true,
+    "large-recv-buffer": true,
+    "interface": "eth0",
+    "domain-strategy": "prefer-ipv4"
   }
 }
 ```
 
-## تنظیم مقصد
+برای هر line جدید، یک object از `addresses` با احتمالی متناسب با `weight` آن انتخاب می‌شود. گزینه‌هایی که داخل یک object مقصد حذف شده‌اند مقدار top-level از `settings` را به ارث می‌برند. برای `interface` و `source-ip`، مقدار `null` یک مقدار inherited top-level را برای آن مقصد غیرفعال می‌کند.
 
-باید دقیقا یکی از این دو سبک را انتخاب کنید:
+## فیلدهای ضروری
 
-- `address` + `port`
-- `addresses`
+فیلدهای سطح بالا:
 
-این دو سبک را با هم ترکیب نکنید.
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `name` | string | نام دلخواه نود. باید داخل فایل config یکتا باشد. |
+| `type` | string | باید دقیقاً `"TcpConnector"` باشد. |
+| `settings` | object | تنظیمات مقصد و socket. |
 
-| گزینه | توضیح |
-|---|---|
-| `address` | مقصد ثابت یا context-based |
-| `port` | پورت ثابت یا context-based |
-| `addresses` | آرایه مقصدهای weighted |
+`settings` باید دقیقاً از یک سبک مقصد استفاده کند:
 
-مقدارهای معتبر برای `address`:
+| سبک | فیلدهای لازم | توضیح |
+| --- | --- | --- |
+| مقصد تکی | `address` و `port` | هر line از همان قانون مقصد استفاده می‌کند. |
+| مقصدهای weighted | `addresses` | هر line یک مقصد weighted انتخاب می‌کند. |
 
-- IPv4 ثابت، مثل `93.184.216.34`
-- IPv6 ثابت
-- domain ثابت، مثل `example.com`
-- `src_context->address`
-- `dest_context->address`
+`addresses` را با `address` یا `port` top-level ترکیب نکنید.
 
-مقدارهای معتبر برای `port`:
+## انتخاب مقصد
 
-- عدد ثابت، مثل `443`
-- `src_context->port`
-- `dest_context->port`
+### مقصد تکی
 
-:::warning
-در نسخه فعلی `TcpConnector`، فرم `random(x,y)` برای `port` پشتیبانی نمی‌شود.
-:::
-
-## addresses
-
-`addresses` آرایه‌ای از مقصدهاست. هر entry باید این فیلدها را داشته باشد:
-
-| فیلد | توضیح |
-|---|---|
-| `address` | همان فرم‌های معتبر `address` |
-| `port` | همان فرم‌های معتبر `port` |
-| `weight` | عدد مثبت؛ احتمال انتخاب مقصد متناسب با وزن |
-
-هر entry می‌تواند گزینه‌های socket مثل `nodelay`، `fastopen`، `reuseaddr`، `large-send-buffer`، `large-recv-buffer`، `fwmark`، `interface`، `source-ip` و `domain-strategy` را override کند. اگر گزینه‌ای در entry نیاید، مقدار top-level از `settings` استفاده می‌شود. برای `interface` و `source-ip` مقدار `null` مقدار inherited را غیرفعال می‌کند.
-
-alias قدیمی `adresses` هم توسط parser پذیرفته می‌شود، اما spelling درست و پیشنهادی `addresses` است.
-
-## تنظیمات socket
-
-| گزینه | پیش‌فرض | توضیح |
-|---|---:|---|
-| `nodelay` | `true` | فعال‌سازی `TCP_NODELAY` |
-| `fastopen` | `false` | درخواست `TCP_FASTOPEN` اگر platform پشتیبانی کند |
-| `reuseaddr` | `false` | فعال‌سازی `SO_REUSEADDR` |
-| `large-send-buffer` | `false` یا در صورت وجود mux مقدار large پیش‌فرض | تنظیم `SO_SNDBUF` |
-| `large-recv-buffer` | `false` یا در صورت وجود mux مقدار large پیش‌فرض | تنظیم `SO_RCVBUF` |
-| `fwmark` | - | socket mark در Linux با `SO_MARK` |
-| `interface` | - | bind به interface؛ در Linux با `SO_BINDTODEVICE` |
-| `source-ip` | - | bind کردن socket به source IP مشخص با source port موقت |
-| `domain-strategy` | مقدار `dns.domain-strategy` در core | انتخاب IPv4/IPv6 برای نتیجه DNS |
-
-## domain-strategy
-
-`domain-strategy` در `TcpConnector` واقعا در مسیر DNS استفاده می‌شود. اگر مقصد domain باشد، مقدار انتخاب‌شده روی destination context خط ست می‌شود و `DomainResolver` داخلی بر اساس آن آدرس را resolve می‌کند.
-
-مقدارهای string معتبر:
-
-| مقدار | رفتار |
-|---|---|
-| `prefer-ipv4` | اولویت با IPv4، سپس IPv6 |
-| `prefer-ipv6` | اولویت با IPv6، سپس IPv4 |
-| `only-ipv4` | فقط IPv4 |
-| `only-ipv6` | فقط IPv6 |
-| `accept-dns-returned-order` | پذیرش ترتیب برگشتی DNS |
-
-## CIDR روی IP ثابت
-
-اگر `address` یک IP ثابت همراه CIDR باشد، `TcpConnector` host part را random می‌کند:
+از `address` و `port` مستقیماً زیر `settings` استفاده کنید.
 
 ```json
-"address": "198.51.100.0/24"
+{
+  "settings": {
+    "address": "93.184.216.34",
+    "port": 443
+  }
+}
 ```
 
-این فقط برای IP ثابت است، نه domain و نه context lookup. IPv4 prefix باید در محدوده `/0` تا `/32` باشد. IPv6 prefix باید در محدوده `/64` تا `/128` باشد.
+مقادیر معتبر برای `address`:
 
-## رفتار lifecycle
+| مقدار | رفتار |
+| --- | --- |
+| string IPv4 | اتصال به آن آدرس IPv4. |
+| string IPv6 | اتصال به آن آدرس IPv6. |
+| string domain | Resolve کردن domain قبل از اتصال. |
+| `"src_context->address"` | کپی آدرس source از routing context line. |
+| `"dest_context->address"` | کپی آدرس destination از routing context line. |
 
-- upstream `Init` مقصد، پورت، optionها و domain strategy را انتخاب می‌کند.
-- اگر مقصد domain باشد، DNS resolution به صورت async توسط `DomainResolver` داخلی انجام می‌شود.
-- بعد از resolve، connect به صورت async شروع می‌شود.
-- اگر connect موفق شود، downstream `Est` به نود قبلی ارسال می‌شود.
-- payload upstream روی TCP socket نوشته می‌شود.
-- داده دریافتی از remote به صورت downstream payload به نود قبلی برمی‌گردد.
-- اگر DNS resolution یا connect شکست بخورد، line finish می‌شود.
+مقادیر معتبر برای `port`:
 
-## صف و flow control
+| مقدار | رفتار |
+| --- | --- |
+| عدد | اتصال به آن پورت ثابت. باید `1` تا `65535` باشد. |
+| `"src_context->port"` | کپی پورت source از routing context line. |
+| `"dest_context->port"` | کپی پورت destination از routing context line. |
 
-اگر DNS، connect، یا write هنوز آماده نباشد، payloadهای upstream ممکن است queue شوند.
+`random(x,y)` در parser فعلی برای `TcpConnector` پشتیبانی نمی‌شود.
 
-| وضعیت | رفتار |
-|---|---|
-| بیشتر از `1 KB` queue | نود قبلی pause می‌شود |
-| خالی شدن writeهای pending | نود قبلی resume می‌شود |
-| بیشتر از `16 MB` queue | connection بسته و line finish می‌شود |
+### مقصدهای weighted
 
-## نکته‌ها
+از `addresses` برای انتخاب مقصد per-line weighted استفاده کنید.
 
-- DNS resolution در این مسیر asynchronous است.
-- `domain-strategy` در مسیر DNS استفاده می‌شود.
-- `fwmark` و bind به interface platform-dependent هستند.
-- این نود chain end است و خودش `next` لازم ندارد.
+```json
+{
+  "settings": {
+    "addresses": [
+      {
+        "address": "192.0.2.10",
+        "port": 443,
+        "weight": 3
+      },
+      {
+        "address": "198.51.100.20",
+        "port": 443,
+        "weight": 1
+      }
+    ]
+  }
+}
+```
+
+هر object باید شامل باشد:
+
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `address` | string | همان فرم‌های معتبر `address` در مقصد تکی. |
+| `port` | عدد یا string خاص | همان فرم‌های معتبر `port` در مقصد تکی. |
+| `weight` | عدد صحیح مثبت | احتمال نسبی برای انتخاب این مقصد. |
+
+هر object می‌تواند موارد زیر را هم override کند:
+
+| گزینه |
+| --- |
+| `nodelay` |
+| `fastopen` |
+| `reuseaddr` |
+| `large-send-buffer` |
+| `large-recv-buffer` |
+| `fwmark` |
+| `interface` |
+| `source-ip` |
+| `domain-strategy` |
+
+Parser کلید قدیمی غلط‌نویسی‌شده `adresses` را هم می‌پذیرد، اما config‌های جدید باید از `addresses` استفاده کنند. هر دو نام را همزمان تعریف نکنید.
+
+## تنظیمات اختیاری
+
+| گزینه | نوع | پیش‌فرض | توضیح |
+| --- | --- | --- | --- |
+| `nodelay` | boolean | `true` | فعال‌سازی `TCP_NODELAY` روی socketهای خروجی. |
+| `fastopen` | boolean | `false` | درخواست `TCP_FASTOPEN` وقتی platform آن را در معرض می‌گذارد. |
+| `reuseaddr` | boolean | `false` | فعال‌سازی `SO_REUSEADDR` روی socketهای خروجی. |
+| `large-send-buffer` | boolean یا عدد مثبت | `false`، یا `true` اگر mux وجود داشته باشد و حذف شده باشد | تنظیم `SO_SNDBUF`. |
+| `large-recv-buffer` | boolean یا عدد مثبت | `false`، یا `true` اگر mux وجود داشته باشد و حذف شده باشد | تنظیم `SO_RCVBUF`. |
+| `fwmark` | integer | تنظیم نشده | اعمال socket mark به سبک Linux از طریق `SO_MARK` در صورت پشتیبانی. |
+| `interface` | string | تنظیم نشده | محدود کردن socketهای خروجی به یک network device محلی در صورت پشتیبانی. |
+| `source-ip` | string | تنظیم نشده | Bind کردن socketهای خروجی به یک source IP محلی مشخص با یک source port موقت. |
+| `domain-strategy` | string یا integer | `dns.domain-strategy` در core | نحوه انتخاب نتایج DNS برای مقصدهای domain. |
+
+وقتی از `addresses` استفاده می‌شود، این فیلدها می‌توانند در سطح top-level به عنوان پیش‌فرض تنظیم شوند و توسط هر object مقصد override شوند.
+
+### گزینه‌های socket buffer
+
+`large-send-buffer` و `large-recv-buffer` مقادیر زیر را می‌پذیرند:
+
+| مقدار | معنا |
+| --- | --- |
+| `true` | استفاده از buffer socket بزرگ پیش‌فرض WaterWall که فعلاً `4194304` بایت است. |
+| `false` | عدم تنظیم صریح این socket buffer؛ استفاده از پیش‌فرض kernel. |
+| عدد مثبت | درخواست مستقیم آن تعداد بایت. |
+
+اگر هر کدام از این گزینه‌ها حذف شوند و chain نهایی شامل `MuxClient` یا `MuxServer` باشد، `TcpConnector` به‌طور خودکار از buffer socket بزرگ پیش‌فرض برای آن گزینه حذف‌شده استفاده می‌کند. مقدار صریح `false` همچنان sizing صریح socket buffer را غیرفعال می‌کند.
+
+### domain strategy
+
+`domain-strategy` نحوه تبدیل یک مقصد domain به آدرس IP را کنترل می‌کند وقتی DNS هر دو نتیجه IPv4 و IPv6 برمی‌گرداند.
+
+اگر حذف شود، نود از مقدار `dns.domain-strategy` در core استفاده می‌کند. اگر مقدار core هم حذف شده باشد، WaterWall پیش‌فرض `"prefer-ipv4"` را به‌کار می‌برد.
+
+مقادیر معتبر string:
+
+| مقدار | رفتار |
+| --- | --- |
+| `"prefer-ipv4"` | اگر موجود باشد اولین نتیجه IPv4 را انتخاب کن؛ در غیر این صورت به IPv6 برگرد. |
+| `"prefer-ipv6"` | اگر موجود باشد اولین نتیجه IPv6 را انتخاب کن؛ در غیر این صورت به IPv4 برگرد. |
+| `"only-ipv4"` | فقط از نتایج DNS IPv4 استفاده کن. اگر هیچ‌کدام برنگشت، resolution برای آن line قابل استفاده نیست. |
+| `"only-ipv6"` | فقط از نتایج DNS IPv6 استفاده کن. اگر هیچ‌کدام برنگشت، resolution برای آن line قابل استفاده نیست. |
+| `"accept-dns-returned-order"` | از اولین آدرس قابل استفاده در ترتیب برگشتی resolver استفاده کن. |
+
+مقادیر integer قدیمی هم پذیرفته می‌شوند:
+
+| مقدار | استراتژی |
+| --- | --- |
+| `0` | `accept-dns-returned-order` |
+| `1` | `prefer-ipv4` |
+| `2` | `prefer-ipv6` |
+| `3` | `only-ipv4` |
+| `4` | `only-ipv6` |
+
+برای `addresses` weighted، یک object مقصد می‌تواند `domain-strategy` را فقط برای lineهایی که آن object را انتخاب می‌کنند override کند.
+
+### interface، source IP و egress pinning
+
+`interface` socket خروجی را به یک device محلی محدود می‌کند.
+
+در Linux، WaterWall در صورت وجود از `SO_BINDTODEVICE` استفاده می‌کند. روی platformهایی که device binding ندارند، به bind کردن socket به آدرس IPv4 interface برمی‌گردد. اگر این fallback نتواند یک IP interface پیدا کند، راه‌اندازی اتصال شکست می‌خورد.
+
+`source-ip` socket خروجی را قبل از connect به یک source IP محلی مشخص bind می‌کند. خانواده آدرس باید با خانواده مقصد مطابقت داشته باشد.
+
+اگر `TunDevice` loop protection یک egress pin خودکار منتشر کرده باشد و `interface` حذف شده باشد، `TcpConnector` آن pin را اعمال می‌کند. در این حالت، `source-ip` به تنهایی interface pinned را override نمی‌کند؛ مطمئن شوید source IP به interface pinned/پیش‌فرض تعلق دارد یا `interface` را صریحاً تنظیم کنید.
+
+## نمونه‌های رایج
+
+### مقصد راه دور ثابت
+
+```json
+{
+  "name": "out",
+  "type": "TcpConnector",
+  "settings": {
+    "address": "example.com",
+    "port": 443,
+    "domain-strategy": "prefer-ipv4"
+  }
+}
+```
+
+### اتصال به destination context موجود
+
+```json
+{
+  "name": "context-out",
+  "type": "TcpConnector",
+  "settings": {
+    "address": "dest_context->address",
+    "port": "dest_context->port"
+  }
+}
+```
+
+بعد از نودهایی که destination metadata را decode، بازنویسی یا route می‌کنند مفید است.
+
+### bind به یک آدرس محلی مشخص
+
+```json
+{
+  "name": "egress-ip-a",
+  "type": "TcpConnector",
+  "settings": {
+    "address": "203.0.113.10",
+    "port": 443,
+    "source-ip": "192.0.2.10"
+  }
+}
+```
+
+### استخر egress weighted
+
+```json
+{
+  "name": "egress-pool",
+  "type": "TcpConnector",
+  "settings": {
+    "addresses": [
+      {
+        "address": "edge-a.example.net",
+        "port": 443,
+        "weight": 4,
+        "interface": "eth0"
+      },
+      {
+        "address": "edge-b.example.net",
+        "port": 443,
+        "weight": 1,
+        "interface": "eth1"
+      }
+    ],
+    "domain-strategy": "prefer-ipv4"
+  }
+}
+```
+
+## رفتار chain
+
+در طول upstream `init`، `TcpConnector` وضعیت line خود را مقداردهی می‌کند، قانون مقصد را انتخاب می‌کند، مقادیر address و port را به destination context line کپی می‌کند و domain strategy line را تنظیم می‌کند.
+
+جریان داخلی:
+
+1. راه‌اندازی مقصد `address`، `port`، socket option‌ها و داده CIDR randomization اختیاری را انتخاب می‌کند.
+2. `DomainResolver` داخلی مقصد را در صورت domain بودن resolve می‌کند.
+3. بعد از اینکه مقصد یک آدرس IP با پورت شد، `TcpConnector` socket خروجی را می‌سازد و یک connect async شروع می‌کند.
+4. بعد از موفقیت connect، `TcpConnector` downstream `est` را به نود قبلی می‌فرستد.
+5. payloadهای upstream روی socket نوشته می‌شوند و داده‌های خوانده‌شده از socket به payload downstream تبدیل می‌شوند.
+
+اگر راه‌اندازی مقصد، DNS resolution، راه‌اندازی socket یا connect شکست بخورد، line به صورت downstream به سمت نود قبلی finish می‌شود.
+
+## domain resolution
+
+Domain resolution async است. `TcpConnector` یک chain `DomainResolver` داخلی می‌سازد و `domain-strategy` انتخاب‌شده را قبل از resolution روی destination context line ذخیره می‌کند.
+
+payloadهایی که در حین pending بودن DNS می‌رسند توسط resolver نگه داشته می‌شوند. payloadهایی که بعد از موفقیت DNS اما قبل از تکمیل TCP connect می‌رسند توسط `TcpConnector` صف می‌شوند تا socket آماده شود.
+
+## CIDR randomization روی IPهای ثابت
+
+یک `address` IP ثابت می‌تواند پسوند CIDR داشته باشد. وقتی یک بازه CIDR وجود دارد، `TcpConnector` قبل از اتصال host part را random می‌کند.
+
+```json
+{
+  "settings": {
+    "address": "198.51.100.0/24",
+    "port": 443
+  }
+}
+```
+
+```json
+{
+  "settings": {
+    "address": "2001:db8:1::/64",
+    "port": 443
+  }
+}
+```
+
+پسوندهای CIDR فقط روی آدرس‌های IP ثابت معتبر هستند. روی domain‌ها، `"src_context->address"` یا `"dest_context->address"` معتبر نیستند.
+
+قوانین پیاده‌سازی:
+
+| خانواده آدرس | طول prefix معتبر | توضیح |
+| --- | --- | --- |
+| IPv4 | `0` تا `32` | `/32` مثل یک آدرس ثابت رفتار می‌کند. prefixهای بالاتر از `/32` رد می‌شوند. |
+| IPv6 | `64` تا `128` | `/64` بیت‌های پایینی ۶۴ بیت را random می‌کند. prefixهای گسترده‌تر از `/64` رد می‌شوند. |
+
+اگر بازه محاسبه‌شده صفر باشد، مقصد مثل یک آدرس ثابت رفتار می‌کند.
+
+## کنترل جریان و buffering
+
+در حالی که DNS، connect یا socket write‌ها در انتظار هستند، `TcpConnector` ممکن است payloadهای upstream را صف کند.
+
+آستانه‌های فعلی:
+
+| وضعیت صف | رفتار |
+| --- | --- |
+| بیشتر از `1 KB` در صف | نود قبلی pause می‌شود. |
+| تکمیل write‌های pending | نود قبلی resume می‌شود. |
+| بیشتر از `16 MB` در صف | اتصال بسته و line finish می‌شود. |
+
+این محدودیت‌ها از رشد بی‌محدود حافظه وقتی remote کند است یا اتصال آماده نیست جلوگیری می‌کند.
+
+## idle timeout
+
+هر اتصال خروجی در یک جدول idle مخصوص worker ردیابی می‌شود. timeout idle فعلی حدود `300 ثانیه` است. فعالیت read و write timeout را refresh می‌کند.
+
+اگر اتصال منقضی شود، socket بسته می‌شود و downstream `finish` به نود قبلی فرستاده می‌شود.
+
+## نکات و هشدارها
+
+- `TcpConnector` یک chain end خروجی است و به `next` نیاز ندارد.
+- DNS resolution async است و از `domain-strategy` انتخاب‌شده استفاده می‌کند.
+- `fwmark`، `TCP_FASTOPEN` و device binding به platform وابسته هستند.
+- `fwmark` روی Windows در دسترس نیست.
+- `source-ip` باید یک آدرس IP معتبر باشد و باید با خانواده آدرس مقصد مطابقت داشته باشد.
+- کلید قدیمی `adresses` برای سازگاری پذیرفته می‌شود، اما `addresses` نام‌گذاری مستند‌شده است.

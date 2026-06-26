@@ -2,6 +2,7 @@
 sidebar_position: 900
 title: "Router"
 sidebar_label: "Router"
+description: "مستندات مرجع نود Router."
 ---
 
 # Router
@@ -10,8 +11,9 @@ sidebar_label: "Router"
 در میانه زنجیره قرار می‌گیرد، روی اولین upstream payload هر line تصمیم می‌گیرد
 و کل آن connection را فقط به یک شاخه انتخاب‌شده می‌فرستد.
 
-اگر هیچ ruleای match نشود، connection به `next` خود Router می‌رود. بنابراین
-`next` مسیر پیش‌فرض یا default route است.
+از آن زمانی استفاده کنید که یک مسیر inbound باید بر اساس source IP، port ورودی،
+destination IP، destination domain، نوع شبکه، protocol تشخیص‌داده‌شده، HTTP
+Upgrade flag یا username/password احراز هویت‌شده به چند مسیر outbound تقسیم شود.
 
 ```mermaid
 flowchart LR
@@ -23,28 +25,29 @@ flowchart LR
 
 ## مدل ذهنی
 
-`Router` در زمان `Init` شاخه را انتخاب نمی‌کند. دلیلش این است که بعضی ruleها
-به payload اول نیاز دارند؛ مثل تشخیص `protocol`، خواندن HTTP Host، خواندن TLS
-SNI یا بررسی HTTP `Upgrade`.
+`Router` را به عنوان یک branch selector با تأخیر در نظر بگیرید:
 
-رفتار کلی:
+- در زمان `Init` شاخه را انتخاب نمی‌کند.
+- منتظر اولین upstream payload می‌ماند تا در صورت نیاز به تشخیص protocol، HTTP
+  Host، TLS SNI یا HTTP `Upgrade` بتواند byteهای قابل مشاهده را بررسی کند.
+- آن byteهای اول را تا تصمیم‌گیری buffer می‌کند.
+- بعد از اینکه یک rule برنده شد، branch انتخابی را initialize می‌کند و byteهای
+  buffer شده را به همان branch replay می‌کند.
+- تصمیم یک‌بار به ازای هر connection گرفته می‌شود. payloadهای بعدی مستقیم از
+  همان branch عبور می‌کنند.
+- ترافیک downstream از branch انتخابی از مسیر Router به نود قبلی برمی‌گردد.
 
-- upstream `Init` فقط state داخلی Router را آماده می‌کند.
-- اولین upstream payload موقتاً buffer می‌شود.
-- sniffing و rule matching انجام می‌شود.
-- اولین rule که همه شرط‌هایش match شود انتخاب می‌شود.
-- branch انتخاب‌شده initialize می‌شود.
-- payload buffer شده به همان branch replay می‌شود.
-- payloadهای بعدی دیگر دوباره classify نمی‌شوند و مستقیم از همان branch عبور
-  می‌کنند.
+اگر هیچ ruleای match نشود، connection به top-level `next` می‌رود. آن `next`
+مسیر default است.
 
 :::warning
-`Router` برای مسیرهایی مناسب است که client اول داده می‌فرستد. اگر protocol از
-نوع server-first باشد و server باید قبل از client چیزی بفرستد، Router تا وقتی
-upstream payload نرسد branch را initialize نمی‌کند.
+`Router` نیاز دارد client اول داده بفرستد. برای protocolهایی که server باید
+اول صحبت کند، Branch انتخاب نمی‌شود تا زمانی که upstream payload اول برسد.
 :::
 
 ## جایگاه رایج
+
+مسیریابی یک TCP listener عادی:
 
 ```text
 TcpListener -> Router
@@ -53,7 +56,7 @@ TcpListener -> Router
                  `-- next: default_path
 ```
 
-بعد از proxy server:
+بعد از proxy server که metadata مقصد را از قبل parse کرده:
 
 ```text
 Socks5Server -> Router -> TcpConnector
@@ -65,11 +68,31 @@ Socks5Server -> Router -> TcpConnector
 TunDevice -> PacketsToConnection -> Router -> TcpConnector
 ```
 
-`Router` یک نود لایه ۴ است و خودش raw packet router نیست. برای packet chainها
-اگر routing در سطح connection می‌خواهید، اول از نودهایی مثل
+`Router` یک نود لایه ۴ است. WaterWall lineها را route می‌کند، نه raw packetها را
+مستقیماً. برای packet chainها، اگر routing در سطح connection می‌خواهید، اول از
 `PacketsToConnection` استفاده کنید.
 
 ## نمونه کامل
+
+این مثال از یک listener ورودی استفاده می‌کند و connectionها را به این صورت توزیع می‌کند:
+
+- کاربر authenticate‌شده `alice` به مسیر premium
+- TLS برای `*.example.org` به مسیر domain-specific
+- SSH به مسیر SSH
+- بقیه به مسیر direct پیش‌فرض
+
+```json
+{
+  "name": "inbound",
+  "type": "TcpListener",
+  "settings": {
+    "address": "0.0.0.0",
+    "port": 443,
+    "nodelay": true
+  },
+  "next": "router"
+}
+```
 
 ```json
 {
@@ -102,18 +125,26 @@ TunDevice -> PacketsToConnection -> Router -> TcpConnector
 }
 ```
 
-در این مثال:
+```json
+{
+  "name": "direct_path",
+  "type": "TcpConnector",
+  "settings": {
+    "address": "203.0.113.10",
+    "port": 443
+  }
+}
+```
 
-- کاربر authenticate شده با username برابر `alice` به `premium_path` می‌رود.
-- TLS برای دامنه‌های `*.example.org` به `example_tls_path` می‌رود.
-- مقصد port `22` به `ssh_path` می‌رود.
-- بقیه connectionها به `direct_path` می‌روند.
+targetهایی مثل `premium_path`، `example_tls_path` و `ssh_path` باید نام nodeهای
+واقعی در همان config باشند. هر target یک branch entry است و می‌تواند به یک
+connector، protocol tunnel، `Bridge` یا segment دیگری از chain اشاره کند.
 
 ## فیلدهای اصلی
 
 | فیلد | نوع | توضیح |
 | --- | --- | --- |
-| `name` | string | نام نود. |
+| `name` | string | نام نود. باید داخل فایل config یکتا باشد. |
 | `type` | string | باید دقیقاً `"Router"` باشد. |
 | `next` | string | اجباری؛ مسیر default وقتی هیچ ruleای match نشود. |
 
@@ -124,19 +155,18 @@ TunDevice -> PacketsToConnection -> Router -> TcpConnector
 
 | گزینه | نوع | پیش‌فرض | توضیح |
 | --- | --- | --- | --- |
-| `rules` | array | unset | لیست ruleها به ترتیب priority. |
-| `sniffing` | array | unset | modeهای domain sniffing: مقدارهای مجاز `http1` و `tls`. |
+| `rules` | array | unset | لیست ruleها به ترتیب. Missing یعنی همه ترافیک به `next` می‌رود. آرایه خالی نامعتبر است. |
+| `sniffing` | array | unset | modeهای domain sniffing: مقدارهای مجاز `"http1"` و `"tls"`. |
 | `sniff-even-if-domain-is-already-provided` | boolean | `false` | اگر `true` باشد، Host/SNI می‌تواند domain موجود را جایگزین کند. |
-| `resolve-domains` | boolean | `false` | قبل از Router یک `DomainResolver` داخلی می‌گذارد تا domain destinationهای unresolved قبل از routing resolve شوند. |
+| `resolve-domains` | boolean | `false` | قبل از Router یک `DomainResolver` داخلی می‌گذارد. |
 | `geoip-db-path` | string | unset | فقط وقتی لازم است که rule از `geoip:<cc>` استفاده کند. |
 | `geosite-db-path` | string | unset | فقط وقتی لازم است که rule از `geosite:<list>` استفاده کند. |
 
-مقدار قدیمی `http` برای sniffing یا protocol دیگر معتبر نیست؛ از `http1`
-استفاده کنید.
+مقدار قدیمی `"http"` برای sniffing نامعتبر است؛ از `"http1"` استفاده کنید.
 
-## قانون‌های Matching
+## مبانی Rule
 
-هر rule باید `target` و حداقل یک شرط داشته باشد.
+هر rule یک `target` به اضافه حداقل یک شرط است:
 
 ```json
 {
@@ -153,13 +183,12 @@ TunDevice -> PacketsToConnection -> Router -> TcpConnector
 
 | سطح | منطق |
 | --- | --- |
-| مقدارهای داخل یک condition | OR |
-| conditionهای داخل یک rule | AND |
-| ruleهای داخل `rules` | اولین match برنده است |
-| بدون match | مسیر `next` استفاده می‌شود |
+| مقدارهای داخل یک condition | OR. `destination-port: [80, 443]` هر کدام از portها را match می‌کند. |
+| conditionهای داخل یک rule | AND. همه شرط‌های تنظیم‌شده باید match شوند. |
+| ruleهای داخل `rules` | اولین match کامل برنده است؛ رuleهای بعدی رد می‌شوند. |
+| بدون match | connection به top-level `next` می‌رود. |
 
-یعنی rule بالا فقط وقتی match می‌شود که network برابر TCP باشد و destination
-port یکی از `80` یا `443` باشد.
+فیلدهای ناشناخته داخل یک rule با warning نادیده گرفته می‌شوند. rule فقط با `target` و بدون هیچ شرطی نامعتبر است.
 
 ## شرط‌های قابل استفاده
 
@@ -167,58 +196,156 @@ port یکی از `80` یا `443` باشد.
 | --- | --- | --- |
 | `source-ips` | string یا array | IP/CIDR مبدا یا `geoip:<cc>`. |
 | `source-port` | integer یا array | port local/inbound که peer به آن وصل شده است. |
-| `source-port-range` | array دو عددی | بازه inclusive برای source port. |
+| `source-port-range` | array دو عددی | بازه inclusive برای source/local listener port. |
 | `destination-ip` | string یا array | IP/CIDR مقصد یا `geoip:<cc>`. مقصد domain-only بدون resolve شدن match نمی‌شود. |
-| `destination-port` | integer یا array | port مقصد. |
+| `destination-port` | integer یا array | port مقصد داخل `dest_ctx.port`. |
 | `destination-port-range` | array دو عددی | بازه inclusive برای destination port. |
-| `destination-domain` | string یا array | domain مقصد، domain sniff شده، wildcard، `*` یا `geosite:<list>`. |
-| `network` | string یا array | یکی از `tcp`، `udp`، `icmp`، `packet` یا ترکیب مثل `"tcp,udp"`. |
+| `destination-domain` | string یا array | domain مقصد، domain sniff شده، wildcard `*` یا `geosite:<list>`. |
+| `network` | string یا array | فلگ‌های transport: `tcp`، `udp`، `icmp`، `packet`. ترکیب مثل `"tcp,udp"` هم قبول می‌شود. |
 | `protocol` | string یا array | protocol تشخیص داده‌شده از payload اول: `http1`، `tls`، `bittorrent`. |
-| `attributes` | array غیرخالی | فعلاً فقط `http_upgrade_present`. |
+| `attributes` | array غیرخالی | مشخصات boolean sniff شده. فعلاً فقط `http_upgrade_present`. |
 | `username` | string یا array | username authenticate شده روی line، exact و case-sensitive. |
 | `password` | string یا array | password authenticate شده روی line، exact و case-sensitive. |
 
-## Domain و Sniffing
+مقادیر port باید integer در بازه `0..65535` باشند. port range باید دقیقاً دو integer داشته باشد و اولی کوچکتر یا مساوی دومی باشد.
 
-برای routing بر اساس domain:
+## شرط‌های Source
+
+### `source-ips`
+
+`source-ips` با آدرس source مطابقت دارد:
 
 ```json
 {
-  "sniffing": [
-    "http1",
-    "tls"
+  "source-ips": [
+    "10.0.0.0/8",
+    "192.0.2.10",
+    "geoip:ir"
   ],
-  "rules": [
-    {
-      "destination-domain": [
-        "*.example.com",
-        "geosite:cn"
-      ],
-      "target": "domain_path"
-    }
-  ]
+  "target": "local_or_iran_path"
 }
 ```
 
-`http1` مقدار HTTP Host را می‌خواند. `tls` مقدار SNI را از ClientHello می‌خواند.
-اگر destination از قبل domain داشته باشد، Router به صورت پیش‌فرض آن را با
-Host/SNI جایگزین نمی‌کند. این کار باعث می‌شود domain انتخاب‌شده توسط config یا
-نود قبلی با داده‌ای که client داخل payload فرستاده عوض نشود.
+مقدارهای مجاز: IPv4/IPv6 تکی، IPv4/IPv6 CIDR، یا `geoip:<ISO-3166-alpha-2>` مثل `geoip:ir`.
 
-اگر واقعاً می‌خواهید Host/SNI domain قبلی را override کند:
+### `source-port` و `source-port-range`
+
+در رفتار listener فعلی، `source-port` port local/inbound است که peer به آن وصل
+شده، نه port ephemeral تصادفی peer.
+
+برای multiport listener مفید است:
 
 ```json
 {
-  "sniff-even-if-domain-is-already-provided": true
+  "source-port": [
+    80,
+    443
+  ],
+  "target": "web_path"
 }
 ```
 
-## Protocol Detection
+می‌توانید `source-port` و `source-port-range` را با هم در یک rule ترکیب کنید:
 
-`protocol` از payload اول تشخیص داده می‌شود و به root `sniffing` نیاز ندارد.
-اگر ruleای از `protocol` استفاده کند، Router detector لازم را خودش اجرا می‌کند.
+```json
+{
+  "source-port": 443,
+  "source-port-range": [
+    10000,
+    10100
+  ],
+  "target": "selected_inbound_ports"
+}
+```
 
-مقدارهای مجاز:
+## شرط‌های Destination
+
+### `destination-ip`
+
+`destination-ip` با `dest_ctx` مطابقت دارد وقتی مقصد IP است:
+
+```json
+{
+  "destination-ip": [
+    "198.51.100.0/24",
+    "geoip:us"
+  ],
+  "target": "us_path"
+}
+```
+
+اگر مقصد فقط domain باشد، این شرط match نمی‌شود. برای routing بر اساس GeoIP روی مقصدهای domain، از `resolve-domains: true` استفاده کنید.
+
+### `destination-port` و `destination-port-range`
+
+```json
+{
+  "destination-port": [
+    80,
+    443
+  ],
+  "target": "web_path"
+}
+```
+
+```json
+{
+  "destination-port-range": [
+    1000,
+    2000
+  ],
+  "target": "range_path"
+}
+```
+
+### `destination-domain`
+
+```json
+{
+  "destination-domain": [
+    "example.com",
+    "*.example.org",
+    "geosite:cn"
+  ],
+  "target": "domain_path"
+}
+```
+
+| pattern | معنی |
+| --- | --- |
+| `example.com` | match دقیق، case-insensitive. |
+| `*.example.com` | subdomainها مثل `www.example.com` را match می‌کند؛ خود `example.com` را نه. |
+| `*` | هر domain غیرخالی. |
+| `geosite:cn` | لیست نام‌دار GeoSite که از `geosite-db-path` بارگذاری شده. |
+
+برای مقصدهای IP-only، root `sniffing` را فعال کنید تا Router از HTTP Host یا TLS SNI domain را بخواند.
+
+## شرط‌های Network و Protocol
+
+### `network`
+
+```json
+{
+  "network": "tcp,udp",
+  "target": "tcp_or_udp_path"
+}
+```
+
+مقدارهای مجاز: `tcp`، `udp`، `icmp`، `packet`. می‌توانید string تکی، آرایه‌ای از stringها یا ترکیب‌شده با comma بدهید.
+
+### `protocol`
+
+`protocol` از اولین upstream payload تشخیص داده می‌شود:
+
+```json
+{
+  "protocol": [
+    "tls",
+    "bittorrent"
+  ],
+  "target": "special_protocol_path"
+}
+```
 
 | مقدار | تشخیص |
 | --- | --- |
@@ -226,9 +353,17 @@ Host/SNI جایگزین نمی‌کند. این کار باعث می‌شود do
 | `tls` | TLS ClientHello. |
 | `bittorrent` | handshake بیت‌تورنت. |
 
+`protocol` به root `sniffing` نیاز ندارد. اگر ruleای از `protocol` استفاده کند، Router detector لازم را خودش اجرا می‌کند.
+
+مقدار قدیمی `"http"` نامعتبر است؛ از `"http1"` استفاده کنید.
+
 ## Attributes
 
-تنها attribute فعلی:
+`attributes` با حقایق boolean sniff شده از اولین payload مطابقت دارد:
+
+| attribute | معنی |
+| --- | --- |
+| `http_upgrade_present` | اولین HTTP/1 request شامل header با نام `Upgrade:` است. |
 
 ```json
 {
@@ -239,9 +374,105 @@ Host/SNI جایگزین نمی‌کند. این کار باعث می‌شود do
 }
 ```
 
-این شرط وقتی match می‌شود که درخواست HTTP/1 اول header با نام `Upgrade:` داشته
-باشد. برای این attribute باید root `sniffing` شامل `http1` باشد، وگرنه rule
-هیچ‌وقت match نمی‌شود.
+برای این attribute باید root `sniffing` شامل `"http1"` باشد:
+
+```json
+{
+  "sniffing": [
+    "http1"
+  ],
+  "rules": [
+    {
+      "attributes": [
+        "http_upgrade_present"
+      ],
+      "target": "websocket_path"
+    }
+  ]
+}
+```
+
+اگر `http1` sniffing فعال نباشد، rule هیچ‌وقت match نمی‌شود و Router در startup یک warning می‌دهد. نام‌های attribute ناشناخته خطای fatal config هستند.
+
+## Authenticated Identity
+
+`username` و `password` با credentialهایی که توسط یک tunnel upstream به line اضافه شده مطابقت دارند:
+
+```json
+{
+  "username": [
+    "alice",
+    "bob"
+  ],
+  "target": "premium_path"
+}
+```
+
+```json
+{
+  "password": "customer-secret",
+  "target": "customer_path"
+}
+```
+
+matching دقیق و case-sensitive است. اگر line username یا password authenticated نداشته باشد، شرط match نمی‌شود.
+
+نمونه‌هایی از tunnelهایی که می‌توانند credentials را populate کنند: `Socks5Server`، `TrojanServer` و `VlessServer`.
+
+## Sniffing Host و SNI
+
+`sniffing` در سطح root به Router اجازه می‌دهد domain را از اولین payload بخواند:
+
+```json
+{
+  "sniffing": [
+    "http1",
+    "tls"
+  ]
+}
+```
+
+| مقدار | می‌خواند |
+| --- | --- |
+| `http1` | HTTP/1 header با نام `Host`. |
+| `tls` | TLS ClientHello SNI. |
+
+این بیشتر برای مقصدهای IP-backed کاربرد دارد که destination اصلی IP است اما routing بر اساس domain می‌خواهید:
+
+```json
+{
+  "sniffing": [
+    "tls"
+  ],
+  "rules": [
+    {
+      "destination-domain": "*.example.org",
+      "target": "example_path"
+    }
+  ]
+}
+```
+
+به صورت پیش‌فرض، Router یک domain که از قبل در `dest_ctx` وجود دارد را با Host/SNI جایگزین نمی‌کند. اگر عمداً می‌خواهید Host/SNI به domain قبلی اولویت داشته باشد، از `sniff-even-if-domain-is-already-provided: true` استفاده کنید.
+
+وقتی domain از یک مقصد IP-backed sniff می‌شود، Router آن را به عنوان metadata ذخیره می‌کند و IP endpoint اصلی را حفظ می‌کند.
+
+## بافر کردن Payload اول
+
+Router برای تصمیم‌گیری payload اول را buffer می‌کند. detectorها ممکن است برای HTTP/TLS/BitTorrent ناقص درخواست bytes بیشتر کنند.
+
+حد پنجره sniffing:
+
+```text
+8192 bytes
+```
+
+اگر اطلاعات لازم تا این حد پیدا نشود، detector آن را missing در نظر می‌گیرد و Router با اطلاعاتی که دارد ادامه می‌دهد.
+
+نتایج عملی:
+
+- ruleهایی که از `protocol`، `destination-domain` با `sniffing` یا `http_upgrade_present` استفاده می‌کنند ممکن است انتخاب branch را تا رسیدن bytes کافی به تأخیر بیندازند.
+- بعد از انتخاب route، payloadهای بعدی دوباره classify نمی‌شوند.
 
 ## GeoIP
 
@@ -254,6 +485,13 @@ Host/SNI جایگزین نمی‌کند. این کار باعث می‌شود do
     {
       "source-ips": "geoip:ir",
       "target": "iran_path"
+    },
+    {
+      "destination-ip": [
+        "geoip:us",
+        "geoip:de"
+      ],
+      "target": "western_path"
     }
   ]
 }
@@ -261,11 +499,11 @@ Host/SNI جایگزین نمی‌کند. این کار باعث می‌شود do
 
 نکته‌ها:
 
-- `geoip-db-path` فقط وقتی اجباری است که rule واقعاً `geoip:` داشته باشد.
+- `geoip-db-path` فقط وقتی اجباری است که rule واقعاً از `geoip:` استفاده کند.
 - دیتابیس باید MaxMind country database باشد.
-- country code دو حرفی و case-insensitive است.
-- برای `destination-ip` اگر مقصد هنوز domain-only است، باید قبل از matching
-  resolve شود.
+- country code دو حرفی ISO-3166 و case-insensitive است.
+- اگر IP در دیتابیس نباشد، شرط GeoIP match نمی‌شود.
+- مقصد domain-only باید قبل از matching با `destination-ip: geoip:...` resolve شود.
 
 ## GeoSite
 
@@ -284,17 +522,13 @@ Host/SNI جایگزین نمی‌کند. این کار باعث می‌شود do
         "geosite:cn",
         "geosite:category-ads-all"
       ],
-      "target": "geosite_path"
+      "target": "special_domain_path"
     }
   ]
 }
 ```
 
-فایل GeoSite با generator داخل سورس ساخته می‌شود:
-
-```text
-tunnels/Router/geosite_ww_style_generator/do_the_job.py
-```
+`geosite-db-path` فقط وقتی اجباری است که rule از token `geosite:` استفاده کند. Router دیتابیس JSON را در startup بارگذاری و اعتبارسنجی می‌کند.
 
 نوع‌های پشتیبانی‌شده در GeoSite:
 
@@ -302,14 +536,19 @@ tunnels/Router/geosite_ww_style_generator/do_the_job.py
 | --- | --- |
 | `full` | match دقیق domain. |
 | `domain` / `root_domain` | root domain و subdomainها. |
-| `plain` / `keyword` | substring. |
-| `regex` / `regexp` | regex با STC `cregex`. |
+| `plain` / `keyword` | substring case-insensitive. |
+| `regex` / `regexp` | الگوی STC `cregex`، case-insensitive. |
+
+فایل GeoSite با generator داخل سورس ساخته می‌شود:
+
+```text
+tunnels/Router/geosite_ww_style_generator/do_the_job.py
+```
 
 ## resolve-domains
 
 اگر `resolve-domains` برابر `true` باشد، Router یک `DomainResolver` داخلی قبل
-از خودش می‌سازد. این برای حالتی خوب است که مقصد به صورت domain آمده، اما شما
-می‌خواهید بر اساس `destination-ip` یا GeoIP تصمیم بگیرید.
+از خودش می‌سازد:
 
 ```json
 {
@@ -324,8 +563,14 @@ tunnels/Router/geosite_ww_style_generator/do_the_job.py
 }
 ```
 
-این resolver فقط domainهای unresolved را resolve می‌کند و domainهایی را که
-بعداً از HTTP Host یا TLS SNI sniff می‌شوند دوباره resolve نمی‌کند.
+این برای حالتی خوب است که مقصد به صورت domain آمده، اما می‌خواهید بر اساس `destination-ip` یا GeoIP تصمیم بگیرید.
+
+نکات مهم:
+
+- resolver داخلی قبل از classification اول Router اجرا می‌شود.
+- فقط مقصدهای domain unresolved را resolve می‌کند.
+- domainهایی را که بعداً از HTTP Host یا TLS SNI sniff می‌شوند دوباره resolve نمی‌کند.
+- مقصدهای IP-only بدون تغییر از resolver عبور می‌کنند.
 
 ## Target Branchها
 
@@ -343,34 +588,178 @@ targetها را وارد chain خودش می‌کند تا:
 - یک target نباید قبلاً به previous ناسازگار وصل شده باشد.
 - چند rule می‌توانند یک target مشترک داشته باشند.
 
-اگر branch شما جای دیگری در config است، می‌توانید از `Bridge` به عنوان target
-استفاده کنید.
-
-## بافر کردن Payload اول
-
-Router برای تصمیم‌گیری payload اول را buffer می‌کند. detectorها ممکن است برای
-HTTP/TLS/BitTorrent ناقص درخواست bytes بیشتر کنند.
-
-حد پنجره sniffing:
+اگر branch شما جای دیگری در config است، از `Bridge` به عنوان target استفاده کنید.
 
 ```text
-8192 bytes
+TcpListener -> Router
+               |-- target: bridge_to_special_path
+               `-- next: direct_path
 ```
 
-بعد از انتخاب مسیر، payloadهای بعدی دیگر دوباره classify نمی‌شوند.
+## جهت و Lifecycle
+
+رفتار callback:
+
+| callback | رفتار |
+| --- | --- |
+| upstream `Init` | فقط state داخلی Router را initialize می‌کند و `dest_ctx.optional_flags` را پاک می‌کند. هنوز branch initialize نمی‌کند. |
+| اولین upstream `Payload` | payload را buffer می‌کند، در صورت نیاز sniff می‌کند، ruleها را evaluate می‌کند، branch انتخابی را initialize می‌کند، byteهای buffer شده را replay می‌کند. |
+| payloadهای بعدی upstream | مستقیم به target انتخابی یا default `next` می‌روند. |
+| upstream `Pause` / `Resume` | فقط بعد از انتخاب route forward می‌شوند. |
+| upstream `Finish` | state داخلی را destroy می‌کند و target/default branch انتخابی را finish می‌کند اگر وجود داشته باشد. |
+| downstream `Payload` / `Pause` / `Resume` / `Est` | به نود قبلی برمی‌گردند. |
+| downstream `Finish` | state داخلی را destroy می‌کند سپس finish را به نود قبلی forward می‌کند. |
+
+Router عمداً `dest_ctx.optional_flags` را در upstream `Init` پاک می‌کند تا protocol bits تشخیص داده‌شده توسط یک Router به Router بعدی روی همان line نشت نکنند.
+
+## دستورالعمل‌ها
+
+### مسیریابی بر اساس domain با default fallback
+
+```json
+{
+  "name": "router",
+  "type": "Router",
+  "settings": {
+    "sniffing": [
+      "http1",
+      "tls"
+    ],
+    "rules": [
+      {
+        "destination-domain": [
+          "*.example.com",
+          "api.vendor.test"
+        ],
+        "target": "domain_path"
+      }
+    ]
+  },
+  "next": "default_path"
+}
+```
+
+### مسیریابی GeoIP
+
+```json
+{
+  "name": "router",
+  "type": "Router",
+  "settings": {
+    "geoip-db-path": "/var/lib/waterwall/GeoLite2-Country.mmdb",
+    "rules": [
+      {
+        "source-ips": [
+          "geoip:ir",
+          "10.0.0.0/8"
+        ],
+        "target": "regional_path"
+      }
+    ]
+  },
+  "next": "default_path"
+}
+```
+
+### جداسازی WebSocket Upgrade
+
+```json
+{
+  "name": "router",
+  "type": "Router",
+  "settings": {
+    "sniffing": [
+      "http1"
+    ],
+    "rules": [
+      {
+        "attributes": [
+          "http_upgrade_present"
+        ],
+        "target": "websocket_path"
+      }
+    ]
+  },
+  "next": "plain_http_path"
+}
+```
+
+### ترکیب چند شرط با AND
+
+```json
+{
+  "name": "router",
+  "type": "Router",
+  "settings": {
+    "rules": [
+      {
+        "network": "tcp",
+        "destination-port": 443,
+        "protocol": "tls",
+        "target": "tls_443_path"
+      }
+    ]
+  },
+  "next": "default_path"
+}
+```
+
+این rule فقط وقتی match می‌شود که connection TCP باشد، destination port برابر `443` باشد، و payload اول به عنوان TLS تشخیص داده شود.
+
+### مسیریابی بر اساس کاربر authenticate‌شده
+
+```json
+{
+  "name": "router",
+  "type": "Router",
+  "settings": {
+    "rules": [
+      {
+        "username": [
+          "alice",
+          "bob"
+        ],
+        "target": "premium_path"
+      },
+      {
+        "username": "guest",
+        "target": "limited_path"
+      }
+    ]
+  },
+  "next": "anonymous_path"
+}
+```
+
+Router را بعد از tunnel که authenticate می‌کند و credentials را روی line ذخیره می‌کند قرار دهید.
 
 ## اشتباه‌های رایج
 
-- ترتیب ruleها مهم است؛ اولین match برنده است. ruleهای خاص را بالاتر بگذارید.
-- rule بدون condition و فقط با `target` معتبر نیست؛ برای مسیر پیش‌فرض از
-  `next` استفاده کنید.
-- `destination-domain` روی مقصد IP-only بدون `sniffing` کار نمی‌کند.
-- `protocol` به root `sniffing` نیاز ندارد.
-- `source-port` معمولاً port local/inbound listener است، نه port تصادفی client.
-- برای protocolهای server-first، Router تا رسیدن اولین upstream payload مسیر را
-  انتخاب نمی‌کند.
+### انتظار priority-free بودن ترتیب ruleها
 
-## Metadata نود
+Ruleها همه evaluate و score نمی‌شوند. اولین rule که کامل match شود برنده است. ruleهای specificتر را بالاتر و ruleهای broad/catch-all را پایین‌تر بگذارید.
+
+### استفاده از match-all rule
+
+Rule فقط با `target` و بدون شرط نامعتبر است. برای مسیر پیش‌فرض از top-level `next` استفاده کنید. اگر یک broad rule صریح قبل از default می‌خواهید، از یک شرط واقعی مثل `"destination-domain": "*"` برای domain-only routing استفاده کنید.
+
+### انتظار کار کردن `destination-domain` روی traffic IP-only بدون sniffing
+
+برای flowهای IP-only، `dest_ctx.domain` خالی است مگر اینکه نود قبلی آن را داده باشد یا Router آن را از HTTP Host/TLS SNI sniff کرده باشد. برای این حالت root `sniffing` را فعال کنید.
+
+### انتظار اینکه `protocol` به root `sniffing` نیاز داشته باشد
+
+تشخیص `protocol` از sniffing مربوط به Host/SNI جدا است. اگر ruleای از `protocol` استفاده کند، Router detectorهای لازم برای protocol را خودش اجرا می‌کند.
+
+### اشتباه گرفتن `source-port` با port ephemeral کلاینت
+
+برای listenerهای رایج، `source-port` همان port local/inbound است که peer به آن وصل شده. از آن برای multiport listener routing استفاده کنید.
+
+### Routing برای protocolهای server-first
+
+Router بر اساس اولین upstream payload classify می‌کند. اگر server باید قبل از اینکه client چیزی بفرستد صحبت کند، Router تا رسیدن client data نمی‌تواند branch را initialize کند.
+
+## متادیتای نود
 
 | ویژگی | مقدار |
 | --- | --- |
@@ -382,4 +771,4 @@ HTTP/TLS/BitTorrent ناقص درخواست bytes بیشتر کنند.
 | `layer_group_next_node` | `kNodeLayerAnything` |
 | `required_padding_left` | `0` bytes |
 
-`Router` header جدید prepend نمی‌کند، بنابراین به left padding نیاز ندارد.
+`Router` header جدید prepend نمی‌کند و به left padding نیاز ندارد.

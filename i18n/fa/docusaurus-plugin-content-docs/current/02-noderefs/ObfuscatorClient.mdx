@@ -2,26 +2,55 @@
 sidebar_position: 500
 title: "ObfuscatorClient"
 sidebar_label: "ObfuscatorClient"
+description: "مستندات مرجع نود ObfuscatorClient."
 ---
 
 # ObfuscatorClient
 
-`ObfuscatorClient` یک transform برگشت‌پذیر روی payload اعمال می‌کند تا الگوهای واضح داخل traffic کمتر دیده شوند. این نود رمزنگاری امن نیست؛ برای امنیت واقعی از `EncryptionClient/Server` یا TLS استفاده کنید.
+`ObfuscatorClient` یک transform برگشت‌پذیر روی payload اعمال می‌کند تا الگوهای واضح داخل traffic کمتر دیده شوند. در نسخه فعلی فقط روش `xor` پشتیبانی می‌شود.
 
-در نسخه فعلی فقط روش `xor` پشتیبانی می‌شود و باید با `ObfuscatorServer` در سمت مقابل، با همان تنظیمات، جفت شود.
+این نود باید با `ObfuscatorServer` با همان method، key و header options تنظیم شود. یک لایه سبک traffic-shaping است، نه رمزنگاری. برای confidentiality یا authentication از `EncryptionClient`/`EncryptionServer` یا TLS استفاده کنید.
+
+`ObfuscatorClient` با packet-tunnel API ساخته می‌شود و per-line tunnel state ندارد. Payload bytes در-جا transform می‌شوند، مگر اینکه حالت TLS-like header نیاز به clone کردن buffer داشته باشد.
 
 ## جایگاه رایج
 
-```text
-TcpListener -> ObfuscatorClient -> TcpConnector
-TcpListener -> ObfuscatorClient -> UdpConnector
-```
-
-سمت مقابل:
+مسیر TCP ساده:
 
 ```text
-TcpListener -> ObfuscatorServer -> TcpConnector
+client side: TcpListener -> ObfuscatorClient -> TcpConnector
+server side: TcpListener -> ObfuscatorServer -> TcpConnector
 ```
+
+مسیر UDP:
+
+```text
+client side: UdpListener -> ObfuscatorClient -> UdpConnector
+server side: UdpListener -> ObfuscatorServer -> UdpConnector
+```
+
+مسیر raw packet:
+
+```text
+TunDevice -> ObfuscatorClient -> packet transport
+packet transport -> ObfuscatorServer -> RawSocket
+```
+
+از `skip: "ipv4"` یا `skip: "transport"` استفاده کنید وقتی payload یک packet خام IPv4 است و headerها باید برای routing یا injection قابل خواندن بمانند.
+
+## این نود چه می‌کند؟
+
+- نیاز دارد `settings.method: "xor"` باشد.
+- نیاز دارد `settings.xor_key` باشد.
+- XOR را روی upstream payload bytes قبل از forward کردن به `next` اعمال می‌کند.
+- به صورت اختیاری بعد از upstream XOR یک header ۵ بایتی شبیه TLS record prepend می‌کند.
+- به صورت اختیاری header ۵ بایتی شبیه TLS را قبل از downstream XOR strip می‌کند.
+- XOR را روی downstream payload bytes قبل از forward کردن به نود قبلی اعمال می‌کند.
+- می‌تواند IPv4 header، یا IPv4 به اضافه TCP/UDP header را بدون obfuscation رها کند.
+- payload های packet-line را برای recalculation checksum بعد از تغییر bytes علامت می‌زند.
+- payload ها را buffer نمی‌کند و per-line state نگه نمی‌دارد.
+
+چون XOR symmetric است، اعمال دوباره همان transform با همان key، payload اصلی را بازیابی می‌کند.
 
 ## نمونه تنظیم
 
@@ -39,41 +68,127 @@ TcpListener -> ObfuscatorServer -> TcpConnector
 }
 ```
 
-## تنظیمات
+server متناظر:
 
-| گزینه | اجباری | توضیح |
-|---|---|---|
-| `method` | بله | فعلا فقط `xor` |
-| `xor_key` | بله، وقتی `method=xor` | کلید یک‌بایتی XOR. مقدارهای بیرون `0..255` عملا به یک بایت تبدیل می‌شوند. |
-| `skip` | خیر | بخش ابتدایی packet که clear باقی می‌ماند: `none`، `ipv4` یا `transport` |
-| `tls_record_header` | خیر | اگر `true` باشد سمت transport یک header پنج‌بایتی شبیه TLS application-data اضافه/حذف می‌شود |
+```json
+{
+  "name": "obfuscator-server",
+  "type": "ObfuscatorServer",
+  "settings": {
+    "method": "xor",
+    "xor_key": 90,
+    "skip": "transport",
+    "tls_record_header": true
+  },
+  "next": "service-node"
+}
+```
 
-## skip چه می‌کند؟
+## فیلدهای اجباری
 
-`skip` مشخص می‌کند قبل از اجرای XOR چه مقدار از ابتدای payload دست‌نخورده بماند:
+فیلدهای top-level:
 
-- `none`: کل payload XOR می‌شود.
-- `ipv4`: اگر payload یک IPv4 packet معتبر باشد، فقط IPv4 header clear می‌ماند.
-- `transport`: اگر payload یک IPv4 TCP/UDP packet معتبر باشد، IPv4 header و TCP/UDP header clear می‌مانند.
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `name` | string | نام یکتای نود داخل config. |
+| `type` | string | باید دقیقاً `"ObfuscatorClient"` باشد. |
+| `settings` | object | اجباری. باید `method` و `xor_key` داشته باشد. |
+| `next` | string | اجباری در استفاده معمولی. نود بعدی upstream payloadهای obfuscated را دریافت می‌کند. |
 
-اگر `skip` فعال باشد ولی payload قابل parse به شکل مورد انتظار نباشد، نود fallback می‌کند و کل payload را XOR می‌کند.
+فیلدهای اجباری داخل `settings`:
 
-## tls_record_header
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `method` | string | باید `"xor"` باشد در پیاده‌سازی فعلی. |
+| `xor_key` | integer | کلید XOR. مقدار به یک بایت ذخیره می‌شود، پس مقادیر خارج از `0..255` به `uint8_t` تبدیل می‌شوند. |
 
-وقتی `tls_record_header` فعال باشد:
+## تنظیمات اختیاری
 
-- در مسیر transport-facing، بعد از XOR یک header پنج‌بایتی اضافه می‌شود.
-- در مسیر برگشت، همان header validate و حذف می‌شود، سپس XOR انجام می‌شود.
-- header شبیه TLS application-data است: `17 03 03` و بعد طول payload به صورت big-endian.
+| گزینه | نوع | پیش‌فرض | توضیح |
+| --- | --- | --- | --- |
+| `skip` | string | `"none"` | header های ابتدایی packet که قبل از XOR clear می‌مانند. مقادیر: `"none"`، `"ipv4"` و `"transport"`. |
+| `tls_record_header` | boolean | `false` | یک header ۵ بایتی شبیه TLS application-data روی payload سمت transport اضافه/حذف می‌کند. |
+| `tls_header` | boolean | تنظیم نشده | alias deprecated برای `tls_record_header`. پذیرفته می‌شود ولی warning log می‌کند. |
 
-این TLS واقعی نیست، handshake ندارد و امنیت رمزنگاری ایجاد نمی‌کند. فقط شکل recordهای post-handshake TLS را تقلید می‌کند.
+## حالت‌های Skip
+
+`skip` کنترل می‌کند چه مقدار از ابتدای payload XOR نشود:
+
+| مقدار | رفتار |
+| --- | --- |
+| `"none"` | کل payload XOR می‌شود. |
+| `"ipv4"` | اگر payload یک IPv4 packet معتبر باشد، IPv4 header clear می‌ماند و bytes بعد از آن XOR می‌شوند. |
+| `"transport"` | اگر payload یک IPv4 TCP/UDP packet معتبر باشد، IPv4 header و TCP/UDP header clear می‌مانند. برای سایر protocolهای IPv4، فقط IPv4 header clear می‌ماند. |
+
+اگر payload خیلی کوتاه باشد یا IPv4 packet معتبر نباشد، skip length به `0` تبدیل می‌شود و کل payload XOR می‌شود.
+
+برای TCP/UDP header های malformed یا incomplete زیر `skip: "transport"`، نود fallback می‌کند و فقط IPv4 header را clear می‌گذارد.
+
+## Header شبیه TLS
+
+وقتی `tls_record_header` فعال باشد، upstream payload های سمت transport این‌طور ارسال می‌شوند:
+
+```text
+17 03 03 + length(2 bytes, big-endian) + obfuscated payload
+```
+
+این bytes یک TLS application-data record header را تقلید می‌کنند:
+
+| فیلد | مقدار |
+| --- | --- |
+| content type | `23` / `0x17` |
+| legacy version | `0x0303` |
+| length | طول payload obfuscated شده، ۱۶ بیتی big-endian |
+
+در مسیر دریافت downstream، header validate و strip می‌شود و سپس XOR اجرا می‌شود.
 
 :::warning
-برخلاف نسخه‌های قدیمی docs، این نود همیشه بدون تغییر سایز نیست. اگر `tls_record_header=true` باشد، سمت transport برای هر payload پنج بایت header اضافه می‌کند و در برگشت حذف می‌کند. payload بزرگ‌تر از `65535` بایت در این mode قابل قرار گرفتن در یک record نیست و drop می‌شود.
+این TLS نیست. handshake، certificate، SNI، ALPN، رمزنگاری و authentication ندارد. فقط شکل یک TLS application-data record post-handshake را تقلید می‌کند.
 :::
 
-## نکته‌ها
+محدودیت‌های مهم:
 
-- `ObfuscatorClient` و `ObfuscatorServer` باید `method` و `xor_key` یکسان داشته باشند.
-- XOR برای مخفی‌سازی سبک است، نه امنیت cryptographic.
-- helper XOR در سورس با مسیرهای AVX2 و chunked بهینه شده است؛ این فقط روی سرعت اثر دارد، نه رفتار قابل مشاهده.
+- payloadهای بزرگ‌تر از `65535` بایت هنگام wrap شدن drop می‌شوند
+- headerهای truncated هنگام strip شدن drop می‌شوند
+- recordهایی که طول اعلام‌شده‌شان دقیقاً با طول payload buffer فعلی مطابقت ندارند drop می‌شوند
+- reassembly buffer record وجود ندارد، پس payload callback های سمت receive باید دقیقاً یک TLS-like record کامل داشته باشند
+
+## رفتار جهت‌ها
+
+| callback ورودی | رفتار |
+| --- | --- |
+| upstream `Payload` | بر اساس `skip` XOR می‌کند، به صورت اختیاری header شبیه TLS را prepend می‌کند، recalculation checksum packet-line را علامت می‌زند و به `next` forward می‌کند. |
+| downstream `Payload` | به صورت اختیاری header شبیه TLS را validate و strip می‌کند، بر اساس `skip` XOR می‌کند، recalculation checksum packet-line را علامت می‌زند و به نود قبلی forward می‌کند. |
+| downstream `Init` | به نود قبلی forward می‌شود. |
+| سایر lifecycle callbackها | از رفتار default packet-tunnel استفاده می‌کند. |
+
+## Buffer و Padding
+
+متادیتای نود:
+
+```text
+required_padding_left = 5
+layer_group = kNodeLayerAnything
+```
+
+۵ بایت برای header اختیاری شبیه TLS است. اگر buffer هنگام فعال بودن `tls_record_header` padding چپ کافی نداشته باشد، نود payload را داخل buffer جدیدی با padding کافی clone می‌کند، buffer اصلی را recycle می‌کند و سپس header را prepend می‌کند.
+
+وقتی line فعلی worker packet line باشد، نود بعد از transform کردن payload bytes مقدار `recalculate_checksum = true` را تنظیم می‌کند.
+
+## نکته‌های Implementation
+
+XOR helper مسیرهای بهینه دارد:
+
+- AVX2 وقتی در دسترس باشد
+- aligned 64-bit chunk processing روی buildهای ۶۴ بیتی
+- aligned 32-bit یا byte-wise fallback در غیر این صورت
+
+این مسیرها فقط روی performance تأثیر دارند؛ رفتار قابل مشاهده همچنان byte-wise XOR با کلید یک بایتی تنظیم‌شده است.
+
+## نکته‌های عملی
+
+- `ObfuscatorClient` و `ObfuscatorServer` باید `method`، `xor_key`، `skip` و `tls_record_header` یکسان داشته باشند.
+- این obfuscation است، نه امنیت cryptographic.
+- `skip: "none"` برای byte streamهای معمولی ساده‌ترین حالت است.
+- `skip: "transport"` برای packetهای خام IPv4 TCP/UDP که IP و transport headerهایشان باید قابل خواندن بمانند مفید است.
+- اگر header packet خام را obfuscate کنید، packet output downstream ممکن است دیگر routable نباشد حتی اگر WaterWall checksumها را برای recalculation علامت بزند.

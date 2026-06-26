@@ -2,30 +2,46 @@
 sidebar_position: 300
 title: "EncryptionClient"
 sidebar_label: "EncryptionClient"
+description: "مستندات مرجع نود EncryptionClient."
 ---
 
 # EncryptionClient
 
-`EncryptionClient` سمت client برای `EncryptionServer` است. این نود payloadهای
-upstream را با AEAD رمز می‌کند و آن‌ها را داخل recordهای شبیه TLS application
-data می‌فرستد. در مسیر downstream، recordهای رمز شده را decrypt می‌کند و payload
-خام را به نود قبلی برمی‌گرداند.
+`EncryptionClient` سمت client برای `EncryptionServer` است. این نود payloadهای upstream را با AEAD رمز می‌کند و آن‌ها را داخل recordهای شبیه TLS application data می‌فرستد. در مسیر downstream، recordهای رمز شده را decrypt می‌کند و payload خام را به نود قبلی برمی‌گرداند.
 
 :::warning
-این نود `TlsClient` نیست. TLS handshake انجام نمی‌دهد، certificate را verify
-نمی‌کند و SNI/ALPN ندارد. فقط از شکل record شبیه TLS برای framing payload
-رمزشده استفاده می‌کند.
+این نود `TlsClient` نیست. TLS handshake انجام نمی‌دهد، certificate را verify نمی‌کند و SNI/ALPN ندارد. فقط از شکل record شبیه TLS برای framing payload رمزشده استفاده می‌کند.
 :::
 
 ## جایگاه رایج
+
+جفت مستقیم داخل یک process:
+
+```text
+TesterClient -> EncryptionClient -> EncryptionServer -> TesterServer
+```
+
+تونل TCP دو سروری:
 
 ```text
 client side: TcpListener -> EncryptionClient -> TcpConnector
 server side: TcpListener -> EncryptionServer -> TcpConnector
 ```
 
-تنظیمات دو سمت باید با هم سازگار باشند و تونل‌های بین دو سمت باید byteهای record
-رمزشده را بدون تغییر عبور دهند.
+تنظیمات دو سمت باید با هم سازگار باشند و تونل‌های بین دو سمت باید byteهای record رمزشده را بدون تغییر عبور دهند.
+
+## این نود چه می‌کند؟
+
+- یک کلید ۳۲ بایتی AEAD از `password`، `salt` و `kdf-iterations` derive می‌کند.
+- payloadهای upstream را encrypt می‌کند.
+- plaintext upstream بزرگ‌تر از `max-frame-size` را به چند record تقسیم می‌کند.
+- هر chunk encrypt شده را داخل یک record شبیه TLS application-data می‌پیچد.
+- bytesهای downstream رمزشده را تا رسیدن recordهای کامل buffer می‌کند.
+- قبل از decrypt، headers record و طول‌های body را validate می‌کند.
+- recordهای downstream را decrypt می‌کند و plaintext بازیابی‌شده را به نود قبلی می‌فرستد.
+- در صورت record نامعتبر، read-buffer overflow یا شکست AEAD authentication، هر دو جهت را می‌بندد.
+
+`EncryptionClient` یک middle stream tunnel است. socket نمی‌سازد و packet line نمی‌سازد.
 
 ## نمونه تنظیم
 
@@ -44,15 +60,39 @@ server side: TcpListener -> EncryptionServer -> TcpConnector
 }
 ```
 
+تنظیمات متناظر سمت server:
+
+```json
+{
+  "name": "enc-server",
+  "type": "EncryptionServer",
+  "settings": {
+    "algorithm": "chacha20-poly1305",
+    "password": "replace-with-a-strong-secret",
+    "salt": "chain-a",
+    "kdf-iterations": 20000,
+    "max-frame-size": 16356
+  },
+  "next": "service"
+}
+```
+
 ## فیلدهای لازم
+
+فیلدهای top-level:
 
 | فیلد | نوع | توضیح |
 | --- | --- | --- |
-| `name` | string | نام node در config. |
-| `type` | string | باید `"EncryptionClient"` باشد. |
-| `next` | string | نود بعدی که recordهای رمز شده را دریافت می‌کند. |
+| `name` | string | نام node در config. باید یکتا باشد. |
+| `type` | string | باید دقیقاً `"EncryptionClient"` باشد. |
+| `next` | string | اجباری. نود بعدی که recordهای رمز شده را دریافت می‌کند. |
 | `settings` | object | اجباری است و باید حداقل `password` داشته باشد. |
-| `settings.password` | non-empty string | secret مشترک برای ساخت کلید AEAD. |
+
+فیلدهای لازم داخل `settings`:
+
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `password` | non-empty string | secret مشترک برای ساخت کلید AEAD. باید با سمت server یکسان باشد. |
 
 این نود باید هم نود قبلی داشته باشد و هم `next`. chain head یا chain end نیست.
 
@@ -61,7 +101,7 @@ server side: TcpListener -> EncryptionServer -> TcpConnector
 | گزینه | نوع | پیش‌فرض | توضیح |
 | --- | --- | --- | --- |
 | `algorithm` | string یا numeric enum | `chacha20-poly1305` | الگوریتم AEAD. اگر `algorithm` نباشد، `method` هم به عنوان alias پذیرفته می‌شود. |
-| `salt` | string | `waterwall-encryption` | ورودی salt برای key derivation. |
+| `salt` | string | `waterwall-encryption` | ورودی salt برای key derivation. باید با سمت server یکسان باشد. |
 | `kdf-iterations` | integer | `12000` | تعداد دورهای KDF. بازه معتبر `1` تا `1000000` است. |
 | `max-frame-size` | integer | `16356` | حداکثر plaintext هر record. بازه معتبر `1` تا `16356` است. |
 
@@ -72,8 +112,19 @@ server side: TcpListener -> EncryptionServer -> TcpConnector
 | ChaCha20-Poly1305 | `chacha20-poly1305`, `chacha20poly1305`, `chacha20`, `chacha` |
 | AES-256-GCM | `aes-gcm`, `aes256gcm`, `aes-256-gcm`, `aes256-gcm` |
 
-اگر AES-GCM انتخاب شود ولی backend فعال crypto آن را پشتیبانی نکند، startup شکست
-می‌خورد.
+اگر AES-GCM انتخاب شود ولی backend فعال crypto آن را پشتیبانی نکند، startup شکست می‌خورد.
+
+## Key Derivation
+
+هر دو peer همان کلید ۳۲ بایتی را از این موارد derive می‌کنند:
+
+- `password`
+- `salt`
+- `kdf-iterations`
+
+پیاده‌سازی از یک حلقه derivation مبتنی بر BLAKE2s خاص WaterWall استفاده می‌کند، نه PBKDF2 یا Argon2. کلید derive شده در tunnel state نگه‌داری می‌شود و هنگام destroy شدن tunnel instance صفر می‌شود.
+
+برای کار کردن مسیر رمزشده، هر دو سمت باید `password`، `salt`، `kdf-iterations` یکسان و `algorithm` سازگار داشته باشند.
 
 ## فرمت record
 
@@ -85,14 +136,13 @@ server side: TcpListener -> EncryptionServer -> TcpConnector
 
 | بخش | مقدار |
 | --- | --- |
-| record type | `0x17` |
+| record type | `0x17` application data |
 | version | `0x0303` |
-| body length | طول `nonce + ciphertext + tag` به صورت big-endian |
+| body length | طول `nonce + ciphertext + tag` به صورت big-endian ۱۶ بیتی |
 
-هدر ۵ بایتی به عنوان AEAD associated data استفاده می‌شود. الگوریتم داخل record
-نوشته نمی‌شود و باید در دو سمت config یکسان باشد.
+هدر ۵ بایتی به عنوان AEAD associated data authenticate می‌شود. الگوریتم داخل record نوشته نمی‌شود و باید در دو سمت config یکسان باشد.
 
-## محدودیت‌ها
+## محدودیت‌ها و Padding
 
 | مقدار | اندازه |
 | --- | --- |
@@ -103,8 +153,9 @@ server side: TcpListener -> EncryptionServer -> TcpConnector
 | حداکثر plaintext هر record | `16356 bytes` |
 | `required_padding_left` | `17 bytes` |
 
-اگر upstream payload از `max-frame-size` بزرگ‌تر باشد، client آن را به چند record
-تقسیم می‌کند. payload با طول صفر recycle می‌شود و forward نمی‌شود.
+`required_padding_left` برابر `17` است، به اندازه کافی برای header ۵ بایتی و nonce ۱۲ بایتی که قبل از encrypt کردن prepend می‌شوند.
+
+اگر upstream payload از `max-frame-size` بزرگ‌تر باشد، client آن را به چند record تقسیم می‌کند. payload با طول صفر recycle می‌شود و forward نمی‌شود.
 
 ## رفتار جهت‌ها
 
@@ -113,13 +164,29 @@ server side: TcpListener -> EncryptionServer -> TcpConnector
 | upstream payload | encrypt و frame می‌شود و به `next` می‌رود. |
 | downstream payload | buffer، parse و decrypt می‌شود و plaintext به `prev` می‌رود. |
 
-اگر record نامعتبر باشد، طول body معتبر نباشد، decrypt شکست بخورد یا read buffer
-بیش از حدود دو record کامل شود، line بسته می‌شود.
+frameهای کامل downstream ممکن است split‌شده در چند payload callback برسند یا چند frame در یک callback برسند. read stream byteهای buffer شده را تا زمان parse کردن recordهای کامل نگه می‌دارد.
+
+اگر داده رمزشده buffer شده از حدود دو record کامل بیشتر شود، line بسته می‌شود.
+
+## رفتار Lifecycle
+
+در upstream `Init`، client per-line read stream خود را initialize می‌کند و upstream `Init` را به `next` forward می‌کند.
+
+در upstream `Finish`، state محلی line را destroy می‌کند و upstream `Finish` را به `next` forward می‌کند. در downstream `Finish`، state محلی line را destroy می‌کند و downstream `Finish` را به `prev` forward می‌کند.
+
+pause و resume به صورت جهت‌دار forward می‌شوند:
+
+| callback | forward می‌شود به |
+| --- | --- |
+| upstream pause/resume | next tunnel upstream |
+| downstream pause/resume | previous tunnel downstream |
+
+upstream `Est` و downstream `Init` برای این نود غیرفعال هستند.
 
 ## نکته‌ها
 
 - باید با `EncryptionServer` استفاده شود.
-- `password`، `salt`، `kdf-iterations`، `algorithm` و معمولاً `max-frame-size`
-  دو سمت باید سازگار باشند.
-- برای TLS واقعی از `TlsClient` و `TlsServer` استفاده کنید.
-- upstream `Est` و downstream `Init` برای این نود غیرفعال هستند.
+- این نود payload bytes را محافظت می‌کند، اما پنهان نمی‌کند که داده داخل فرمت record شبیه TLS WaterWall در جریان است.
+- `password` باید طولانی، تصادفی و خارج از configهای عمومی باشد.
+- `max-frame-size` معمولاً باید در هر دو سمت یکسان باشد. receiver recordهایی بزرگ‌تر از حد تنظیم‌شده خودش را رد می‌کند.
+- از `TlsClient`/`TlsServer` وقتی به semantics واقعی TLS نیاز دارید استفاده کنید.

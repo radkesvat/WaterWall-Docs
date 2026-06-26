@@ -2,17 +2,33 @@
 sidebar_position: 1050
 title: "PacketSplitStream"
 sidebar_label: "PacketSplitStream"
+description: "مستندات مرجع نود PacketSplitStream."
 ---
 
 # PacketSplitStream
 
-`PacketSplitStream` یک packet-line anchored bridge است. این نود یک worker packet line را به دو line پایدار stream-facing تقسیم می‌کند: یک خط `up` برای ارسال packetها به شاخه upload و یک خط `down` برای دریافت payload برگشتی از شاخه download.
+`PacketSplitStream` یک split bridge متکی به packet-line است. وقتی یک packet-side line نیاز دارد به دو ورودی شاخه نام‌دار داشته باشد استفاده می‌شود:
 
-## کاربرد
+- `up`: شاخه‌ای که upstream payload packetها را دریافت می‌کند
+- `down`: شاخه‌ای که به عنوان سمت برگشت/download initialize می‌شود
 
-- ساخت chainهای ترکیبی packet/stream.
-- جدا کردن مسیر data stream از مسیر packet در سناریوهای خاص.
-- اتصال به نودهایی که یک سمت آن‌ها packet-line و سمت دیگر normal line است.
+این نود یک router عمومی نیست و خودش packetها را به stream frame نمی‌کند. یک branch-composition helper برای layoutهای خاص packet/stream است.
+
+:::info
+`PacketSplitStream` با `HalfDuplexClient` فرق دارد. این نود pairing handshake انجام نمی‌دهد، connection paired را بازسازی نمی‌کند، و یک lifecycle عادی per-connection پیرامون packet line نمی‌سازد.
+:::
+
+## جایگاه رایج
+
+chain قابل مشاهده به `PacketSplitStream` اشاره می‌کند، در حالی که شاخه‌های split در `settings` نام برده می‌شوند:
+
+```text
+packet-side-node -> PacketSplitStream
+                    settings.up   -> upload-branch-head
+                    settings.down -> download-branch-head
+```
+
+`PacketSplitStream` عمداً از فیلد `next` سطح بالا استفاده نمی‌کند.
 
 ## نمونه تنظیم
 
@@ -27,17 +43,91 @@ sidebar_label: "PacketSplitStream"
 }
 ```
 
-## تنظیمات
+نودهای شاخه referenced باید در جای دیگری در همان تنظیمات WaterWall تعریف شده باشند.
 
-| گزینه | اجباری | توضیح |
-|---|---|---|
-| `up` | بله | نام نودی که به عنوان entry سمت upload استفاده می‌شود |
-| `down` | بله | نام نودی که شاخه download از آن chain می‌شود |
+## مدل جریان
 
-`next` در سطح بالای این نود عمدا استفاده نمی‌شود؛ مسیرها از `settings.up` و `settings.down` گرفته می‌شوند.
+```mermaid
+flowchart LR
+    P[tunnel packet-side قبلی] --> S[PacketSplitStream]
+    S -- upstream Init --> U[شاخه up]
+    S -- upstream Init --> D[شاخه down]
+    S -- upstream Payload --> U
+    D -- downstream Payload --> S
+    S -- downstream Payload --> P
+```
 
-## نکته‌ها
+رفتار پیاده‌سازی فعلی:
 
-- برخلاف `HalfDuplexClient`، این نود pairing handshake ندارد.
-- اگر فقط می‌خواهید packetها را روی stream طول‌گذاری کنید، معمولا `PacketsToStream` و `StreamToPackets` انتخاب واضح‌تری هستند.
-- packet line بین packetهای مختلف worker مشترک است؛ این نود را مثل یک اتصال TCP معمولی نبینید.
+| callback دریافت‌شده توسط `PacketSplitStream` | رفتار |
+| --- | --- |
+| upstream `Init` | upstream `Init` را روی هر دو ورودی شاخه `up` و `down` صدا می‌زند. |
+| upstream `Payload` | payload را به شاخه `up` می‌فرستد. |
+| downstream `Payload` | payload را به tunnel قبلی برمی‌گرداند. |
+| upstream `Est`، `Pause`، `Resume` | No-op. |
+| downstream `Init`، `Est`، `Pause`، `Resume` | No-op. |
+| upstream یا downstream `Finish` | به عنوان غیرمنتظره در نظر گرفته می‌شود و برنامه را terminate می‌کند. |
+
+چون `Finish` یک مسیر runtime پشتیبانی‌شده نیست، از این نود با flowهای سبک packet-line استفاده کنید که worker packet line در طول عمر chain زنده می‌ماند.
+
+## فیلدهای ضروری
+
+فیلدهای سطح بالا:
+
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `name` | string | نام دلخواه نود. باید داخل فایل config یکتا باشد. |
+| `type` | string | باید دقیقاً `"PacketSplitStream"` باشد. |
+| `settings` | object | اجباری. شامل ورودی‌های شاخه split نام‌دار است. |
+
+فیلدهای اجباری `settings`:
+
+| گزینه | نوع | توضیح |
+| --- | --- | --- |
+| `up` | string | نام نودی که به عنوان tunnel ورودی upstream برای packetهای ارسالی استفاده می‌شود. |
+| `down` | string | نام نودی که به عنوان شاخه downstream/return عادی chain می‌شود. |
+
+## قوانین اعتبارسنجی
+
+سورس فعلی این قوانین را اعمال می‌کند:
+
+- `next` سطح بالا نباید تنظیم شود
+- `settings.up` لازم است
+- `settings.down` لازم است
+- هر دو نود referenced باید وجود داشته باشند
+- `up` و `down` باید به نودهای متفاوت اشاره کنند
+- هیچ‌کدام از شاخه‌ها نباید به نود `PacketSplitStream` خودش اشاره کنند
+- ورودی‌های شاخه referenced نباید از قبل به tunnel قبلی دیگری bound باشند
+
+در طول ساخت chain، WaterWall ورودی شاخه واقعی را بعد از اینکه هر نود referenced خودش را chain کرد resolve می‌کند. این برای نودهایی که tunnel داخلی در جلوی خودشان insert می‌کنند اهمیت دارد.
+
+## متادیتای نود
+
+| ویژگی | مقدار |
+| --- | --- |
+| node flag | `kNodeFlagChainEnd` |
+| `can_have_prev` | `true` |
+| `can_have_next` | `false` |
+| `layer_group` | `kNodeLayerAnything` |
+| `layer_group_prev_node` | `kNodeLayerAnything` |
+| `layer_group_next_node` | `kNodeLayerAnything` |
+| `required_padding_left` | `0` |
+
+`PacketSplitStream` payload bufferها را prepend، rewrite یا مصرف نمی‌کند. روی payload callbackها، buffer موجود را به مسیر callback بعدی انتخاب‌شده منتقل می‌کند.
+
+## نکات packet-line
+
+این نود حول رفتار packet-line WaterWall طراحی شده است. یک worker packet line بین packetها روی آن worker مشترک است و همان چیزی که یک TCP-style connection line عادی است نیست.
+
+نتایج عملی:
+
+- از این نود به گونه‌ای استفاده نکنید که گویا مالک lineهای per-connection عادی است.
+- از آن رفتار close یا reconnect per-flow انتظار نداشته باشید.
+- آن را در مسیری که propagation `Finish` عادی انتظار می‌رود قرار ندهید.
+- وقتی هدف simple packet-to-stream length framing است از `PacketsToStream` / `StreamToPackets` استفاده کنید.
+
+## چه وقت از آن استفاده کنید
+
+وقتی یک pipeline packet-side باید یک شاخه upload تغذیه کند در حالی که همزمان یک شاخه جداگانه آماده می‌کند که payload downstream آن به packet side برمی‌گردد از `PacketSplitStream` استفاده کنید.
+
+وقتی نیاز دارید policy routing، multi-branch selection بر اساس قانون، یا مدیریت connection lifecycle عادی داشته باشید از آن دوری کنید. برای آن موارد، از یک نود router-style یا یکی از tunnelهای packet/stream boundary که مستقیماً با flow مورد نظر match می‌کند استفاده کنید.

@@ -1,0 +1,184 @@
+---
+sidebar_position: 1041
+title: "PacketReceiver"
+sidebar_label: "PacketReceiver"
+description: "مستندات مرجع نود PacketReceiver."
+---
+
+# PacketReceiver
+
+`PacketReceiver` یک endpoint packet counter برای IPv4 است. این نود packetهای خام IPv4 را مصرف می‌کند، آن‌ها را بر اساس source IP گروه‌بندی می‌کند، هر source را با تعداد packet مورد انتظار per-IP مقایسه می‌کند و یک report file می‌نویسد.
+
+وقتی با `PacketSender` جفت شود، برای پیدا کردن source IPهای خوب، reachable یا whitelisted در محیط‌های IP-restricted مفید است. `PacketSender` از source rangeهای candidate ترافیک تولید می‌کند؛ `PacketReceiver` نشان می‌دهد کدام source IPها واقعاً رسیده‌اند.
+
+## جایگاه رایج
+
+دریافت packetهای raw IPv4 از capture/output node:
+
+```text
+RawSocket -> PacketReceiver
+```
+
+دریافت packet از tunnel path:
+
+```text
+UdpStatelessSocket -> WireGuardDevice -> PacketReceiver
+```
+
+`PacketReceiver` می‌تواند packetها را از callbackهای upstream یا downstream مصرف کند. بنابراین می‌تواند انتهای یک packet chain باشد، یا ابتدای chainی باشد که packetها از peer سمت next آن وارد می‌شوند.
+
+## چه کاری انجام می‌دهد
+
+- یک CIDR range از نوع IPv4 یا آرایه‌ای از CIDR rangeهای IPv4 را track می‌کند.
+- برای هر source IP تحت track یک counter اختصاص می‌دهد.
+- packetهایی را می‌شمارد که IPv4 source address آن‌ها داخل rangeهای track شده باشد.
+- packetهای خارج از rangeهای تنظیم‌شده را unexpected حساب می‌کند.
+- هر packet buffer مصرف‌شده را recycle می‌کند.
+- بعد از `report-after-ms` یک report می‌نویسد.
+- اگر report قبلاً نوشته نشده باشد، هنگام destroy یک report نهایی می‌نویسد.
+- برای completion به packet-line `Finish` وابسته نیست.
+
+فقط IPv4 source address برای matching استفاده می‌شود. Protocol، port، destination address و payload در counterهای per-IP دخیل نیستند.
+
+## تست Source-IP Allowlist
+
+برای محیط‌های IP-restricted یا allowlisted:
+
+1. `PacketSender.source-ip4-range` را با source IP rangeهای candidate تنظیم کنید.
+2. `PacketReceiver.source-ip4-range` را با همان rangeها تنظیم کنید.
+3. `expected-packets-per-ip` را برابر count مورد انتظار از sender بگذارید.
+4. تست را اجرا کنید و منتظر report گیرنده بمانید.
+5. دنبال source IPهایی بگردید که loss کم یا delivery کامل دارند.
+
+بهترین candidateها source IPهایی هستند که مقدار `received` آن‌ها نزدیک `expected` است و `loss-percent` پایینی دارند.
+
+## نمونه تنظیم
+
+```json
+{
+  "name": "packet-receiver",
+  "type": "PacketReceiver",
+  "settings": {
+    "source-ip4-range": [
+      "198.51.100.0/24",
+      "203.0.113.0/24"
+    ],
+    "expected-packets-per-ip": 100,
+    "report-after-ms": 7000,
+    "output-file": "packet-receiver-report.txt"
+  }
+}
+```
+
+برای `PacketSender` متناظر با `protocol-number: "ALL"` و `packets-per-ip: 100` از این مقدار استفاده کنید:
+
+```json
+{
+  "expected-packets-per-ip": 25500
+}
+```
+
+چون `ALL` برای هر source IP مقدار `100 * 255` packet می‌فرستد.
+
+## فیلدهای ضروری
+
+فیلدهای سطح بالا:
+
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `name` | string | نام دلخواه نود. باید داخل فایل config یکتا باشد. |
+| `type` | string | باید دقیقاً `"PacketReceiver"` باشد. |
+| `settings` | object | لازم است و نباید خالی باشد. |
+
+فیلدهای ضروری داخل `settings`:
+
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `source-ip4-range` | string یا آرایه string | یک CIDR range از نوع IPv4، یا آرایه‌ای از CIDR rangeهای IPv4 برای track کردن. |
+
+این نود باید یا tunnel قبلی داشته باشد یا tunnel بعدی، تا packetها بتوانند به آن برسند.
+
+## تنظیمات اختیاری
+
+| گزینه | نوع | پیش‌فرض | توضیح |
+| --- | --- | --- | --- |
+| `expected-packets-per-ip` | integer | `1` | تعداد packet مثبت مورد انتظار برای هر source IP تحت track. |
+| `report-after-ms` | integer | `1000` | delay مثبت قبل از نوشتن report و terminate کردن برنامه. این مقدار را بیشتر از duration سمت sender به علاوه delay احتمالی tunnel تنظیم کنید. |
+| `output-file` | string | `packet-receiver-report.txt` | path غیرخالی برای report file. |
+
+## جفت شدن با PacketSender
+
+از این countهای مورد انتظار استفاده کنید:
+
+| Sender mode | Receiver `expected-packets-per-ip` |
+| --- | --- |
+| `TCP` | sender `packets-per-ip` |
+| `UDP` | sender `packets-per-ip` |
+| `ICMP` | sender `packets-per-ip` |
+| `ALL` | sender `packets-per-ip * 255` |
+
+`report-after-ms` معمولاً باید بیشتر از این مقدار باشد:
+
+```text
+PacketSender duration-ms + network delay + reordering/jitter window
+```
+
+اگر report خیلی زود نوشته شود، packetهای دیررس lost حساب می‌شوند، چون `PacketReceiver` بعد از marked-written شدن report دیگر countها را update نمی‌کند.
+
+## فرمت Report
+
+Report فقط در `output-file` نوشته می‌شود. ابتدا summary fields را می‌نویسد:
+
+```text
+PacketReceiver report
+output-file: packet-receiver-report.txt
+source-ip-count: ...
+expected-packets-per-ip: ...
+expected-total-packets: ...
+received-total-packets: ...
+lost-total-packets: ...
+unexpected-packets: ...
+```
+
+سپس برای هر source IP تحت track یک row می‌نویسد:
+
+```text
+source-ip | expected | received | lost | loss-percent | histogram
+198.51.100.1 | 100 | 100 | 0 | 0.00% | [################################]
+198.51.100.2 | 100 | 50 | 50 | 50.00% | [################----------------]
+```
+
+Histogram عرض 32 character دارد. `#` سهم received و `-` سهم missing را نسبت به expected count نشان می‌دهد.
+
+`unexpected-packets` شامل packetهایی است که IPv4 بودند اما source IP آن‌ها داخل هیچ source range تنظیم‌شده‌ای نبود، به علاوه packetهای non-IPv4 یا too-short که توسط این نود مصرف شده‌اند.
+
+## رفتار Direction
+
+| callback ورودی | رفتار |
+| --- | --- |
+| upstream `Payload` | packet را count/recycle می‌کند. |
+| downstream `Payload` | packet را count/recycle می‌کند. |
+| `Init`, `Est`, `Pause`, `Resume`, `Finish` | no-op. completion بر اساس timer/report است، نه lifecycle line. |
+
+`PacketReceiver` با packet-tunnel API خود WaterWall ساخته می‌شود و line state مخصوص tunnel ندارد.
+
+## نکته‌های Buffer و Padding
+
+Node metadata این مقدارها را advertise می‌کند:
+
+```text
+required_padding_left = 0
+layer_group = kNodeLayerAnything
+layer_group_next_node = kNodeLayer3
+layer_group_prev_node = kNodeLayer3
+```
+
+این نود payloadها را prepend، frame، rewrite یا forward نمی‌کند. بعد از شمارش، packet bufferها را consume و recycle می‌کند.
+
+## نکته‌های عملی
+
+- روی `PacketSender` و `PacketReceiver` از source rangeهای یکسان استفاده کنید.
+- rangeها را آن‌قدر کوچک نگه دارید که یک counter برای هر source IP منطقی باشد.
+- برای مسیرهای high-latency، high-jitter یا multi-hop tunnel مقدار `report-after-ms` طولانی‌تری استفاده کنید.
+- در محیط‌های source-IP restricted، source IPهایی که loss کمی دارند candidateهای likely usable یا whitelisted هستند.
+- این نود برای packet test و report است، نه forwarding ترافیک application.

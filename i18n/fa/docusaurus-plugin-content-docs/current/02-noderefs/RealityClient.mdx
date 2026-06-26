@@ -2,6 +2,7 @@
 sidebar_position: 1660
 title: "RealityClient"
 sidebar_label: "RealityClient"
+description: "مستندات مرجع نود RealityClient."
 ---
 
 # RealityClient
@@ -34,15 +35,29 @@ TcpListener -> RealityClient -> TcpConnector
 }
 ```
 
+با transport TCP معمولی:
+
+```json
+{
+  "name": "server-tcp",
+  "type": "TcpConnector",
+  "settings": {
+    "address": "203.0.113.10",
+    "port": 443
+  }
+}
+```
+
 ## فیلدهای اجباری
 
 | فیلد | نوع | توضیح |
 |---|---|---|
+| `name` | string | نام دلخواه نود. باید داخل config یکتا باشد. |
 | `type` | string | باید `RealityClient` باشد. |
 | `next` | string | نودی که stream مربوط به TLS و Reality recordها را به سمت server حمل می‌کند. |
 | `settings` | object | باید object غیرخالی باشد. |
 | `settings.sni` | string | برای `TlsClient` داخلی لازم است و visitor TLS server name است. |
-| `settings.password` | string | secret مشترک Reality. باید با server یکی باشد. |
+| `settings.password` | string | secret مشترک Reality غیرخالی. باید با server یکی باشد. |
 
 ## تنظیمات
 
@@ -50,10 +65,10 @@ TcpListener -> RealityClient -> TcpConnector
 
 | گزینه | پیش‌فرض | توضیح |
 |---|---|---|
-| `sni` | اجباری | SNI مربوط به visitor domain. |
-| `verify` | `true` | تنظیم verification برای `TlsClient` داخلی. |
-| `ech-sni-trick` | تنظیم نشده | گزینه اختیاری TLS client trick. |
-| `x25519mlkem768` | پیش‌فرض داخلی TLS | فعال/غیرفعال کردن hybrid TLS group در صورت پشتیبانی. |
+| `sni` | اجباری | SNI مربوط به visitor domain که توسط `TlsClient` داخلی استفاده می‌شود. |
+| `verify` | `true` | تنظیم certificate verification برای `TlsClient` داخلی. |
+| `ech-sni-trick` | تنظیم نشده | گزینه اختیاری TLS client trick که به `TlsClient` داخلی پاس داده می‌شود. |
+| `x25519mlkem768` | پیش‌فرض داخلی TLS | فعال/غیرفعال کردن hybrid TLS group در `TlsClient` داخلی در صورت پشتیبانی. |
 | `password` | اجباری | secret مشترک برای key derivation. |
 | `algorithm` | `chacha20-poly1305` | یکی از `chacha20-poly1305`، `chacha20poly1305`، `aes-gcm`، `aes-256-gcm` یا `aes256gcm`. |
 | `method` | مثل `algorithm` | alias برای `algorithm`، وقتی `algorithm` وجود نداشته باشد. |
@@ -65,9 +80,13 @@ TcpListener -> RealityClient -> TcpConnector
 
 ## جریان اجرا
 
-در upstream `Init`، نود line state خودش را آماده می‌کند و `Init` را وارد `TlsClient` داخلی می‌کند. تا زمانی که TLS takeover کامل نشده باشد، payloadهای upstream در صف نگه داشته می‌شوند.
+در upstream `Init`، `RealityClient`:
 
-وقتی `TlsClient` داخلی downstream `Est` بدهد، `RealityClient` state داخلی TLS را بدون بستن اتصال deinit می‌کند، line را Reality-ready می‌کند، payloadهای صف‌شده را به صورت Reality record رمزنگاری‌شده می‌فرستد و سپس downstream `Est` را به نود قبلی می‌دهد.
+1. state خودش را برای line initialize می‌کند
+2. `Init` را وارد `TlsClient` داخلی می‌کند
+3. منتظر کامل شدن TLS handshake داخلی می‌ماند
+
+payloadهای upstream که قبل از TLS takeover می‌رسند queue می‌شوند. وقتی `TlsClient` داخلی downstream `Est` بدهد، `RealityClient` state داخلی TLS را بدون بستن اتصال deinit می‌کند، line را Reality-ready می‌کند، payloadهای queue شده را به صورت Reality record رمزنگاری‌شده می‌فرستد و سپس downstream `Est` را به نود قبلی می‌دهد.
 
 بعد از takeover:
 
@@ -76,9 +95,11 @@ TcpListener -> RealityClient -> TcpConnector
 | Upstream payload | cleartext از نود قبلی رمزنگاری و به صورت TLS-like application-data record به `next` ارسال می‌شود. |
 | Downstream payload | Reality record از `next` parse، authenticate و decrypt می‌شود و cleartext به نود قبلی می‌رود. |
 
-اگر downstream payload قبل از takeover برسد، record نامعتبر باشد، یا authentication شکست بخورد، line از هر دو جهت بسته می‌شود.
+اگر downstream payload قبل از TLS takeover برسد، record نامعتبر باشد، یا authentication شکست بخورد، line از هر دو جهت بسته می‌شود.
 
 ## قالب Record
+
+Reality recordها شکل TLS application-data record دارند:
 
 ```text
 TLS record header (5 bytes)
@@ -87,14 +108,30 @@ ciphertext
 AEAD tag          (16 bytes)
 ```
 
-header شبیه TLS application data با content type `0x17` و version `0x0303` است. header به عنوان AEAD associated data استفاده می‌شود و nonce برای هر record تصادفی است.
+TLS-like header از این مقادیر استفاده می‌کند:
+
+| فیلد | مقدار |
+|---|---|
+| Content type | `0x17` application data |
+| Version | `0x0303` |
+| Length | `12-byte nonce + ciphertext + 16-byte tag` |
+
+TLS record header به عنوان AEAD associated data authenticate می‌شود. nonce برای هر record تصادفی است.
+
+## نکته‌های Buffer و Lifecycle
+
+- `RealityClient` به ازای هر line state نگه می‌دارد که شامل downstream record parser، upstream payloadهای queue شده قبل از handshake و TLS-ready flag است.
+- این نود line معمولی را ایجاد یا destroy نمی‌کند؛ فقط state خودش را destroy می‌کند، یا وقتی line finish می‌شود یا وقتی هر دو جهت را بعد از خطای Reality می‌بندد.
+- این نود `17` بایت required left padding advertise می‌کند: `5` بایت برای TLS-like record header و `12` بایت برای nonce prefix.
+- payload buffer خالی بدون ارسال Reality record recycle می‌شود.
+- payloadهایی بزرگ‌تر از `max-frame-size` به چند record رمزنگاری‌شده تقسیم می‌شوند.
 
 ## نکته‌های عملیاتی
 
 - `RealityClient` به `TlsClient` وابسته است و build باید `INCLUDE_TLS_CLIENT=ON` داشته باشد.
+- اولین مرحله یک TLS client handshake واقعی است، بنابراین `sni`، رفتار certificate verification و گزینه‌های TLS fingerprinting اهمیت دارند.
 - `password`، `salt`، `kdf-iterations` و `algorithm` باید با `RealityServer` یکی باشند.
 - این نود stream tunnel است، نه packet tunnel.
-- `required_padding_left` این نود `17` است.
 
 ## مشخصات نود
 
@@ -102,6 +139,8 @@ header شبیه TLS application data با content type `0x17` و version `0x0303
 |---|---|
 | جایگاه | Middle stream tunnel |
 | نیاز به `next` | بله |
+| Previous layer | Anything |
+| Next layer | Anything |
 | Per-line state | دارد |
 | ایجاد line | خیر |
 | destroy کردن line | خیر |

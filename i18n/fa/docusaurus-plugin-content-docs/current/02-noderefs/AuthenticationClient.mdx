@@ -1,0 +1,431 @@
+---
+sidebar_position: 510
+title: "AuthenticationClient"
+sidebar_label: "AuthenticationClient"
+description: "مستندات مرجع نود AuthenticationClient."
+---
+
+# AuthenticationClient
+
+`AuthenticationClient` سمت frontend پروتکل دیتابیس authentication WaterWall است. یک control line داخلی روی worker `0` می‌سازد، آن line را upstream به نود `next` می‌فرستد، با یک `AuthenticationServer` authenticate می‌کند، جدول کاربران معتبر را دریافت می‌کند و به صورت دوره‌ای session را زنده نگه می‌دارد و countersهای ترافیک محلی را push می‌کند.
+
+`AuthenticationClient` یک tunnel pass-through داده نیست. نودهای serving traffic از API داخلی آن برای خواندن کاربران و ثبت مصرف محلی در برابر جدول کاربران دریافت‌شده استفاده می‌کنند.
+
+## جایگاه رایج
+
+```text
+AuthenticationClient -> ... -> AuthenticationServer
+```
+
+برای سرور remote، chain سمت client معمولاً این‌گونه است:
+
+```text
+AuthenticationClient -> TcpConnector
+```
+
+مسیر connector باید به یک chain سمت server ختم‌شده به `AuthenticationServer` برسد.
+
+## این نود چه می‌کند؟
+
+- یک control line داخلی طولانی‌مدت روی worker `0` می‌سازد.
+- با اعتبارنامه‌های client تنظیم‌شده، `Authenticate` را به `AuthenticationServer` می‌فرستد.
+- session token 64 بایتی بازگشتی را ذخیره می‌کند.
+- بعد از authentication، جدول کاربران کامل را با `GetAllUsers` دریافت می‌کند.
+- یک جدول کاربران محلی قفل‌شده برای سایر tunnelها نگه می‌دارد.
+- countersهای ترافیک محلی sync‌نشده را در طول refresh کامل جدول حفظ می‌کند.
+- درخواست‌های `Ping` authenticated دوره‌ای می‌فرستد.
+- درخواست‌های `PushUserStats` دوره‌ای با hint های counter ترافیک می‌فرستد.
+- درخواست‌های `GetAllUsers` دوره‌ای یا revision-driven می‌فرستد.
+- در صورت بسته شدن transport downstream، دوباره وصل می‌شود و authenticate می‌کند.
+- helpers مربوط به user lookup، JSON copy-out، traffic accounting و admission را از طریق `AuthenticationClient/interface.h` expose می‌کند.
+
+چون control line را خودش می‌سازد، مسئول destroy کردن آن هم هست.
+
+## نمونه تنظیم
+
+احراز هویت in-process کم‌حجم:
+
+```json
+{
+  "name": "auth-client",
+  "type": "AuthenticationClient",
+  "settings": {
+    "name": "edge-1",
+    "secret": "long-random-secret"
+  },
+  "next": "auth-db"
+}
+```
+
+chain سرور authentication از راه دور:
+
+```json
+{
+  "name": "auth-client",
+  "type": "AuthenticationClient",
+  "settings": {
+    "name": "edge-1",
+    "secret": "long-random-secret",
+    "ping-interval-ms": 60000,
+    "pull-interval-ms": 300000,
+    "push-interval-ms": 300000,
+    "reconnect-interval-ms": 5000,
+    "request-timeout-ms": 120000,
+    "max-pending-requests": 64,
+    "verbose": false
+  },
+  "next": "auth-server-connector"
+}
+```
+
+```json
+{
+  "name": "auth-server-connector",
+  "type": "TcpConnector",
+  "settings": {
+    "address": "127.0.0.1",
+    "port": 9000,
+    "nodelay": true
+  }
+}
+```
+
+جفت `settings.name` و `settings.secret` باید با یک entry داخل `settings.auth-clients` سمت `AuthenticationServer` تطابق داشته باشد:
+
+```json
+{
+  "name": "edge-1",
+  "secret": "long-random-secret",
+  "allow-user-pull": true,
+  "allow-stats-push": true,
+  "allow-user-write": false
+}
+```
+
+## فیلدهای اجباری
+
+فیلدهای top-level:
+
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `name` | string | نام نود. نودهای دیگر برای reference به auth client از این مقدار استفاده می‌کنند. |
+| `type` | string | باید دقیقاً `"AuthenticationClient"` باشد. |
+| `next` | string | اجباری. نود بعدی باید به یک `AuthenticationServer` منتهی شود. |
+| `settings` | object | اعتبارنامه authentication و تنظیمات timer. |
+
+فیلدهای اجباری داخل `settings`:
+
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `name` | non-empty string | نام client control-plane که به `AuthenticationServer` ارسال می‌شود. |
+| `secret` | non-empty string | secret control-plane که همراه با `settings.name` ارسال می‌شود. |
+
+`name` و `secret` control-plane، اعتبارنامه‌های traffic-user نیستند.
+
+## تنظیمات اختیاری
+
+| گزینه | نوع | پیش‌فرض | توضیح |
+| --- | --- | --- | --- |
+| `ping-interval-ms` | صفر یا عدد مثبت | `60000` | `Ping` authenticated می‌فرستد. همچنین در حالت connected اما unauthenticated، `Authenticate` را retry می‌کند. |
+| `pull-interval-ms` | صفر یا عدد مثبت | `300000` | بازه `GetAllUsers` دوره‌ای. `0` pullهای timer-driven را غیرفعال می‌کند. |
+| `push-interval-ms` | صفر یا عدد مثبت | `300000` | بازه `PushUserStats` دوره‌ای. `0` pushهای دوره‌ای را غیرفعال می‌کند. |
+| `reconnect-interval-ms` | صفر یا عدد مثبت | `5000` | تأخیر قبل از reconnect بعد از بسته شدن control transport. |
+| `request-timeout-ms` | صفر یا عدد مثبت | `120000` | اگر یک درخواست pending بیشتر از این مدت منتظر بماند، reconnect می‌کند. `0` بررسی timeout درخواست را غیرفعال می‌کند. |
+| `max-pending-requests` | عدد مثبت | `64` | حداکثر تعداد درخواست‌های protocol در-پرواز. |
+| `verbose` | boolean | `false` | logهای debug متمرکز برای control-line، timer، request و response را فعال می‌کند. |
+
+`pull-interval-ms` فقط pullهای timer-driven را غیرفعال می‌کند. client همچنان یک بار بعد از authentication موفق pull می‌کند و دوباره وقتی response سرور نشان دهد نسخه محلی نیاز به refresh دارد pull می‌کند.
+
+`push-interval-ms` فقط pushهای دوره‌ای را غیرفعال می‌کند. tunnelهای دیگر همچنان می‌توانند از طریق API داخلی درخواست push بدهند.
+
+## استفاده از سایر نودها
+
+`AuthenticationClient` معمولاً با نام نود reference می‌شود. برای مثال، `Socks5Server` می‌تواند از یک `AuthenticationClient` موجود این‌گونه استفاده کند:
+
+```json
+{
+  "name": "socks-server",
+  "type": "Socks5Server",
+  "settings": {
+    "auth-client-node-name": "auth-client",
+    "connect": true,
+    "udp": false
+  },
+  "next": "outbound-tcp"
+}
+```
+
+`AuthenticationClient` در مسیر داده `Socks5Server` قرار نمی‌گیرد. کنترل connection خودش را نگه می‌دارد و جدول کاربران pull‌شده را از طریق API داخلی expose می‌کند.
+
+## مدل ارتباطی
+
+client از یک control line طولانی‌مدت استفاده می‌کند، نه یک line به ازای هر درخواست.
+
+در هنگام startup، worker `0` یک `line_t` داخلی می‌سازد و upstream `init` را به tunnel بعدی می‌فرستد. در یک chain مثل `AuthenticationClient -> TcpConnector`، آن یک WaterWall line به یک transport connection outbound به chain سمت server تبدیل می‌شود.
+
+تمام درخواست‌های authentication، ping، pull و push روی همان line frame می‌شوند. responseها با correlation ID با درخواست‌ها تطبیق داده می‌شوند.
+
+اگر transport بسته شود، downstream `finish` control line owned را بسته و destroy می‌کند، token فعال را پاک می‌کند، state درخواست pending را پاک می‌کند و reconnect را schedule می‌کند مگر اینکه tunnel در حال توقف باشد. اتصال بعدی با یک `Authenticate` جدید شروع می‌شود؛ token قدیمی استفاده نمی‌شود.
+
+در حالت disconnected یا unauthenticated، درخواست‌های protocol جدید فرستاده نمی‌شوند. جدول کاربران محلی به عنوان cache در دسترس است، اما sync فقط بعد از reconnect، transport `est` و authentication موفق از سر گرفته می‌شود.
+
+## جریان Startup
+
+در `onStart`، tunnel کار startup را به worker `0` در صف می‌گذارد.
+
+سپس worker `0`:
+
+1. client را به عنوان started علامت می‌زند.
+2. ping timer را وقتی فعال باشد arm می‌کند.
+3. sync timer را وقتی pull یا push فعال باشد شروع می‌کند.
+4. control line owned را می‌سازد.
+5. per-line state این tunnel را initialize می‌کند.
+6. `tunnelNextUpStreamInit()` را صدا می‌زند.
+
+وقتی سمت بعدی transport را برقرار کند و downstream `est` ارسال کند، client control line را به عنوان connected علامت می‌زند و `Authenticate` را با یک session token صفر می‌فرستد.
+
+وقتی `Authenticate` یک session response برگرداند، token 64 بایتی به عنوان token فعال برای درخواست‌های بعدی تبدیل می‌شود و client فوراً `GetAllUsers` می‌فرستد.
+
+## Timerها
+
+تمام timer های protocol روی worker `0` هستند، همان worker که control line owned را دارد.
+
+| Timer | رفتار |
+| --- | --- |
+| `ping_timer` | در حالت authenticated، `Ping` می‌فرستد و در حالت connected اما unauthenticated، `Authenticate` را retry می‌کند. |
+| `sync_timer` | pull جدول کاربران و push stats را با کوتاه‌ترین بازه pull/push فعال‌شده هدایت می‌کند. |
+| `reconnect_timer` | بعد از بسته شدن transport downstream، یک control line جدید باز می‌کند. |
+
+هر sync tick ابتدا `PushUserStats` را وقتی due باشد امتحان می‌کند، سپس `GetAllUsers` را وقتی revisionها متفاوت باشند یا بازه pull due باشد و response equal-revision جدیدتری جدول محلی را current تأیید نکرده باشد، می‌فرستد.
+
+Timerها از `onWorkerStop` برای worker `0` حذف می‌شوند، چون حذف timer باید روی همان event loop worker که timer را داراست اتفاق بیفتد.
+
+## جدول کاربران محلی
+
+client یک جدول کاربران محلی فعال نگه می‌دارد که با یک `wrwlock_t` سطح tunnel محافظت می‌شود.
+
+جایگزینی `GetAllUsers` از دیدگاه سایر tunnelها atomic است:
+
+1. JSON response به یک `users_t` تازه parse می‌شود.
+2. جدول تازه validate می‌شود.
+3. delta های ترافیک محلی sync‌نشده و countersهای runtime process-local با durable user id منتقل می‌شوند، با SHA-256 به عنوان fallback legacy.
+4. deadline انقضای محلی هر کاربر از فیلدهای زمانی server-owned و `server-time-ms` response محاسبه می‌شود.
+5. pointer جدول فعال زیر write side of rwlock swap می‌شود.
+6. generation counter افزایش می‌یابد.
+7. جدول قدیمی بعد از swap destroy می‌شود.
+
+Readerها read side همان rwlock را در حین کپی کردن JSON، کپی کردن stats یا update کردن ترافیک با SHA-256 نگه می‌دارند. این از invalid شدن یک pointer داخل `users_t` فعلی در طول یک عملیات جلوگیری می‌کند.
+
+جدول محلی یک cache به اضافه تجمع counter محلی است. server برای پیکربندی کامل کاربر و `first-usage-at-ms` منبع اصلی است.
+
+## API داخلی
+
+سایر tunnelها include می‌کنند:
+
+```c
+#include "AuthenticationClient/interface.h"
+```
+
+این API داخلی WaterWall از external `api.c` tunnel API مجزاست.
+
+سایر tunnelها نباید pointer های خام `user_t *` از `AuthenticationClient` را دریافت یا cache کنند. به جای آن از `user_handle_t` استفاده می‌کنند که یک value identifier حاوی این موارد است:
+
+```text
+sha256(password)
+users_generation
+user_id
+```
+
+`user_id` از record کاربر synced کپی می‌شود و ممکن است برای کاربران legacy مقدار `0` باشد. وقتی موجود باشد، live enforcement helpers با durable user id resolve می‌کنند، با SHA-256 به عنوان fallback.
+
+State helperهای رایج:
+
+```c
+authenticationclientGetState(t)
+authenticationclientIsReady(t)
+authenticationclientUsersGeneration(t)
+```
+
+Lookup helperها:
+
+```c
+authenticationclientGetUserByPassword(t, password, &handle)
+authenticationclientGetUserByPasswordWithResult(t, password, &handle)
+authenticationclientGetUserBySHA224(t, sha224, &handle)
+authenticationclientGetUserBySHA256(t, sha256, &handle)
+authenticationclientGetUserByPasswordWithProfile(t, password, &handle, &profile)
+authenticationclientGetUserBySHA224WithProfile(t, sha224, &handle, &profile)
+authenticationclientUserProfileClear(&profile)
+```
+
+Copy-out و stats helperها:
+
+```c
+authenticationclientUserHandleIsLive(t, &handle)
+authenticationclientUserToJson(t, &handle)
+authenticationclientUsersToJson(t)
+authenticationclientUserGetStats(t, &handle, &stats)
+authenticationclientUserAddTraffic(t, &handle, upload, download)
+```
+
+Live enforcement helperها:
+
+```c
+authenticationclientUserTryAdmitConnection(t, &handle, &ip_key, now_ms)
+authenticationclientUserReleaseConnection(t, &handle, &ip_key)
+authenticationclientUserAccountTraffic(t, &handle, upload, download, now_ms)
+authenticationclientUserShouldClose(t, &handle, now_ms)
+```
+
+Manual sync helperها:
+
+```c
+authenticationclientRequestPull(t)
+authenticationclientRequestPush(t)
+```
+
+`authenticationclientUserToJson()` و `authenticationclientUsersToJson()` object های `cJSON` جدیدی که caller مالک آن‌هاست برمی‌گردانند. stats به storage caller کپی می‌شوند. نودهای serving traffic نباید `user_t` را مستقیم mutate کنند.
+
+آرگومان‌های `now_ms` برای live enforcement helperها در domain ساعت monotonic محلی client هستند. فیلدهای انقضای server-owned هنگام نصب `GetAllUsers` به آن domain project می‌شوند.
+
+## حالت‌های Client
+
+`authenticationclientGetState()` برمی‌گرداند:
+
+| حالت | معنی |
+| --- | --- |
+| `kAuthenticationClientStateStopped` | client متوقف یا در دسترس نیست. |
+| `kAuthenticationClientStateConnecting` | client شروع شده اما هنوز session control authenticated ندارد. |
+| `kAuthenticationClientStateAuthenticating` | transport connected است یا token موجود است، اما کاربران هنوز کامل بارگذاری نشده‌اند. |
+| `kAuthenticationClientStateReady` | client authenticated است و یک جدول کاربران نصب کرده است. |
+
+`authenticationclientIsReady()` فقط در `kAuthenticationClientStateReady` مقدار true دارد.
+
+Password lookup با result می‌تواند برگرداند:
+
+| نتیجه | معنی |
+| --- | --- |
+| `ok` | lookup موفق بود. |
+| `invalid password lookup` | آرگومان‌های بد، password خالی، یا handle خروجی مفقود. |
+| `password hash failed` | محاسبه SHA-256 شکست خورد. |
+| `users table unavailable` | جدول کاربران محلی بارگذاری نشده است. |
+| `user not found` | هیچ کاربری با password تطابق ندارد. |
+| `password mismatch` | hash تطبیق داشت اما بررسی plaintext password شکست خورد. |
+| `user disabled` | کاربر matching غیرفعال است. |
+| `user expired` | کاربر matching در دید client-time محلی منقضی شده است. |
+| `user limit reached` | کاربر matching به یک محدودیت تنظیم‌شده رسیده است. |
+
+## پروتکل Wire
+
+پروتکل با `AuthenticationServer` تطابق دارد.
+
+پیام request:
+
+```text
+u32 body_len
+u8[64] session_token
+request_frame
+```
+
+فریم request:
+
+```text
+u8 request_type
+u32 correlation_id
+u32 request_data_len
+u8[request_data_len] request_data
+```
+
+پیام response:
+
+```text
+u32 body_len
+u64 config_revision
+u64 stats_revision
+response_frame...
+```
+
+فریم response:
+
+```text
+u8 response_type
+u32 correlation_id
+u32 response_data_len
+u8[response_data_len] response_data
+```
+
+تمام فیلدهای integer به صورت big-endian هستند. client یک request frame در هر پیام می‌فرستد. parser هر تعدادی response frame را در یک response message قبول می‌کند و هر frame را با correlation ID تطبیق می‌دهد.
+
+revisionهای response به عنوان آخرین server revisionها ذخیره می‌شوند و قبل از pullهای timer-driven با local users-table revisionها مقایسه می‌شوند.
+
+## Stats Push
+
+`PushUserStats` یک به‌روزرسانی hint جزئی است. client فقط فیلدهایی که server نیاز دارد را می‌فرستد:
+
+```json
+{
+  "users": [
+    {
+      "password": "user-password",
+      "stats": {
+        "traffic": {
+          "up": "12345",
+          "down": "67890"
+        }
+      }
+    }
+  ]
+}
+```
+
+کاربرانی که counter ترافیک تغییر نداشته‌اند برای آن push رد می‌شوند.
+
+سرور این countersها را با baseline session ایجادشده توسط `GetAllUsers` مقایسه می‌کند و فقط deltaها را اعمال می‌کند. client `time.first-usage-at-ms` را نمی‌فرستد؛ وقتی اولین delta ترافیک غیرصفر برای کاربری که authoritative first-usage time هنوز مفقود است می‌رسد، سرور آن فیلد را با ساعت خودش stamp می‌کند.
+
+`authenticationclientUserAccountTraffic()` همچنین در اولین accounting محلی غیرصفر، وقتی first usage هنوز missing است، یک flag runtime-only برای همان user علامت می‌زند. client یک تلاش `PushUserStats` روی worker `0` queue می‌کند، اگر stats push دیگری در حال انجام باشد یک follow-up push را defer می‌کند، و payload callهای بعدی را تا وقتی usage push شده با یک view تازه از `GetAllUsers` دنبال شود یا تلاش ارسال شکست بخورد coalesce می‌کند.
+
+اگر سرور `needs-pull: true` برگرداند، client `GetAllUsers` را دوباره درخواست می‌کند تا cache محلی و session baseline سمت سرور را refresh کند.
+
+## رفتار Lifecycle و جهت‌ها
+
+`AuthenticationClient` یک chain-head control node است. درخواست‌ها را upstream می‌فرستد:
+
+```c
+tunnelNextUpStreamInit()
+tunnelNextUpStreamPayload()
+tunnelNextUpStreamFinish()
+```
+
+responseهای سرور را از طریق downstream callbacks دریافت می‌کند:
+
+```text
+DownStreamEst
+DownStreamPayload
+DownStreamPause
+DownStreamResume
+DownStreamFinish
+```
+
+Pause و resume به tunnel قبلی منعکس نمی‌شوند چون `AuthenticationClient` data producer قبلی ندارد. فقط ردیابی می‌کنند که آیا درخواست‌های protocol جدید می‌توانند فوراً فرستاده شوند.
+
+line state control line، read stream response downstream را نگه می‌دارد. قبل از `tunnelNextUpStreamInit()` initialize می‌شود و قبل از اینکه client upstream finish را propagate کند یا owned line را destroy کند، destroy می‌شود.
+
+در downstream `finish`، client:
+
+1. pointer control-line فعال را زیر control mutex حذف می‌کند.
+2. session token، authenticated state، in-flight flags و pending requests را پاک می‌کند.
+3. line state این tunnel را destroy می‌کند.
+4. owned control line را destroy می‌کند.
+5. reconnect را schedule می‌کند مگر اینکه tunnel در حال توقف باشد.
+
+وقتی client خودش control line را می‌بندد، مثل در طول shutdown worker-0 یا handling response malformed، ابتدا local line state را destroy می‌کند، `tunnelNextUpStreamFinish()` را می‌فرستد و سپس owned line را اگر هنوز زنده باشد destroy می‌کند.
+
+## نکته‌ها
+
+- `AuthenticationClient` نیاز به نود `next` دارد.
+- یک control-plane node است، نه data pass-through node.
+- فقط internal control line که خودش ساخته را owns و destroy می‌کند.
+- از packet line استفاده نمی‌کند و packet tunnel نیست.
+- محدودیت‌های data request، response payload و outer message payload برابر `16 MiB` هستند.
+- secretها، session tokenها، passwordها و raw users JSON عمداً در verbose logging چاپ نمی‌شوند.
+- نام ماژول `UpdateUserTraficStatsDiff` عمداً از spelling فعلی source پیروی می‌کند.
