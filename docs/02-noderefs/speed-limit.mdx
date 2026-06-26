@@ -4,20 +4,39 @@ sidebar_position: 1400
 
 # SpeedLimit
 
-`SpeedLimit` payload را با token bucket محدود می‌کند. این نود داده پروتکل را تغییر نمی‌دهد؛ فقط تعیین می‌کند هر payload چه زمانی اجازه عبور دارد یا در modeهای packet چه زمانی drop شود.
+`SpeedLimit` is a pass-through tunnel that rate-limits payload bytes with a token bucket. It does not rewrite protocol
+data, add headers, remove headers, or change the destination context. It only decides whether a payload can pass now,
+must wait, or should be dropped.
 
-## جایگاه رایج
+The same bucket accounts for both directions that use it. For example, if one bucket is configured for `1 MB/s`, upload
+and download through that bucket share the same `1 MB/s`.
+
+## Typical placement
+
+Stream shaping:
 
 ```text
 TcpListener -> SpeedLimit -> TcpConnector
-UdpListener -> SpeedLimit -> UdpConnector
+TcpListener -> TlsServer -> SpeedLimit -> TcpConnector
 ```
 
-## نمونه تنظیم
+Packet or datagram limiting:
+
+```text
+UdpListener -> SpeedLimit -> UdpConnector
+TunDevice -> SpeedLimit -> UdpStatelessSocket
+```
+
+Use `pause` mode for stream-like traffic where excess data should wait. Use `drop` mode for packet or datagram traffic
+where old packets are usually worse than missing packets.
+
+## Stream example
+
+Each connection gets its own 256 KiB/s bucket, and excess stream data is queued until enough tokens refill.
 
 ```json
 {
-  "name": "limit",
+  "name": "speed-limit",
   "type": "SpeedLimit",
   "settings": {
     "kilo-bytes-per-sec": 256,
@@ -28,49 +47,167 @@ UdpListener -> SpeedLimit -> UdpConnector
 }
 ```
 
-## تنظیمات ضروری
+## Shared cap example
 
-| گزینه | توضیح |
-|---|---|
-| `bytes-per-sec` یا `kilo-bytes-per-sec` یا `mega-bytes-per-sec` | دقیقا یکی از این سه باید تنظیم شود |
-| `limit-mode` | یکی از modeهای `per-line`/`per-connection`، `all-lines`/`all-connections` یا `per-worker` |
-| `work-mode` | یکی از `pause` یا `drop` |
-| `token-recharge-rate` | اختیاری؛ فاصله refill شدن tokenها به میلی‌ثانیه، پیش‌فرض `10` |
+All lines passing through this `SpeedLimit` instance share one 8 MiB/s bucket.
 
-## معنی modeها
+```json
+{
+  "name": "global-speed-limit",
+  "type": "SpeedLimit",
+  "settings": {
+    "mega-bytes-per-sec": 8,
+    "limit-mode": "all-lines",
+    "token-recharge-rate": 20,
+    "work-mode": "pause"
+  },
+  "next": "next-node"
+}
+```
 
-- `per-line`: هر line محدودیت جدا دارد.
-- `all-lines`: همه lineهای این instance یک محدودیت مشترک دارند.
-- `per-worker`: هر worker محدودیت مشترک خودش را دارد؛ پس سقف کل می‌تواند تقریبا به تعداد workerها ضرب شود.
-- `pause`: برای stream مناسب است؛ payload اضافه نگه داشته و بعدا ارسال می‌شود.
-- `drop`: برای packet/UDP مناسب است؛ payload اضافه drop می‌شود.
+## Packet drop example
 
-## token-recharge-rate
+Each worker gets a 500000 bytes/s shared bucket. Payload chunks that do not fit are discarded.
 
-این گزینه پهنای‌باند نیست؛ فاصله زمانی شارژ شدن bucket است. مثلا اگر limit برابر `1000 bytes-per-sec` و `token-recharge-rate` برابر `10` باشد، نود هر `10ms` مقداری token اضافه می‌کند.
+```json
+{
+  "name": "packet-speed-limit",
+  "type": "SpeedLimit",
+  "settings": {
+    "bytes-per-sec": 500000,
+    "limit-mode": "per-worker",
+    "work-mode": "drop"
+  },
+  "next": "next-node"
+}
+```
 
-- مقدار کمتر معمولا خروجی نرم‌تر و burst کوچک‌تر می‌دهد.
-- مقدار بیشتر ممکن است traffic را burstyتر کند.
-- برای streamهای حساس به latency، پیش‌فرض `10ms` معمولا نقطه شروع خوبی است.
+## Required fields
 
-## رفتار در pause mode
+`settings` is required and must be a non-empty object.
 
-در mode `pause`، اگر bucket token کافی نداشته باشد:
+Exactly one rate field must be configured:
 
-- payload داخل خود tunnel صف می‌شود.
-- سمت source با callbackهای backpressure واتروال pause می‌شود.
-- وقتی tokenها دوباره شارژ شدند، داده صف‌شده به ترتیب آزاد می‌شود.
-- اگر buffer بزرگ باشد، ممکن است فقط بخشی از آن ارسال شود و بقیه برای refill بعدی بماند.
+| Field | Meaning |
+| --- | --- |
+| `bytes-per-sec` | Bytes per second. |
+| `kilo-bytes-per-sec` | Kibibytes per second, multiplied by `1024`. |
+| `mega-bytes-per-sec` | Mebibytes per second, multiplied by `1024 * 1024`. |
 
-این mode برای TCP و stream بهتر است، چون ordering حفظ می‌شود و داده دور ریخته نمی‌شود.
+The selected value must be a number greater than `0`. If more than one rate field is present, node creation fails.
 
-## رفتار در drop mode
+You must also configure:
 
-در mode `drop`، تصمیم روی کل payload chunk گرفته می‌شود. اگر token کافی نباشد، همان packet یا datagram کامل drop می‌شود و برای بعد نگه داشته نمی‌شود. این mode برای packet tunnelها و UDP-style traffic امن‌تر است، چون صف کردن packetهای قدیمی معمولا رفتار شبکه را بدتر می‌کند.
+| Field | Accepted values |
+| --- | --- |
+| `limit-mode` | `per-line`, `per-connection`, `all-lines`, `all-connections`, `per-worker` |
+| `work-mode` | `pause`, `drop` |
 
-## نکته‌های عملی
+These string values are case-sensitive in the current parser.
 
-- محدودیت انتخاب‌شده برای هر bucket مجموع دو جهت را شامل می‌شود. مثلا یک bucket با `1 MB/s` بین upload و download همان bucket مشترک است.
-- محدودیت را بیش از حد پایین نگذارید؛ ممکن است باعث timeout نودهای دیگر شود.
-- برای stream معمولا `work-mode: "pause"` و برای packet معمولا `work-mode: "drop"` انتخاب بهتری است.
-- در packet chainها، packet line یک state مشترک worker است؛ بنابراین `per-line` روی packet line مثل limit worker-local عمل می‌کند، نه limit جدا برای هر flow واقعی.
+## Optional fields
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `token-recharge-rate` | `10` | Token refill interval in milliseconds. Must be greater than `0`. |
+
+`token-recharge-rate` is not a bandwidth setting. It controls how often tokens are added to the bucket.
+
+For example:
+
+- `bytes-per-sec: 1000`
+- `token-recharge-rate: 10`
+
+The bucket receives about 10 bytes worth of tokens every 10 ms. A smaller interval usually feels smoother. A larger
+interval can be more bursty because traffic is released in larger time steps.
+
+## Limit modes
+
+| Mode | Behavior |
+| --- | --- |
+| `per-line` / `per-connection` | Every Waterwall line gets its own bucket. Two simultaneous lines configured for `1 MB/s` can together use about `2 MB/s`. |
+| `all-lines` / `all-connections` | All lines through this tunnel instance share one atomic global bucket across workers. A `1 MB/s` setting means the whole node shares `1 MB/s`. |
+| `per-worker` | Each worker has its own shared bucket. With 4 workers and `1 MB/s`, the practical total can reach about `4 MB/s`. |
+
+Each bucket starts full and has a capacity equal to one second of the configured rate. This allows an initial burst of up
+to roughly one second of traffic before the limiter settles into the configured average rate.
+
+## Work modes
+
+### `pause`
+
+`pause` mode is intended for ordered stream traffic.
+
+When a payload does not fit in the bucket:
+
+1. The buffer is queued inside `SpeedLimit`.
+2. The source side is paused with Waterwall `Pause` callbacks.
+3. A worker timer waits until enough tokens refill.
+4. Queued data is drained in order.
+5. When the queue becomes empty, the locally paused source side is resumed.
+
+If a queued buffer is larger than the currently available token grant, `SpeedLimit` may send a leading slice of that
+buffer and keep the remainder queued for a later timer tick. This preserves byte order while shaping the average rate.
+
+`pause` mode can hold buffers in memory. Very low limits, long-lived stalled peers, or high incoming rates can therefore
+increase memory usage and latency.
+
+### `drop`
+
+`drop` mode is intended for packet or datagram traffic.
+
+For each payload chunk:
+
+- if the bucket has enough tokens for the whole chunk, the chunk is forwarded
+- if the bucket does not have enough tokens, the whole chunk is discarded
+
+`drop` mode does not split payload chunks and does not queue them for later. This is usually the better behavior for UDP
+or packet chains because queued old datagrams often become useless.
+
+## Direction and backpressure behavior
+
+The limiter is symmetrical:
+
+- upstream payload uses the same selected bucket logic as downstream payload
+- upstream queued data locally pauses the previous side
+- downstream queued data locally pauses the next side
+- external `Pause` and `Resume` callbacks are remembered so `SpeedLimit` does not accidentally resume a side that is
+  still externally paused
+
+This means `pause` mode composes with normal Waterwall stream backpressure instead of just sleeping inside the payload
+callback.
+
+## Packet-line caveat
+
+Waterwall packet lines are worker-local helper lines that are reused for many packets. In packet chains, `per-line` does
+not mean "per real network flow"; it means the bucket attached to that worker's persistent packet line. If you need
+packet limiting that scales by worker, use `per-worker` explicitly. If you need one cap across all workers, use
+`all-lines`.
+
+For packet or UDP-style chains, prefer `work-mode: "drop"` unless you specifically want backpressure and delayed packet
+delivery.
+
+## Finish behavior
+
+Line state is initialized during `Init`. On `Finish`, `SpeedLimit` destroys its local line state, cancels any drain
+timers, releases queued buffers, and then forwards the Waterwall `Finish` in the same direction.
+
+The tunnel does not prepend data, so `required_padding_left` is `0`.
+
+## Node metadata
+
+| Property | Value |
+| --- | --- |
+| Node flag | `kNodeFlagChainHead` |
+| Previous node | Allowed |
+| Next node | Allowed |
+| Layer group | `kNodeLayerAnything` |
+| `required_padding_left` | `0` |
+
+## Common mistakes
+
+- Do not configure more than one rate field.
+- Do not use `pause` mode for packet chains unless delayed packets are acceptable.
+- Do not expect `per-worker` to enforce one global cap; it scales with worker count.
+- Do not expect `per-line` in packet chains to mean per-client or per-flow.
+- Do not set an extremely large `token-recharge-rate` unless bursty delivery is acceptable.

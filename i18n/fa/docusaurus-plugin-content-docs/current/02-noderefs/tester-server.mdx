@@ -1,0 +1,202 @@
+---
+sidebar_position: 1510
+---
+
+# TesterServer
+
+`TesterServer` peer تستی `TesterClient` در انتهای مسیر validation است. request deterministic را verify می‌کند و response deterministic را روی همان line یا packet path برمی‌گرداند.
+
+این نود برای اثبات سالم ماندن payload، ordering، packet shape و lifecycle در nodeهای میانی استفاده می‌شود.
+
+## جایگاه رایج
+
+Stream mode:
+
+```text
+TesterClient -> SomeTunnel -> SomeTunnel -> TesterServer
+```
+
+Packet-mode با Bridge:
+
+```text
+TesterClient(packet-mode=true) -> PingClient -> Bridge
+TesterServer(packet-mode=true) -> PingServer -> Bridge
+```
+
+`TesterServer` معمولا chain end است. در packet mode می‌تواند `next` هم داشته باشد تا مسیرهای packet bridged از سمت next/downstream آن را تغذیه کنند.
+
+## نمونه تنظیم
+
+Stream mode:
+
+```json
+{
+  "name": "tester-server",
+  "type": "TesterServer"
+}
+```
+
+Packet mode:
+
+```json
+{
+  "name": "tester-server",
+  "type": "TesterServer",
+  "settings": {
+    "packet-mode": true
+  }
+}
+```
+
+Packet mode همراه با startup init:
+
+```json
+{
+  "name": "tester-server",
+  "type": "TesterServer",
+  "settings": {
+    "packet-mode": true,
+    "packet-init-on-start": true,
+    "packet-ipv4": {
+      "source-ip": "198.51.100.10",
+      "dest-ip": "203.0.113.20",
+      "transport": "udp",
+      "ttl": 64
+    }
+  }
+}
+```
+
+## فیلدهای ضروری
+
+| فیلد | نوع | توضیح |
+|---|---|---|
+| `name` | string | نام node. |
+| `type` | string | باید `TesterServer` باشد. |
+
+`settings` اختیاری است. اگر نباشد، stream-mode پیش‌فرض استفاده می‌شود.
+
+`next` فقط وقتی مجاز است که `packet-mode=true` باشد.
+
+## تنظیمات
+
+| فیلد | پیش‌فرض | توضیح |
+|---|---|---|
+| `packet-mode` | `false` | استفاده از worker packet line به جای stream behavior معمولی. |
+| `packet-init-on-start` | `false` | فقط packet mode؛ اگر packet-side `Init` قبلا نرسیده باشد، state هر worker را در startup initialize می‌کند. |
+| `streaming-response` | `false` | فقط stream mode؛ response chunkها بعد از verify شدن chunk متناظر request قابل ارسال می‌شوند. |
+| `packet-stateless` | `false` | فقط packet mode؛ request packetها می‌توانند out of order باشند و با size تشخیص داده می‌شوند. |
+| `chunk-count` | `11` | تعداد chunkهای فعال از ابتدای جدول. بازه معتبر `1` تا `11`. |
+| `max-payload-size` | `0` | محدود کردن response bufferهای stream یا packet size. |
+| `split-payload-delay-ms` | `1` | فقط stream mode؛ تاخیر بین responseهای split شده. |
+| `split-payload-burst` | `1` | فقط stream mode؛ تعداد buffer قبل از اعمال delay. |
+| `packet-ipv4` | ندارد | فقط packet mode؛ request و response به صورت IPv4 packet مصنوعی بررسی/تولید می‌شوند. |
+
+`packet-init-on-start`، `packet-stateless` و `packet-ipv4` نیازمند `packet-mode=true` هستند. `max-payload-size` با `packet-stateless=true` پشتیبانی نمی‌شود.
+
+## جدول Chunkها
+
+Stream mode:
+
+```text
+1, 2, 4, 32, 512, 1024, 4096, 32768, 32769, 1048576, 2097152
+```
+
+Packet mode:
+
+```text
+1, 2, 4, 32, 64, 128, 256, 512, 1024, 1499, 1500
+```
+
+Packet mode با IPv4 خام:
+
+```text
+21, 22, 24, 52, 84, 148, 276, 532, 1044, 1499, 1500
+```
+
+Packet mode با IPv4 و transport header:
+
+```text
+41, 42, 44, 52, 84, 148, 276, 532, 1044, 1499, 1500
+```
+
+اولین byte request شامل flow id انتخاب‌شده توسط `TesterClient` است. `TesterServer` با همین flow id request را verify و response متناظر را generate می‌کند.
+
+## Packet IPv4
+
+`packet-ipv4` فقط با `packet-mode=true` معتبر است.
+
+| فیلد | پیش‌فرض | توضیح |
+|---|---|---|
+| `source-ip` | اجباری | IPv4 source مورد انتظار برای request packetها. |
+| `dest-ip` | اجباری | IPv4 destination مورد انتظار برای request packetها. |
+| `transport` | `none` | مقدار `tcp`، `udp`، `icmp`، `raw` یا `none`. |
+| `protocol` | `253` | IPv4 protocol number. اگر transport مشخص باشد باید با آن match کند. |
+| `ttl` | `64` | TTL برای response packetهای synthetic. |
+
+برای response packetها، source و destination خودکار برعکس می‌شوند.
+
+## Runtime
+
+در upstream `Init`، نود:
+
+1. line state خودش را initialize می‌کند
+2. downstream `Est` را به سمت previous می‌فرستد
+
+این `Est` سیگنال شروع ارسال برای `TesterClient` است.
+
+در packet mode، اگر `packet-init-on-start=true` باشد، نود می‌تواند worker packet-line state را در startup initialize کند.
+
+## Verification
+
+در stream mode:
+
+- request bytes در buffer_stream جمع می‌شوند
+- chunkهای کامل به ترتیب verify می‌شوند
+- trailing byte اضافه خطاست
+- بعد از verify شدن کامل request، response آماده ارسال می‌شود
+
+در packet mode:
+
+- هر request packet باید با chunk مورد انتظار match شود
+- با `packet-ipv4`، packet باید IPv4 کامل و non-fragmented با source/destination/protocol مورد انتظار باشد
+- هر request معتبر یک response deterministic queue می‌کند
+- packet line باید در runtime زنده بماند
+
+با `packet-stateless=true`، requestها می‌توانند out of order باشند و chunk با packet size تشخیص داده می‌شود.
+
+## Response
+
+در stream mode، responseها با `tunnelPrevDownStreamPayload()` برمی‌گردند. اگر `streaming-response=false` باشد، تا verify کامل request نگه داشته می‌شوند. اگر `true` باشد، هر chunk بعد از verify شدن request متناظر می‌تواند ارسال شود.
+
+در packet mode، direction پاسخ به این بستگی دارد که request از کدام سمت آمده است:
+
+- request upstream، response downstream می‌گیرد
+- request downstream، response upstream به سمت `next` می‌گیرد
+
+این رفتار برای topologyهای bridged packet لازم است.
+
+## Finish
+
+در stream mode، `Finish` قبل از verify کامل request یا قبل از ارسال کامل response خطاست. بعد از exchange موفق، upstream `Finish` فقط state محلی tester را destroy می‌کند.
+
+در packet mode، `Finish` در runtime روی packet line خطاست؛ packet lineها state مشترک worker هستند و نباید در تست packet بسته شوند.
+
+## مشخصات Node
+
+| ویژگی | مقدار |
+|---|---|
+| Normal position | Chain end |
+| Packet mode | Chain end یا participant در مسیر bridged packet |
+| `next` | فقط با `packet-mode=true` |
+| Required left padding | `0` |
+
+## خطاهای رایج
+
+- استفاده به عنوان سرویس production.
+- اضافه کردن `next` در stream mode.
+- فعال کردن packet mode بدون packet-layer node در chain.
+- انتظار close شدن packet line در packet mode.
+- ترکیب `packet-stateless=true` با `max-payload-size`.
+- استفاده از `packet-ipv4` بدون `packet-mode=true`.
+
