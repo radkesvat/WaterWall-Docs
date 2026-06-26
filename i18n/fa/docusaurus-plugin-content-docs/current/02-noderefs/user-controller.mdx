@@ -1,0 +1,130 @@
+---
+sidebar_position: 515
+---
+
+# UserController
+
+`UserController` یک نود پیشرفته و support داخلی است که limitهای userهای authenticate شده را برای chainهای سرویس‌دهنده enforce می‌کند.
+
+کاربران معمولی معمولاً نباید این نود را دستی قرار دهند. نودهای server-side مثل `Socks5Server`، `TrojanServer` و `VlessServer` وقتی در حالت authenticated database-backed اجرا می‌شوند، یک `UserController` داخلی می‌سازند. اول همان نودهای سطح بالاتر را تنظیم کنید، مگر اینکه یک tunnel سفارشی می‌سازید که خودش `lineAddUser()` را صدا می‌زند و lifecycle مربوط به user handle را می‌شناسد.
+
+## کاری که انجام می‌دهد
+
+`UserController` بعد از نودی قرار می‌گیرد که user را authenticate کرده و یک `user_handle_t` معتبر روی line ثبت کرده است. برای هر line authenticate شده، این نود:
+
+- enabled بودن user را بررسی می‌کند
+- expiry user را بررسی می‌کند
+- یک connection slot زنده reserve می‌کند
+- اگر source IP موجود باشد، IP slot را reserve می‌کند
+- bytesهای upstream و downstream را account می‌کند
+- lineهای active را وقتی user disabled، expired، removed یا over-quota شود می‌بندد
+- هنگام finish شدن line، connection/IP slot را release می‌کند
+
+این نود login protocol را parse نمی‌کند و دیتابیس اصلی userها را نگه نمی‌دارد. برای lookup و accounting به یک `AuthenticationClient` موجود وابسته است.
+
+## جایگاه رایج
+
+برای server nodeهای authenticated عادی، آن را دستی اضافه نکنید:
+
+```text
+TcpListener -> Socks5Server -> TcpConnector
+```
+
+در authenticated mode، `Socks5Server` خودش یک `UserController` داخلی بین خودش و outbound node تنظیم‌شده قرار می‌دهد.
+
+جایگذاری دستی فقط برای chainهای سفارشی پیشرفته است که node قبلی user handle معتبر ثبت می‌کند:
+
+```text
+CustomAuthNode -> UserController -> TcpConnector
+```
+
+lineهایی که current user handle معتبر ندارند بدون enforcement عبور می‌کنند.
+
+## نمونه تنظیمات
+
+```json
+{
+  "name": "user-controller",
+  "type": "UserController",
+  "settings": {
+    "auth-client-node-name": "auth-client",
+    "sweep-interval-ms": 1000,
+    "verbose": false
+  },
+  "next": "outbound"
+}
+```
+
+`auth-client` باید یک `AuthenticationClient` در همان config باشد. `UserController` فقط به آن node موجود reference می‌دهد و خودش auth client نمی‌سازد.
+
+## فیلدهای اجباری
+
+| فیلد | نوع | توضیح |
+|---|---|---|
+| `type` | string | باید `UserController` باشد. |
+| `settings` | object | باید object غیرخالی باشد. |
+| `settings.auth-client-node-name` | string | نام یک `AuthenticationClient` موجود. نباید به خود `UserController` اشاره کند. |
+
+## تنظیمات اختیاری
+
+| گزینه | پیش‌فرض | توضیح |
+|---|---|---|
+| `sweep-interval-ms` | `1000` | فاصله check کردن lineهای managed روی هر worker، حتی وقتی idle هستند. باید `>= 1` باشد. |
+| `verbose` | `false` | context بیشتر برای warningهای reject یا close شدن lineهای managed. |
+
+## limitهایی که enforce می‌شود
+
+`UserController` limit user را از table محلی نگه‌داری‌شده توسط `AuthenticationClient` می‌خواند.
+
+| محدوده | رفتار |
+|---|---|
+| `enabled` | user غیرفعال نمی‌تواند line managed جدید باز کند و lineهای موجودش بسته می‌شوند. |
+| expiry زمانی | user expired نمی‌تواند line managed جدید باز کند و lineهای موجودش بسته می‌شوند. |
+| `traffic.up`, `traffic.down`, `traffic.total` | bytesهای payload به counters تجمعی اضافه می‌شوند. user over-quota reject یا close می‌شود. |
+| `connections-out` | حداکثر تعداد lineهای outbound هم‌زمان برای user. |
+| `ips` | حداکثر تعداد source IPهای هم‌زمان برای user. استفاده دوباره از IP قبلاً شمرده‌شده مجاز است. |
+
+`connections-in` توسط این نود enforce نمی‌شود. محدودیت سرعت `bandwidth` هم اینجا انجام نمی‌شود؛ برای bytes-per-second از `SpeedLimit` استفاده کنید.
+
+limit صفر یا نبودن یک limit یعنی برای همان field نامحدود است.
+
+## جریان اجرا
+
+در upstream `Init`:
+
+1. line state آماده می‌شود
+2. current user handle line خوانده می‌شود
+3. lineهای anonymous یا handle نامعتبر بدون enforcement forward می‌شوند
+4. lineهای authenticated از طریق `AuthenticationClient` بررسی می‌شوند
+5. lineهای قبول‌شده connection/IP slot reserve می‌کنند و برای sweep ثبت می‌شوند
+6. lineهای reject شده بدون باز کردن upstream side، به سمت previous finish می‌شوند
+
+در upstream payload، byte count به عنوان upload user حساب می‌شود. در downstream payload، byte count به عنوان download user حساب می‌شود. اگر accounting بگوید user باید بسته شود، buffer recycle می‌شود و هر دو جهت finish می‌شوند.
+
+در `Finish`، نود accounting state را release می‌کند، state خودش را destroy می‌کند و finish را فقط به جهت مقابل طبق directional finish rules می‌فرستد.
+
+## Sweep Timer
+
+هر worker یک sweep timer دوره‌ای دارد. این timer lineهای managed را بررسی می‌کند تا userهای disabled، expired، removed یا over-quota حتی بدون payload جدید هم قطع شوند.
+
+## نکته‌های عملیاتی
+
+- جایگذاری دستی نیازمند node قبلی است که `lineAddUser()` را با user handle معتبر صدا بزند.
+- `Socks5Server`، `TrojanServer` و `VlessServer` در authenticated mode این نود را داخلی می‌سازند؛ در آن حالت یک `UserController` دیگر مستقیم بعد از آن‌ها قرار ندهید.
+- `UserController` هیچ‌وقت config user مثل password، enabled state یا limitها را نمی‌نویسد.
+- live connection/IP counters state محلی پردازش هستند و از طریق helperهای `AuthenticationClient` نگه‌داری می‌شوند.
+- cumulative traffic به stats عادی user اضافه می‌شود.
+- این نود stream-style support node است، نه packet tunnel.
+
+## مشخصات نود
+
+| ویژگی | مقدار |
+|---|---|
+| مخاطب | کاربران پیشرفته و ترکیب داخلی serverهای authenticated |
+| جایگاه | Middle stream support node |
+| نیاز به `AuthenticationClient` | بله |
+| Per-line state | دارد |
+| ایجاد line | خیر |
+| destroy کردن line | خیر |
+| تغییر payload | خیر |
+| Required left padding | `0` |

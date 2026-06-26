@@ -1,0 +1,122 @@
+---
+sidebar_position: 205
+---
+
+<!--
+Documentation version: 106
+Sync note: Any change to this file must also be applied to WaterWall/tunnels/Internals/DomainResolver/description.md, and both files must keep the same documentation version.
+-->
+
+# DomainResolver
+
+`DomainResolver` is an advanced support node that resolves a line's destination domain before forwarding that line's `Init`.
+
+Normal users usually should not configure this node manually. Several higher-level nodes create and configure it internally, including `TcpConnector`, `UdpConnector`, `Router`, `Socks5Client`, `VlessClient`, and `TrojanClient`. Use the public settings on those nodes first unless you are deliberately building a custom chain that sets `line->routing_context.dest_ctx` yourself.
+
+## What It Does
+
+`DomainResolver` reads and updates the line destination address context:
+
+```text
+line->routing_context.dest_ctx
+```
+
+If the destination is already an IP address, or has already been resolved, `DomainResolver` forwards `Init` immediately. If the destination is a domain name, it submits asynchronous DNS on the current worker, applies the configured domain strategy, writes the selected IP back into `dest_ctx`, then forwards the delayed `Init`.
+
+It does not:
+
+- open sockets
+- create lines
+- transform payload bytes
+- prepend protocol data
+- resolve `src_ctx`
+- perform packet-line work
+
+## Typical Placement
+
+Manual placement is advanced. Put it after a node that sets `dest_ctx` to a domain and before a node that requires a concrete IP address.
+
+```text
+TcpListener -> Socks5Server -> DomainResolver -> TcpConnector
+```
+
+In many real configs this is unnecessary because the connector/protocol node inserts its own internal resolver.
+
+## Basic Example
+
+```json
+{
+  "name": "resolve-domain",
+  "type": "DomainResolver",
+  "settings": {
+    "strategy": "prefer-ipv4",
+    "verbose": false
+  },
+  "next": "outbound"
+}
+```
+
+## Fields
+
+| Field | Type | Required | Description |
+|---|---|---|---|
+| `type` | string | Yes | Must be `DomainResolver`. |
+| `settings` | object | No | Optional settings object. If present, it must be an object. |
+| `next` | string | Usually | The node that receives the line after destination resolution in the upstream direction. |
+
+`DomainResolver` can technically receive upstream or downstream `Init`, but normal manual use is upstream in the middle of a stream chain.
+
+## Settings
+
+| Field | Default | Description |
+|---|---|---|
+| `strategy` | core `dns.domain-strategy` | DNS result selection strategy. Accepts `core-settings`, `accept-dns-returned-order`, `prefer-ipv4`, `prefer-ipv6`, `only-ipv4`, or `only-ipv6`. |
+| `verbose` | `false` | Logs DNS start messages at debug level. Resolved-address logs still use the normal DNS debug logger. |
+
+`strategy` can be given as a string or as the internal domain-strategy value accepted by the shared parser.
+
+## Runtime Flow
+
+On upstream `Init`:
+
+1. line state is initialized
+2. `dest_ctx` is inspected
+3. if no DNS is needed, upstream `Init` is forwarded to `next`
+4. if DNS is needed, the node enters resolving state and returns
+5. when DNS completes, the selected address is written into `dest_ctx`
+6. the delayed upstream `Init` is forwarded
+7. payloads queued during DNS are replayed upstream
+
+The downstream direction behaves the same way, but forwards the delayed `Init` to the previous node.
+
+## Pending Payloads
+
+Payloads that arrive from the initiating side while DNS is pending are queued. The queue limit is `1 MiB` per line.
+
+The limit is checked after enqueue, so the pending queue may exceed the limit by one buffer before the line is closed. If DNS fails or the queue overflows, the node destroys its own line state and finishes only the side that initiated the unresolved line.
+
+Callbacks other than payload are ignored until the resolver reaches open state.
+
+## Failure Behavior
+
+The line is rejected when:
+
+- the destination is not an IP address and not a domain
+- async DNS submission fails
+- DNS returns no usable address for the configured strategy
+- the pending payload queue exceeds its limit
+
+`DomainResolver` does not retry DNS by itself. Retry behavior belongs in the higher-level node or transport design.
+
+## Node Metadata
+
+| Property | Value |
+|---|---|
+| Intended audience | Advanced users and internal node composition |
+| Position | Middle stream support node |
+| Layer group | Anything to anything |
+| Per-line state | Yes |
+| Creates lines | No |
+| Destroys lines | No |
+| Modifies payload | No |
+| Required left padding | `0` |

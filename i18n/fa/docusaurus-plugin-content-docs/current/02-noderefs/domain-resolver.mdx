@@ -1,0 +1,112 @@
+---
+sidebar_position: 205
+---
+
+# DomainResolver
+
+`DomainResolver` یک نود پیشرفته و support داخلی است که قبل از forward کردن `Init`، domain مقصد یک line را resolve می‌کند.
+
+کاربران معمولی معمولاً نباید این نود را دستی در config قرار دهند. چند نود سطح بالاتر مثل `TcpConnector`، `UdpConnector`، `Router`، `Socks5Client`، `VlessClient` و `TrojanClient` در صورت نیاز آن را به صورت داخلی می‌سازند و تنظیم می‌کنند. اول از تنظیمات عمومی همان نودها استفاده کنید، مگر اینکه عمداً یک chain سفارشی می‌سازید که خودش `line->routing_context.dest_ctx` را تنظیم می‌کند.
+
+## کاری که انجام می‌دهد
+
+`DomainResolver` فقط destination address context را می‌خواند و به‌روزرسانی می‌کند:
+
+```text
+line->routing_context.dest_ctx
+```
+
+اگر مقصد از قبل IP باشد، یا قبلاً resolve شده باشد، `Init` فوراً forward می‌شود. اگر مقصد domain باشد، DNS به صورت async روی worker فعلی ارسال می‌شود، strategy انتخاب آدرس اعمال می‌شود، IP انتخاب‌شده داخل `dest_ctx` نوشته می‌شود، و سپس `Init` تاخیرخورده forward می‌شود.
+
+این نود:
+
+- socket باز نمی‌کند
+- line جدید نمی‌سازد
+- payload را تغییر نمی‌دهد
+- protocol byte به buffer اضافه نمی‌کند
+- `src_ctx` را resolve نمی‌کند
+- packet-line node نیست
+
+## جایگاه رایج
+
+استفاده دستی از این نود advanced است. آن را بعد از نودی بگذارید که `dest_ctx` را به domain تنظیم می‌کند و قبل از نودی که IP واقعی لازم دارد.
+
+```text
+TcpListener -> Socks5Server -> DomainResolver -> TcpConnector
+```
+
+در بیشتر configهای عادی این کار لازم نیست، چون connector یا protocol node خودش resolver داخلی می‌سازد.
+
+## نمونه تنظیمات
+
+```json
+{
+  "name": "resolve-domain",
+  "type": "DomainResolver",
+  "settings": {
+    "strategy": "prefer-ipv4",
+    "verbose": false
+  },
+  "next": "outbound"
+}
+```
+
+## فیلدها
+
+| فیلد | نوع | اجباری | توضیح |
+|---|---|---|---|
+| `type` | string | بله | باید `DomainResolver` باشد. |
+| `settings` | object | خیر | object تنظیمات اختیاری. اگر وجود داشته باشد باید object باشد. |
+| `next` | string | معمولاً | نودی که بعد از resolve شدن مقصد، upstream `Init` را می‌گیرد. |
+
+این نود از نظر فنی می‌تواند upstream یا downstream `Init` بگیرد، اما استفاده دستی رایج آن upstream و وسط chain stream است.
+
+## تنظیمات
+
+| گزینه | پیش‌فرض | توضیح |
+|---|---|---|
+| `strategy` | مقدار core `dns.domain-strategy` | روش انتخاب نتیجه DNS. یکی از `core-settings`، `accept-dns-returned-order`، `prefer-ipv4`، `prefer-ipv6`، `only-ipv4` یا `only-ipv6`. |
+| `verbose` | `false` | شروع resolve را در debug log ثبت می‌کند. log مربوط به آدرس resolve شده همچنان از DNS debug logger عادی استفاده می‌کند. |
+
+`strategy` می‌تواند string یا مقدار داخلی قابل قبول برای parser مشترک domain-strategy باشد.
+
+## جریان اجرا
+
+در upstream `Init`:
+
+1. line state آماده می‌شود
+2. `dest_ctx` بررسی می‌شود
+3. اگر DNS لازم نباشد، upstream `Init` به `next` می‌رود
+4. اگر DNS لازم باشد، نود وارد resolving state می‌شود و برمی‌گردد
+5. بعد از کامل شدن DNS، آدرس انتخاب‌شده داخل `dest_ctx` نوشته می‌شود
+6. upstream `Init` تاخیرخورده forward می‌شود
+7. payloadهای صف‌شده هنگام DNS replay می‌شوند
+
+downstream هم همین مدل را دارد، اما `Init` تاخیرخورده را به نود قبلی می‌فرستد.
+
+## Pending Payload
+
+payloadهایی که هنگام DNS از سمت initiating side برسند queue می‌شوند. محدودیت queue برابر `1 MiB` برای هر line است.
+
+این محدودیت بعد از enqueue بررسی می‌شود، پس queue ممکن است به اندازه یک buffer از حد عبور کند و بعد line بسته شود. اگر DNS fail شود یا queue overflow کند، نود state خودش را destroy می‌کند و فقط سمتی را finish می‌کند که line unresolved را شروع کرده بود.
+
+callbackهای غیر payload تا قبل از open state نادیده گرفته می‌شوند.
+
+## نکته‌های عملیاتی
+
+- این نود retry داخلی DNS ندارد.
+- اگر مقصد نه IP باشد و نه domain معتبر، line رد می‌شود.
+- این نود stream-style support node است، نه packet tunnel.
+- `required_padding_left` آن `0` است.
+
+## مشخصات نود
+
+| ویژگی | مقدار |
+|---|---|
+| مخاطب | کاربران پیشرفته و ترکیب داخلی nodeها |
+| جایگاه | Middle stream support node |
+| Per-line state | دارد |
+| ایجاد line | خیر |
+| destroy کردن line | خیر |
+| تغییر payload | خیر |
+| Required left padding | `0` |
