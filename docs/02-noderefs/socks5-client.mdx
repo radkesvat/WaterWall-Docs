@@ -4,17 +4,35 @@ sidebar_position: 1320
 
 # Socks5Client
 
-`Socks5Client` سمت client پروتکل SOCKS5 است. این نود روی اتصال stream بعدی greeting، احراز هویت اختیاری و دستور `CONNECT` را می‌فرستد و payload برنامه را تا موفق شدن handshake نگه می‌دارد.
+`Socks5Client` is a stream middle tunnel that speaks the client side of the SOCKS5 protocol. It connects to the next
+transport as a SOCKS proxy connection, negotiates the SOCKS5 method, optionally authenticates with username/password,
+and then sends either a `CONNECT` or `UDP ASSOCIATE` request for the configured final target.
 
-## جایگاه رایج
+The target configured on `Socks5Client` is the final destination that should appear inside the SOCKS5 request. The
+address of the SOCKS proxy itself belongs to the next connector, usually `TcpConnector` for TCP-only use or
+`TcpUdpConnector` when UDP relay traffic is needed.
+
+## Typical placement
+
+TCP proxying:
 
 ```text
 TcpListener -> Socks5Client -> TcpConnector
 ```
 
-در این چینش، `TcpConnector` معمولا به آدرس SOCKS5 proxy وصل می‌شود و `Socks5Client` handshake و request مقصد را روی همان اتصال انجام می‌دهد.
+TCP and UDP proxying through the same SOCKS server:
 
-## نمونه تنظیم
+```text
+TcpUdpListener -> Socks5Client -> TcpUdpConnector
+```
+
+In the second topology, the combined connector is expected to reach the SOCKS proxy over TCP for the control connection
+and UDP for the relay address returned by `UDP ASSOCIATE`.
+
+## Basic example
+
+This example preserves the incoming destination from `line->dest_ctx` and asks the SOCKS proxy to connect to that same
+destination.
 
 ```json
 {
@@ -26,27 +44,155 @@ TcpListener -> Socks5Client -> TcpConnector
     "protocol": "tcp",
     "user": "alice",
     "pass": "secret",
+    "domain-strategy": "do-not-resolve-domains",
     "verbose": false
   },
   "next": "proxy-transport"
 }
 ```
 
-## تنظیمات رایج
+`proxy-transport` should be the node that connects to the SOCKS5 server, for example a `TcpConnector` configured with
+the proxy server address and port.
 
-| گزینه | توضیح |
-|---|---|
-| گزینه | اجباری | توضیح |
-|---|---|---|
-| `address` / `target-address` / `target` | بله | مقصدی که باید در SOCKS5 request بیاید؛ می‌تواند literal یا `dest_context->address` باشد |
-| `port` | بله | پورت مقصد؛ عدد یا `dest_context->port` |
-| `protocol` | خیر | فقط `tcp` یا `connect` پشتیبانی می‌شود |
-| `user` / `username` | خیر | نام کاربری SOCKS5 |
-| `pass` / `password` | خیر | رمز عبور SOCKS5؛ اگر یکی از user/pass باشد دیگری هم باید سازگار باشد |
-| `verbose` | خیر | log بیشتر |
+## Dynamic protocol example
 
-## نکته‌ها
+Use `dest_context->protocol` when the incoming line may already be marked as TCP or UDP and the SOCKS client should
+follow that protocol.
 
-- این نود خودش socket نمی‌سازد؛ برای اتصال به proxy به transport بعدی مثل `TcpConnector` نیاز دارد.
-- مقصدی که در `Socks5Client` می‌نویسید مقصد نهایی SOCKS است، نه آدرس خود proxy.
-- `UDP ASSOCIATE` در data-plane این نود پیاده‌سازی نشده و `protocol: "udp"` محافظه‌کارانه رد می‌شود.
+```json
+{
+  "name": "socks-client",
+  "type": "Socks5Client",
+  "settings": {
+    "address": "dest_context->address",
+    "port": "dest_context->port",
+    "protocol": "dest_context->protocol"
+  },
+  "next": "proxy-transport"
+}
+```
+
+If the incoming destination context is exactly TCP, `Socks5Client` sends `CONNECT`. If it is exactly UDP, it negotiates
+`UDP ASSOCIATE`. If the protocol flags are missing, ambiguous, or not TCP/UDP, it logs a warning and falls back to TCP.
+
+## Fixed target example
+
+```json
+{
+  "name": "socks-client",
+  "type": "Socks5Client",
+  "settings": {
+    "address": "example.com",
+    "port": 443,
+    "protocol": "tcp",
+    "domain-strategy": "resolve-domains-and-prefer-ipv4"
+  },
+  "next": "proxy-transport"
+}
+```
+
+With local domain resolution enabled, the internal `DomainResolver` resolves `example.com` before the SOCKS request is
+sent. If an IPv4 answer is available, the SOCKS request carries the IPv4 address. Otherwise it falls back according to
+the selected strategy.
+
+## Required fields
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `settings` | object | Required and must not be empty. |
+| `settings.address` / `settings.target-address` / `settings.target` | string | Final SOCKS destination address. Use a literal IP/domain, `dest_context->address`, or `line->dest_ctx->address`. |
+| `settings.port` | number or string | Final SOCKS destination port. Use a number from `1` to `65535`, `dest_context->port`, or `line->dest_ctx->port`. |
+| `next` | string | Required. Points to the transport that reaches the SOCKS proxy. |
+
+## Optional fields
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `settings.protocol` / `settings.proto` | `tcp` | SOCKS command source. Supports `tcp`, `connect`, `udp`, `udp-associate`, `dest_context->protocol`, and `line->dest_ctx->protocol`. |
+| `settings.user` / `settings.username` | unset | SOCKS5 username. Must be provided together with `pass`/`password`. |
+| `settings.pass` / `settings.password` | unset | SOCKS5 password. Must be provided together with `user`/`username`. |
+| `settings.domain-strategy` | `do-not-resolve-domains` | Controls whether domain targets are resolved locally before the SOCKS request is encoded. |
+| `settings.verbose` | `false` | Enables extra debug logging. |
+
+Credentials must be non-empty and no longer than 255 bytes each. If only one side of the username/password pair is
+configured, node creation fails.
+
+## Domain strategy
+
+`Socks5Client` always creates an internal target setup tunnel. That setup step writes the final SOCKS target into
+`line->dest_ctx` before the SOCKS protocol code runs, and it also stores the selected protocol for the real client line.
+
+When `domain-strategy` enables local resolution, the client also inserts an internal `DomainResolver` between the setup
+step and `Socks5Client`. Resolution applies to fixed domain targets and to targets copied from `dest_context->address`.
+Literal IP addresses are left unchanged.
+
+Supported values:
+
+| Value | Behavior |
+| --- | --- |
+| `do-not-resolve-domains` | Keep domain names as SOCKS5 domain addresses. The SOCKS server side resolves them. |
+| `resolve-domains-with-core-settings` | Use the DNS preference configured in `core.json`. |
+| `resolve-domains-and-accept-dns-returned-order` | Resolve locally and use the first usable DNS result. |
+| `resolve-domains-and-prefer-ipv4` | Prefer IPv4, fall back to IPv6. |
+| `resolve-domains-and-prefer-ipv6` | Prefer IPv6, fall back to IPv4. |
+| `resolve-domains-and-use-only-ipv4` | Use only IPv4 answers; close the line if none are available. |
+| `resolve-domains-and-use-only-ipv6` | Use only IPv6 answers; close the line if none are available. |
+
+## TCP behavior
+
+For TCP mode, the lifecycle is:
+
+1. Upstream `Init` initializes `Socks5Client` line state and forwards `Init` to the next transport.
+2. The next transport establishes the proxy connection and sends downstream `Est`.
+3. `Socks5Client` sends the SOCKS5 method greeting.
+4. If credentials are configured and the server selects username/password auth, it sends the username/password request.
+5. It sends a SOCKS5 `CONNECT` command for the configured target.
+6. After a successful command reply, it emits downstream `Est` toward the previous node.
+7. Pending upstream payload is flushed to the proxy connection.
+
+If upstream payload arrives before the SOCKS request succeeds, it is queued. The pending queue is created with capacity
+for 8 buffers and the total queued upstream payload is limited to 1 MiB. The handshake input buffer is limited to 4096
+bytes.
+
+If the proxy rejects all methods, authentication fails, the command reply is invalid, or the command fails, the tunnel
+closes the line.
+
+## UDP behavior
+
+For UDP mode, the application line represents the user-facing UDP flow, while `Socks5Client` creates two internal lines:
+
+| Internal line | Purpose |
+| --- | --- |
+| UDP control line | A TCP line that connects to the SOCKS proxy and sends `UDP ASSOCIATE`. The request target is `0.0.0.0:0`. |
+| UDP relay line | A UDP line that connects to the relay address returned by the SOCKS proxy. |
+
+The application line is established only after both the TCP control association and the UDP relay line are ready. Until
+then, upstream datagrams are queued under the same 1 MiB pending-payload limit.
+
+When application payload goes upstream, `Socks5Client` prepends a SOCKS5 UDP request header containing the configured
+final target and sends the datagram through the UDP relay line. When a relay datagram comes back downstream, it validates
+and strips the SOCKS5 UDP header before forwarding only the payload toward the previous node.
+
+SOCKS5 UDP fragmentation is not reassembled. Datagrams with `FRAG != 0` are ignored conservatively.
+
+## Node metadata
+
+| Property | Value |
+| --- | --- |
+| Node flag | `kNodeFlagNone` |
+| Previous node | Allowed |
+| Next node | Required |
+| Layer group | `kNodeLayerAnything` |
+| `required_padding_left` | Worst-case SOCKS5 UDP header: `4 + 1 + 255 + 2` bytes |
+
+The padding requirement lets UDP mode prepend SOCKS5 datagram headers without breaking Waterwall buffer-padding
+assumptions. If an incoming buffer still lacks enough left capacity, the tunnel allocates a replacement buffer and
+copies the payload before adding the header.
+
+## Common mistakes
+
+- Do not put the SOCKS proxy address in `settings.address`; that field is the final target inside the SOCKS request.
+- Do not use UDP mode with a TCP-only next connector. UDP mode needs a next side that can create the TCP control line
+  and the UDP relay line.
+- Do not expect `domain-strategy` to change literal IP targets. It only affects domain targets.
+- Do not omit `port` when using `dest_context->address`; address and port are selected independently.

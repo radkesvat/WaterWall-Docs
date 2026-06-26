@@ -1,0 +1,215 @@
+---
+sidebar_position: 430
+---
+
+# TcpUdpConnector
+
+`TcpUdpConnector` is a chain-end adapter wrapper around `TcpConnector` and `UdpConnector`. It creates one internal TCP
+connector and one internal UDP connector with the same connector settings, then chooses the correct child connector for
+each line from WaterWall routing metadata.
+
+This node does not encapsulate TCP inside UDP and does not encapsulate UDP inside TCP. It is a dual-protocol connector
+wrapper.
+
+## Typical Placement
+
+Use `TcpUdpConnector` when one outbound node should support both TCP and UDP:
+
+```text
+Socks5Server -> TcpUdpConnector
+TcpUdpListener -> TcpUdpConnector
+TcpUdpListener -> SniffRouter -> TcpUdpConnector
+PacketsToConnection -> TcpUdpConnector
+```
+
+The previous node must provide protocol metadata in either the destination context or the source context. `TcpUdpConnector`
+uses that metadata to decide whether the line should leave through the internal `TcpConnector` or internal `UdpConnector`.
+
+## Basic Example
+
+```json
+{
+  "name": "mixed-out",
+  "type": "TcpUdpConnector",
+  "settings": {
+    "address": "198.51.100.10",
+    "port": 443,
+    "domain-strategy": "prefer-ipv4",
+    "reuseaddr": true,
+    "nodelay": true,
+    "fastopen": false,
+    "large-send-buffer": true,
+    "large-recv-buffer": true,
+    "interface": "eth0",
+    "fwmark": 10,
+    "balance-mode": "connection"
+  }
+}
+```
+
+Both TCP lines and UDP peer lines use the same configured destination. TCP lines are handled by the internal
+`TcpConnector`; UDP lines are handled by the internal `UdpConnector`.
+
+## Dynamic-Destination Example
+
+```json
+{
+  "name": "mixed-out",
+  "type": "TcpUdpConnector",
+  "settings": {
+    "address": "dest_context->address",
+    "port": "dest_context->port",
+    "domain-strategy": "prefer-ipv4",
+    "reuseaddr": true,
+    "large-send-buffer": true,
+    "large-recv-buffer": true
+  }
+}
+```
+
+This form is useful after nodes such as `Socks5Server`, `SniffRouter`, or other routing-aware nodes that populate the
+destination address, destination port, and destination protocol.
+
+## Weighted Destination Example
+
+```json
+{
+  "name": "mixed-out",
+  "type": "TcpUdpConnector",
+  "settings": {
+    "addresses": [
+      {
+        "address": "198.51.100.10",
+        "port": 443,
+        "weight": 3
+      },
+      {
+        "address": "198.51.100.20",
+        "port": 443,
+        "weight": 1
+      }
+    ],
+    "domain-strategy": "prefer-ipv4",
+    "reuseaddr": true,
+    "large-send-buffer": true,
+    "large-recv-buffer": true,
+    "balance-mode": "connection"
+  }
+}
+```
+
+The same `addresses` array is passed to both child connectors. Use destination forms that are valid for both
+`TcpConnector` and `UdpConnector` if both protocols may be selected.
+
+## Required Fields
+
+Top-level fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | string | User-chosen node name. Must be unique inside the config file. |
+| `type` | string | Must be exactly `"TcpUdpConnector"`. |
+| `settings` | object | Shared connector settings passed to both internal child connectors. Must be a non-empty object. |
+
+`TcpUdpConnector` is a chain end. It must not have `next`.
+
+Required destination settings:
+
+| Style | Required fields | Description |
+| --- | --- | --- |
+| Single destination | `address` and `port` | Every selected child connector uses the same destination rule. |
+| Weighted destinations | `addresses` | Each line chooses from a weighted destination list. The legacy misspelling `adresses` is accepted by the child connectors, but new configs should use `addresses`. |
+
+Do not mix `addresses` with top-level `address` or `port`.
+
+## Shared Connector Settings
+
+The settings object must be acceptable to both child connectors at startup. This matters even if you expect only one
+protocol at runtime, because the wrapper creates both internal connectors while loading the config.
+
+| Setting | Applies to | Description |
+| --- | --- | --- |
+| `address` | TCP and UDP children | Constant address, domain, `"src_context->address"`, or `"dest_context->address"`. |
+| `port` | TCP and UDP children | Constant port, `"src_context->port"`, or `"dest_context->port"`. |
+| `addresses` | TCP and UDP children | Weighted destination list. |
+| `domain-strategy` | TCP and UDP children | DNS result selection strategy for domain destinations. |
+| `reuseaddr` | TCP and UDP children | Enables `SO_REUSEADDR` where supported. |
+| `large-send-buffer` | TCP and UDP children | Sets `SO_SNDBUF` where supported. |
+| `large-recv-buffer` | TCP and UDP children | Sets `SO_RCVBUF` where supported. |
+| `fwmark` | TCP and UDP children | Applies a Linux-style socket mark where supported. |
+| `interface` | TCP and UDP children | Restricts outbound sockets to a network device where supported. |
+| `source-ip` | TCP and UDP children | Binds outbound sockets to a specific local source IP. |
+| `nodelay` | TCP child | Enables `TCP_NODELAY` on outbound TCP sockets. |
+| `fastopen` | TCP child | Requests `TCP_FASTOPEN` where supported. |
+| `balance-mode` | UDP child | Controls UDP weighted destination selection: `"connection"` or `"packet"`. |
+
+For full destination selection, DNS, socket-option, and UDP balance-mode details, see the `TcpConnector` and
+`UdpConnector` pages.
+
+:::warning
+`UdpConnector` supports UDP-only port syntax such as `"random(x,y)"`, but `TcpConnector` does not. Because
+`TcpUdpConnector` creates both child connectors, avoid UDP-only destination syntax here unless the current code has also
+made it valid for `TcpConnector`.
+:::
+
+## Protocol Selection
+
+During upstream `Init`, `TcpUdpConnector` chooses one child connector and stores that choice in this node's per-line
+state. Later upstream callbacks use the stored child, so the selected connector remains stable even if another node
+updates routing context fields later.
+
+Selection order:
+
+| Step | Behavior |
+| --- | --- |
+| 1 | Check `line->routing_context.dest_ctx`. |
+| 2 | If the destination context has an exact TCP protocol flag, select the internal `TcpConnector`. |
+| 3 | If the destination context has an exact UDP protocol flag, select the internal `UdpConnector`. |
+| 4 | If the destination context has no protocol flags, fall back to `line->routing_context.src_ctx`. |
+| 5 | If the source context has an exact TCP or UDP protocol flag, select the matching child connector. |
+| 6 | If no exact protocol can be selected, treat it as a fatal configuration or routing error. |
+
+Destination protocol wins over source protocol. That allows routing-aware nodes to receive one transport on the inbound
+side and still choose the outbound transport from the requested destination.
+
+## Runtime Flow
+
+At startup, `TcpUdpConnector` creates two internal child tunnels:
+
+- `TcpConnector`, named like `<node-name>.tcp-connector`
+- `UdpConnector`, named like `<node-name>.udp-connector`
+
+Both children are inserted into the chain below the wrapper. Runtime callbacks work like this:
+
+1. the previous node sends upstream `Init` to `TcpUdpConnector`
+2. the wrapper selects and initializes one child connector
+3. upstream payload, pause, resume, establishment, and finish callbacks are forwarded to that same child
+4. downstream callbacks from the child connector enter `TcpUdpConnector`
+5. the wrapper forwards downstream callbacks to the previous node
+
+## Line Ownership
+
+`TcpUdpConnector` does not create or destroy connection lines. The previous adapter or bridge owns line creation.
+
+The wrapper only stores the selected child connector in a small per-line state. It clears that state before forwarding a
+real upstream or downstream finish. It never calls `lineDestroy()`.
+
+## Node Metadata
+
+| Property | Value |
+| --- | --- |
+| Node flag | `kNodeFlagChainEnd` |
+| Previous node | Required |
+| Next node | Not allowed |
+| Layer group | `kNodeLayerAnything` |
+| `required_padding_left` | `0` |
+| Line state | selected child connector |
+
+## Common Mistakes
+
+- Do not use `TcpUdpConnector` as a protocol converter. It only chooses between TCP and UDP child connectors.
+- Do not add `next`; this node is a chain end.
+- Do not expect separate TCP and UDP destination settings. Both child connectors receive the same settings object.
+- Do not use UDP-only destination syntax such as `"random(x,y)"` in configs that must also create the internal
+  `TcpConnector`.
+- Do not place it after a node that fails to provide exact TCP or UDP protocol metadata.

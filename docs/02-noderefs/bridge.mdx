@@ -2,221 +2,339 @@
 sidebar_position: 100100
 ---
 
-
 # Bridge
 
-## 📖 معرفی کلی
+`Bridge` connects two separately declared places inside the same WaterWall
+configuration. A pair of `Bridge` nodes forwards lifecycle callbacks and payload
+between each other, but with the direction flipped.
 
-| ویژگی              | مقدار                       | توضیح                                                                 |
-|--------------------|-----------------------------|------------------------------------------------------------------------|
-| نوع نود            | Tunnel (چندجهته)            | جهت برای این تونل بی‌معناست.                                            |
-| لایه شبکه          | تمام لایه ها   | با داده به‌صورت خام کار می‌کند و «اتصال» برایش معنا ندارد.            |
-| جهت پشتیبانی       | دو‌جهته                     | جهت این نود به خودِ داده و زنجیره‌ای که در آن قرار گرفته بستگی دارد.   |
-| موقعیت در زنجیره   | ابتدا یا انتهای زنجیره      | فقط در ابتدا یا انتهای یک زنجیره قابل استفاده است.                     |
-| وابستگی            | وابسته به جفت و همسایه‌ها   | اگر در انتهای زنجیره باشد به نود قبلی و اگر در ابتدای زنجیره باشد به نود بعدی وابسته است؛ خودش صرفاً داده را عبور می‌دهد. |
+This node was created mainly for reverse-tunnel layouts. It lets WaterWall keep
+the normal single-`next` chain model while still attaching the "back side" of a
+node such as `ReverseClient` or `ReverseServer` to another chain segment.
 
-## عملکرد
+`Bridge` does not add a protocol. It does not open sockets, parse payload,
+buffer data, prepend headers, or create a transport. It only relays WaterWall
+line events between two named bridge nodes.
 
-در زمان نگارش این مستند، این نود عملاً برای ساخت تونل معکوس (Reverse Tunnel) استفاده می‌شود و احتمال کمی دارد که در سناریوهای دیگر به آن نیاز داشته باشید.
+## Why Bridge Exists
 
-در اغلب نودهای لایهٔ انتقال واتروال، جهت حرکت «چپ 🡐 راست» است؛ یعنی اتصال‌ها از چپ شروع شده و به سمت راست ادامه پیدا می‌کنند.
-
-ساده‌ترین نمونه، «پورت فورواردینگ» است که چنین نمایش داده می‌شود:
+Most layer-4 WaterWall chains are easy to read from left to right:
 
 ```mermaid
-flowchart LR;
-    user1 --> A1;
-
-subgraph Waterwall;
-    A1[TcpListener] --> B1[TcpConnector];
-    end;
-    B1 --> C1[SomeWhere];
+flowchart LR
+    User[user] --> Listener[TcpListener]
+    Listener --> Connector[TcpConnector]
+    Connector --> Service[service]
 ```
 
-حال ببینیم چرا Bridge طراحی شد. برای ساخت تونل معکوس با دو چالش روبه‌رو بودیم؛ نخست در حالت کلاینت:
+`ReverseClient` breaks that simple shape. On the client-side machine, it must
+use its normal `next` path to create outbound reverse connections toward the
+remote `ReverseServer`. At the same time, it also needs to connect to a local
+destination such as an xray-core inbound, a local proxy, or another local
+service path.
 
-- در کانفیگ سمت سرور خارج (حالت کلاینت)، نود ReverseClient باید فقط «اتصال ایجاد کند»؛ یعنی هیچ نودِ Listener نداریم.
-- از یک ReverseClient به دو مقصد نیاز داریم؛ اما در ساختار تنظیمات، معمولاً فقط یک فیلد `next` وجود دارد.
-
-### ایدهٔ اول (رد شده)
-
-این بود که ReverseClient دو `next` داشته باشد و آن‌ها را در تنظیمات داخلی نود (بخش `settings`) تعریف کنیم، نه در سطح بیرونی که تنها یک `next` دارد. چیزی شبیه به:
+One rejected design was to give `ReverseClient` two custom next fields:
 
 ```json
 {
-    "name": "node_name",
-    "type": "ReverseClient",
-    "settings": {
-        "next-core": "next_core_node_name", // xray core inbound
-        "next-peer": "next_peer_node_name"   // server iran
-    }
+  "name": "reverse-client",
+  "type": "ReverseClient",
+  "settings": {
+    "next-core": "local-core-path",
+    "next-peer": "remote-peer-path"
+  }
 }
 ```
 
+That would make `ReverseClient` special and would bypass WaterWall's ordinary
+chain composition model. `Bridge` solves the same problem without adding a
+second `next` concept. One bridge sits near the reverse node, the other sits
+near the local service path, and the pair mirrors callbacks into the opposite
+direction.
+
 ```mermaid
-flowchart LR;
-    Rc[ReverseClient] --> O1[TcpConnector next-core]
-    Rc --> O2[TcpConnector next-peer]
+flowchart LR
+    B1[bridge-core] --> Core[TcpConnector to local core]
+    B2[bridge-reverse] --> RC[ReverseClient]
+    RC --> Peer[TcpConnector to ReverseServer]
+    B1 -. pair .- B2
 ```
 
-این ایده جذاب نبود؛ ترجیح دادیم همچنان از همان `next` استاندارد استفاده کنیم.
+The same idea is used on the `ReverseServer` side when one path receives
+reverse links from `ReverseClient` and another path receives real user traffic:
 
----
+```mermaid
+flowchart LR
+    Users[TcpListener for users] --> B2[bridge-users]
+    Peers[TcpListener for reverse links] --> RS[ReverseServer]
+    RS --> B1[bridge-reverse]
+    B1 -. pair .- B2
+```
 
-## ایدهٔ دوم (پذیرفته‌شده)
+In short: `Bridge` makes two branches behave as if they touch each other, while
+preserving WaterWall's usual one-`next` node configuration.
 
-در این ایده از `next` برای مسیر «peer» استفاده می‌کنیم؛ یعنی مسیری که به ReverseServer می‌رسد:
+## What It Does
+
+- Resolves another `Bridge` node by name through `settings.pair`.
+- Stores a pointer to the paired tunnel during chain wiring.
+- Sends upstream events on this bridge to the paired bridge's downstream side.
+- Sends downstream events on this bridge to the paired bridge's upstream side.
+- Relays `Init`, `Est`, `Payload`, `Finish`, `Pause`, and `Resume`.
+- Reuses the same `line_t *` and payload buffer; it does not allocate a new
+  protocol frame.
+- Requires no extra left padding.
+
+`Bridge` should be configured as a pair. Both bridge nodes should point at each
+other.
+
+## Configuration Example
+
+Two paired bridge nodes:
 
 ```json
 {
-    "name": "node_name",
-    "type": "ReverseClient",
-    "settings": {
-    },
-    "next": "next_peer_node_name"  // server iran
+  "name": "bridge-a",
+  "type": "Bridge",
+  "settings": {
+    "pair": "bridge-b"
+  },
+  "next": "path-a-next-node"
 }
 ```
-
-```mermaid
-flowchart LR;
-    Rc[ReverseClient] -->  O2[TcpConnector next-peer]
-```
-
-اما نود متصل‌شونده به مقصد نهایی (مثلاً xray) کجا قرار بگیرد؟ می‌خواستیم آن را «پشت» ReverseClient بگذاریم:
 
 ```json
 {
-    "name": "outbound_xray",
-    "type": "TcpConnector",
-    "settings": {
-        "address": "127.0.0.1",
-        "port": 1234
-    },
-    "next":"node_reverse_client_name"
-},
-{
-    "name": "node_reverse_client_name",
-    "type": "ReverseClient",
-    "settings": {
-    },
-    "next": "next_peer_node_name"  // server iran
+  "name": "bridge-b",
+  "type": "Bridge",
+  "settings": {
+    "pair": "bridge-a"
+  },
+  "next": "path-b-next-node"
 }
 ```
 
-```mermaid
-flowchart LR;
-    O1[TcpConnector next-core] <-- ReverseClient  -->  O2[TcpConnector next-peer]
+`next` is optional at the JSON level, because a bridge is often placed at either
+the beginning or the end of a declared branch. Whether a specific bridge needs a
+`next` depends on which direction will leave through that bridge in your layout.
+
+## Required Fields
+
+Top-level fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | string | User-chosen node name. Must be unique inside the config file. |
+| `type` | string | Must be exactly `"Bridge"`. |
+| `settings` | object | Must contain `pair`. |
+
+Required `settings` fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `pair` | string | Name of the other bridge node in the same loaded configuration. |
+
+There are no optional `settings` fields.
+
+Startup fails if `pair` is missing or if the named node cannot be found. For a
+useful and predictable topology, configure the pair symmetrically:
+
+```text
+bridge-a.settings.pair = bridge-b
+bridge-b.settings.pair = bridge-a
 ```
 
-اما این منطقی نیست؛ چون تقریباً همهٔ نودهای لایهٔ انتقال جهت‌شان «چپ 🡐 راست» است، در حالی که اینجا می‌خواهیم از «راست 🡐 چپ» حرکت کنیم. پس به نودی نیاز داریم که «جهت» را معکوس کند؛ نودی با دو مسئولیت روشن:
+## Direction Flip
 
-- اگر در ابتدای مسیر باشد: هر داده‌ای را که از راست به چپ می‌گیرد، به چپ 🡐 راست منتقل کند.
-- اگر در انتهای زنجیره باشد: هر داده‌ای را که از چپ به راست می‌آید، به راست 🡐 چپ برگرداند.
+The important behavior is not payload transformation. It is callback direction
+translation:
 
-این دقیقاً همان چیزی است که Bridge انجام می‌دهد.
+| Event reaches this bridge as | Bridge calls on the paired bridge | Leaves paired bridge through |
+| --- | --- | --- |
+| upstream `Init` / `Est` / `Payload` / `Finish` / `Pause` / `Resume` | `tunnelPrevDownStream*` | paired bridge's previous side |
+| downstream `Init` / `Est` / `Payload` / `Finish` / `Pause` / `Resume` | `tunnelNextUpStream*` | paired bridge's next side |
+
+That is why Bridge feels like a mirror: data that enters one bridge exits the
+other bridge in the opposite WaterWall direction.
+
+## ReverseClient Layout
+
+In a common `ReverseClient` setup, the `ReverseClient` keeps its ordinary `next`
+path for outbound reverse links to the peer. The local core path is attached
+through the paired bridge:
 
 ```mermaid
-flowchart LR;
-    B1[Bridge] <-- ReverseClient -->  O2[TcpConnector next-peer]
-
-    B2[Bridge] --> O1[TcpConnector next-core]
+flowchart LR
+    B1[bridge-to-core] --> Core[TcpConnector to local core]
+    B2[bridge-to-reverse-client] --> RC[ReverseClient]
+    RC --> Peer[TcpConnector to remote ReverseServer]
+    B1 -. pair .- B2
 ```
 
-و اگر در انتهای زنجیره باشد (سناریوی ReverseServer):
-
-```mermaid
-flowchart LR;
-    I1[TcpListener for-users] --> ReverseServer --> B1[Bridge]
-
-    I2[TcpListener for-peer] --> B2[Bridge]
-```
-
-به این ترتیب، Bridge به‌وجود آمد. در تنظیمات، نام «جفت» خود را می‌گیرد و با آن جفت می‌شود؛ هر داده‌ای که وارد یک Bridge شود، انگار وارد جفتش شده اما در «جهت مخالف» خارج می‌شود.
-
-## ⚙️ راهنمای پیکربندی
+Example TCP-only skeleton:
 
 ```json
 {
-    "name": "b1",
-    "type": "Bridge",
-    "settings": {
-        "pair": "b2"
-    },
-    "next": "next_node_name" // optional (when making reverse client)
-},
-
-{
-    "name": "b2",
-    "type": "Bridge",
-    "settings": {
-        "pair": "b1"
-    },
-    "next": "next_node_name" // optional (when making reverse client)
+  "name": "outbound_to_core",
+  "type": "TcpConnector",
+  "settings": {
+    "nodelay": true,
+    "address": "127.0.0.1",
+    "port": 443
+  }
 }
 ```
-
-نکات:
-- این نود همیشه به‌صورت زوج استفاده می‌شود، چون به «جفت» خود نیاز دارد.
-- دقیقاً مثل یک آینه عمل می‌کند: هرچه دریافت کند، به جفتش می‌فرستد تا در جهت مخالف ارسال شود.
-
----
-
-با Bridge، سناریوی ReverseClient کامل می‌شود: از سمت `next` اتصال به سرور همتا (peer) برقرار می‌کنیم و از سمت «عقب» به هسته (مثلاً xray) وصل می‌شویم.
-
-```mermaid
-flowchart LR;
-    B1[Bridge] <-- ReverseClient -->  O2[TcpConnector next-peer]
-
-    B2[Bridge] --> O1[TcpConnector next-core]
-```
-
-### مثال کامل JSON برای ReverseClient
 
 ```json
 {
-    "name": "outbound_to_core",
-    "type": "TcpConnector",
-    "settings": {
-        "nodelay": true,
-        "address": "127.0.0.1",
-        "port": 443
-    }
-},
-
-{
-    "name": "bridge1",
-    "type": "Bridge",
-    "settings": {
-        "pair": "bridge2"
-    },
-    "next": "outbound_to_core"
-},
-
-{
-    "name": "bridge2",
-    "type": "Bridge",
-    "settings": {
-        "pair": "bridge1"
-    },
-    "next": "reverse_client"
-},
-
-{
-    "name": "reverse_client",
-    "type": "ReverseClient",
-    "settings": {
-        "minimum-unused": 4
-    },
-    "next": "outbound_to_iran"
-},
-
-{
-    "name": "outbound_to_iran",
-    "type": "TcpConnector",
-    "settings": {
-        "nodelay": true,
-        "address": "1.1.1.1",
-        "port": 443
-    }
+  "name": "bridge_core",
+  "type": "Bridge",
+  "settings": {
+    "pair": "bridge_reverse_client"
+  },
+  "next": "outbound_to_core"
 }
 ```
+
+```json
+{
+  "name": "bridge_reverse_client",
+  "type": "Bridge",
+  "settings": {
+    "pair": "bridge_core"
+  },
+  "next": "reverse_client"
+}
+```
+
+```json
+{
+  "name": "reverse_client",
+  "type": "ReverseClient",
+  "settings": {
+    "minimum-unused": 4
+  },
+  "next": "outbound_to_peer"
+}
+```
+
+```json
+{
+  "name": "outbound_to_peer",
+  "type": "TcpConnector",
+  "settings": {
+    "nodelay": true,
+    "address": "1.1.1.1",
+    "port": 443
+  }
+}
+```
+
+In this shape:
+
+- `reverse_client.next` is the peer path.
+- `bridge_core.next` is the local service path.
+- `bridge_core` and `bridge_reverse_client` connect those two declared branches.
+
+## ReverseServer Layout
+
+On the `ReverseServer` side, one listener usually accepts reverse links from
+the remote `ReverseClient`, while another listener accepts real user traffic.
+The bridge pair connects those two halves:
+
+```mermaid
+flowchart LR
+    Users[TcpListener users] --> B2[bridge-users]
+    Peers[TcpListener reverse peers] --> RS[ReverseServer]
+    RS --> B1[bridge-reverse]
+    B1 -. pair .- B2
+```
+
+Example TCP-only skeleton:
+
+```json
+{
+  "name": "users_inbound",
+  "type": "TcpListener",
+  "settings": {
+    "address": "0.0.0.0",
+    "port": 443,
+    "nodelay": true
+  },
+  "next": "bridge_users"
+}
+```
+
+```json
+{
+  "name": "bridge_users",
+  "type": "Bridge",
+  "settings": {
+    "pair": "bridge_reverse"
+  }
+}
+```
+
+```json
+{
+  "name": "bridge_reverse",
+  "type": "Bridge",
+  "settings": {
+    "pair": "bridge_users"
+  }
+}
+```
+
+```json
+{
+  "name": "reverse_server",
+  "type": "ReverseServer",
+  "settings": {},
+  "next": "bridge_reverse"
+}
+```
+
+```json
+{
+  "name": "peers_inbound",
+  "type": "TcpListener",
+  "settings": {
+    "address": "0.0.0.0",
+    "port": 8443,
+    "nodelay": true,
+    "whitelist": ["1.1.1.1/32"]
+  },
+  "next": "reverse_server"
+}
+```
+
+The peer listener should normally be restricted to the expected remote side with
+`whitelist` or an equivalent routing/security layer. Production deployments
+usually add TLS, mux, routing, or other transport layers around this minimal
+TCP-only example.
+
+## Lifecycle and Line Behavior
+
+`Bridge` does not create or destroy `line_t` objects. It forwards the same line
+pointer through the paired bridge. Its per-line state is effectively unused.
+
+Payload handling is direct relay:
+
+| Direction into current bridge | Forwarded as |
+| --- | --- |
+| upstream payload | downstream payload from the paired bridge toward its previous node |
+| downstream payload | upstream payload from the paired bridge toward its next node |
+
+Because Bridge does not prepend or frame bytes, `required_padding_left = 0`.
+
+## Notes and Caveats
+
+- `Bridge` is not a network adapter and does not connect to an address or port.
+- It is not an Ethernet bridge and does not inspect IP, TCP, UDP, or routing
+  metadata.
+- It is not a packet/stream converter. It simply relays whatever callbacks the
+  surrounding chain sends.
+- The paired bridge must exist in the same config file loaded by the same node
+  manager configuration.
+- Do not use a bridge without a meaningful pair and neighboring branch layout;
+  an isolated bridge has no useful behavior.

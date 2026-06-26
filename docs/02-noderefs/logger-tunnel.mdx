@@ -4,9 +4,13 @@ sidebar_position: 1900
 
 # LoggerTunnel
 
-`LoggerTunnel` payload را مشاهده و ثبت می‌کند، اما داده، lifecycle و جهت زنجیر را تغییر نمی‌دهد. این نود برای debug و عیب‌یابی بسیار مفید است.
+`LoggerTunnel` is a transparent observability tunnel. It watches payload callbacks and records what passes through, but it does not rewrite payload bytes, create lines, destroy lines, or change lifecycle direction.
 
-## جایگاه رایج
+Use it when you need to inspect a chain without changing the chain's behavior.
+
+## Typical Placement
+
+Because `LoggerTunnel` is passive, it can be placed at the beginning, middle, or end of many chain segments:
 
 ```text
 TcpListener -> LoggerTunnel -> TcpConnector
@@ -14,7 +18,11 @@ TunDevice -> LoggerTunnel -> IpManipulator
 UdpListener -> LoggerTunnel -> UdpConnector
 ```
 
-## نمونه تنظیم: log معمولی
+It accepts both previous and next links, but it also tolerates a missing side. If a callback reaches a side that does not exist, the tunnel returns instead of creating synthetic lifecycle behavior.
+
+## Basic Examples
+
+Write each payload to the network logger:
 
 ```json
 {
@@ -28,7 +36,7 @@ UdpListener -> LoggerTunnel -> UdpConnector
 }
 ```
 
-## نمونه تنظیم: خروجی فایل
+Append raw payload bytes into one file per direction:
 
 ```json
 {
@@ -42,43 +50,125 @@ UdpListener -> LoggerTunnel -> UdpConnector
 }
 ```
 
-## modeها
+Extract only IPv4 TCP transport payload bytes from packet buffers:
 
-| mode | کاربرد |
-|---|---|
-| `log` | ثبت خلاصه payload در network log |
-| `file` | ذخیره payload خام در فایل |
-| `tcp-payload-file` | استخراج payload TCP از IPv4 packet و ذخیره در فایل |
+```json
+{
+  "name": "tcp-body-dump",
+  "type": "LoggerTunnel",
+  "settings": {
+    "mode": "tcp-payload-file",
+    "output-mode": "per-payload"
+  },
+  "next": "next-node"
+}
+```
 
-## تنظیمات
+## Required Fields
 
-| گزینه | اجباری | پیش‌فرض | توضیح |
+| Field | Type | Description |
+|---|---|---|
+| `type` | string | Must be `LoggerTunnel`. |
+| `settings` | object | Must be a non-empty object and must include `mode`. |
+
+`name` is strongly recommended. File output uses the node name as the filename prefix. If the name is absent or empty, the implementation falls back to `LoggerTunnel`.
+
+## Settings
+
+| Field | Required | Default | Description |
 |---|---|---|---|
-| `mode` | بله | - | یکی از `log`، `file` یا `tcp-payload-file` |
-| `level` | فقط برای `log` اختیاری | `debug` | یکی از `debug`، `info`، `warning`، `error`، `fatal` |
-| `output-mode` | برای file modeها اختیاری | `split-direction` | یکی از `per-payload`، `split-direction` یا `single-file` |
+| `mode` | Yes | none | Output mode. Accepts `log`, `file`, or `tcp-payload-file`. |
+| `level` | No, log mode only | `debug` | Network logger severity for `mode: "log"`. Accepts `debug`, `info`, `warning`, `error`, or `fatal`. |
+| `output-mode` | No, file modes only | `split-direction` | File layout for `mode: "file"` and `mode: "tcp-payload-file"`. Accepts `per-payload`, `split-direction`, or `single-file`. |
 
-## output-mode
+When `mode` is `log`, `output-mode` is not used. When `mode` is `file` or `tcp-payload-file`, `level` is not used.
 
-| مقدار | فایل‌های خروجی |
+## Modes
+
+| Mode | What gets recorded | Destination |
+|---|---|---|
+| `log` | Payload length and a hexadecimal rendering of the full payload buffer. | Waterwall network logger. |
+| `file` | Exact payload bytes from the `sbuf_t` passed to the callback. | Files in the current working directory. |
+| `tcp-payload-file` | Only the TCP transport payload extracted from an IPv4 packet buffer. | Files in the current working directory. |
+
+## Output Modes
+
+`output-mode` is used by `file` and `tcp-payload-file`.
+
+| Value | Behavior |
 |---|---|
-| `per-payload` | هر payload یک فایل جدا: `<name>-up-1.txt`، `<name>-down-1.txt` و ... |
-| `split-direction` | همه payloadهای هر جهت در یک فایل: `<name>-up.txt` و `<name>-down.txt` |
-| `single-file` | هر دو جهت در یک فایل مشترک: `<name>-all.txt` |
+| `per-payload` | Writes every payload callback to a separate file: `<name>-up-1.txt`, `<name>-up-2.txt`, `<name>-down-1.txt`, and so on. Sequence counters are kept separately for upstream and downstream. Files are opened with write mode, so files with the same generated name from an earlier run can be overwritten. |
+| `split-direction` | Appends all upstream bytes to `<name>-up.txt` and all downstream bytes to `<name>-down.txt`. |
+| `single-file` | Appends both directions to `<name>-all.txt`. |
 
-## tcp-payload-file
+The file extension is `.txt`, but the contents are raw bytes. No separators, timestamps, packet lengths, or frame markers are added.
 
-در این mode، نود payload ورودی را به عنوان packet بررسی می‌کند و فقط payload transport مربوط به IPv4 TCP را می‌نویسد:
+## Runtime Flow
 
-- non-IPv4 نادیده گرفته می‌شود.
-- IPv6 نادیده گرفته می‌شود.
-- packetهای غیر TCP نادیده گرفته می‌شوند.
-- fragmentهای IPv4 نادیده گرفته می‌شوند.
-- TCP segment بدون payload نوشته نمی‌شود.
+`LoggerTunnel` logs a payload before it forwards that payload.
 
-## نکته‌ها
+Upstream payload flow:
 
-- این نود payload را تغییر نمی‌دهد.
-- برای داده حساس با احتیاط استفاده کنید، چون ممکن است محتوای واقعی traffic را ذخیره کند.
-- در مسیرهای packet، mode مناسب را انتخاب کنید؛ payload خام ممکن است یک IP packet کامل باشد.
-- خروجی file در working directory فعلی نوشته می‌شود و raw bytes است، حتی اگر پسوند فایل `.txt` باشد.
+```text
+previous node -> LoggerTunnel logs payload -> next node
+```
+
+The upstream callback forwards with `tunnelNextUpStreamPayload()` when `next` exists.
+
+Downstream payload flow:
+
+```text
+next node -> LoggerTunnel logs payload -> previous node
+```
+
+The downstream callback forwards with `tunnelPrevDownStreamPayload()` when `prev` exists.
+
+Non-payload callbacks are pure pass-through operations:
+
+| Callback direction | Forwarding behavior |
+|---|---|
+| Upstream `Init`, `Est`, `Finish`, `Pause`, `Resume` | Forwarded to the next node when `next` exists. |
+| Downstream `Init`, `Est`, `Finish`, `Pause`, `Resume` | Forwarded to the previous node when `prev` exists. |
+
+The tunnel has no per-line state. Its state is tunnel-wide and contains the selected mode, log level, file paths, file counters, and a mutex used to serialize file writes.
+
+## TCP Payload Extraction
+
+`tcp-payload-file` treats each payload buffer as a complete IPv4 packet and writes only the TCP bytes after the IPv4 and TCP headers.
+
+The packet is ignored when:
+
+- it is shorter than an IPv4 header
+- it is not IPv4
+- the IPv4 protocol is not TCP
+- the IPv4 header length or total length is invalid
+- the IPv4 packet is fragmented
+- the TCP header length is invalid
+- the TCP segment has no transport payload
+
+This mode is IPv4-only. IPv6 packets and non-TCP packets are skipped.
+
+If a valid IPv4 packet contains trailing bytes beyond the IPv4 total length, those trailing bytes are not part of the extracted TCP payload.
+
+## Operational Notes
+
+- `LoggerTunnel` records real traffic content. Be careful with passwords, tokens, private keys, cookies, user data, and production traffic.
+- `log` mode renders every payload byte as hex. Large or high-throughput chains can create very large logs.
+- File output is written relative to the Waterwall process current working directory.
+- `split-direction` and `single-file` append to existing files. Rotate or remove old files when needed.
+- File writes are serialized inside the tunnel state, so multi-worker writes do not run through the output path at the same time.
+- In packet chains, `file` mode records the complete packet buffer that reaches the tunnel. Use `tcp-payload-file` only when those buffers are IPv4 packets and you specifically want TCP application bytes.
+- Logging or file write failures do not intentionally change forwarding behavior. The payload continues through the chain unchanged.
+
+## Node Metadata
+
+| Property | Value |
+|---|---|
+| Position | Chain head, middle, chain end, or no-chain capable |
+| Layer group | Anything to anything |
+| Per-line state | None |
+| Creates lines | No |
+| Destroys lines | No |
+| Modifies payload | No |
+| Required left padding | `0` |
+| File prefix | Node `name`, or `LoggerTunnel` if empty |

@@ -4,15 +4,34 @@ sidebar_position: 300
 
 # UdpListener
 
-`UdpListener` نود سرور UDP است. روی یک آدرس و پورت یا بازه پورت گوش می‌دهد، packetهای ورودی را براساس remote peer گروه‌بندی می‌کند، برای هر peer یک line می‌سازد و payloadها را به نود بعدی می‌فرستد.
+`UdpListener` is a UDP server adapter. It binds a local UDP address and port,
+receives inbound datagrams, groups them by remote peer, creates one WaterWall
+line for each peer, and sends payloads upstream to the next node.
 
-جایگاه رایج:
+Typical placement:
 
 ```text
-UdpListener -> ... -> UdpConnector
+client -> UdpListener -> ... -> UdpConnector -> remote UDP service
 ```
 
-## نمونه تنظیم
+This node is normally used as the beginning of a UDP stream-style chain.
+
+## What It Does
+
+- Listens on one UDP port, several explicit UDP ports, or a contiguous UDP port
+  range.
+- Receives inbound UDP datagrams through WaterWall's socket manager.
+- Applies optional listener filters such as `whitelist`, `blacklist`, and
+  balance groups.
+- Creates one WaterWall line per remote peer address and port.
+- Sends inbound datagrams upstream as payloads to the next node.
+- Sends downstream payloads back to the remembered peer address.
+- Tracks peer lines with UDP idle timeouts.
+
+UDP itself is connectionless, but `UdpListener` gives the rest of the chain a
+stable line abstraction per peer.
+
+## Configuration Example
 
 ```json
 {
@@ -20,7 +39,13 @@ UdpListener -> ... -> UdpConnector
   "type": "UdpListener",
   "settings": {
     "address": "0.0.0.0",
-    "port": [20000, 20100],
+    "port": [
+      5353,
+      853,
+      123
+    ],
+    "large-send-buffer": true,
+    "large-recv-buffer": true,
     "interface": "eth0",
     "fwmark": 10,
     "balance-group": "udp-public",
@@ -29,70 +54,242 @@ UdpListener -> ... -> UdpConnector
     "whitelist": [
       "192.168.1.0/24",
       "2001:db8::/64"
+    ],
+    "blacklist": [
+      "192.168.1.50/32"
     ]
   },
   "next": "next-node-name"
 }
 ```
 
-## فیلدهای ضروری
+## Required Fields
 
-| فیلد | توضیح |
-|---|---|
-| `name` | نام دلخواه نود |
-| `type` | باید دقیقا `UdpListener` باشد |
-| `next` | نودی که lineها و payloadهای UDP را دریافت می‌کند |
-| `settings.address` | آدرس bind، مثل `0.0.0.0`، `::` یا IP مشخص |
-| `settings.port` | یک عدد مثل `5353` یا آرایه دو عضوی مثل `[20000, 20100]` |
+Top-level fields:
 
-در JSON واقعی این دو کلید داخل `settings` با نام‌های `address` و `port` نوشته می‌شوند.
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | string | User-chosen node name. Must be unique inside the config file. |
+| `type` | string | Must be exactly `"UdpListener"`. |
+| `next` | string | Node that receives UDP peer lines and payloads. |
 
-نسخه فعلی بازه پورت را به شکل آرایه دو عضوی می‌خواند، نه string.
+Required `settings` fields:
 
-## تنظیمات اختیاری
+| Field | Type | Description |
+| --- | --- | --- |
+| `address` | string | Local bind address, such as `"0.0.0.0"`, `"::"`, or a specific local IP. |
+| `port` or `port-range` | number, array, or range array | Listening port definition. Exactly one of these fields is required. |
 
-| گزینه | توضیح |
-|---|---|
-| `interface` | محدود کردن socket به interface محلی؛ در Linux از `SO_BINDTODEVICE` استفاده می‌شود |
-| `fwmark` | socket mark در سیستم‌هایی که `SO_MARK` دارند |
-| `balance-group` | گروه توزیع بین چند listener هم‌پورت |
-| `balance-interval` | مدت sticky بودن peer در گروه balance، به میلی‌ثانیه |
-| `multiport-backend` | برای بازه پورت: `iptables` یا `socket` |
-| `whitelist` | IP یا CIDRهای مجاز، IPv4 و IPv6 |
+`settings` must be a non-empty object.
 
-:::warning
-در نسخه فعلی سورس، `UdpListener` مثل `TcpListener` فیلد `whitelist` را parse می‌کند، اما `blacklist` را از JSON نمی‌خواند. configهای قدیمی دارای `blacklist` را به whitelist یا چند listener جدا تبدیل کنید.
-:::
+## Port Configuration
 
-## رفتار UDP
+`UdpListener` supports three port modes.
 
-UDP اتصال واقعی مثل TCP ندارد، اما `UdpListener` برای هر remote address/port یک line نگه می‌دارد. نتیجه:
-
-- packetهای یک peer به همان line فرستاده می‌شوند.
-- پاسخ downstream به همان peer برگشت داده می‌شود.
-- idle peerها بعد از timeout پاک می‌شوند.
-
-مسیر داده:
-
-- peer به زنجیر: datagram ورودی به upstream payload برای `next`
-- زنجیر به peer: downstream payload به datagram خروجی برای همان peer
-
-## whitelist و balance
+### Single Port
 
 ```json
-"whitelist": [
-  "10.0.0.0/8",
-  "203.0.113.10/32",
-  "2001:db8::/64"
-]
+{
+  "settings": {
+    "address": "0.0.0.0",
+    "port": 5353
+  }
+}
 ```
 
-اگر whitelist تنظیم شود، فقط peerهای match شده وارد این listener می‌شوند. در سناریوهای چند listener روی یک port، می‌توانید با whitelist مسیر peerهای خاص را جدا کنید.
+### Explicit Port List
 
-`balance-group` برای پخش peerها بین چند listener هم‌پورت استفاده می‌شود. sticky بودن براساس peer انجام می‌شود تا packetهای پشت سر هم یک peer بین چند مسیر پخش نشوند.
+```json
+{
+  "settings": {
+    "address": "0.0.0.0",
+    "port": [
+      5353,
+      853,
+      123
+    ]
+  }
+}
+```
 
-## نکته‌های عملی
+This listens only on the listed ports. It does not mean the range from `123` to
+`5353`.
 
-- برای UDP، کوچک بودن payload و timeoutهای کوتاه‌تر طبیعی است؛ مقدارهای keepalive و idle را با پروتکل واقعی خود هماهنگ کنید.
-- اگر به stateless UDP واقعی بر اساس routing context نیاز دارید، به جای `UdpListener` نود `UdpStatelessSocket` را بررسی کنید.
-- برای WireGuard داخل WaterWall معمولا `UdpStatelessSocket` همسایه مناسب‌تری برای `WireGuardDevice` است.
+### Contiguous Port Range
+
+```json
+{
+  "settings": {
+    "address": "0.0.0.0",
+    "port-range": [
+      20000,
+      20100
+    ]
+  }
+}
+```
+
+`port-range` must be an array with exactly two positive integer ports:
+`[min, max]`. The minimum must be lower than or equal to the maximum.
+
+Rules:
+
+| Rule | Behavior |
+| --- | --- |
+| Use both `port` and `port-range` | Startup fails. |
+| `port` number | Listens on one UDP port. |
+| `port` array | Listens on the explicit ports in the array. |
+| `port-range` array | Listens on every UDP port from minimum to maximum. |
+| Invalid, zero, negative, or above `65535` port | Startup fails. |
+
+:::warning
+Do not use old string-style ranges such as `"20000-20100"`. The current parser
+expects `port-range` as a two-item array.
+:::
+
+## Optional Settings
+
+| Setting | Type | Default | Description |
+| --- | --- | --- | --- |
+| `large-send-buffer` | boolean or positive integer | `true` | Sets `SO_SNDBUF` on UDP listener sockets. |
+| `large-recv-buffer` | boolean or positive integer | `true` | Sets `SO_RCVBUF` on UDP listener sockets. |
+| `interface` | string | not set | Restricts the listener to a local network interface. |
+| `fwmark` | integer | not set | Applies a Linux-style socket mark where supported. |
+| `balance-group` | string | not set | Groups compatible same-port listeners for sticky distribution. |
+| `balance-interval` | integer, milliseconds | socket-manager default | Sticky interval for repeated peers in a balance group. |
+| `multiport-backend` | string | runtime default for `port-range` | Backend for contiguous port ranges: `"iptables"` or `"socket"`. |
+| `whitelist` | array of strings | not set | Allowed peer IPs or CIDR ranges. |
+| `blacklist` | array of strings | not set | Blocked peer IPs or CIDR ranges. |
+
+### Socket Buffer Options
+
+`large-send-buffer` and `large-recv-buffer` accept:
+
+| Value | Meaning |
+| --- | --- |
+| `true` | Use WaterWall's default large socket buffer size, currently `4194304` bytes. |
+| `false` | Do not explicitly set this socket buffer; use the kernel default. |
+| positive integer | Request that many bytes directly. |
+
+Both options default to WaterWall's large socket buffer size for UDP listeners.
+
+### Interface and `fwmark`
+
+`interface` restricts the listener to a local network device.
+
+On Linux, WaterWall uses `SO_BINDTODEVICE`. On platforms without device binding,
+WaterWall falls back to binding by the interface's IPv4 address when possible.
+
+`fwmark` uses `SO_MARK` on platforms that provide it. It is platform-dependent
+and is not available on Windows.
+
+## Filtering and Balancing
+
+Filtering and balancing happen in the shared socket manager before the datagram
+is delivered to `UdpListener`.
+
+| Setting | Behavior |
+| --- | --- |
+| `whitelist` | If configured, only matching peer IPs are accepted. |
+| `blacklist` | Matching peer IPs are rejected. |
+| `balance-group` | Enables sticky peer distribution between compatible listeners on the same port. |
+| `balance-interval` | Controls how long a peer remains sticky to the chosen listener. |
+| `multiport-backend` | Controls how a contiguous `port-range` listener is implemented. |
+
+When both ACL lists are configured, a peer must match the whitelist, if any, and
+must not match the blacklist.
+
+Example:
+
+```json
+{
+  "settings": {
+    "address": "0.0.0.0",
+    "port": 5353,
+    "whitelist": [
+      "10.0.0.0/8",
+      "203.0.113.10/32",
+      "2001:db8::/64"
+    ],
+    "blacklist": [
+      "10.0.0.99/32"
+    ]
+  }
+}
+```
+
+## Per-Peer Line Model
+
+UDP has no transport connection, so `UdpListener` builds a pseudo-connection
+model for the chain.
+
+For each unique remote peer address and port on a listening socket:
+
+1. A new WaterWall line is created on the first accepted datagram.
+2. The peer address is stored in listener line state.
+3. Later datagrams from the same peer reuse the same line until it expires.
+4. Downstream payloads on that line are sent back to the remembered peer.
+
+This lets later stream-style nodes work with UDP traffic using normal WaterWall
+line callbacks.
+
+## Data Flow
+
+Peer to chain:
+
+```text
+UDP datagram -> UdpListener -> upstream payload -> next node
+```
+
+Chain to peer:
+
+```text
+previous downstream payload -> UdpListener -> UDP send to remembered peer
+```
+
+The line source context is filled from the peer socket address and marked as
+UDP.
+
+## Establishment Semantics
+
+A new peer line is created on the first accepted datagram. The line becomes
+established only when a downstream `est` callback reaches `UdpListener` from the
+next node.
+
+## Pause Behavior
+
+`UdpListener` does not queue inbound datagrams while a peer line is paused.
+
+If a datagram arrives from a paused peer line:
+
+- the datagram is dropped
+- the line remains alive
+- once resumed, new datagrams from that peer can be forwarded again
+
+This is different from TCP-style backpressure. For this node, pause means drop,
+not buffer.
+
+## Idle Timeout
+
+Each peer line is tracked in an idle table.
+
+Current timeouts:
+
+| State | Timeout |
+| --- | --- |
+| Newly created peer line | about `30 seconds` |
+| Active peer after traffic continues | about `300 seconds` |
+
+If the peer line expires, `UdpListener` sends upstream `finish` and destroys the
+line it created.
+
+## Notes and Caveats
+
+- `UdpListener` is a UDP chain-head node and requires `next`.
+- `port` arrays are explicit lists, not ranges.
+- Use `port-range` for contiguous ranges.
+- `whitelist` and `blacklist` support IPv4 and IPv6 CIDR strings.
+- `fwmark` and device binding are platform-dependent.
+- Paused peer lines drop inbound datagrams instead of buffering them.
+- For packet-level, stateless UDP behavior, `UdpStatelessSocket` may be a better
+  fit than `UdpListener`.

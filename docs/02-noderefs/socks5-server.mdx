@@ -4,51 +4,231 @@ sidebar_position: 1330
 
 # Socks5Server
 
-`Socks5Server` سمت server پروتکل SOCKS5 را داخل زنجیر WaterWall پیاده می‌کند. این نود method negotiation و احراز هویت اختیاری را انجام می‌دهد و سپس `CONNECT` یا `UDP ASSOCIATE` را به مسیرهای WaterWall تبدیل می‌کند.
+`Socks5Server` is the server side of SOCKS5 inside a Waterwall chain. It accepts SOCKS5 control traffic from the
+previous node, performs method negotiation, authenticates through an existing `AuthenticationClient` node or explicit
+`no-auth`, and then maps SOCKS5 requests into Waterwall traffic.
 
-## جایگاه رایج
+It supports:
+
+- SOCKS5 method negotiation
+- username/password authentication through `AuthenticationClient`
+- `CONNECT`
+- `UDP ASSOCIATE`
+- authenticated UDP relay associations
+
+It rejects `BIND`.
+
+## Typical placement
+
+TCP-only SOCKS5 server:
 
 ```text
 TcpListener -> Socks5Server -> TcpConnector
 ```
 
-## نمونه تنظیم
+SOCKS5 server with UDP support:
+
+```text
+TcpListener -> Socks5Server -> TcpConnector
+UdpListener -> Socks5Server -> UdpConnector
+```
+
+The TCP listener accepts the SOCKS5 control connection. The UDP listener receives SOCKS5 UDP datagrams after the client
+has created a valid UDP association over the TCP control connection.
+
+Do not manually place `UserController` after an authenticated `Socks5Server`. Authenticated mode creates and inserts an
+internal `UserController` before the configured `next` node.
+
+## Authenticated example
 
 ```json
 {
   "name": "socks-server",
   "type": "Socks5Server",
   "settings": {
+    "auth-client-node-name": "auth-client",
     "connect": true,
     "udp": true,
     "ipv4": "0.0.0.0",
-    "users": [
-      {
-        "username": "alice",
-        "password": "secret"
-      }
-    ],
+    "sweep-interval-ms": 1000,
     "verbose": false
   },
-  "next": "tcp-out"
+  "next": "outbound"
 }
 ```
 
-## تنظیمات
+`auth-client` must be an existing node of type `AuthenticationClient` in the same configuration. `Socks5Server` uses
+that node for lookups; it does not create the authentication client.
 
-| گزینه | پیش‌فرض | توضیح |
-|---|---|---|
-| `connect` | `true` | فعال‌سازی دستور SOCKS5 CONNECT |
-| `udp` | `false` | فعال‌سازی UDP ASSOCIATE |
-| `ipv4` | - | وقتی `udp=true` است اجباری است؛ آدرس IPv4 اعلام‌شده در پاسخ UDP associate |
-| `username`, `password` | - | فرم تک‌اکانت. `username` بدون password یعنی password خالی. |
-| `users` یا `accounts` | - | فرم چنداکانت؛ هر مورد `username` و password اختیاری دارد |
-| `verbose` | `false` | log بیشتر |
+## No-auth example
 
-حداقل یکی از `connect` یا `udp` باید فعال باشد.
+```json
+{
+  "name": "socks-server",
+  "type": "Socks5Server",
+  "settings": {
+    "no-auth": true,
+    "connect": true,
+    "udp": false
+  },
+  "next": "outbound"
+}
+```
 
-## نکته‌ها
+Exactly one authentication mode must be selected: either `auth-client-node-name` or `no-auth: true`.
 
-- برای proxy TCP ساده، `TcpListener -> Socks5Server -> TcpConnector` کافی است.
-- برای UDP، علاوه بر TCP control connection معمولا به مسیر `UdpListener -> Socks5Server -> UdpConnector` هم نیاز دارید.
-- `BIND` پشتیبانی نمی‌شود.
+## Required fields
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `settings` | object | Required and must not be empty. |
+| `settings.auth-client-node-name` | string | Required unless `no-auth` is explicitly `true`. Must point to an existing `AuthenticationClient` node and must not point back to the same `Socks5Server`. |
+| `settings.no-auth` | boolean | Required only when no authentication client is configured. Must be `true` to enable no-auth mode. |
+| `settings.ipv4` / `settings.udp-ipv4` | string | Required when `udp` is enabled. IPv4 address returned in the `UDP ASSOCIATE` reply. |
+| `next` | string | Required. Points to the real outbound path. |
+
+At least one of `connect` or `udp` must be enabled.
+
+## Optional fields
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `settings.connect` | `true` | Enables SOCKS5 `CONNECT`. |
+| `settings.udp` | `false` | Enables SOCKS5 `UDP ASSOCIATE` and UDP datagram handling. |
+| `settings.verbose` | `false` | Enables extra logging, including authentication rejection reasons. |
+| `settings.sweep-interval-ms` | `1000` | Forwarded to the internal `UserController` in authenticated mode. |
+
+The old inline authentication settings `username`, `password`, `users`, and `accounts` are no longer accepted. If any of
+those keys are present, node creation fails. Use `AuthenticationServer` plus `AuthenticationClient`, or use explicit
+`no-auth: true`.
+
+## Authentication model
+
+When authenticated mode is enabled, the SOCKS5 client must offer username/password authentication. `Socks5Server`
+receives the SOCKS username and password, builds one lookup string in this exact form:
+
+```text
+username:password
+```
+
+It then calls the configured `AuthenticationClient` and checks that combined string as the user's password.
+
+For `AuthenticationServer` users intended for SOCKS5, store the SOCKS credential pair in the user object's `password`
+field using the exact `username:password` form. The user object's `name` is not used for the SOCKS5 wire username; it can
+remain operator-facing metadata.
+
+After successful authentication:
+
+- the returned `user_handle_t` is stored in `Socks5Server` line state
+- the handle is added to the Waterwall line with `lineAddUser()`
+- the raw SOCKS username/password are also copied to the line for downstream username/password routing rules
+- the internal `UserController` enforces the user's live connection, IP, traffic, expiry, and enabled-state limits before
+  the line reaches the configured `next` node
+
+In `no-auth` mode, the line receives an empty anonymous handle.
+
+SOCKS usernames and passwords must be non-empty in authenticated mode. Embedded NUL bytes are rejected because the
+authentication lookup key is passed as a C string.
+
+## CONNECT behavior
+
+After method negotiation and authentication, a `CONNECT` request is handled as a normal Waterwall stream path:
+
+1. The requested SOCKS destination is copied into `line->dest_ctx`.
+2. The destination protocol is set to TCP.
+3. Upstream `Init` is sent to the next node.
+4. Upstream and downstream payload may be queued while the next side establishes.
+5. When downstream `Est` arrives from the next side, `Socks5Server` sends a SOCKS5 success reply to the client.
+6. It then emits downstream `Est` toward the previous node and flushes queued payload.
+
+If `connect` is disabled, `CONNECT` requests are rejected with `command not supported`.
+
+## UDP ASSOCIATE behavior
+
+`UDP ASSOCIATE` creates an association that is owned by the TCP control line. It does not open a normal upstream stream
+from the control line.
+
+The UDP associate reply uses:
+
+- the configured `settings.ipv4` or `settings.udp-ipv4` as the reply address
+- the local TCP listener port that accepted the control connection as the reply port
+
+For example, if the TCP control connection was accepted on local port `443` and `ipv4` is `0.0.0.0`, the reply tells the
+client to send SOCKS UDP datagrams to `0.0.0.0:443`.
+
+The request's UDP peer hint is used when present. If the hint contains a concrete IP and port, the association is keyed
+to that source. If the hint uses an any-address, the TCP control connection source IP is used.
+
+## UDP security model
+
+The UDP listener is not an open proxy. A UDP datagram is accepted only when:
+
+- the datagram sender matches a registered association
+- the association was created by a successfully negotiated TCP control line
+- the association entry still exists
+
+When the TCP control line closes, its UDP association is unregistered immediately. Later UDP datagrams for that
+association are rejected.
+
+Associations are stored in a 64-shard registry on the `Socks5Server` tunnel state. Registry entries store copied
+metadata only:
+
+- a generation token
+- the owner worker id
+- the authenticated `user_handle_t`
+- copied raw username/password strings, when authenticated mode is used
+
+They do not store a usable `line_t *`. The generation token prevents an older closing control line from deleting a newer
+association that reused the same key.
+
+## UDP payload behavior
+
+When a SOCKS UDP datagram arrives:
+
+1. The server looks up the matching association.
+2. It validates the SOCKS5 UDP header.
+3. If `FRAG != 0`, it ignores the datagram conservatively.
+4. It parses the requested remote destination from the header.
+5. It creates or reuses an internal backend UDP line for that destination.
+6. It strips the SOCKS5 UDP header and sends only the payload upstream through that backend line.
+
+When a reply comes back from the next node:
+
+1. The payload is wrapped in a SOCKS5 UDP response header.
+2. The response header source address is the remote destination represented by the backend UDP line.
+3. The wrapped datagram is sent downstream toward the UDP listener/client side.
+
+The internal backend UDP lines are normal Waterwall lines created behind the client-facing UDP side. This keeps the
+client-facing association line separate from per-remote outbound destinations and preserves normal line lifecycle rules.
+
+## Finish behavior
+
+The implementation follows Waterwall's close ordering:
+
+- local line state is destroyed before real `Finish` propagation
+- the control line unregisters its UDP association before it can die
+- internal backend UDP lines detach from the client line before closing
+- final SOCKS5 failure replies, when needed before establishment, are sent through a close path that guards against
+  re-entrant callbacks
+
+## Node metadata
+
+| Property | Value |
+| --- | --- |
+| Node flag | `kNodeFlagChainHead` |
+| Previous node | Allowed |
+| Next node | Required |
+| Layer group | `kNodeLayerAnything` |
+| `required_padding_left` | Worst-case SOCKS5 UDP header: `4 + 1 + 255 + 2` bytes |
+
+The padding requirement lets UDP replies prepend SOCKS5 datagram headers while preserving Waterwall buffer-padding
+assumptions. If a reply buffer lacks enough left capacity, the tunnel allocates a replacement buffer and copies the
+payload before adding the header.
+
+## Common mistakes
+
+- Do not configure `username`, `password`, `users`, or `accounts`; those legacy keys are rejected.
+- Do not configure both `auth-client-node-name` and `no-auth: true`.
+- Do not enable UDP without `ipv4` or `udp-ipv4`.
+- Do not manually place `UserController` immediately after an authenticated `Socks5Server`; it is inserted internally.
+- Do not expect SOCKS5 `BIND` or UDP fragmentation reassembly.

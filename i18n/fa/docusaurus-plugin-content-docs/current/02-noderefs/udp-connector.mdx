@@ -1,0 +1,166 @@
+---
+sidebar_position: 400
+---
+
+# UdpConnector
+
+`UdpConnector` نود خروجی UDP است. این نود یک UDP socket محلی می‌سازد، مقصد را انتخاب می‌کند و datagramها را بین نود قبلی و remote peer جابه‌جا می‌کند.
+
+این نود معمولا انتهای زنجیر است و `next` لازم ندارد.
+
+## نمونه تنظیم ساده
+
+```json
+{
+  "name": "udp-out",
+  "type": "UdpConnector",
+  "settings": {
+    "address": "example.com",
+    "port": "random(40000,40100)",
+    "reuseaddr": true,
+    "large-send-buffer": true,
+    "large-recv-buffer": true,
+    "fwmark": 10,
+    "interface": "eth0",
+    "source-ip": "192.0.2.10",
+    "domain-strategy": "prefer-ipv4"
+  }
+}
+```
+
+## نمونه چند مقصد weighted
+
+```json
+{
+  "name": "udp-out",
+  "type": "UdpConnector",
+  "settings": {
+    "balance-mode": "packet",
+    "addresses": [
+      {
+        "address": "1.1.1.1",
+        "port": 53,
+        "weight": 3
+      },
+      {
+        "address": "8.8.8.8",
+        "port": "random(40000,40100)",
+        "weight": 1
+      }
+    ],
+    "reuseaddr": true,
+    "domain-strategy": "prefer-ipv4"
+  }
+}
+```
+
+## تنظیم مقصد
+
+باید یکی از دو سبک زیر را انتخاب کنید:
+
+- `address` + `port`
+- `addresses`
+
+این دو سبک را با هم ترکیب نکنید.
+
+مقدارهای معتبر برای `address`:
+
+- IPv4 ثابت
+- IPv6 ثابت
+- domain ثابت
+- `src_context->address`
+- `dest_context->address`
+
+مقدارهای معتبر برای `port`:
+
+- عدد ثابت، مثل `53`
+- string عددی، مثل `"53"`
+- `src_context->port`
+- `dest_context->port`
+- `random(x,y)`
+
+`random(x,y)` یک پورت تصادفی در بازه inclusive `[x, y]` انتخاب می‌کند. مقدارها باید port معتبر باشند و `x` نباید از `y` بزرگ‌تر باشد.
+
+## addresses و balance-mode
+
+`addresses` آرایه‌ای از مقصدهای weighted است. هر entry باید `address`، `port` و `weight` داشته باشد. alias قدیمی `adresses` هم پذیرفته می‌شود، اما `addresses` spelling پیشنهادی است.
+
+`balance-mode` مشخص می‌کند انتخاب weighted چه زمانی انجام شود:
+
+| مقدار | رفتار |
+|---|---|
+| `connection` | پیش‌فرض؛ در زمان init هر line یک مقصد انتخاب می‌شود و همان line تا پایان عمرش همان مقصد را نگه می‌دارد |
+| `packet` | برای هر upstream payload یک مقصد weighted انتخاب می‌شود |
+
+در نسخه فعلی `UdpConnector`، entryهای داخل `addresses` فقط `address`، `port` و `weight` دارند. optionهایی مثل `reuseaddr`، `interface`، `source-ip`، `large-send-buffer` و `domain-strategy` در سطح top-level داخل `settings` تنظیم می‌شوند، نه داخل هر entry.
+
+## تنظیمات socket
+
+| گزینه | پیش‌فرض | توضیح |
+|---|---:|---|
+| `reuseaddr` | `false` | فعال‌سازی `SO_REUSEADDR` |
+| `large-send-buffer` | `true` | تنظیم `SO_SNDBUF` |
+| `large-recv-buffer` | `true` | تنظیم `SO_RCVBUF` |
+| `fwmark` | - | socket mark با `SO_MARK` در platformهای پشتیبانی‌شده |
+| `interface` | - | محدود کردن socket به interface محلی |
+| `source-ip` | - | bind کردن UDP socket به source IP مشخص با port موقت |
+| `domain-strategy` | مقدار `dns.domain-strategy` در core | انتخاب IPv4/IPv6 برای نتیجه DNS |
+
+`large-send-buffer` و `large-recv-buffer` می‌توانند `true`، `false` یا عدد مثبت باشند. مقدار `true` یعنی استفاده از buffer بزرگ پیش‌فرض WaterWall که فعلا `4194304` بایت است.
+
+## domain-strategy و DNS
+
+اگر مقصد domain باشد، `UdpConnector` مقدار `domain-strategy` را روی destination context خط ست می‌کند و `DomainResolver` داخلی به صورت async آدرس را resolve می‌کند.
+
+مقدارهای string معتبر:
+
+| مقدار | رفتار |
+|---|---|
+| `prefer-ipv4` | اولویت با IPv4، سپس IPv6 |
+| `prefer-ipv6` | اولویت با IPv6، سپس IPv4 |
+| `only-ipv4` | فقط IPv4 |
+| `only-ipv6` | فقط IPv6 |
+| `accept-dns-returned-order` | پذیرش ترتیب برگشتی DNS |
+
+در `balance-mode: "packet"`، domainهای داخل `addresses` به صورت lazy برای هر destination object و هر line resolve می‌شوند. بعد از resolve، همان نتیجه برای packetهای بعدی همان line استفاده می‌شود.
+
+## رفتار UDP
+
+UDP handshake ندارد. در پیاده‌سازی فعلی:
+
+- upstream `Init` مقصد را محاسبه می‌کند.
+- اگر مقصد domain باشد، DNS async انجام می‌شود.
+- بعد از آماده شدن IP و port، socket ساخته و bind می‌شود.
+- downstream `Est` وقتی فرستاده می‌شود که UDP socket محلی ساخته و آماده ارسال باشد، نه وقتی remote جواب بدهد.
+- payload upstream به remote peer ارسال می‌شود.
+- datagram دریافتی به صورت downstream payload به نود قبلی برمی‌گردد.
+
+در `connection` mode، datagramهایی که از peer غیرمنتظره برسند drop می‌شوند. در `packet` mode، datagramهای دریافتی روی socket پذیرفته می‌شوند تا جواب مقصدهای مختلف packet-balanced بتوانند برگردند.
+
+## queue، pause و timeout
+
+اگر DNS یا resolve مقصد packet-balanced هنوز آماده نباشد، payloadهای upstream ممکن است queue شوند.
+
+| وضعیت | رفتار |
+|---|---|
+| بیشتر از `1 KB` queue | نود قبلی pause می‌شود |
+| خالی شدن writeهای pending | نود قبلی resume می‌شود |
+| بیشتر از `16 MB` queue | UDP line بسته می‌شود |
+
+اگر read pause باشد، datagram دریافتی buffer نمی‌شود و drop می‌شود.
+
+هر UDP line در جدول idle نگه داشته می‌شود:
+
+| وضعیت | timeout |
+|---|---|
+| بعد از initialization | حدود `30s` |
+| بعد از ادامه traffic | حدود `300s` |
+
+بعد از expire شدن، socket بسته می‌شود و downstream `Finish` به نود قبلی می‌رود.
+
+## نکته‌ها
+
+- DNS resolution در این مسیر asynchronous است.
+- `domain-strategy` در مسیر DNS استفاده می‌شود.
+- `fwmark` و device binding platform-dependent هستند.
+- اگر به UDP stateless با routing context نیاز دارید، `UdpStatelessSocket` را بررسی کنید.
