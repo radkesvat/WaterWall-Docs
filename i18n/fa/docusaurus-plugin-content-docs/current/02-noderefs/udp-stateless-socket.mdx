@@ -1,0 +1,117 @@
+---
+sidebar_position: 1700
+---
+
+# UdpStatelessSocket
+
+`UdpStatelessSocket` یک UDP edge adapter دوطرفه است. این نود یک UDP socket bind می‌کند، datagram را از هر peer دریافت می‌کند و datagramهای خروجی را به مقصدی می‌فرستد که داخل routing context خط فعلی قرار دارد.
+
+این نود عمدا stateless است: برای هر peer line جدا نمی‌سازد، session نگه نمی‌دارد، و مثل ترکیب `UdpListener` و `UdpConnector` رفتار نمی‌کند. کاربرد اصلی آن کنار nodeهایی مثل `WireGuardDevice` است که یک UDP socket مشترک برای send و receive لازم دارند.
+
+## جایگاه رایج
+
+```text
+WireGuardDevice -> UdpStatelessSocket
+UdpStatelessSocket -> WireGuardDevice
+TunDevice -> WireGuardDevice -> UdpStatelessSocket
+UdpStatelessSocket -> WireGuardDevice -> TunDevice
+```
+
+از این نود در edge سمت UDP یک packet chain استفاده کنید؛ مخصوصا وقتی نود کناری می‌تواند routing context را برای مقصد خروجی تنظیم کند.
+
+## نمونه تنظیم
+
+```json
+{
+  "name": "wg-udp-socket",
+  "type": "UdpStatelessSocket",
+  "settings": {
+    "listen-address": "0.0.0.0",
+    "listen-port": 51820,
+    "interface": "eth0",
+    "fwmark": 10,
+    "large-send-buffer": true,
+    "large-recv-buffer": true,
+    "source-ip": "192.0.2.10",
+    "verbose": false
+  }
+}
+```
+
+## تنظیمات ضروری
+
+| فیلد | نوع | توضیح |
+|---|---|---|
+| `listen-address` | string | آدرس IP محلی برای bind. باید IP معتبر باشد. |
+| `listen-port` | integer | پورت UDP محلی. بازه معتبر `0` تا `65535` است. |
+
+آبجکت `settings` باید وجود داشته باشد و خالی نباشد.
+
+## تنظیمات اختیاری
+
+| فیلد | پیش‌فرض | توضیح |
+|---|---|---|
+| `interface` | ندارد | socket را به یک network device محلی محدود یا pin می‌کند، اگر پلتفرم پشتیبانی کند. |
+| `fwmark` | ندارد | socket mark در پلتفرم‌هایی که `SO_MARK` دارند؛ عمدتا Linux. |
+| `source-ip` | ندارد | آدرس bind موثر را override می‌کند و برای این نود جایگزین `listen-address` می‌شود. |
+| `large-send-buffer` | `true` | اگر `true` باشد از buffer بزرگ پیش‌فرض واتروال استفاده می‌کند؛ اگر عدد مثبت باشد همان اندازه درخواست می‌شود. |
+| `large-recv-buffer` | `true` | مثل send buffer، ولی برای receive. |
+| `verbose` | `false` | log debug برای datagramهای دریافتی و ارسالی. |
+
+اندازه buffer بزرگ پیش‌فرض فعلی `4194304` بایت است.
+
+## رفتار interface و source-ip
+
+`interface` قبل از bind اعمال می‌شود. روی Linux معمولا device binding انجام می‌شود. اگر پلتفرم bind by device نداشته باشد و `source-ip` تنظیم نشده باشد، واتروال سعی می‌کند socket را روی IPv4 address همان interface bind کند.
+
+`source-ip` برای این نود override مستقیم `listen-address` است، چون همان socket هم دریافت می‌کند و هم ارسال.
+
+اگر `TunDevice` loop protection یک egress pin خودکار منتشر کرده باشد، `source-ip` به تنهایی آن pin را override نمی‌کند. برای انتخاب interface متفاوت، `interface` را صریح تنظیم کنید.
+
+## مسیر دریافت
+
+وقتی UDP datagram برسد:
+
+1. worker مالک socket datagram را دریافت می‌کند
+2. نود worker packet line همان worker را می‌گیرد
+3. آدرس و پورت فرستنده داخل `routing_context.src_ctx` نوشته می‌شود
+4. local listener port هم در routing context ثبت می‌شود
+5. body datagram به سمت chain کناری forward می‌شود
+
+اگر این نود آخر chain باشد، packetها به سمت previous می‌روند؛ در غیر این صورت به سمت next می‌روند.
+
+در buildهای debug، بعد از forward بررسی می‌شود که packet line هنوز alive باشد. نابود شدن packet line در runtime نقض قرارداد packet tunnel است.
+
+## مسیر ارسال
+
+وقتی payload از هر جهت به این نود برسد:
+
+1. مقصد از `line->routing_context.dest_ctx` خوانده می‌شود
+2. اگر مقصد domain resolve نشده باشد، async DNS شروع می‌شود
+3. اگر مقصد IP و port آماده باشد، به socket address تبدیل می‌شود
+4. datagram با همان UDP socket ارسال می‌شود
+
+اگر destination context آماده نباشد یا port نداشته باشد، datagram drop می‌شود و warning/error log می‌شود.
+
+برای domainهای resolve نشده، نتیجه DNS به مدت `30 minutes` بر اساس domain، port و domain strategy cache می‌شود.
+
+## Worker Ownership
+
+UDP socket فقط متعلق به یک worker loop است. اگر payload برای ارسال از worker دیگری برسد، send روی worker مالک socket schedule می‌شود و `sendto()` همان‌جا انجام می‌شود.
+
+## چرا UdpListener یا UdpConnector نه؟
+
+در WireGuard و سناریوهای مشابه، یک socket باید هم به peer ارسال کند و هم از هر peer دریافت کند. `UdpListener` رفتار listener اتصال‌محور دارد و `UdpConnector` رفتار connector. `UdpStatelessSocket` بدون session state و فقط بر اساس routing context ارسال می‌کند.
+
+## Packet Line
+
+این نود از worker packet line برای receive استفاده می‌کند و برای peerها line جدا نمی‌سازد. callbackهای connection-style مثل `Init`، `Est`، `Finish`، `Pause` و `Resume` نادیده گرفته می‌شوند. مسیر اصلی runtime، payload است.
+
+## خطاهای رایج
+
+- ارسال payload قبل از اینکه `dest_ctx` مقصد IP/domain و port داشته باشد.
+- انتظار یک line جدا برای هر UDP peer.
+- استفاده از این نود مثل stream adapter عمومی.
+- تکیه به `source-ip` برای override کردن loop-protection؛ در این حالت `interface` را صریح تنظیم کنید.
+- فراموش کردن وابستگی `fwmark` و interface binding به پلتفرم.
+

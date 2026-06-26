@@ -4,16 +4,85 @@ sidebar_position: 1040
 
 # PacketSender
 
-`PacketSender` یک chain-head لایه ۳ برای ساخت و ارسال packetهای IPv4 مصنوعی است. این نود در startup یک packet store می‌سازد و packetها را در طول مدت تنظیم‌شده به شکل یکنواخت روی worker packet lineها پخش می‌کند.
+`PacketSender` is a layer-3 IPv4 packet generator. It pre-builds raw IPv4
+packets at startup and sends them across WaterWall worker packet lines over a
+configured duration.
 
-## جایگاه رایج
+It is mainly useful for controlled packet-path testing. Paired with
+`PacketReceiver`, it can help find good, reachable, or whitelisted source IPs
+in IP-restricted environments: generate packets from candidate source ranges,
+send them through the packet path, then compare the receiver report to see
+which source IPs arrived.
+
+:::warning
+Only use this on networks and address ranges you are authorized to test.
+Source-IP experiments also depend on the sender-side network. If your provider,
+kernel path, raw socket backend, or upstream network blocks non-local source
+addresses, the generated packets may never leave the sender.
+:::
+
+## Typical Placement
+
+Raw IPv4 output:
+
+```text
+PacketSender -> RawSocket
+```
+
+With packet manipulation:
 
 ```text
 PacketSender -> IpManipulator -> RawSocket
+```
+
+WireGuard-style packet transport:
+
+```text
 PacketSender -> WireGuardDevice -> UdpStatelessSocket
 ```
 
-## نمونه تنظیم
+Matching receiver side:
+
+```text
+RawSocket -> PacketReceiver
+```
+
+`PacketSender` is a chain-head singleton adapter. It must be at the start of a
+layer-3 chain and must have a `next` node.
+
+## What It Does
+
+- Accepts one IPv4 source CIDR range or an array of source CIDR ranges.
+- Accepts one destination IPv4 address.
+- Builds raw IPv4 packets for `TCP`, `UDP`, `ICMP`, or `ALL`.
+- Repeats each source IP `packets-per-ip` times.
+- Materializes the whole packet store before sending starts.
+- Distributes packet indexes across workers.
+- Sends packets over `duration-ms`, using packet index deadlines to spread them
+  across the configured duration.
+- Updates the packet line routing context before each send.
+- Does not close or finish worker packet lines after sending.
+
+Source ranges are processed in config order. They are not interleaved.
+
+## Source-IP Allowlist Testing
+
+`PacketSender` and `PacketReceiver` are built for scenarios where the path or
+service is restricted by source IP. A common workflow is:
+
+1. Configure `PacketSender` with candidate `source-ip4-range` values.
+2. Configure `PacketReceiver` with the same ranges.
+3. Send packets toward the receiver-side host or packet chain.
+4. Read the receiver report.
+5. Treat source IPs with high or complete delivery as the better candidates.
+
+For single-protocol modes, set `PacketReceiver.expected-packets-per-ip` to the
+sender `packets-per-ip`. For `protocol-number: "ALL"`, set it to
+`packets-per-ip * 255`.
+
+## Configuration Example
+
+ICMP probing:
 
 ```json
 {
@@ -25,8 +94,26 @@ PacketSender -> WireGuardDevice -> UdpStatelessSocket
       "203.0.113.0/24"
     ],
     "dest-ip4": "203.0.113.20",
+    "protocol-number": "ICMP",
+    "duration-ms": 5000,
+    "packets-per-ip": 100
+  },
+  "next": "raw-ip"
+}
+```
+
+TCP-shaped probing:
+
+```json
+{
+  "name": "packet-sender",
+  "type": "PacketSender",
+  "settings": {
+    "source-ip4-range": "198.51.100.0/24",
+    "dest-ip4": "203.0.113.20",
     "protocol-number": "TCP",
     "duration-ms": 5000,
+    "packets-per-ip": 10,
     "dest-port": 443,
     "src-port": "random"
   },
@@ -34,47 +121,105 @@ PacketSender -> WireGuardDevice -> UdpStatelessSocket
 }
 ```
 
-## تنظیمات ضروری
+## Required Fields
 
-| گزینه | توضیح |
-|---|---|
-| `source-ip4-range` | یک CIDR IPv4 یا آرایه‌ای از CIDRها. نود برای هر IP در این رنج packet می‌سازد. |
-| `dest-ip4` | مقصد IPv4 |
-| `protocol-number` | یکی از `TCP`، `UDP`، `ICMP` یا `ALL` |
-| `duration-ms` | مدت زمان پخش packetها به میلی‌ثانیه |
-| `dest-port` | برای `TCP`، `UDP` و `ALL` لازم است |
-| `src-port` | برای `TCP`، `UDP` و `ALL` لازم است؛ عدد یا `"random"` |
+Top-level fields:
 
-## راهنمای استفاده
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | string | User-chosen node name. Must be unique inside the config file. |
+| `type` | string | Must be exactly `"PacketSender"`. |
+| `settings` | object | Required and must not be empty. |
+| `next` | string | Required. The next layer-3 node receives generated packets. |
 
-- این نود با packet خام کار می‌کند؛ آن را در مسیر stream معمولی TCP قرار ندهید.
-- برای تست مسیرهای `IpManipulator`، `RawSocket` و `WireGuardDevice` مفید است.
-- `PacketSender` باید ابتدای chain باشد و shared packet lineها را در runtime نابود نمی‌کند.
-- اگر سناریو شما تولید ترافیک stream است، معمولا `TesterClient` مناسب‌تر است.
+Required `settings` fields:
 
-## شکل packetهای تولیدشده
+| Field | Type | Description |
+| --- | --- | --- |
+| `source-ip4-range` | string or array of strings | One IPv4 CIDR range, or an array of IPv4 CIDR ranges. |
+| `dest-ip4` | string | Destination IPv4 address. Must be a single IPv4 address, not CIDR. |
+| `protocol-number` | string | `TCP`, `UDP`, `ICMP`, or `ALL`. Case-insensitive. |
+| `duration-ms` | integer | Positive send duration in milliseconds. |
+| `dest-port` | integer | Required for `TCP`, `UDP`, and `ALL`. Must be non-zero and in `0..65535`. |
+| `src-port` | integer or `"random"` | Required for `TCP`, `UDP`, and `ALL`. Must be non-zero, or `"random"`. |
 
-همه خروجی‌ها IPv4 هستند و TTL پیش‌فرض `64` دارند.
+`dest-port` and `src-port` are not required for `ICMP`.
 
-| protocol-number | خروجی |
-|---|---|
-| `TCP` | TCP segment حداقلی با flag `ACK`، checksum معتبر، destination port و source port تنظیم‌شده |
-| `UDP` | UDP datagram حداقلی با checksum معتبر و portهای تنظیم‌شده |
-| `ICMP` | ICMP echo request با checksum معتبر و identifier/sequence deterministic |
-| `ALL` | برای هر source IP دقیقا `255` packet، یکی برای protocol numberهای `0` تا `254` |
+## Optional Settings
 
-در حالت `ALL`، protocolهای `6`، `17` و `1` به شکل معتبر TCP، UDP و ICMP ساخته می‌شوند و بقیه protocolها IPv4 packet معتبر با payload کوچک opaque هستند.
+| Setting | Type | Default | Description |
+| --- | --- | --- | --- |
+| `packets-per-ip` | integer | `1` | Positive repeat count for each source IP. In `ALL` mode, each repeat sends 255 protocol variants. |
 
-## زمان‌بندی ارسال
+When `src-port` is `"random"`, the current implementation selects a stable
+ephemeral-range port from `49152..65535` based on source IP, destination IP, and
+protocol. It is deterministic for the generated packet shape rather than random
+per packet.
 
-`PacketSender` همه packetها را یک‌جا قبل از شروع ارسال materialize می‌کند، بعد deadline هر packet را براساس index آن، تعداد کل packetها و `duration-ms` حساب می‌کند. نتیجه این است که packetها در کل بازه تنظیم‌شده پخش می‌شوند و همه یک‌باره burst نمی‌شوند.
+## Generated Packet Shapes
 
-اگر چند packet به یک میلی‌ثانیه بیفتند، همان worker آنها را پشت سر هم می‌فرستد.
+All generated packets are IPv4 with:
 
-## مصرف حافظه
+| Field | Value |
+| --- | --- |
+| TTL | `64` |
+| fragment flag | Don't Fragment (`DF`) |
+| source IP | one address from `source-ip4-range` |
+| destination IP | `dest-ip4` |
+| checksums | calculated before materialization |
 
-packet store به صورت contiguous ساخته می‌شود تا fragmentation کمتر شود. برای ایمنی، configهایی که packet store نهایی‌شان بیشتر از `512 MiB` شود رد می‌شوند. اگر ترافیک بیشتری می‌خواهید، source range را کوچک‌تر کنید یا چند `PacketSender` جدا بسازید.
+Protocol-specific shapes:
 
-## نکته
+| `protocol-number` | Generated packet |
+| --- | --- |
+| `TCP` | Minimal TCP segment with `ACK` flag, deterministic sequence/ack numbers, configured ports, and valid checksums. |
+| `UDP` | Minimal UDP datagram with configured ports and valid checksums. |
+| `ICMP` | ICMP echo request with deterministic identifier/sequence and valid checksums. |
+| `ALL` | For every source IP and repeat, one packet for protocol numbers `0` through `254`. Protocols `6`, `17`, and `1` are valid TCP, UDP, and ICMP shapes; all others are IPv4 packets with an 8-byte opaque payload. |
 
-در mode `ALL` برای هر source IP تعداد `255` packet ساخته می‌شود؛ یکی برای protocol numberهای `0` تا `254`. برای رنج‌های بزرگ، حجم packet store می‌تواند زیاد شود.
+`ALL` mode emits `255` protocol variants per repeat, not `256`.
+
+## Scheduling And Workers
+
+Before runtime starts, `PacketSender` materializes every packet into a contiguous
+packet store. During startup:
+
+- total packet indexes are divided across workers
+- each worker uses its persistent worker packet line
+- each packet gets a global deadline based on its index and `duration-ms`
+- workers send ready packets and re-arm one-shot timers when the next packet is
+  not due yet
+
+This spreads packets across the configured duration instead of sending the whole
+store as one immediate burst. If several packets are due at the same moment, a
+worker may send them back-to-back.
+
+## Limits
+
+- Total source IP count must fit in `uint32_t`.
+- Total packet count must fit in `uint64_t`.
+- Total materialized packet bytes must fit in `size_t`.
+- The materialized packet store is capped at `8 GiB`.
+- `required_padding_left = 0`.
+
+Large ranges, `ALL` mode, and high `packets-per-ip` values grow memory usage
+quickly. Split large tests into smaller ranges or several runs if needed.
+
+## Packet-Line Semantics
+
+`PacketSender` uses worker packet lines created by the chain. These packet lines
+are persistent worker helper lines, not per-connection lines.
+
+`PacketSender` does not destroy packet lines and does not use `Finish` as a
+completion signal. Completion only logs that all assigned packets were sent.
+
+## Practical Notes
+
+- Use `PacketReceiver` on the target side to get per-source delivery counts.
+- Choose `report-after-ms` on `PacketReceiver` longer than sender
+  `duration-ms` plus expected network delay and reordering time.
+- Use `ICMP` for simple path probing when allowed.
+- Use `TCP`, `UDP`, or `ALL` when the restricted environment behaves
+  differently by protocol or port.
+- If the sender-side network enforces source address validation, spoofed or
+  non-local source ranges may be filtered before reaching WaterWall's peer.

@@ -1,0 +1,200 @@
+---
+sidebar_position: 1041
+---
+
+# PacketReceiver
+
+`PacketReceiver` is an endpoint IPv4 packet counter. It consumes raw IPv4
+packets, groups them by source IP, compares each source against an expected
+per-IP packet count, and writes a report file.
+
+Paired with `PacketSender`, it is useful for finding good, reachable, or
+whitelisted source IPs in IP-restricted environments. `PacketSender` generates
+traffic from candidate source ranges; `PacketReceiver` shows which source IPs
+actually arrived.
+
+## Typical Placement
+
+Receive raw IPv4 packets from a capture/output node:
+
+```text
+RawSocket -> PacketReceiver
+```
+
+Receive packets from a tunnel path:
+
+```text
+UdpStatelessSocket -> WireGuardDevice -> PacketReceiver
+```
+
+`PacketReceiver` can consume packets from upstream or downstream callbacks. It
+can therefore be placed at the end of a packet chain, or at the start of a chain
+where packets arrive from its next-side peer.
+
+## What It Does
+
+- Tracks one IPv4 CIDR range or an array of IPv4 CIDR ranges.
+- Allocates one counter per tracked source IP.
+- Counts packets whose IPv4 source address falls inside the tracked ranges.
+- Counts packets outside the configured ranges as unexpected.
+- Recycles every consumed packet buffer.
+- Writes a report after `report-after-ms`.
+- Writes a final report during destroy if one has not already been written.
+- Does not depend on packet-line `Finish` for completion.
+
+Only the IPv4 source address is used for matching. Protocol, port, destination
+address, and payload are not used for the per-IP counters.
+
+## Source-IP Allowlist Testing
+
+For IP-restricted or allowlisted environments:
+
+1. Configure `PacketSender.source-ip4-range` with candidate source IP ranges.
+2. Configure `PacketReceiver.source-ip4-range` with the same ranges.
+3. Set `expected-packets-per-ip` to the expected count from the sender.
+4. Run the test and wait for the receiver report.
+5. Look for source IPs with low loss or full delivery.
+
+The best candidates are the source IPs whose `received` count is close to
+`expected` and whose `loss-percent` is low.
+
+## Configuration Example
+
+```json
+{
+  "name": "packet-receiver",
+  "type": "PacketReceiver",
+  "settings": {
+    "source-ip4-range": [
+      "198.51.100.0/24",
+      "203.0.113.0/24"
+    ],
+    "expected-packets-per-ip": 100,
+    "report-after-ms": 7000,
+    "output-file": "packet-receiver-report.txt"
+  }
+}
+```
+
+For a matching `PacketSender` using `protocol-number: "ALL"` and
+`packets-per-ip: 100`, use:
+
+```json
+{
+  "expected-packets-per-ip": 25500
+}
+```
+
+because `ALL` sends `100 * 255` packets per source IP.
+
+## Required Fields
+
+Top-level fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | string | User-chosen node name. Must be unique inside the config file. |
+| `type` | string | Must be exactly `"PacketReceiver"`. |
+| `settings` | object | Required and must not be empty. |
+
+Required `settings` fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `source-ip4-range` | string or array of strings | One IPv4 CIDR range, or an array of IPv4 CIDR ranges to track. |
+
+The node must have either a previous or next tunnel so packets can reach it.
+
+## Optional Settings
+
+| Setting | Type | Default | Description |
+| --- | --- | --- | --- |
+| `expected-packets-per-ip` | integer | `1` | Positive expected packet count for each tracked source IP. |
+| `report-after-ms` | integer | `1000` | Positive delay before writing the report and terminating the program. Set this longer than sender duration plus expected tunnel delay. |
+| `output-file` | string | `packet-receiver-report.txt` | Non-empty path for the report file. |
+
+## Pairing With PacketSender
+
+Use these expected counts:
+
+| Sender mode | Receiver `expected-packets-per-ip` |
+| --- | --- |
+| `TCP` | sender `packets-per-ip` |
+| `UDP` | sender `packets-per-ip` |
+| `ICMP` | sender `packets-per-ip` |
+| `ALL` | sender `packets-per-ip * 255` |
+
+`report-after-ms` should usually be greater than:
+
+```text
+PacketSender duration-ms + network delay + reordering/jitter window
+```
+
+If the report is written too early, late packets will be counted as lost because
+`PacketReceiver` stops updating counts after the report is marked written.
+
+## Report Format
+
+The report is written only to `output-file`. It starts with summary fields:
+
+```text
+PacketReceiver report
+output-file: packet-receiver-report.txt
+source-ip-count: ...
+expected-packets-per-ip: ...
+expected-total-packets: ...
+received-total-packets: ...
+lost-total-packets: ...
+unexpected-packets: ...
+```
+
+Then it writes one row per tracked source IP:
+
+```text
+source-ip | expected | received | lost | loss-percent | histogram
+198.51.100.1 | 100 | 100 | 0 | 0.00% | [################################]
+198.51.100.2 | 100 | 50 | 50 | 50.00% | [################----------------]
+```
+
+The histogram is 32 characters wide. `#` represents received share and `-`
+represents missing share relative to the expected count.
+
+`unexpected-packets` counts packets that were IPv4 but whose source IP was not
+inside any configured source range, plus non-IPv4 or too-short packets consumed
+by this node.
+
+## Direction Behavior
+
+| Incoming callback | Behavior |
+| --- | --- |
+| upstream `Payload` | Counts/recycles the packet. |
+| downstream `Payload` | Counts/recycles the packet. |
+| `Init`, `Est`, `Pause`, `Resume`, `Finish` | No-op. Completion is timer/report based, not line-lifecycle based. |
+
+`PacketReceiver` is created with WaterWall's packet-tunnel API and has no
+per-line tunnel state.
+
+## Buffer And Padding Notes
+
+Node metadata advertises:
+
+```text
+required_padding_left = 0
+layer_group = kNodeLayerAnything
+layer_group_next_node = kNodeLayer3
+layer_group_prev_node = kNodeLayer3
+```
+
+The node does not prepend, frame, rewrite, or forward payloads. It consumes and
+recycles packet buffers after counting them.
+
+## Practical Notes
+
+- Use the same source ranges on `PacketSender` and `PacketReceiver`.
+- Keep ranges small enough that one counter per source IP is reasonable.
+- Use a longer `report-after-ms` for high-latency, high-jitter, or multi-hop
+  tunnel paths.
+- In source-IP restricted environments, source IPs with low loss are the likely
+  usable or whitelisted candidates.
+- This node is for packet tests and reports, not for forwarding application
+  traffic.

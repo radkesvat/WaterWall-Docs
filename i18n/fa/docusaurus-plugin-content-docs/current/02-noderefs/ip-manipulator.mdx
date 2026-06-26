@@ -1,0 +1,473 @@
+---
+sidebar_position: 100005
+---
+
+# IpManipulator
+
+`IpManipulator` یک packet tunnel برای تغییر دادن packetهای خام IPv4 داخل chainهای
+لایه ۳ WaterWall است.
+
+این نود برای مسیرهایی است که payload آن‌ها خود packet خام IP است؛ مثلا کنار
+`TunDevice`، `RawSocket`، `WireGuardDevice` یا نودهای packet دیگر. این نود را
+نباید داخل chain معمولی stream/TCP byte قرار داد.
+
+:::warning
+بیشتر قابلیت‌های این نود برای packet shaping و آزمایش رفتار middleboxها هستند.
+نتیجه کاملا به مسیر شبکه وابسته است؛ ممکن است یک trick روی یک شبکه جواب بدهد و
+روی مسیر دیگر drop شود یا اثر بد داشته باشد.
+:::
+
+## عملکرد کلی
+
+- روی upstream و downstream packet payload کار می‌کند.
+- trickهای فعال را روی packetهای IPv4 اعمال می‌کند.
+- می‌تواند IP protocol number مربوط به TCP و UDP را تغییر دهد و برگرداند.
+- می‌تواند TCP flagها را rewrite کند.
+- می‌تواند source/destination port اصلی را انتهای packet حمل کند و port زنده را
+  تغییر دهد.
+- می‌تواند packet نهایی را duplicate کند.
+- می‌تواند شکل packetهای TLS ClientHello را تغییر دهد.
+- می‌تواند TLS ClientHello را با SNI Blender به fragmentهای IPv4 تبدیل کند و با
+  ترتیب shuffle شده بفرستد.
+- وقتی headerها را تغییر می‌دهد، packet را برای checksum recalculation علامت
+  می‌زند.
+
+این نود با API مربوط به `packettunnelCreate()` ساخته می‌شود. بنابراین callbackهای
+اتصالی مثل `Finish`، `Pause`، `Resume` و `Est` مسیر runtime عادی آن نیستند.
+
+## جایگاه رایج
+
+نمونه chain packet:
+
+```text
+TunDevice -> IpManipulator -> RawSocket
+```
+
+```text
+TunDevice -> WireGuardDevice -> IpManipulator -> UdpStatelessSocket
+```
+
+برای protocol swap دو طرفه معمولا باید در سمت مقابل هم `IpManipulator` با تنظیمات
+سازگار داشته باشید تا packetها به protocol اصلی برگردند.
+
+اگر trickهایی مثل `real-sni-upstream-node`،
+`crafted-server-hello-upstream-node` یا `real-fin-upstream-node` استفاده می‌کنید،
+آن branch helper را جدا از مسیر معمولی `next` تعریف کنید.
+
+## نمونه تنظیم
+
+Protocol swap ساده:
+
+```json
+{
+  "name": "ip-manipulator",
+  "type": "IpManipulator",
+  "settings": {
+    "protoswap-tcp": 253,
+    "protoswap-udp": 252
+  },
+  "next": "next-packet-node"
+}
+```
+
+SNI Blender:
+
+```json
+{
+  "name": "ip-manipulator",
+  "type": "IpManipulator",
+  "settings": {
+    "sni-blender": true,
+    "sni-blender-packets": 4
+  },
+  "next": "next-packet-node"
+}
+```
+
+نمونه ترکیبی:
+
+```json
+{
+  "name": "ip-manipulator",
+  "type": "IpManipulator",
+  "settings": {
+    "protoswap-tcp": 253,
+    "protoswap-tcp-2": 254,
+    "first-sni": "cover.example.net",
+    "first-sni-count": 2,
+    "first-sni-replay-delay": 20,
+    "first-sni-final-delay": 50,
+    "first-sni-ttl": 1,
+    "packet-duplicate": 1,
+    "carry-original-tcp-flags": true,
+    "up-tcp-bit-ack": "packet->fin",
+    "up-tcp-bit-fin": "packet->ack",
+    "dw-tcp-bit-ack": "packet->fin",
+    "dw-tcp-bit-fin": "packet->ack"
+  },
+  "next": "next-packet-node"
+}
+```
+
+## فیلدهای لازم
+
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `name` | string | نام دلخواه و یکتا برای node. |
+| `type` | string | باید دقیقا `"IpManipulator"` باشد. |
+| `settings` | object | باید حداقل یک trick فعال داشته باشد. |
+| `next` | string | برای forwarding معمولی لازم است. بعضی trickها صراحتا top-level `next` می‌خواهند. |
+
+اگر هیچ trickای فعال نباشد، ساخت نود fail می‌شود:
+
+```text
+IpManipulator: no tricks are enabled, nothing to do
+```
+
+## خلاصه trickها
+
+| خانواده | تنظیمات اصلی | جهت | کاربرد |
+| --- | --- | --- | --- |
+| Protocol swap | `protoswap-tcp`, `protoswap-tcp-2`, `protoswap-udp` | دو طرف | تغییر IPv4 protocol number و restore در سمت مقابل. |
+| SNI Blender | `sni-blender`, `sni-blender-packets` | upstream | fragment و shuffle کردن IPv4/TCP TLS ClientHello. |
+| Packet duplicate | `packet-duplicate` | final send path | ارسال چند کپی اضافه از packet نهایی و سپس original. |
+| first-sni | `first-sni` | upstream | ارسال یک ClientHello fake قبل از original. |
+| smuggle-sni | `smuggle-sni`, `real-sni-upstream-node` | upstream | ارسال ClientHello واقعی روی branch جدا و fake delayed روی مسیر عادی. |
+| overlap-sni | `overlap-sni`, `crafted-server-hello-upstream-node` | upstream با tracking downstream | overlap کردن ClientHello generated با byteهای واقعی TLS. |
+| ech-sni-trick | `ech-sni-trick` | upstream | ارسال fake ClientHello جاسازی‌شده توسط `TlsClient` داخل ECH payload به صورت out-of-order TCP segment. |
+| synfin-sni | `synfin-sni` | upstream | ترکیب real-first chunk، close packet، fake SYN، fake ClientHello، filler و باقی byteهای واقعی. |
+| smuggle-fin | `smuggle-fin`, `real-fin-upstream-node` | upstream با tracking echo downstream | تزریق mirrored `FIN|ACK` روی branch جدا و queue کردن traffic تا echo/delay کامل شود. |
+| TCP flag rewrite | `up-tcp-bit-*`, `dw-tcp-bit-*` | دو طرف | force، toggle یا remap کردن TCP flagها. |
+| Port ghost | `source-port-ghost`, `dest-port-ghost` | apply در upstream، restore در downstream | حمل port اصلی در tail packet و تغییر دادن live transport port. |
+
+## Protocol Swap
+
+در IPv4، فیلد `Protocol` مشخص می‌کند payload از چه نوعی است. برای مثال TCP عدد
+`6` و UDP عدد `17` دارد.
+
+| گزینه | نوع | توضیح |
+| --- | --- | --- |
+| `protoswap` | integer | alias قدیمی برای `protoswap-tcp`. |
+| `protoswap-tcp` | integer | protocol number جایگزین برای packetهای TCP. |
+| `protoswap-tcp-2` | integer | عدد دوم اختیاری؛ TCPها در هر جهت بین دو عدد alternate می‌شوند. |
+| `protoswap-udp` | integer | protocol number جایگزین برای packetهای UDP. |
+
+مقدار معتبر برای protocol replacement از `0` تا `255` است.
+
+وقتی packet برگشتی با یکی از عددهای جایگزین match شود، نود آن را به TCP یا UDP
+عادی برمی‌گرداند. برای تونل دوطرفه، سمت مقابل هم باید تنظیمات سازگار داشته باشد.
+
+بهتر است مقدار TCP و UDP را یکسان نگذارید. parser فعلی reject نمی‌کند، اما restore
+کردن ambiguous می‌شود و عیب‌یابی سخت خواهد شد.
+
+اگر تغییر مستقیما بین TCP و UDP باشد، فقط IPv4 header checksum refresh می‌شود. در
+تغییرهای دیگر، `line->recalculate_checksum` ست می‌شود تا output packet بعدی
+checksumها را rebuild کند.
+
+## TCP Flag Rewrite
+
+این همان بخشی است که در مستندات قدیمی با عنوان «بازی با بیت‌های TCP» توضیح داده
+شده بود. ایده اصلی همان است: می‌توانید flagهای TCP را force، toggle یا از flag
+دیگر packet کپی کنید.
+
+فرمت کلیدها:
+
+```text
+up-tcp-bit-<flag>
+dw-tcp-bit-<flag>
+```
+
+flagهای پشتیبانی‌شده:
+
+```text
+cwr, ece, urg, ack, psh, rst, syn, fin
+```
+
+مقدارهای قابل قبول:
+
+```text
+off
+on
+toggle
+flip
+switch
+packet->cwr
+packet->ece
+packet->urg
+packet->ack
+packet->psh
+packet->rst
+packet->syn
+packet->fin
+```
+
+`flip` و `switch` alias برای `toggle` هستند.
+
+نمونه swap کردن ACK و FIN:
+
+```json
+{
+  "up-tcp-bit-ack": "packet->fin",
+  "up-tcp-bit-fin": "packet->ack",
+  "dw-tcp-bit-ack": "packet->fin",
+  "dw-tcp-bit-fin": "packet->ack"
+}
+```
+
+اعمال بیت‌ها همزمان انجام می‌شود، نه خط‌به‌خط. یعنی مقدارها از flagهای packet
+اصلی خوانده می‌شوند، نه از نسخه‌ای که همین الان تغییر کرده است.
+
+اگر flag تغییر کند، packet برای checksum recalculation علامت می‌خورد.
+
+### حمل Flag اصلی
+
+| گزینه | نوع | پیش‌فرض | توضیح |
+| --- | --- | --- | --- |
+| `carry-original-tcp-flags` | boolean | `false` | جهت rewrite شده، byte اصلی TCP flags را انتهای payload می‌گذارد تا سمت دیگر بتواند restore کند. |
+| `bit-transport` | boolean | `false` | alias سازگار برای `carry-original-tcp-flags`. |
+
+این حالت فقط روی IPv4 TCP کامل کار می‌کند و packetهای fragmented را skip می‌کند.
+
+## SNI Blender
+
+SNI Blender خود SNI را rewrite نمی‌کند. فقط شکل packet مربوط به upstream TLS
+ClientHello را تغییر می‌دهد.
+
+| گزینه | نوع | اجباری | توضیح |
+| --- | --- | --- | --- |
+| `sni-blender` | boolean | بله | فعال‌سازی fragmentation و shuffle برای TLS ClientHello. |
+| `sni-blender-packets` | integer | وقتی فعال است بله | تعداد fragmentها. مقدار معتبر `1` تا `16`. |
+
+رفتار:
+
+- upstream IPv4/TCP packetهای حاوی TLS ClientHello را تشخیص می‌دهد
+- packetهای از قبل fragmented را skip می‌کند
+- TCP header را داخل fragment اول نگه می‌دارد
+- IP payload را به چند IPv4 fragment تقسیم می‌کند
+- offsetها را طبق قانون IPv4 روی مرزهای ۸ بایتی قرار می‌دهد
+- fragmentها را با ترتیب shuffle شده می‌فرستد
+
+نکته‌های عملی از مستندات قدیمی هنوز مهم هستند:
+
+- traffic باید در packet layer شامل TLS ClientHello قابل مشاهده باشد.
+- اگر application کاربر خودش TLS دارد، WaterWall لازم نیست فقط برای این trick
+  TLS بسازد.
+- اگر chain باید خودش TLS تولید کند، باید مسیر مناسب `TlsClient` / `TlsServer`
+  داشته باشد تا قبل از رسیدن packet به این نود ClientHello قابل تشخیص شود.
+- در سناریوهای local یا serverless، routing/capture سیستم عامل باید طوری باشد
+  که packetهای مورد نظر از WaterWall عبور کنند.
+
+این trick روی همه شبکه‌ها جواب نمی‌دهد. بعضی مسیرها packetهای fragment شده را
+drop می‌کنند.
+
+## Packet Duplicate
+
+| گزینه | نوع | توضیح |
+| --- | --- | --- |
+| `packet-duplicate` | integer بزرگ‌تر از `0` | این تعداد packet duplicate ارسال می‌شود و بعد original یک بار فرستاده می‌شود. |
+
+این مرحله در final send path و بعد از بقیه trickهای فعال اجرا می‌شود.
+
+## Port Ghost
+
+Port ghost در upstream final send اعمال و در ابتدای downstream restore می‌شود.
+
+| گزینه | نوع | توضیح |
+| --- | --- | --- |
+| `source-port-ghost` | boolean | source port اصلی انتهای packet اضافه می‌شود و live source port به high port deterministic تغییر می‌کند. |
+| `dest-port-ghost` | boolean | destination port اصلی انتهای packet اضافه می‌شود و live destination port تغییر می‌کند. |
+
+اگر هر دو فعال باشند، اول source port و بعد destination port append می‌شود.
+
+downstream packetهایی که tail مربوطه را داشته باشند، portهای اصلی را restore
+می‌کنند و packet دوباره به طول اصلی shrink می‌شود. packetهای fragmented skip
+می‌شوند.
+
+## first-sni
+
+`first-sni` یک یا چند کپی crafted از ClientHello را قبل از original می‌فرستد.
+
+| گزینه | نوع | پیش‌فرض | توضیح |
+| --- | --- | --- | --- |
+| `first-sni` | string غیرخالی | اجباری برای فعال‌سازی | SNI نوشته‌شده داخل کپی crafted. |
+| `first-sni-count` | integer بزرگ‌تر از `0` | `1` | تعداد fake copy قبل از original. |
+| `first-sni-replay-delay` | ms، `>= 0` | `0` | تاخیر بین replayهای fake بعد از اولین packet. |
+| `first-sni-final-delay` | ms، `>= 0` | `0` | تاخیر بین آخرین fake و original. |
+| `first-sni-ttl` | `0` تا `255` | حفظ TTL اصلی | TTL برای کپی crafted. |
+| `first-sni-random-tcp-sequence` | boolean | `false` | random کردن TCP sequence در کپی crafted. |
+
+فقط کپی crafted تغییر می‌کند و original در مسیر عادی باقی می‌ماند. اگر ClientHello
+شامل TLS 1.3 PSK binder باشد و تغییر SNI نیاز به recompute binder داشته باشد،
+trick محافظه‌کارانه skip می‌شود.
+
+## smuggle-sni
+
+`smuggle-sni` ClientHello واقعی را به branch helper می‌فرستد و یک ClientHello
+crafted و delayed را روی مسیر معمولی `next` ارسال می‌کند.
+
+| گزینه | نوع | پیش‌فرض | توضیح |
+| --- | --- | --- | --- |
+| `smuggle-sni` | string غیرخالی | اجباری برای فعال‌سازی | SNI داخل کپی crafted. |
+| `smuggle-sni-delay-ms` | ms، `>= 0` | `0` | تاخیر ارسال fake روی مسیر معمولی. |
+| `real-sni-upstream-node` | string | اجباری | branch که real ClientHello را فوری دریافت می‌کند. |
+
+این trick به top-level `next` معمولی نیاز دارد. node helper باید وجود داشته باشد
+و نباید به خود `IpManipulator` اشاره کند. در عمل بهتر است این helper branch جدا
+از `next` اصلی باشد.
+
+`IpManipulator` برای ساخت شکل ClientHello crafted یک `TlsClient` داخلی no-chain
+می‌سازد.
+
+## overlap-sni
+
+`overlap-sni` packetهای اولیه TLS را capture می‌کند، یک ClientHello شبیه Chrome
+می‌سازد، یک server-side TLS packet crafted را از helper branch می‌فرستد و byteهای
+generated و real را روی TCP sequence range overlap می‌کند.
+
+| گزینه | نوع | پیش‌فرض | توضیح |
+| --- | --- | --- | --- |
+| `overlap-sni` | string غیرخالی | اجباری برای فعال‌سازی | SNI برای ClientHello generated. |
+| `overlap-sni-delay-ms` | ms، `>= 0` | `0` | تاخیر packetهای بعد از fake SYN و packetهای بعدی در overlap window. |
+| `overlap-sni-syn-ttl` | `0` تا `255` | حفظ TTL اصلی | TTL برای fake TCP `SYN`. |
+| `crafted-server-hello-upstream-node` | string | اجباری | helper branch برای crafted server-side TLS packet. |
+
+این trick به top-level `next` معمولی نیاز دارد. helper branch باید وجود داشته
+باشد و نباید به خود `IpManipulator` اشاره کند.
+
+## ech-sni-trick
+
+`ech-sni-trick` برای هماهنگی با `TlsClient.settings.ech-sni-trick` طراحی شده
+است. `TlsClient` یک fake ClientHello را داخل GREASE
+`encrypted_client_hello` payload قرار می‌دهد و `IpManipulator` همان byte range را
+به صورت out-of-order TCP segment می‌فرستد، بدون اینکه byteهای original ClientHello
+را تغییر دهد.
+
+| گزینه | نوع | پیش‌فرض | توضیح |
+| --- | --- | --- | --- |
+| `ech-sni-trick` | string غیرخالی | اجباری برای فعال‌سازی | باید با مقدار مرتبط در `TlsClient.settings.ech-sni-trick` هماهنگ باشد. |
+| `data-shard-1-delay` | ms، `>= 0` | `0` | تاخیر آزاد کردن اولین original packet بعد از ارسال fake inner ClientHello segment. |
+| `data-shard-2-delay` | ms، `>= 0` | `0` | تاخیر آزاد کردن packet اصلی بعدی. |
+
+جمع delayها باید در بازه unsigned 32-bit پشتیبانی‌شده جا شود. packet out-of-order
+با flag `PSH` ارسال می‌شود. اگر packet crafted از `GLOBAL_MTU_SIZE` بزرگ‌تر شود،
+flow به جای reshape شدن reject می‌شود.
+
+## synfin-sni
+
+`synfin-sni` یک trick پیشرفته upstream برای TLS ClientHello است. این trick یک
+real first TLS data chunk، سپس close packet، fake SYN، crafted fake ClientHello،
+filler TLS-looking و بعد باقی byteهای واقعی ClientHello را می‌فرستد.
+
+| گزینه | نوع | پیش‌فرض | توضیح |
+| --- | --- | --- | --- |
+| `synfin-sni` | string غیرخالی | اجباری برای فعال‌سازی | SNI برای ClientHello generated. |
+| `synfin-sni-additional-range-min` | `0` تا `65535` | `0` | حداقل byte اضافه از real ClientHello در chunk اول. |
+| `synfin-sni-additional-range-max` | `0` تا `65535` | اگر فقط min باشد همان min، وگرنه `0` | حداکثر byte اضافه؛ برای هر flow یک مقدار random انتخاب و clamp می‌شود. |
+| `synfin-sni-syn-ttl` | `0` تا `255` | حفظ TTL اصلی | TTL برای fake SYN. |
+| `synfin-sni-fin-ttl` | `0` تا `255` | حفظ TTL اصلی | TTL برای close packet. |
+| `synfin-sni-fake-ttl` | `0` تا `255` | حفظ TTL اصلی | TTL برای full crafted fake ClientHello packet. |
+| `synfin-sni-random-syn-checksum` | boolean | `false` | random کردن checksumهای IPv4/TCP برای fake SYN. |
+| `synfin-sni-random-fin-checksum` | boolean | `false` | random کردن checksumهای close packet. |
+| `synfin-sni-random-syn-sequence` | boolean | `false` | random کردن sequence fake SYN. |
+| `synfin-sni-random-fin-sequence` | boolean | `false` | random کردن sequence close packet. |
+| `synfin-sni-use-rst` | boolean | `false` | استفاده از `RST|ACK` به جای `FIN|ACK` برای close packet. |
+
+TTL برابر `0` واقعا TTL صفر تنظیم می‌کند. اگر می‌خواهید TTL اصلی حفظ شود، کلید
+TTL را اصلا قرار ندهید.
+
+## smuggle-fin
+
+`smuggle-fin` یک mirrored `FIN|ACK` روی branch helper تزریق می‌کند و traffic روی
+همان worker را تا دیدن echo downstream و تمام شدن delay اختیاری queue می‌کند.
+
+| گزینه | نوع | پیش‌فرض | توضیح |
+| --- | --- | --- | --- |
+| `smuggle-fin` | boolean | اجباری برای فعال‌سازی | تزریق mirrored FIN/ACK را فعال می‌کند. |
+| `fin-sni-delay-ms` | ms، `>= 0` | `0` | تاخیر بعد از echo downstream قبل از replay کردن queued packets. |
+| `real-fin-upstream-node` | string | اجباری | helper branch برای crafted mirrored FIN/ACK. |
+
+این trick به top-level `next` معمولی نیاز دارد. node helper باید وجود داشته باشد
+و نباید به خود `IpManipulator` اشاره کند.
+
+packetهای بدون TCP payload، packetهایی که از قبل `SYN`، `FIN` یا `RST` هستند،
+packetهای non-TCP و packetهای fragmented IPv4 بدون تغییر عبور می‌کنند.
+
+## ناسازگاری‌ها
+
+parser فعلی این ترکیب‌ها را reject می‌کند:
+
+| همزمان فعال نشوند |
+| --- |
+| `smuggle-sni` و `overlap-sni` |
+| `smuggle-sni` و `synfin-sni` |
+| `overlap-sni` و `synfin-sni` |
+| `ech-sni-trick` و `smuggle-sni` |
+| `ech-sni-trick` و `overlap-sni` |
+| `ech-sni-trick` و `synfin-sni` |
+
+`first-sni` مستقل parse می‌شود، اما در runtime وقتی یک trick بعدی packet را کامل
+handle کند، pipeline همان‌جا برمی‌گردد.
+
+## ترتیب اجرای Runtime
+
+ترتیب upstream payload:
+
+1. `smuggle-fin`
+2. protocol swap
+3. TCP flag rewrite
+4. `synfin-sni`
+5. `ech-sni-trick`
+6. `overlap-sni`
+7. `smuggle-sni`
+8. `first-sni`
+9. SNI Blender
+10. final send path، شامل port ghost و packet duplicate
+
+ترتیب downstream payload:
+
+1. port-ghost restore
+2. `smuggle-fin`
+3. `ech-sni-trick`
+4. `overlap-sni`
+5. protocol swap
+6. TCP flag rewrite
+7. hook downstream مربوط به SNI Blender
+8. logging hook مربوط به `smuggle-sni`
+9. final downstream send
+
+## Lifecycle و Packet Line
+
+`IpManipulator` یک pure packet tunnel است:
+
+- lifecycle اتصال per-packet ندارد
+- payload callbackها مسیر runtime اصلی هستند
+- `Finish`، `Pause`، `Resume` و `Est` برای استفاده عادی معتبر نیستند
+- نباید packet line را در runtime destroy کند
+
+در upstream packet-line `Init`، مسیر `next` عادی initialize می‌شود. اگر branchهای
+helper برای real-SNI یا real-FIN تنظیم شده باشند، آن‌ها هم initialize می‌شوند.
+
+## محدودیت‌ها و Padding
+
+| مقدار | اندازه |
+| --- | --- |
+| `required_padding_left` | `0 bytes` |
+| تعداد fragmentهای SNI Blender | `1` تا `16` |
+| protocol replacement number | `0` تا `255` |
+
+این نود left padding از chain نمی‌خواهد. بعضی trickها برای ساخت packetهای crafted
+buffer clone یا allocate می‌کنند.
+
+## نکته‌ها
+
+- پیاده‌سازی فعلی عمدتا IPv4 را تغییر می‌دهد؛ IPv6 معمولا توسط این trickها ignore
+  می‌شود.
+- بسیاری از trickها packet کامل و non-fragmented IPv4 TCP با TCP header کامل
+  می‌خواهند.
+- بیشتر trickهای SNI فقط upstream و فقط روی TLS ClientHello کار می‌کنند.
+- این نود به این وابسته است که output packet بعدی
+  `line->recalculate_checksum` را رعایت کند.
+- branchهای helper بهتر است جدا از `next` معمولی باشند.
+- وقتی `sni-blender` فعال است، `sni-blender-packets` اجباری است.
+- فیلد `trick_sni_blender_packets_delay_max` داخل struct C وجود دارد، اما parser
+  فعلی JSON آن را expose یا استفاده نمی‌کند.

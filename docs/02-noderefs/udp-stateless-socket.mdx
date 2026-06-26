@@ -4,60 +4,22 @@ sidebar_position: 1700
 
 # UdpStatelessSocket
 
-## 📖 معرفی کلی
+`UdpStatelessSocket` is a bidirectional UDP edge adapter. It binds one UDP socket, receives datagrams from arbitrary peers, and sends datagrams to the destination stored in the current line routing context.
 
-| ویژگی              | مقدار                        | توضیح                                              |
-|--------------------|------------------------------|----------------------------------------------------|
-| نوع نود            | Adapter (دوجهته)             | سوکت UDP دوجهته                                   |
-| لایه شبکه          | لایه ۳                    | کار با بسته‌های UDP به‌صورت stateless (بدون اتصال) |
-| موقعیت در زنجیره    | ابتدا یا انتهای زنجیره        | فقط در ابتدا یا انتهای زنجیره قابل استفاده است    |
-| وابستگی            | نود قبل/بعد                  | برای دریافت/ارسال داده ضروری است                  |
+It is intentionally stateless: it does not create one line per peer, does not track sessions, and does not behave like `UdpListener` plus `UdpConnector`. It exists mainly for packet-oriented nodes such as `WireGuardDevice`, where the same UDP socket must send and receive peer datagrams.
 
-## عملکرد
+## Typical Placement
 
-این نود در اصل برای WireGuard طراحی شده، اما می‌تواند در سناریوهای دیگر هم به‌کار گرفته شود.
-
-از نظر رفتاری شبیه `UdpListener` / `UdpConnector` است، با این تفاوت که:
-- دوجهته است
-- فقط با نودهای لایه ۳ سازگار است
-
-روی یک IP و پورت مشخص گوش می‌دهد و از همان سوکت برای ارسال بسته‌های UDP به بیرون نیز استفاده می‌کند. بنابراین می‌تواند در ابتدای زنجیره یا در انتهای زنجیره قرار بگیرد.
-
-و مثل نود TunDevice ؛ وقتی در انتهای زنیجر باشه پکت هایی که دریافت کنه رو به سمت چپ می فرسته و اگه ابتدای زنجیر باشه به سمت راست.
-
-درمورد رفتار نود های اداپتر ۲ جهته در صفحه TunDevice کامل تر توضیح دادم با دیاگرام.
-
-## ⚙️ راهنمای پیکربندی
-
-```json
-{
-  "name": "node_name",
-  "type": "UdpStatelessSocket",
-  "settings": {
-    "listen-address": "0.0.0.0",
-    "listen-port": 1234
-  },
-  "next": "next_node_name"
-}
+```text
+WireGuardDevice -> UdpStatelessSocket
+UdpStatelessSocket -> WireGuardDevice
+TunDevice -> WireGuardDevice -> UdpStatelessSocket
+UdpStatelessSocket -> WireGuardDevice -> TunDevice
 ```
 
-### `listen-address`
+Use it at the UDP edge of a packet chain when the adjacent node knows how to set or consume routing context. `WireGuardDevice` is the main example: it writes peer endpoints into destination routing context before sending encrypted datagrams.
 
-آدرس IP که سوکت روی آن ساخته و گوش می‌کند.
-
-### `listen-port`
-
-پورتی که سوکت روی آن گوش می‌کند و از همان برای ارسال نیز استفاده می‌شود.
-
-### تنظیمات اختیاری
-
-| گزینه | توضیح |
-|---|---|
-| `interface` | محدود کردن UDP socket به interface محلی؛ در Linux معمولا با `SO_BINDTODEVICE` |
-| `fwmark` | socket mark با `SO_MARK` در platformهای پشتیبانی‌شده |
-| `source-ip` | override برای local bind address؛ چون همان socket هم ارسال می‌کند هم دریافت |
-
-نمونه:
+## Basic Example
 
 ```json
 {
@@ -68,59 +30,102 @@ sidebar_position: 1700
     "listen-port": 51820,
     "interface": "eth0",
     "fwmark": 10,
-    "source-ip": "192.0.2.10"
+    "large-send-buffer": true,
+    "large-recv-buffer": true,
+    "source-ip": "192.0.2.10",
+    "verbose": false
   }
 }
 ```
 
----
+## Required Settings
 
-این نود بسته‌ها را به مقصدی که در `dest-ctx` تعریف شده ارسال می‌کند؛ معمولاً این مقدار توسط نود WireGuard تنظیم می‌شود.
+| Field | Type | Description |
+|---|---|---|
+| `listen-address` | string | Local IP address to bind. Must be a valid IP address. |
+| `listen-port` | integer | Local UDP port to bind. Valid range is `0` through `65535`. |
 
+The top-level `settings` object must exist and must not be empty.
 
-:::caution توجه
+## Optional Settings
 
-این نود یک نود لایه ۳ حساب میشه ؛ فقط با یه سوکت udp کار میکنه و اینطوری نیست که برای کانکشن های بیشتر سوکت جدید بسازه
+| Field | Default | Description |
+|---|---|---|
+| `interface` | unset | Restricts or pins the socket to a local network device where supported. |
+| `fwmark` | unset | Socket mark applied with platform support for `SO_MARK`. Mainly Linux-oriented. |
+| `source-ip` | unset | Overrides the effective local bind address. For this node, it replaces `listen-address`. |
+| `large-send-buffer` | `true` | `true` uses Waterwall's default large socket buffer, `false` leaves the kernel default, and a positive integer requests that byte size. |
+| `large-recv-buffer` | `true` | Same as `large-send-buffer`, but for `SO_RCVBUF`. |
+| `verbose` | `false` | Enables per-datagram debug logging for receive and send. |
 
-کلا نباید کانکشن به سمت این نود ایجاد بشه یعنی دقیقا یک نود لایه ۳ هست که پکت هارو به سوکت udp رد و بدل می کنه.
+The default large socket buffer size is currently `4194304` bytes.
 
-پس یا توی زنجیر لایه ۴ قرار ندید این را یا اینکه از نود های تبادل گر به درستی استفاده کنید.
+## Interface And Source-IP Behavior
 
-:::
+`interface` is applied before bind. On Linux, this normally uses device binding. On platforms where binding by device is unavailable, and `source-ip` is not set, Waterwall falls back to binding the socket to that interface's IPv4 address.
 
----
+`source-ip` is treated as an override for `listen-address`, because this node uses the same socket for both receive and send.
 
-## مثال عملی: WireGuard 🚀
+If `TunDevice` loop protection has published an automatic egress pin, `source-ip` alone does not override that pin. Use an explicit `interface` setting when you need to choose a different physical interface.
 
-اگر با WireGuard آشنا باشید، ساختاری شبیه OpenVPN دارد اما چند نقطه قوت باعث می‌شود در شرایط ایده‌آل (بدون فیلترینگ) یکی از بهترین‌ها باشد:
+## Receive Path
 
-### 🔥 مزایای WireGuard
-1. 📡 UDP: از UDP برای انتقال داده استفاده می‌کند؛ بسته‌ها یکپارچه منتقل می‌شوند (البته با MTU کمتر).
-2. 🔐 رمزنگاری مدرن: بر پایهٔ الگوریتم‌های مینیمال و مدرن مانند `Curve25519` و `ChaCha20-Poly1305` است:
-   - سبک و CPU-friendly
-   - نیازمند هندشیک کمتر
-   - امن
+When a UDP datagram arrives:
 
-### 📊 ساختار WireGuard با واتروال
+1. the socket-owning worker receives the datagram
+2. `UdpStatelessSocket` gets that worker's packet line
+3. the sender address and port are written into `routing_context.src_ctx`
+4. the local listener port is recorded in the line routing context
+5. the datagram body is forwarded into the adjacent chain side
 
-#### سمت کلاینت
+If this node is the last node in the chain, received datagrams are forwarded toward the previous node. Otherwise, they are forwarded toward the next node.
 
-```mermaid
-flowchart LR;
-    TunDevice --> WireGuardDevice --> UdpStatelessSocket
-```
+In debug builds, the node asserts that the worker packet line is still alive after forwarding. Destroying packet lines during runtime is a packet-tunnel contract violation.
 
-#### سمت سرور VPN
+## Send Path
 
-```mermaid
-flowchart LR;
-    TunDevice --> WireGuardDevice --> UdpStatelessSocket
-```
-### 🔍 چرا UdpStatelessSocket؟
+When payload reaches `UdpStatelessSocket` from either direction:
 
-علت استفاده نکردن از `UdpListener` / `UdpConnector` این است که در WireGuard از همان سوکت و پورت که با آن ارسال انجام می‌شود، دریافت هم صورت می‌گیرد.
+1. the destination is read from `line->routing_context.dest_ctx`
+2. if the destination is an unresolved domain, async DNS resolution is started
+3. otherwise, the destination IP and port are converted to a socket address
+4. the datagram is sent using the bound UDP socket
 
-- `UdpListener` فقط گوش‌دهنده است و نمی‌تواند آغازگر ارسال به یک همتا (peer) باشد.
-- `UdpConnector` فقط ارسال‌کننده است و وقتی همتا قبل از آن بسته‌ای فرستاده، توان پردازش دریافت را ندارد.
+If the destination context is not ready or has no port, the datagram is dropped and a warning/error is logged.
 
-✅ بنابراین نود جدیدی طراحی شد که از یک پورت هم ارسال کند و هم گوش دهد: `UdpStatelessSocket`.
+For unresolved domain destinations, the node caches async DNS results for `30 minutes` by domain, port, and domain strategy. This matters because packet-line routing context is scratch metadata and may be overwritten by the next packet.
+
+## Worker Ownership
+
+The UDP socket is owned by one worker loop. If a datagram to send is produced on another worker, `UdpStatelessSocket` schedules the send onto the socket-owning worker and performs the actual `sendto()` there.
+
+This keeps socket ownership stable while still allowing packet-line traffic to originate from any worker.
+
+## Why Not UdpListener Or UdpConnector?
+
+WireGuard-style UDP needs one socket that can both send to a peer and receive from any peer. `UdpListener` is connection-oriented listener behavior, and `UdpConnector` is connector behavior. `UdpStatelessSocket` deliberately avoids both models and sends by routing context instead.
+
+## Packet-Line Semantics
+
+`UdpStatelessSocket` is an adapter around a packet chain. It uses worker packet lines for received datagrams and does not create per-peer connection lines.
+
+Connection-style callbacks such as `Init`, `Est`, `Finish`, `Pause`, and `Resume` are ignored. Payload callbacks are the meaningful runtime path.
+
+## Node Metadata
+
+| Property | Value |
+|---|---|
+| Runtime model | Stateless UDP adapter |
+| Socket count | One bound UDP socket per node instance |
+| Per-peer state | none |
+| Packet-line use | Worker packet line on receive |
+| Required left padding | `0` |
+| DNS cache freshness | `30 minutes` |
+
+## Common Mistakes
+
+- Sending payload before `dest_ctx` contains a destination IP/domain and port.
+- Expecting one Waterwall line per UDP peer. This node is stateless.
+- Using it as a general stream adapter. It forwards datagram payloads.
+- Relying on `source-ip` to override `TunDevice` loop-protection pinning. Set `interface` explicitly.
+- Forgetting that `fwmark` and interface binding are platform-dependent.
