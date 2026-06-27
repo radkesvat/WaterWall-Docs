@@ -1,0 +1,221 @@
+---
+sidebar_position: 925
+title: "JunkDatagramSender"
+sidebar_label: "JunkDatagramSender"
+description: "مستندات مرجع نود JunkDatagramSender."
+---
+
+<!-- Written from version 106 of the English doc. -->
+
+# JunkDatagramSender
+
+`JunkDatagramSender` یک tunnel میانی قابل ترکیب است که قبل از payload upstream اولیه روی هر line، payloadهای datagram تولیدشده شبیه UDP را inject می‌کند.
+
+برای آزمایش‌های camouflage و protocol-noise در مسیرهای UDP-style طراحی شده است. این نود payload واقعی را تغییر نمی‌دهد. در عوض، وقتی upstream payload می‌رسد، ممکن است ابتدا یک batch random از payloadهای junk تولیدی به `next` بفرستد، سپس payload واقعی را بدون تغییر forward کند.
+
+`JunkDatagramSender` یک tunnel عادی با per-line state است. socket adapter نیست، object از نوع `line_t` نمی‌سازد یا destroy نمی‌کند و IPv4 packet tunnel خام نیست.
+
+## جایگاه رایج
+
+مسیر UDP-style:
+
+```text
+UdpListener -> JunkDatagramSender -> UdpConnector
+```
+
+با نودهای دیگری که datagram را حفظ می‌کنند:
+
+```text
+UdpListener -> JunkDatagramSender -> EncryptionClient -> UdpConnector
+```
+
+در جایی از آن استفاده کنید که انتظار می‌رود یک WaterWall payload مثل یک datagram رفتار کند. در مسیرهای TCP stream معمولی، payloadهای junk به byte اضافه تبدیل می‌شوند که معمولاً application protocol انتظارش را ندارد.
+
+## این نود چه می‌کند؟
+
+- یک counter trigger باقی‌مانده per-line از `resend-again-times` initialize می‌کند.
+- junk را فقط وقتی upstream payload callback برسد می‌فرستد.
+- junk را قبل از upstream payload واقعی می‌فرستد.
+- تعداد random از payloadهای junk بین `packet-count-perline-min` و `packet-count-perline-max` می‌فرستد.
+- protocol generator هر junk payload را به صورت random از `selected-protocols` انتخاب می‌کند.
+- می‌تواند یک duplicate با تاخیر از هر junk payload تولیدشده schedule کند.
+- payload upstream واقعی را بدون تغییر بعد از batch junk forward می‌کند.
+- payloadهای downstream را بدون تغییر forward می‌کند.
+- `Est`، `Pause` و `Resume` را در همان جهت بدون تغییر pass می‌کند.
+- local line state را قبل از forward کردن directional `Finish` destroy می‌کند.
+
+اگر تولید junk یا forwarding قبل از forward شدن payload واقعی line را ببندد، نود buffer payload واقعی را recycle و return می‌کند.
+
+## نمونه تنظیم
+
+```json
+{
+  "name": "junk",
+  "type": "JunkDatagramSender",
+  "settings": {
+    "packet-count-perline-min": 2,
+    "packet-count-perline-max": 5,
+    "resend-again-times": 2,
+    "selected-protocols": [
+      "dns",
+      "ntp",
+      "quic-http3",
+      "rtp-rtcp-srtp"
+    ],
+    "keep-sending-max-ms": 1500
+  },
+  "next": "udp-out"
+}
+```
+
+با تنظیمات پیش‌فرض، اولین upstream payload روی هر line یک junk payload تولیدشده trigger می‌کند، سپس payload واقعی forward می‌شود.
+
+## فیلدهای لازم
+
+فیلدهای top-level:
+
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `name` | string | نام دلخواه node. باید در config file یکتا باشد. |
+| `type` | string | باید دقیقاً `"JunkDatagramSender"` باشد. |
+| `settings` | object | object تنظیمات اختیاری. تنظیمات خالی از پیش‌فرض استفاده می‌کنند. |
+| `next` | string | اختیاری در metadata نود، اما معمولاً به tunnel بعدی که upstream payload دریافت می‌کند تنظیم می‌شود. |
+
+## تنظیمات
+
+| گزینه | نوع | پیش‌فرض | توضیح |
+| --- | --- | --- | --- |
+| `packet-count-perline-min` | integer | `1` | حداقل تعداد junk payload تولیدشده برای هر trigger. مقادیر منفی به `0` clamp می‌شوند. |
+| `packet-count-perline-max` | integer | `1` | حداکثر تعداد junk payload تولیدشده برای هر trigger. مقادیر منفی به `0` و بالاتر از `256` به `256` clamp می‌شوند. اگر کمتر از min باشد، به min clamp می‌شود. |
+| `resend-again-times` | integer | `1` | تعداد upstream payload callbackهایی که junk sending را روی هر line trigger می‌کنند. `0` junk sending را غیرفعال می‌کند. مقادیر منفی به `0` و بالاتر از `256` به `256` clamp می‌شوند. |
+| `selected-protocols` | array از string | همه protocolهای پیاده‌سازی‌شده | generator protocolهایی که برای انتخاب random واجد شرایط هستند. اگر حذف شود، از همه generatorهای پیاده‌سازی‌شده استفاده می‌شود. array خالی قابل قبول است اما node را به pass-through بدون junk تبدیل می‌کند. |
+| `keep-sending-max-ms` | integer | `0` | مقدار `0` delayed duplicate sends را غیرفعال می‌کند. وقتی بزرگ‌تر از `0` باشد، هر junk payload تولیدشده یک بار duplicate می‌شود و با delay random از `1` تا این مقدار به میلی‌ثانیه schedule می‌شود. مقادیر منفی delayed send را غیرفعال می‌کنند. |
+
+## رفتار Trigger
+
+`resend-again-times` upstream payload callbackها را می‌شمارد، نه byteهای جداگانه و نه تلاش‌های اتصال.
+
+مثلاً:
+
+```json
+{
+  "packet-count-perline-min": 2,
+  "packet-count-perline-max": 4,
+  "resend-again-times": 3
+}
+```
+
+روی هر line، سه upstream payload callback اول هر کدام یک batch random از `2` تا `4` junk payload trigger می‌کنند. payload upstream چهارم و بعدی بدون junk اضافه forward می‌شوند.
+
+هیچ junk‌ای در طول `Init` به تنهایی فرستاده نمی‌شود. نود منتظر می‌ماند تا یک upstream payload واقعی برسد.
+
+## انتخاب Protocol
+
+نام‌های canonical قابل قبول:
+
+| نام canonical | aliasهای قابل قبول |
+| --- | --- |
+| `dns` | ندارد |
+| `dhcp` | ندارد |
+| `ntp` | ندارد |
+| `quic-http3` | `quic`، `http3`، `http/3`، `quic/http3` |
+| `rtp-rtcp-srtp` | `rtp`، `rtcp`، `srtp` |
+| `stun-turn-ice` | `stun`، `turn`، `ice` |
+| `mdns` | ندارد |
+| `snmp` | ندارد |
+| `syslog` | ندارد |
+| `ipsec-nat-t` | `ipsec-natt`، `natt` |
+| `sip` | ندارد |
+
+از `"all"` داخل `selected-protocols` استفاده کنید تا صریحاً همه generatorهای پیاده‌سازی‌شده فعال شوند:
+
+```json
+{
+  "selected-protocols": ["all"]
+}
+```
+
+نام protocolها در پیاده‌سازی فعلی case-insensitive مطابقت داده می‌شوند، اگرچه lowercase نام‌های مستند شده هستند.
+
+## نام‌های Protocol غیرفعال
+
+نام‌های زیر فقط به عنوان placeholder غیرفعال وجود دارند. اگر هر کدام در `selected-protocols` باشند، startup fail می‌شود:
+
+| نام غیرفعال | یادداشت |
+| --- | --- |
+| `tftp` | فقط placeholder generator |
+| `ssdp` | فقط placeholder generator |
+| `radius` | فقط placeholder generator |
+| `gtp-u` / `gtpu` | فقط placeholder generator |
+| `game-udp-protocols` / `game-udp` / `game` | فقط placeholder generator |
+| `coap` | فقط placeholder generator |
+
+## انواع Payload تولیدشده
+
+moduleهای پیاده‌سازی‌شده payloadهای UDP application با ظاهر معتبر تولید می‌کنند، نه UDP/IP header:
+
+| Protocol | شکل تولیدشده |
+| --- | --- |
+| `dns` | payloadهای DNS query، گاهی با داده EDNS(0)-style. |
+| `dhcp` | payloadهای client-message DHCPv4. |
+| `ntp` | payloadهای client request NTP. |
+| `quic-http3` | payloadهای QUIC Initial-like با HTTP/3 ALPN data. |
+| `rtp-rtcp-srtp` | payloadهای RTP media، RTCP control و SRTP-shaped. |
+| `stun-turn-ice` | payloadهای STUN، TURN و ICE connectivity یا relay-control. |
+| `mdns` | payloadهای multicast DNS query و announcement. |
+| `snmp` | payloadهای SNMP v1/v2c manager request. |
+| `syslog` | پیام‌های syslog به سبک RFC3164/RFC5424. |
+| `ipsec-nat-t` | payloadهای NAT-T keepalive، IKEv2 و ESP-in-UDP-shaped. |
+| `sip` | payloadهای SIP request و response. |
+
+نود generator arguments با بازه هدف پیش‌فرض `12` تا `1200` byte می‌فرستد. generatorهای جداگانه ممکن است اندازه‌های fixed انتخاب کنند که شکل protocol آن را لازم داشته باشد.
+
+## رفتار جهت‌ها
+
+| callback ورودی | رفتار |
+| --- | --- |
+| upstream `Init` | line state را initialize می‌کند، سپس `Init` را به `next` forward می‌کند. |
+| upstream `Payload` | batch junk تنظیم‌شده را اگر trigger باقی‌مانده داشته باشد می‌فرستد، سپس payload واقعی را به `next` forward می‌کند. |
+| upstream `Est` / `Pause` / `Resume` | به `next` forward می‌کند. |
+| upstream `Finish` | local line state را destroy می‌کند، سپس `Finish` را به `next` forward می‌کند. |
+| downstream `Init` | line state را initialize می‌کند، سپس `Init` را به نود قبلی forward می‌کند. |
+| downstream `Payload` | بدون تغییر به نود قبلی forward می‌کند. |
+| downstream `Est` / `Pause` / `Resume` | به نود قبلی forward می‌کند. |
+| downstream `Finish` | local line state را destroy می‌کند، سپس `Finish` را به نود قبلی forward می‌کند. |
+
+سورس یک helper جهت downstream junk دارد، اما مسیر active payload فقط روی upstream payload callback junk trigger می‌کند.
+
+## ایمنی Line
+
+`JunkDatagramSender` فقط یک فیلد per-line ذخیره می‌کند:
+
+```text
+remaining_resend_again_times
+```
+
+در طول مدیریت upstream payload، نود line را در حین ارسال batch junk قفل می‌کند. payloadهای duplicate با تاخیر با `lineScheduleDelayedTaskWithBuf()` schedule می‌شوند، پس line scheduler reference موقت line را نگه می‌دارد و buffer duplicate شده را اگر line قبلاً بسته شده باشد وقتی timer اجرا می‌شود، release می‌کند.
+
+این نود `lineDestroy()` صدا نمی‌زند. فقط line state خودش را قبل از forward کردن `Finish` destroy می‌کند.
+
+## یادداشت‌های Buffer و Padding
+
+`JunkDatagramSender` byteی به payload واقعی prepend نمی‌کند و buffer payload واقعی را تغییر نمی‌دهد. برای payloadهای junk تولیدشده، bufferهای بزرگ جداگانه اختصاص می‌دهد.
+
+metadata نود تنظیم می‌کند:
+
+```text
+required_padding_left = 0
+layer_group = kNodeLayerAnything
+```
+
+اگرچه metadata layer permissive است، داده تولیدشده payload application UDP-like است. این نود را به عنوان IPv4 packet mutator تلقی نکنید. برای تغییرات packet خام، از نودهای packet-oriented مثل `IpManipulator` یا `IpOverrider` استفاده کنید.
+
+## یادداشت‌های عملی
+
+- `resend-again-times: 0` نود را به pass-through تبدیل می‌کند.
+- `packet-count-perline-max: 0` نود را به pass-through تبدیل می‌کند.
+- `selected-protocols: []` نود را به pass-through تبدیل می‌کند و یک warning log می‌کند.
+- `keep-sending-max-ms` یک delayed duplicate به ازای هر junk payload تولیدشده schedule می‌کند؛ برای همیشه تولید نمی‌کند.
+- ترتیب delayed duplicate توسط line scheduler تضمین نمی‌شود.
+- این نود address، port، checksum یا packet header را rewrite نمی‌کند.
+- payloadهای تولیدشده camouflage noise هستند، نه encryption یا authentication.

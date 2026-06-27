@@ -2,22 +2,53 @@
 sidebar_position: 220
 title: "ConnectionFisherServer"
 sidebar_label: "ConnectionFisherServer"
+description: "مستندات مرجع نود ConnectionFisherServer."
 ---
+
+<!-- Written from version 106 of the English doc. -->
 
 # ConnectionFisherServer
 
-`ConnectionFisherServer` سمت server برای `ConnectionFisherClient` است. این نود
-ابتدا منتظر probe پنج‌بایتی `FISH?` می‌ماند، در صورت معتبر بودن پاسخ `FISH!`
-را به سمت client می‌فرستد و سپس line را وارد حالت forwarding معمولی می‌کند.
+`ConnectionFisherServer` سمت server برای `ConnectionFisherClient` است. این نود منتظر probe ثابت client می‌ماند، با marker ثابت server پاسخ می‌دهد و تنها بعد از آن اجازه می‌دهد line به stream forwarding عادی تبدیل شود.
+
+فقط در مسیرهایی استفاده شود که انتظار می‌رود ترافیک از `ConnectionFisherClient` دریافت کنند.
 
 ## جایگاه رایج
+
+طرح‌بندی ساده TCP:
 
 ```text
 TcpListener -> ConnectionFisherServer -> TcpConnector
 ```
 
-این نود را فقط در مسیری قرار دهید که قرار است از `ConnectionFisherClient` ترافیک
-بگیرد.
+جفت با client:
+
+```text
+TcpListener -> ConnectionFisherClient -> TcpConnector
+TcpListener -> ConnectionFisherServer -> TcpConnector
+```
+
+با tunnel‌های stream دیگر در میان:
+
+```text
+ConnectionFisherClient -> EncryptionClient -> TcpConnector
+TcpListener -> EncryptionServer -> ConnectionFisherServer -> TcpConnector
+```
+
+سرور باید همان byteهای `FISH?` را ببیند که client بعد از decode شدن توسط هر جفت tunnel client/server میانی می‌فرستد.
+
+## این نود چه می‌کند؟
+
+- در upstream `Init`، فقط state محلی line را initialize می‌کند.
+- upstream `Init` به `next` را به تأخیر می‌اندازد.
+- byteهای upstream را تا زمانی که حداقل ۵ بایت در دسترس باشد buffer می‌کند.
+- نیاز دارد ۵ بایت اول دقیقاً `FISH?` باشند.
+- پاسخ ثابت `FISH!` را downstream به client می‌فرستد.
+- `next` را فقط وقتی payload بعد از probe موجود باشد initialize می‌کند.
+- بعد از کامل شدن فاز probe، payload را به صورت عادی forward می‌کند.
+- در صورت داده probe نامعتبر یا buffer شدن handshake بیش از حد، line را می‌بندد.
+
+`ConnectionFisherServer` یک middle stream tunnel است. socket مستقیم نمی‌سازد و packet line نمی‌سازد.
 
 ## نمونه تنظیم
 
@@ -29,51 +60,92 @@ TcpListener -> ConnectionFisherServer -> TcpConnector
 }
 ```
 
-در نسخه فعلی `settings` اختصاصی ندارد.
+در نسخه فعلی `settings` استفاده نمی‌شود.
 
-## فیلدهای لازم
+## فیلدهای اجباری
+
+فیلدهای top-level:
 
 | فیلد | نوع | توضیح |
 | --- | --- | --- |
-| `name` | string | نام node در config. |
-| `type` | string | باید `"ConnectionFisherServer"` باشد. |
-| `next` | string | نود بعدی که payload بعد از probe به آن ارسال می‌شود. |
+| `name` | string | نام یکتای نود داخل config. |
+| `type` | string | باید دقیقاً `"ConnectionFisherServer"` باشد. |
+| `next` | string | اجباری. نود stream بعدی که payload بعد از فاز probe را دریافت می‌کند. |
 
-این نود باید هم نود قبلی داشته باشد و هم `next`. chain head یا chain end نیست.
+`ConnectionFisherServer` باید نود قبلی هم داشته باشد. chain head یا chain end نیست.
 
-## رفتار probe
+## تنظیمات
 
-| جهت | مقدار | توضیح |
+در حال حاضر هیچ فیلد `settings` parse نمی‌شود.
+
+## تبادل Probe
+
+| جهت | Bytes | معنی |
 | --- | --- | --- |
-| client به server | `FISH?` | پنج بایت اول upstream باید دقیقاً همین مقدار باشد. |
+| client به server | `FISH?` | ۵ بایت اول upstream اجباری. |
 | server به client | `FISH!` | بعد از probe معتبر ارسال می‌شود. |
 
-## رفتار مرحله‌ای
+marker‌ها byteهای ASCII ثابت هستند. مکانیزم امنیتی نیستند.
 
-- upstream `Init` فقط state داخلی را آماده می‌کند و بلافاصله به `next` عبور
-  نمی‌کند.
-- تا زمانی که حداقل پنج بایت دریافت نشود، upstream payload در buffer نگه داشته
-  می‌شود.
-- اگر پنج بایت اول `FISH?` نباشد، line بسته می‌شود.
-- بعد از probe معتبر، `FISH!` به downstream ارسال می‌شود.
-- اگر بعد از probe معتبر payload اضافه وجود داشته باشد، `next` init می‌شود و آن
-  payload ارسال می‌شود.
-- اگر payload اضافه وجود نداشته باشد، init کردن `next` تا رسیدن payload بعدی
-  عقب می‌افتد.
-- بعد از established شدن، payload و pause/resume/est به صورت عادی forward
-  می‌شوند.
+## فازهای Server
+
+پیاده‌سازی از سه فاز استفاده می‌کند:
+
+| فاز | رفتار |
+| --- | --- |
+| wait ping | byteهای upstream buffer می‌شوند تا حداقل ۵ بایت در دسترس باشد. |
+| wait payload | probe معتبر بود و `FISH!` فرستاده شد، اما `next` هنوز initialize نشده مگر اینکه payload اضافه از قبل buffer شده باشد. |
+| established | `next` initialize شده و callback‌های payload/lifecycle به صورت عادی forward می‌شوند. |
+
+## جریان Handshake
+
+در upstream `Init`، سرور فقط state محلی line خود را initialize می‌کند. هنوز `tunnelNextUpStreamInit()` را فراخوانی نمی‌کند.
+
+در upstream payload قبل از establishment:
+
+1. سرور byteهای ورودی را buffer می‌کند.
+2. اگر handshake buffer از `4096` بایت بگذرد، line بسته می‌شود.
+3. وقتی حداقل ۵ بایت در دسترس باشد، ۵ بایت اول خوانده می‌شوند.
+4. اگر دقیقاً `FISH?` نباشند، line بسته می‌شود.
+5. اگر match کردند، `FISH!` به سمت previous downstream فرستاده می‌شود.
+6. اگر payload بعد از ۵ بایت اول باقی مانده باشد، سرور `next` را initialize می‌کند و payload باقی‌مانده را upstream forward می‌کند.
+7. اگر payload اضافه‌ای نباشد، سرور منتظر می‌ماند تا upstream payload بعدی برسد، سپس `next` را initialize و آن payload را forward می‌کند.
+
+بعد از initialize شدن `next`، line توسط این tunnel established در نظر گرفته می‌شود و payload‌های بعدی به صورت عادی forward می‌شوند.
+
+## رفتار Lifecycle
+
+قبل از establishment:
+
+- upstream `Init` فقط local است
+- upstream payload به عنوان probe یا اولین payload بعد از probe در نظر گرفته می‌شود
+- upstream `Pause` و `Resume` forward نمی‌شوند
+- downstream `Est`، `Pause` و `Resume` forward نمی‌شوند
+- payload downstream غیرمنتظره است، recycle می‌شود و باعث بسته شدن line می‌شود
+
+بعد از establishment:
+
+- payload upstream به `next` forward می‌شود
+- payload downstream به نود قبلی forward می‌شود
+- upstream pause/resume به `next` forward می‌شوند
+- downstream est/pause/resume به نود قبلی forward می‌شوند
+
+در upstream `Finish`، سرور state محلی را destroy می‌کند و فقط در صورتی upstream `Finish` را forward می‌کند که `next` قبلاً initialize شده باشد. در صورت خطای پروتکل قبل از وجود `next`، فقط سمت previous بسته می‌شود چون هنوز next-side line‌ای وجود ندارد.
 
 ## محدودیت‌ها
 
-| محدودیت | مقدار |
-| --- | --- |
-| طول probe | `5 bytes` |
-| حداکثر handshake buffer | `4096 bytes` |
-| `required_padding_left` | `0` |
+| محدودیت | مقدار | رفتار |
+| --- | --- | --- |
+| طول probe | `5` bytes | ۵ بایت اول باید `FISH?` باشند. |
+| Handshake buffer | `4096 bytes` | اگر byte‌های بیشتری قبل از کامل شدن probe جمع شوند، line بسته می‌شود. |
+| `required_padding_left` | `0` | سرور به buffer‌های موجود اضافه نمی‌کند. |
+
+پاسخ `FISH!` به عنوان یک buffer کوچک جداگانه اختصاص می‌یابد.
 
 ## نکته‌ها
 
-- این نود باید با `ConnectionFisherClient` استفاده شود.
+- با `ConnectionFisherClient` متناظر استفاده کنید.
+- بعد از هر tunnel server-side که transport بین client و server را decode می‌کند قرار دهید.
 - برای chainهای stream طراحی شده است، نه packet-line.
-- probe ثابت است و مکانیزم امنیتی محسوب نمی‌شود.
+- probe ثابت و عمومی است؛ برای امنیت واقعی از نودهای دیگر WaterWall استفاده کنید.
 - upstream `Est` و downstream `Init` برای این نود غیرفعال هستند.

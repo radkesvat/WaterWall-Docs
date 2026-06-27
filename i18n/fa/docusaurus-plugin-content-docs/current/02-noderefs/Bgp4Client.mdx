@@ -1,0 +1,203 @@
+---
+sidebar_position: 520
+title: "Bgp4Client"
+sidebar_label: "Bgp4Client"
+description: "مستندات مرجع نود Bgp4Client."
+---
+
+<!-- Written from version 106 of the English doc. -->
+
+# Bgp4Client
+
+`Bgp4Client` یک stream tunnel لایه ۴ است که payloadهای upstream را داخل frameهای شبیه BGP می‌پیچد و frameهای downstream تولیدشده توسط `Bgp4Server` را باز می‌کند.
+
+این نود باید با `Bgp4Server` استفاده شود:
+
+```text
+TcpListener -> Bgp4Client -> ... -> Bgp4Server -> TcpConnector
+```
+
+در یک deployment واقعی، `...` معمولاً یک مسیر transport بین دو سمت است، مثل TCP، TLS، mux، reverse یا یک segment chain دیگر از WaterWall.
+
+:::warning
+`Bgp4Client` routing واقعی BGP، BGP peering، route exchange یا BGP authentication را پیاده‌سازی نمی‌کند. فقط از شکل frame شبیه BGP به عنوان camouflage/framing stream استفاده می‌کند.
+:::
+
+## این نود چه می‌کند؟
+
+- یک per-line read stream و first-frame state در طول upstream `init` initialize می‌کند.
+- روی اولین upstream payload، یک synthetic BGP OPEN body قبل از application bytes prepend می‌کند.
+- payloadهای upstream را به عنوان BGP-like frame می‌پیچد.
+- یک نوع BGP غیر-OPEN تصادفی برای frameهای payload upstream بعدی انتخاب می‌کند.
+- BGP-like frameهای downstream را از یک stream buffer parse می‌کند.
+- metadata frame downstream را strip می‌کند و payload بازیابی‌شده را به tunnel قبلی می‌فرستد.
+- هر دو جهت را وقتی داده frame نامعتبر دریافت می‌کند می‌بندد.
+
+`Bgp4Client` یک stream tunnel معمولی است. socket شبکه نمی‌سازد و packet line نمی‌سازد یا destroy نمی‌کند.
+
+## نمونه تنظیم
+
+سمت client:
+
+```json
+{
+  "name": "bgp4-client",
+  "type": "Bgp4Client",
+  "settings": {
+    "password": "compat-value"
+  },
+  "next": "transport-out"
+}
+```
+
+سمت server متناظر:
+
+```json
+{
+  "name": "bgp4-server",
+  "type": "Bgp4Server",
+  "settings": {
+    "password": "compat-value"
+  },
+  "next": "target"
+}
+```
+
+فیلد `password` برای سازگاری با شکل قدیمی config پذیرفته می‌شود، اما در منطق پروتکل فعلی برای encryption یا authentication استفاده نمی‌شود.
+
+## فیلدهای اجباری
+
+فیلدهای top-level:
+
+| فیلد | نوع | توضیح |
+| --- | --- | --- |
+| `name` | string | نام یکتای نود داخل config. |
+| `type` | string | باید دقیقاً `"Bgp4Client"` باشد. |
+| `next` | string | نود stream بعدی که frameهای wrapped را دریافت می‌کند. |
+
+## تنظیمات اختیاری
+
+| گزینه | نوع | پیش‌فرض | توضیح |
+| --- | --- | --- | --- |
+| `password` | string | `"passwd"` | فیلد compatibility. در طول setup hash می‌شود اما hash آن توسط منطق framing فعلی استفاده نمی‌شود. |
+
+هیچ تنظیم دیگری در حال حاضر parse نمی‌شود.
+
+## فرمت Frame
+
+تمام payloadهای upstream به این شکل wrapped می‌شوند:
+
+```text
+16-byte marker | 2-byte body length | 1-byte BGP type | body
+```
+
+جزئیات فیلد:
+
+| فیلد | مقدار |
+| --- | --- |
+| marker | شانزده byte از `0xff`. |
+| body length | `uint16_t` big-endian. شامل type byte به اضافه body bytes. |
+| BGP type | `1` برای اولین OPEN frame؛ `2` تا `5` تصادفی برای frameهای payload بعدی. |
+| body | payload tunneled، یا synthetic OPEN body به اضافه payload tunneled برای اولین upstream frame. |
+
+مقادیر نوع پشتیبانی‌شده:
+
+| نوع | نام |
+| --- | --- |
+| `1` | OPEN |
+| `2` | UPDATE |
+| `3` | NOTIFICATION |
+| `4` | KEEPALIVE |
+| `5` | ROUTE-REFRESH |
+
+طول frame، طول استاندارد BGP message نیست. در این tunnel، طول WaterWall BGP-like قدیمی‌تر است: type byte به اضافه body bytes، به استثنای 16-byte marker و 2-byte length field.
+
+## اولین Upstream Payload
+
+`Bgp4Client` در طول `init` یک standalone OPEN frame نمی‌فرستد. در عوض، اولین upstream payload به عنوان BGP type `1` frame می‌شود و client یک synthetic OPEN body قبل از application bytes prepend می‌کند.
+
+فیلدهای synthetic OPEN:
+
+| فیلد | رفتار |
+| --- | --- |
+| version | همیشه `4`. |
+| AS number | یک `uint16_t` تصادفی تولیدشده در هنگام ساخته شدن tunnel instance. |
+| hold time | `90` ثانیه. |
+| router id | مقدار تصادفی تولیدشده در هنگام ساخته شدن tunnel instance. |
+| optional parameter length | طول تصادفی از `3` تا `10` byte. |
+| optional parameter bytes | byteهای تصادفی در بازه `0` تا `199`. |
+
+بعد از این اولین frame، `open_sent` برای line تنظیم می‌شود. payloadهای upstream بعدی بدون prefix synthetic OPEN wrapped می‌شوند و از یک نوع غیر-OPEN تصادفی استفاده می‌کنند.
+
+چون `Bgp4Server` انتظار دارد application data tunneled بعد از OPEN prefix باشد، اولین OPEN frame باید payload bytes بعد از synthetic OPEN body داشته باشد.
+
+## Downstream Parsing
+
+byteهای downstream در یک `buffer_stream_t` تجمع می‌یابند.
+
+برای هر frame downstream کامل، `Bgp4Client`:
+
+1. تأیید می‌کند که 16 byte اول همه `0xff` هستند.
+2. 2-byte body length را می‌خواند.
+3. frameهایی که body length آن‌ها بزرگ‌تر از type field یک بایتی نیست را رد می‌کند.
+4. صبر می‌کند تا frame کامل buffer شود.
+5. marker، length و type را strip می‌کند.
+6. frameهایی که payload باقی‌مانده ندارند را رد می‌کند.
+7. payload بازیابی‌شده را downstream به tunnel قبلی می‌فرستد.
+
+اگر frame ناقص باشد، parsing منتظر byte بیشتر می‌ماند. اگر داده buffer شده از آستانه حداکثر buffer فعلی بیشتر شود، line بسته می‌شود.
+
+## محدودیت‌ها و Padding
+
+| مقدار | مقدار | یادداشت |
+| --- | --- | --- |
+| حداکثر body length | `65535` bytes | شامل 1-byte type. |
+| حداکثر payload body معمولی | `65534` bytes | payload به اضافه type باید در `65535` جا شود. |
+| حداکثر bytes خوانده‌شده buffer | حدود `131106` bytes | دو framed message با حداکثر اندازه. |
+| `required_padding_left` | `39` bytes | کافی برای frame prefix به اضافه بزرگ‌ترین prefix synthetic OPEN. |
+
+اگر یک upstream payload در یک BGP-like frame جا نشود، رد می‌شود و هیچ wrapped frame ای forward نمی‌شود.
+
+## جریان داده
+
+جهت upstream:
+
+```text
+نود قبلی -> Bgp4Client می‌پیچد -> نود بعدی
+```
+
+جهت downstream:
+
+```text
+نود بعدی -> Bgp4Client باز می‌کند -> نود قبلی
+```
+
+`Bgp4Client` انتظار دارد `Bgp4Server` در سمت مقابل باشد. یک peer غیر-matching که شکل frame مورد انتظار را تولید نکند باعث خطاهای پروتکل می‌شود.
+
+## رفتار Lifecycle
+
+در upstream `init`، `Bgp4Client` line state خود را initialize می‌کند و upstream `init` را به tunnel بعدی forward می‌کند.
+
+در downstream `est`، downstream `est` را به tunnel قبلی forward می‌کند.
+
+در upstream payload، می‌پیچد و به tunnel بعدی forward می‌کند. در downstream payload، buffer می‌کند، parse می‌کند، باز می‌کند و payloadهای بازیابی‌شده را به tunnel قبلی forward می‌کند.
+
+در upstream `finish`، line state خود را destroy می‌کند و upstream `finish` را به tunnel بعدی forward می‌کند. در downstream `finish`، line state خود را destroy می‌کند و downstream `finish` را به tunnel قبلی forward می‌کند.
+
+در صورت داده frame نامعتبر، `Bgp4Client` local state را destroy می‌کند و هر دو جهت را به ترتیب middle-tunnel می‌بندد: upstream finish اول، سپس downstream finish.
+
+pause و resume به صورت جهت‌دار forward می‌شوند:
+
+| Callback | forward می‌شود به |
+| --- | --- |
+| upstream pause/resume | next tunnel upstream |
+| downstream pause/resume | previous tunnel downstream |
+
+## نکته‌ها
+
+- `Bgp4Client` نیاز به یک `Bgp4Server` paired برای عملکرد مفید دارد.
+- `password` یک feature امنیتی در پیاده‌سازی فعلی نیست.
+- BGP-like length field، marker و length bytes را exclude می‌کند.
+- اولین OPEN frame فقط وقتی اولین upstream payload برسد فرستاده می‌شود.
+- upstream `est` و downstream `init` غیرفعال هستند.
+- این نود یک layer-4 stream tunnel است، نه یک packet tunnel.
