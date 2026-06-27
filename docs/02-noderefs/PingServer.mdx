@@ -6,35 +6,37 @@ description: "Reference documentation for the PingServer node."
 ---
 
 <!--
-Documentation version: 106
+Documentation version: 107
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/PingServer/description.md, and both files must keep the same documentation version.
 -->
 
 # PingServer
 
-`PingServer` is the paired server-side packet tunnel for `PingClient`. Like the
-client, it disguises upstream packet payload as ICMP-shaped traffic and reverses
-matching downstream peer traffic.
+`PingServer` is the paired server-side packet tunnel for `PingClient`. It is
+directionally opposite on the client-to-server ingress path: wrapped peer
+traffic is expected to arrive through PingServer's downstream callback, where it
+is restored and forwarded toward the previous node. Plain server-side response
+packets can still be wrapped on the upstream path before they are forwarded
+toward the next node.
 
 It is a pure packet tunnel created with WaterWall's packet-tunnel API. It runs
 on worker packet lines and does not allocate per-connection line state.
 
 ## Direction Model
 
-`PingServer` uses the same payload callback shape as `PingClient`:
+`PingServer` does not use PingClient's request-side mental model:
 
 | Direction | Behavior |
 | --- | --- |
-| upstream `Payload` | Encapsulates or rewrites plain packets, then forwards with `tunnelNextUpStreamPayload()`. |
-| downstream `Payload` | Decapsulates or restores matching peer traffic, then forwards with `tunnelPrevDownStreamPayload()`. |
+| downstream `Payload` | Server inbound path. Decapsulates or restores matching wrapped peer traffic, then forwards with `tunnelPrevDownStreamPayload()`. |
+| upstream `Payload` | Server outbound response path. Encapsulates or rewrites plain response packets, then forwards with `tunnelNextUpStreamPayload()`. |
 
-This matters for packet-topology design. Do not assume `PingServer` decodes on
-its upstream path. Wrapped traffic from the peer must reach `PingServer` through
-the downstream path.
+This matters for packet-topology design. Wrapped traffic from the peer must
+reach `PingServer` through the downstream path.
 
 ```text
-packet side -> PingServer -> packet transport / Bridge
-packet side <- PingServer <- packet transport / Bridge
+plain packet side -> PingServer -> packet transport / Bridge
+plain packet side <- PingServer <- packet transport / Bridge
 ```
 
 ## Typical Placement
@@ -42,12 +44,17 @@ packet side <- PingServer <- packet transport / Bridge
 Opposite a `PingClient`:
 
 ```text
-RawSocket -> PingServer -> TunDevice
+TunDevice -> PingServer -> RawSocket
 TunDevice -> PingClient -> RawSocket
 ```
 
 For local tests, a `Bridge` can connect the two packet branches while preserving
 the intended upstream/downstream callback directions.
+
+```text
+TesterClient(packet-mode=true) -> PingClient -> Bridge
+TesterServer(packet-mode=true) -> PingServer -> Bridge
+```
 
 ## Configuration Example
 
@@ -68,7 +75,7 @@ the intended upstream/downstream callback directions.
     "ttl": 64,
     "tos": 0
   },
-  "next": "tun-out"
+  "next": "raw-out"
 }
 ```
 
@@ -144,8 +151,9 @@ packet. Use it only when surrounding nodes expect that shape.
 Only swaps the IPv4 protocol number in place:
 
 - requires `swap-protocol`
-- upstream changes packets whose IPv4 protocol equals `swap-protocol` to ICMP
-- downstream changes ICMP packets back to `swap-protocol`
+- downstream changes inbound ICMP packets back to `swap-protocol`
+- upstream changes outbound packets whose IPv4 protocol equals `swap-protocol`
+  to ICMP
 - recalculates only the IPv4 header checksum
 - leaves transport bytes unchanged
 - does not use ICMP identifiers, ICMP sequence, XOR, roundup, or outer IPv4 ID
