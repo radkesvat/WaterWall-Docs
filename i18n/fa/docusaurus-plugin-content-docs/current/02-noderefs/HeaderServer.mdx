@@ -5,53 +5,52 @@ sidebar_label: "HeaderServer"
 description: "مستندات مرجع نود HeaderServer."
 ---
 
-<!-- Written from version 106 of the English doc. -->
+<!-- Written from version 107 of the English doc. -->
 
 # HeaderServer
 
-`HeaderServer` یا header دو بایتی port ساخته‌شده توسط `HeaderClient` را مصرف
-می‌کند، یا در upstream `Init` یک destination port ثابت تنظیم می‌کند.
+`HeaderServer` reader سمت server برای headerهای کوچک metadata اتصال است. این
+نود سه کار مختلف انجام می‌دهد:
 
-در حالت dynamic header، این نود header را می‌خواند، port decode شده را داخل
-`line->routing_context.dest_ctx.port` می‌نویسد و بعد نود upstream بعدی را
-initialize می‌کند.
+- header دو بایتی port مخصوص WaterWall را از `HeaderClient` مصرف می‌کند و داخل `dest_context->port` می‌نویسد
+- HAProxy PROXY protocol v1 یا v2 را مصرف می‌کند و IPv4 و port واقعی client را داخل `src_context` می‌نویسد
+- در upstream `Init` یک destination port ثابت تنظیم می‌کند
+
+این نود یک tunnel عادی layer-4 stream است. socket باز نمی‌کند، packet line
+نمی‌سازد و `line_t` ایجاد نمی‌کند.
 
 ## جایگاه رایج
 
-استفاده همراه با `HeaderClient`:
+metadata مربوط به destination port در WaterWall:
 
 ```text
 client side: TcpListener -> HeaderClient -> TcpConnector
 server side: TcpListener -> HeaderServer -> TcpConnector
 ```
 
-حالت constant override، بدون `HeaderClient`:
+metadata مربوط به source از طریق PROXY protocol و از سمت sender قابل اعتماد:
+
+```text
+trusted PROXY sender -> TcpListener -> HeaderServer -> TcpConnector
+```
+
+destination port ثابت:
 
 ```text
 TcpListener -> HeaderServer -> TcpConnector
 ```
 
-## عملکرد
+mode مربوط به PROXY را فقط پشت sender قابل اعتماد استفاده کنید. اگر client خام
+اینترنتی مستقیم به این نود برسد، می‌تواند header پروتکل PROXY را جعل کند؛ مگر
+اینکه proxy یا transport خصوصی جلوی آن را گرفته باشد.
 
-- `settings.override` مشخص می‌کند نود در dynamic-header mode باشد یا constant
-  mode.
-- در dynamic-header mode، upstream `Init` به `next` تا زمان دریافت header دو
-  بایتی delay می‌شود.
-- تا زمان دریافت header، byteهای upstream buffer می‌شوند.
-- header دو بایتی می‌تواند بین چند payload callback split شده باشد.
-- port decode شده داخل destination routing context نوشته می‌شود.
-- payload باقی‌مانده بعد از header به `next` forward می‌شود.
-- در constant mode، port مقصد در همان upstream `Init` تنظیم می‌شود و هیچ byteی از
-  payload مصرف نمی‌شود.
-- lifecycle callbacks فقط بعد از established شدن line به سمت `next` forward
-  می‌شوند.
+## مثال‌های کاربردی
 
-`HeaderServer` یک tunnel معمولی layer-4 stream است. socket باز نمی‌کند، packet
-line نمی‌سازد و `line_t` ایجاد یا destroy نمی‌کند.
+### برگرداندن port اصلی listener از HeaderClient
 
-## نمونه تنظیم
-
-مصرف header ارسال‌شده از `HeaderClient`:
+این حالت pair کلاسیک WaterWall است. instance اول روی چند public port گوش می‌دهد
+ولی همه ترافیک را به یک relay port می‌فرستد. سمت relay، port اصلی پذیرفته‌شده
+را قبل از انتخاب backend توسط `TcpConnector` برمی‌گرداند.
 
 ```json
 {
@@ -64,11 +63,66 @@ line نمی‌سازد و `line_t` ایجاد یا destroy نمی‌کند.
 }
 ```
 
-تنظیم port ثابت:
+`HeaderClient` سمت مقابل معمولا این تنظیم را دارد:
 
 ```json
 {
-  "name": "header-server",
+  "name": "header-client",
+  "type": "HeaderClient",
+  "settings": {
+    "data": "src_context->port"
+  },
+  "next": "relay-connector"
+}
+```
+
+### خواندن source IP و port از PROXY protocol
+
+وقتی peer واقعی قبلی HAProxy PROXY protocol می‌فرستد و nodeهای بعدی WaterWall
+باید client اصلی را در `line->routing_context.src_ctx` ببینند، از این mode
+استفاده کنید.
+
+```json
+{
+  "name": "proxy-source-reader",
+  "type": "HeaderServer",
+  "settings": {
+    "override": "proxy-protocol->source-fields"
+  },
+  "next": "router-or-connector"
+}
+```
+
+sender می‌تواند HAProxy، nginx، Envoy یا `HeaderClient` با یکی از مقدارهای
+`"proxy-protocol"`، `"proxy-protocol-v1"` یا `"proxy-protocol-v2"` باشد.
+
+نمونه sender در WaterWall:
+
+```json
+{
+  "name": "proxy-header",
+  "type": "HeaderClient",
+  "settings": {
+    "data": "proxy-protocol",
+    "frontend-ipv4": "203.0.113.10"
+  },
+  "next": "relay-connector"
+}
+```
+
+در این mode، `HeaderServer` فقط headerهای IPv4 TCP مربوط به PROXY را قبول
+می‌کند. header را مصرف می‌کند، source IP و source port را داخل `src_ctx` می‌نویسد،
+بعد نود upstream بعدی را initialize می‌کند و payload باقی‌مانده بعد از header را
+forward می‌کند.
+
+### اجبار به یک backend port
+
+وقتی همه lineها باید یک destination port ثابت داشته باشند و نباید هیچ headerی
+مصرف شود، از override عددی استفاده کنید.
+
+```json
+{
+  "name": "force-https",
   "type": "HeaderServer",
   "settings": {
     "override": 443
@@ -77,7 +131,12 @@ line نمی‌سازد و `line_t` ایجاد یا destroy نمی‌کند.
 }
 ```
 
+قبل از mode عددی، `HeaderClient` headerنویس قرار ندهید؛ مگر اینکه عمدا بخواهید
+آن header به عنوان application payload باقی بماند.
+
 ## فیلدهای لازم
+
+فیلدهای top-level:
 
 | فیلد | نوع | توضیح |
 | --- | --- | --- |
@@ -90,7 +149,7 @@ line نمی‌سازد و `line_t` ایجاد یا destroy نمی‌کند.
 
 | فیلد | نوع | توضیح |
 | --- | --- | --- |
-| `override` | number یا string | رفتار override کردن destination port را انتخاب می‌کند. |
+| `override` | number یا string | مشخص می‌کند چه فیلدی override شود و چه headerی، اگر وجود دارد، مصرف شود. |
 
 این نود باید هم نود قبلی داشته باشد و هم `next`. برای ابتدا یا انتهای chain نیست.
 
@@ -100,37 +159,68 @@ line نمی‌سازد و `line_t` ایجاد یا destroy نمی‌کند.
 
 | مقدار | معنی |
 | --- | --- |
-| `"dest_context->port"` | header دو بایتی upstream خوانده می‌شود و `dest_ctx.port` از آن تنظیم می‌شود. |
+| `"dest_context->port"` | header دو بایتی upstream مخصوص WaterWall خوانده می‌شود و `dest_ctx.port` تنظیم می‌شود. |
 | `"line->dest_ctx->port"` | alias سازگار با `"dest_context->port"`. |
+| `"proxy-protocol->source-fields"` | PROXY protocol v1 یا v2 خوانده می‌شود و `src_ctx.ip` و `src_ctx.port` تنظیم می‌شوند. |
 | `1` تا `65535` | این destination port ثابت در upstream `Init` تنظیم می‌شود. |
 
 اگر `override` وجود نداشته باشد، string ناشناخته باشد، یا عدد خارج از بازه `1`
 تا `65535` باشد، startup شکست می‌خورد.
 
-## Dynamic Header Mode
+## حالت WaterWall Port Header
 
 وقتی `override` برابر `"dest_context->port"` یا `"line->dest_ctx->port"` باشد،
-هر line در phase انتظار header شروع می‌شود.
+`HeaderServer` منتظر دو byte اول upstream می‌ماند. این دو byte به عنوان port
+big-endian decode می‌شوند و داخل این فیلد نوشته می‌شوند:
 
-upstream `Init` فقط state محلی را initialize می‌کند و هنوز به `next` forward
-نمی‌شود. نود منتظر payload upstream می‌ماند، byteها را داخل `buffer_stream_t`
-نگه می‌دارد و دو byte اول را به عنوان port header big-endian می‌خواند.
+```text
+line->routing_context.dest_ctx.port
+```
 
-بعد از decode شدن header:
+upstream `Init` عمدا تا زمان decode شدن header به تاخیر می‌افتد. byteهای payload
+داخل `buffer_stream_t` نگه داشته می‌شوند، بنابراین header دو بایتی می‌تواند بین
+چند payload callback split شده باشد.
 
-1. port decode شده داخل `line->routing_context.dest_ctx.port` نوشته می‌شود
-2. phase line به established تغییر می‌کند
-3. upstream `Init` به `next` forward می‌شود
-4. اگر بعد از header payload باقی مانده باشد، upstream forward می‌شود
+portهای decode شده کمتر از `10` رد می‌شوند تا رفتار conservative قدیمی این tunnel
+حفظ شود.
 
-به همین دلیل `HeaderServer` می‌تواند headerی را که بین چند payload callback split
-شده است هم بخواند.
+## حالت PROXY Protocol Source-Fields
 
-portهای decode شده کمتر از `10` نامعتبر هستند. در این حالت server داده buffer
-شده را recycle می‌کند، state محلی را destroy می‌کند و line را به سمت نود قبلی
-می‌بندد. اگر سمت `next` قبلا initialize شده باشد، آن سمت هم بسته می‌شود.
+وقتی `override` برابر `"proxy-protocol->source-fields"` باشد، اولین byteهای
+upstream باید یک header معتبر HAProxy PROXY protocol v1 یا v2 باشند. اگر header
+وجود نداشته باشد، malformed باشد، IPv4 نباشد، یا source fields نداشته باشد،
+`HeaderServer` با log سطح error اتصال را می‌بندد.
 
-## Constant Override Mode
+headerهای قابل قبول:
+
+| Header | فرم قابل قبول |
+| --- | --- |
+| PROXY v1 | `PROXY TCP4 <source-ip> <dest-ip> <source-port> <dest-port>\r\n` |
+| PROXY v2 | version 2، command برابر `PROXY`، family/transport برابر `TCP4` |
+
+موارد رد شده:
+
+- PROXY v1 `UNKNOWN`
+- PROXY v1 `TCP6`
+- PROXY v2 `LOCAL`
+- PROXY v2 `UNSPEC`، `TCP6`، `UDP4`، `UDP6` یا هر family پشتیبانی‌نشده
+- headerهای malformed یا بیش از حد بزرگ
+
+فقط این فیلدها اعمال می‌شوند:
+
+```text
+line->routing_context.src_ctx.ip_address = PROXY source IPv4
+line->routing_context.src_ctx.port       = PROXY source port
+line->routing_context.src_ctx.protocol   = TCP
+```
+
+destination fields، TLVها و بقیه فیلدهای PROXY مصرف می‌شوند ولی نادیده گرفته
+می‌شوند. IPv6 در این mode پشتیبانی نمی‌شود. `peer_source_port` بازنویسی نمی‌شود.
+
+PROXY v1 حداکثر `108` byte است. PROXY v2 تمام طول record را، از جمله TLVها، مصرف
+می‌کند ولی وجود address block ثابت TCP4 را لازم دارد.
+
+## حالت Constant Override
 
 وقتی `override` عدد باشد، `HeaderServer` هیچ headerی از payload نمی‌خواند یا حذف
 نمی‌کند.
@@ -144,15 +234,12 @@ line->routing_context.dest_ctx.port = configured port
 سپس upstream `Init` بلافاصله به `next` forward می‌شود و تمام upstream payloadها
 بدون تغییر عبور می‌کنند.
 
-در این mode، قبل از `HeaderServer` از `HeaderClient` استفاده نکنید مگر اینکه
-عمدا بخواهید header دو بایتی به عنوان application payload باقی بماند.
-
 ## رفتار جهت‌ها
 
-| جهت | رفتار در dynamic-header mode |
+| جهت | رفتار در modeهای header تاخیری |
 | --- | --- |
-| upstream `Init` | state محلی initialize می‌شود، اما init به `next` تا زمان decode header delay می‌شود. |
-| upstream payload قبل از header | تا رسیدن حداقل ۲ byte buffer می‌شود. |
+| upstream `Init` | state محلی initialize می‌شود، اما init به `next` تا زمان decode شدن header تنظیم‌شده delay می‌شود. |
+| upstream payload قبل از header | تا کامل شدن header تنظیم‌شده buffer می‌شود. |
 | upstream payload بعد از header | به `next` forward می‌شود. |
 | upstream pause/resume قبل از header | ignore می‌شود؛ هنوز سمت `next` initialize نشده است. |
 | upstream pause/resume بعد از header | به `next` forward می‌شود. |
@@ -168,7 +255,7 @@ callbackهای `UpStreamEst` و `DownStreamInit` برای این نود غیرف
 ## Finish
 
 در upstream `Finish`، `HeaderServer` state محلی را destroy می‌کند. finish فقط وقتی
-به `next` forward می‌شود که routing header کامل شده و سمت `next` قبلا initialize
+به `next` forward می‌شود که header routing کامل شده و سمت `next` قبلا initialize
 شده باشد.
 
 در downstream `Finish`، state محلی destroy می‌شود و finish به نود قبلی forward
@@ -183,17 +270,21 @@ callbackهای `UpStreamEst` و `DownStreamInit` برای این نود غیرف
 
 | مقدار | اندازه |
 | --- | --- |
-| header مصرف‌شده | `2 bytes` |
-| حداقل port قابل قبول از header | `10` |
+| WaterWall port header | `2 bytes` |
+| حداقل port قابل قبول از WaterWall header | `10` |
+| PROXY protocol v1 header | حداکثر `108 bytes` |
+| PROXY protocol v2 base header | `16 bytes` |
+| address block لازم برای PROXY protocol v2 TCP4 | `12 bytes` |
 | `required_padding_left` | `0 bytes` |
 
-server فقط در dynamic-header mode header مصرف می‌کند. این نود byte جدید prepend
-نمی‌کند و به padding چپ نیاز ندارد.
+server فقط header مصرف می‌کند. byte جدید prepend نمی‌کند و به padding چپ نیاز
+ندارد.
 
 ## نکته‌ها
 
-- dynamic-header mode را همراه با `HeaderClient` استفاده کنید.
-- constant mode برای زمانی است که فقط می‌خواهید destination port ثابت شود.
-- مقدار header با network byte order encode شده است.
+- WaterWall port-header mode را با `HeaderClient.data = "src_context->port"` استفاده کنید.
+- PROXY source-fields mode را با یک sender قابل اعتماد PROXY استفاده کنید.
+- PROXY source-fields mode فعلا فقط IPv4 است.
+- PROXY source-fields mode فقط `src_ctx` را update می‌کند؛ `dest_ctx` را بازنویسی نمی‌کند.
 - تا قبل از دریافت header، `HeaderServer` نود بعدی را initialize نکرده است.
 - نباید به عنوان state مشترک packet-line استفاده شود.
