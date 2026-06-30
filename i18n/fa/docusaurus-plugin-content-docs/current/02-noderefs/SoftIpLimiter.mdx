@@ -5,22 +5,26 @@ sidebar_label: "SoftIpLimiter"
 description: "مستندات مرجع نود SoftIpLimiter."
 ---
 
-<!-- Written from version 107 of the English doc. -->
+<!-- Written from version 109 of the English doc. -->
 
 # SoftIpLimiter
 
 `SoftIpLimiter` یک tunnel میانی stream است که محدود می‌کند چند source IP بتوانند هم‌زمان از یک identity اولیه VLESS یا
-Trojan استفاده کنند.
+Trojan استفاده کنند. این node به دیتابیس userهای Waterwall یا لیست کاربرهای VLESS/Trojan شما نیاز ندارد؛ limit را
+مستقیما از identity byteهایی می‌سازد که داخل TCP connection کاربر وجود دارد.
 
-جایگاه اصلی این نود بلافاصله قبل از parser شفاف پروتکل است:
+جایگاه اصلی این نود بلافاصله قبل از parser شفاف پروتکل است، یا قبل از raw TCP relay به سروری که آن parser را اجرا
+می‌کند:
 
-- قبل از `VlessServer` وقتی `identifier` برابر `vless` است
-- قبل از `TrojanServer` وقتی `identifier` برابر `trojan` است
+- قبل از `VlessServer`، یا قبل از TCP relay به سرور VLESS بالادستی، وقتی `identifier` برابر `vless` است
+- قبل از `TrojanServer`، یا قبل از TCP relay به سرور Trojan بالادستی، وقتی `identifier` برابر `trojan` است
 
-این نود فقط حداقل byteهای اولیه لازم برای تشخیص connection را می‌خواند، source IP را با یک table داخلی چک می‌کند، و بعد
-همان byteهای buffer شده را بدون تغییر forward می‌کند. `SoftIpLimiter` کاربر را authenticate نمی‌کند، destination را
-parse نمی‌کند، header اضافه یا حذف نمی‌کند، و payload را rewrite نمی‌کند. بعد از آن هنوز باید `VlessServer` یا
-`TrojanServer` قرار بگیرد تا authentication واقعی پروتکل را انجام دهد.
+این نود فقط حداقل byteهای اولیه لازم برای تشخیص connection را می‌خواند. اگر identity تشخیص داده شود، source IP را با
+یک table داخلی چک می‌کند و بعد همان byteهای buffer شده را بدون تغییر forward می‌کند. اگر identity قابل تشخیص نباشد،
+رفتار پیش‌فرض این است که connection بدون IP limiting عبور کند؛ برای deploymentهای strict می‌توانید آن را به close تغییر
+دهید. `SoftIpLimiter` کاربر را authenticate نمی‌کند، destination را parse نمی‌کند، header اضافه یا حذف نمی‌کند، و
+payload را rewrite نمی‌کند. بعد از آن هنوز باید `VlessServer` یا `TrojanServer` قرار بگیرد تا authentication واقعی
+پروتکل را انجام دهد.
 
 ## جایگاه رایج
 
@@ -42,8 +46,24 @@ Trojan روی TLS:
 TcpListener -> TlsServer -> SoftIpLimiter(identifier=trojan) -> TrojanServer -> TcpUdpConnector
 ```
 
+Relay جلوی یک سرور VLESS/Trojan موجود:
+
+```text
+TcpListener -> TlsServer -> SoftIpLimiter(identifier=trojan) -> TcpConnector(upstream Trojan server)
+```
+
 `SoftIpLimiter` را بعد از هر encryption یا transport wrapper بگذارید که byteهای VLESS/Trojan را مخفی می‌کند، و قبل از
-server پروتکلی که آن byteها را مصرف می‌کند. این node فقط stream است؛ در packet chainها از آن استفاده نکنید.
+server پروتکلی یا raw TCP relay که آن byteها را مصرف یا forward می‌کند. این node فقط stream است؛ در packet chainها از
+آن استفاده نکنید.
+
+## شکل ترافیک قابل پشتیبانی
+
+`SoftIpLimiter` باید یک plain TCP stream ببیند که اولین application byteهای آن همان identity مربوط به VLESS یا Trojan
+باشد. clientهایی که TLS دارند فقط وقتی پشتیبانی می‌شوند که Waterwall قبل از این node، معمولا با `TlsServer`، TLS را
+terminate کرده باشد.
+
+حالت‌های WebSocket، gRPC، XHTTP، wrapperهای HTTP `Host`/header، قرارگیری UDP، و packet chainها پشتیبانی نمی‌شوند. در
+این حالت‌ها identity مربوط به VLESS/Trojan در ابتدای TCP stream شفاف نیست و این node نمی‌تواند کاربر را identify کند.
 
 ## نمونه VLESS
 
@@ -76,6 +96,7 @@ server پروتکلی که آن byteها را مصرف می‌کند. این nod
       "identifier": "vless",
       "simultaneous-user-limit": 2,
       "tolerance-ms": 30000,
+      "on-identification-failure": "passthrough",
       "verbose": false
     },
     "next": "vless-server"
@@ -132,6 +153,7 @@ server پروتکلی که آن byteها را مصرف می‌کند. این nod
       "identifier": "trojan",
       "simultaneous-user-limit": 1,
       "tolerance-ms": 45000,
+      "on-identification-failure": "close",
       "verbose": true
     },
     "next": "trojan-server"
@@ -147,6 +169,22 @@ server پروتکلی که آن byteها را مصرف می‌کند. این nod
     "next": "outbound"
   }
 ]
+```
+
+نمونه minimal برای relay وقتی یک سرور دیگر قرار است بعد از Waterwall ترافیک Trojan را parse کند:
+
+```json
+{
+  "name": "trojan-soft-ip-limit",
+  "type": "SoftIpLimiter",
+  "settings": {
+    "identifier": "trojan",
+    "simultaneous-user-limit": 1,
+    "tolerance-ms": 3000,
+    "verbose": false
+  },
+  "next": "tcp-connector"
+}
 ```
 
 ## فیلدهای اجباری
@@ -172,6 +210,7 @@ server پروتکلی که آن byteها را مصرف می‌کند. این nod
 
 | Field | Default | توضیح |
 | --- | --- | --- |
+| `on-identification-failure` | `passthrough` | وقتی byteهای اولیه قطعا برای `identifier` تنظیم‌شده معتبر نیستند چه کاری انجام شود: `passthrough` line را بدون IP limiting عبور می‌دهد؛ `close` آن را reject می‌کند. aliasهای `passthrough`: `pass` و `pass-through`. |
 | `verbose` | `false` | warning log برای admissionهای reject شده و close شدن active payloadها را فعال می‌کند. |
 
 ## استخراج Identity
@@ -197,6 +236,19 @@ password hash: 56 ASCII hex bytes, hex(SHA224(password))
 byteهای identity مصرف یا rewrite نمی‌شوند. بعد از admission، کل stream buffer شده بدون تغییر به node بعدی forward
 می‌شود.
 
+## رفتار شکست تشخیص
+
+تا وقتی buffer برای تصمیم‌گیری کوتاه است، `SoftIpLimiter` صبر می‌کند. وقتی byteها قطعا برای mode تنظیم‌شده نامعتبر
+باشند، `on-identification-failure` مرحله بعدی را تعیین می‌کند.
+
+در حالت پیش‌فرض `passthrough`، این node برای همان line شفاف می‌شود: هیچ identity row ساخته نمی‌شود، `simultaneous-user-limit`
+و `tolerance-ms` روی آن line اعمال نمی‌شوند، byteهای buffer شده بدون تغییر به node بعدی replay می‌شوند، و payload و
+callbackهای lifecycle بعدی به شکل عادی عبور می‌کنند.
+
+وقتی `VlessServer` یا `TrojanServer` بعدی fallback خودش را دارد، یا وقتی همان chain عمدا probeهای غیر VLESS/Trojan را
+هم می‌پذیرد، از `passthrough` استفاده کنید. اگر early data نامعتبر نباید به node بعدی برسد، مقدار `close` را انتخاب
+کنید.
+
 ## رفتار Limit
 
 limit برای هر identity جداست، نه global برای کل node. اگر `simultaneous-user-limit` برابر `2` باشد، یک UUID یا Trojan
@@ -221,12 +273,20 @@ background timer وجود ندارد. یک line ساکت ممکن است بیش�
 اگر clientها معمولا connectionهای idle طولانی نگه می‌دارند، مقدار tolerance را بزرگ‌تر بگذارید. اگر می‌خواهید slotهای
 IP قدیمی سریع آزاد شوند، مقدار کوچک‌تر انتخاب کنید.
 
+با مقدارهای خیلی بزرگ مراقب باشید. اگر `simultaneous-user-limit` برابر `1` باشد و `tolerance-ms` را مثلا یک ساعت
+بگذارید، وقتی کاربر از اینترنت گوشی به Wi-Fi جابه‌جا شود، IP قبلی ممکن است تا یک ساعت تنها slot همان identity را نگه
+دارد. برای clientهای mobile یا کاربرهایی که network عوض می‌کنند، مقدار کوتاهی مثل `3000` تا `5000` ms معمولا نقطه
+شروع عملی‌تری است.
+
 ## نیاز به Source IP
 
-`SoftIpLimiter` به source IP معتبر در source context مربوط به line نیاز دارد. نودهای listener معمول stream مثل
-`TcpListener` این مقدار را فراهم می‌کنند.
+برای identityهای تشخیص‌داده‌شده، `SoftIpLimiter` به source IP معتبر در source context مربوط به line نیاز دارد. نودهای
+listener معمول stream مثل `TcpListener` این مقدار را فراهم می‌کنند.
 
 اگر source context وجود نداشته باشد یا IPv4/IPv6 نباشد، connection reject می‌شود.
+
+اگر تشخیص identity شکست بخورد و `on-identification-failure` برابر `passthrough` باشد، source-IP row ساخته نمی‌شود و
+این نیازمندی source IP برای آن line استفاده نمی‌شود.
 
 ## Logging
 
@@ -239,11 +299,16 @@ SHA224 خام Trojan log نمی‌شوند.
 ## نکته‌های عملیاتی
 
 - `SoftIpLimiter` نود authentication نیست. `VlessServer` یا `TrojanServer` بعدی هنوز authentication را انجام می‌دهد.
-- early data نامعتبر یا قابل تشخیص نبودن reject می‌شود و به fallback فرستاده نمی‌شود.
+- می‌تواند قبل از `VlessServer`/`TrojanServer` محلی قرار بگیرد، یا قبل از یک `TcpConnector` که ترافیک را به سرور
+  VLESS/Trojan بالادستی relay می‌کند.
+- به fail2ban یا limiter خارجی نیاز ندارد؛ table مربوط به identity/IP داخل خود Waterwall نگهداری می‌شود.
+- early data نامعتبر یا قابل تشخیص نبودن به صورت پیش‌فرض عبور داده می‌شود. برای reject شدن در همین node،
+  `on-identification-failure` را `close` بگذارید.
 - این node username را نمی‌شناسد. key فقط از UUID اولیه VLESS یا مقدار SHA224 اولیه Trojan ساخته می‌شود.
 - اگر `simultaneous-user-limit` برابر `1` باشد، یک identity همچنان می‌تواند چند line هم‌زمان از همان source IP باز کند.
 - اگر clientها بین networkها جابه‌جا می‌شوند، limit را آن‌قدر بالا بگذارید که overlap معمول را پوشش دهد.
 - table در tunnel state قرار دارد، بین workerهای همان tunnel instance مشترک است، و با RW lock محافظت می‌شود.
+- وقتی می‌خواهید بفهمید connection به خاطر IP limit reject یا active-close شده یا نه، موقتا `verbose` را فعال کنید.
 
 ## Metadata نود
 
@@ -261,8 +326,11 @@ SHA224 خام Trojan log نمی‌شوند.
 
 - قرار دادن `SoftIpLimiter(identifier=trojan)` قبل از `TlsServer`. در آن نقطه byteهای Trojan هنوز encrypted هستند و
   limiter نمی‌تواند connection را identify کند.
+- انتظار پشتیبانی از WebSocket، gRPC، XHTTP، یا configهایی که HTTP `Host`/header دارند.
 - قرار دادن `SoftIpLimiter` بعد از `VlessServer` یا `TrojanServer`. این limiter باید raw protocol identity را قبل از
   مصرف شدن توسط parser ببیند.
 - انتظار authentication از این node.
+- انتظار limit شدن lineهای pass-through پیش‌فرض. این lineها بدون identity row forward می‌شوند؛ برای enforcement strict
+  از `"on-identification-failure": "close"` استفاده کنید.
 - تنظیم `simultaneous-user-limit` بیشتر از `6`.
 - استفاده از این node در packet chainها.
