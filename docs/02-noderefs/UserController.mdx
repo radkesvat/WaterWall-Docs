@@ -6,7 +6,7 @@ description: "Reference documentation for the UserController node."
 ---
 
 <!--
-Documentation version: 106
+Documentation version: 108
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/Internals/UserController/description.md, and both files must keep the same documentation version.
 -->
 
@@ -47,6 +47,17 @@ CustomAuthNode -> UserController -> TcpConnector
 ```
 
 Lines without a valid current user handle are passed through without enforcement.
+
+Some nodes authenticate the user only after the line is already open, and their next side is packet lines (one per worker) rather than per-user lines, so they cannot place a `UserController` after themselves. A `WireGuardDevice` doing database-backed peer authentication is the motivating example; it places the `UserController` on its own side that still carries per-peer lines. Depending on which adapter is the chain head, that per-peer line is initiated from either side of the `UserController`:
+
+```text
+UdpStatelessSocket -> UserController -> WireGuardDevice -> TunDevice   (line starts from prev)
+TunDevice -> WireGuardDevice -> UserController -> UdpStatelessSocket   (line starts from next)
+```
+
+In both layouts the per-peer line passes through unmanaged at first, then `WireGuardDevice` records the user with `lineAddUser()` and promotes the line on demand through the [Programmatic Promotion API](#programmatic-promotion-api).
+
+`UserController` is bidirectional: it works whether the line is initiated from its `prev` side (an upstream `Init`) or its `next` side (a downstream `Init`), records that origin per line, and uses it to account upload/download correctly (see [Direction Awareness](#direction-awareness)).
 
 ## Basic Example
 
@@ -96,13 +107,24 @@ Lines without a valid current user handle are passed through without enforcement
 
 A zero or missing limit means unlimited for that field.
 
+## Direction Awareness
+
+`UserController` records, per line, which side the line was initiated from, and uses it to map traffic to the user's upload and download counters correctly. "Upload" is traffic leaving the user toward the far side; "download" is traffic arriving at the user. The user always sits on the side the line started from.
+
+| Line origin | Initiated by | Upstream payload counts as | Downstream payload counts as |
+|---|---|---|---|
+| From `prev` (upstream `Init`) | a head/prev adapter (for example `UdpStatelessSocket` at the front) | upload | download |
+| From `next` (downstream `Init`) | a tail/next adapter (for example `UdpStatelessSocket` at the back) | download | upload |
+
+The forward row is the common case (`Socks5Server`, `TrojanServer`, `VlessServer`). The reverse row happens when the user-facing adapter is the chain tail, as in `TunDevice -> WireGuardDevice -> UserController -> UdpStatelessSocket`: there the user's packets arrive on the `next` side, so downstream payload is the user's upload. Quota enforcement is otherwise identical in both directions.
+
 ## Runtime Flow
 
-On upstream `Init`:
+On `Init` from either side (upstream `Init` for a line from `prev`, downstream `Init` for a line from `next`):
 
 1. line state is initialized
 2. the current line user handle is read
-3. anonymous or invalid-handle lines are forwarded without enforcement
+3. anonymous or invalid-handle lines are forwarded without enforcement (and may be promoted later, see below)
 4. authenticated lines are checked through `AuthenticationClient`
 5. accepted lines reserve connection/IP slots and are registered for sweep checks
 6. rejected lines finish back toward the previous side without opening the upstream side
@@ -110,6 +132,47 @@ On upstream `Init`:
 On upstream payload, byte count is treated as user upload. On downstream payload, byte count is treated as user download. If accounting says the user should close, the buffer is recycled and both directions are finished.
 
 On `Finish`, the node releases the reserved connection/IP accounting state, destroys its own line state, and propagates `Finish` only to the opposite side according to WaterWall's directional finish rules.
+
+## Programmatic Promotion API
+
+Some nodes authenticate a user only after the line is already open (see [Typical Placement](#typical-placement)). For them, `UserController` exposes one function in its public `interface.h`:
+
+```c
+WW_EXPORT user_admission_result_t usercontrollerTunnelTryManageLine(tunnel_t *t, line_t *l);
+```
+
+It runs the same admission as upstream `Init` — checking every limit and reserving a connection + IP slot — but on demand. A node that wants to use it:
+
+1. Keeps a pointer to its `UserController` instance (created the same way `Socks5Server` builds its internal `UserController`, via `nodeUserControllerGet()` and `createHandle`).
+2. Authenticates the peer and records the user on the line with `lineAddUser()`.
+3. Calls `usercontrollerTunnelTryManageLine(user_controller_instance, line)`.
+
+Return values:
+
+| Result | Meaning |
+|---|---|
+| `kUserAdmissionOk` | The line is now managed (admitted), was already managed (idempotent), or carries no user and was left as an unmanaged passthrough. Proceed. |
+| any other `kUserAdmission*` | The user was rejected (disabled, expired, over quota, connection limit, or IP limit). The line is left **unmanaged and untouched**. |
+
+Contract:
+
+- On a non-OK result the function never sends a finish and never destroys line state. The **caller owns the rejection** and must close or drop the line itself; it must not treat a rejected line as admitted. A non-OK call reserves nothing, so retrying later is safe.
+- Call it on the line's owner worker (`lineGetWID(l) == getWID()`), and only on a normal line that already traversed this `UserController` instance. Do not call it on packet lines.
+- Once a line is managed this way, traffic accounting, the idle sweep, and `Finish`-time slot release apply exactly as they do for a line admitted at `Init`; no extra teardown wiring is needed on the caller side.
+
+Example sketch (inside the authenticating node, after a successful handshake on `line`):
+
+```c
+lineAddUser(line, &resolved_handle, username, password);
+
+user_admission_result_t admission = usercontrollerTunnelTryManageLine(ts->user_controller_tunnel, line);
+if (admission != kUserAdmissionOk)
+{
+    // limits exceeded (for example IP limit): reject this peer / close the line here.
+    return;
+}
+// admitted: continue bringing the peer up.
+```
 
 ## Sweep Timer
 

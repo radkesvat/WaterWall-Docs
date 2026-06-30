@@ -5,7 +5,7 @@ sidebar_label: "UserController"
 description: "مستندات مرجع نود UserController."
 ---
 
-<!-- Written from version 106 of the English doc. -->
+<!-- Written from version 108 of the English doc. -->
 
 # UserController
 
@@ -44,6 +44,26 @@ CustomAuthNode -> UserController -> TcpConnector
 ```
 
 lineهایی که current user handle معتبر ندارند بدون enforcement عبور می‌کنند.
+
+بعضی نودها user را فقط بعد از باز شدن line authenticate می‌کنند و سمت `next` آن‌ها packet line است، یعنی یک line برای
+هر worker، نه یک line جدا برای هر user. به همین دلیل نمی‌توانند مثل `Socks5Server` یا `TrojanServer` یک
+`UserController` بعد از خودشان قرار دهند. مثال اصلی این حالت، `WireGuardDevice` در حالت database-backed peer
+authentication است؛ در این مدل `UserController` روی سمتی قرار می‌گیرد که هنوز per-peer line دارد. بسته به اینکه کدام
+adapter سر chain باشد، آن per-peer line می‌تواند از هر کدام از دو سمت `UserController` شروع شود:
+
+```text
+UdpStatelessSocket -> UserController -> WireGuardDevice -> TunDevice   (line starts from prev)
+TunDevice -> WireGuardDevice -> UserController -> UdpStatelessSocket   (line starts from next)
+```
+
+در هر دو چیدمان، per-peer line در ابتدا بدون management از `UserController` عبور می‌کند، چون هنوز user روی line ثبت
+نشده است. بعد از اینکه `WireGuardDevice` peer را authenticate کرد، user را با `lineAddUser()` روی line ثبت می‌کند و
+سپس با [Programmatic Promotion API](#programmatic-promotion-api) همان line را on demand وارد enforcement مربوط به آن
+user می‌کند.
+
+`UserController` دوطرفه است: هم وقتی line از سمت `prev` شروع شود (upstream `Init`) کار می‌کند، هم وقتی از سمت `next`
+شروع شود (downstream `Init`). این نود origin هر line را ذخیره می‌کند و بر اساس آن upload/download را درست account
+می‌کند؛ بخش [Direction Awareness](#direction-awareness) را ببینید.
 
 ## نمونه تنظیمات
 
@@ -93,20 +113,86 @@ lineهایی که current user handle معتبر ندارند بدون enforceme
 
 limit صفر یا نبودن یک limit یعنی برای همان field نامحدود است.
 
+## Direction Awareness
+
+`UserController` برای هر line ذخیره می‌کند که line از کدام سمت شروع شده و از همین اطلاعات برای map کردن traffic به
+counterهای upload و download user استفاده می‌کند. "Upload" یعنی ترافیکی که از user به سمت far side خارج می‌شود؛
+"download" یعنی ترافیکی که به سمت user برمی‌گردد. user همیشه در سمتی قرار دارد که line از آن شروع شده است.
+
+| Line origin | Initiated by | Upstream payload counts as | Downstream payload counts as |
+|---|---|---|---|
+| From `prev` (upstream `Init`) | یک head/prev adapter، مثلا `UdpStatelessSocket` در ابتدای chain | upload | download |
+| From `next` (downstream `Init`) | یک tail/next adapter، مثلا `UdpStatelessSocket` در انتهای chain | download | upload |
+
+ردیف اول حالت معمول است (`Socks5Server`، `TrojanServer`، `VlessServer`). ردیف دوم وقتی رخ می‌دهد که adapter سمت user
+در انتهای chain باشد، مثل `TunDevice -> WireGuardDevice -> UserController -> UdpStatelessSocket`: در این حالت packetهای
+user از سمت `next` وارد می‌شوند، پس downstream payload برای user همان upload است. enforcement quota در هر دو حالت
+یکسان انجام می‌شود.
+
 ## جریان اجرا
 
-در upstream `Init`:
+در `Init` از هر سمت (upstream `Init` برای lineای که از `prev` شروع شده، downstream `Init` برای lineای که از `next`
+شروع شده):
 
 1. line state آماده می‌شود
 2. current user handle line خوانده می‌شود
-3. lineهای anonymous یا handle نامعتبر بدون enforcement forward می‌شوند
+3. lineهای anonymous یا handle نامعتبر بدون enforcement forward می‌شوند و ممکن است بعداً promote شوند
 4. lineهای authenticated از طریق `AuthenticationClient` بررسی می‌شوند
 5. lineهای قبول‌شده connection/IP slot reserve می‌کنند و برای sweep ثبت می‌شوند
-6. lineهای reject شده بدون باز کردن upstream side، به سمت previous finish می‌شوند
+6. lineهای reject شده به سمت همان سمتی که line را شروع کرده finish می‌شوند و سمت مقابل را باز نمی‌کنند
 
-در upstream payload، byte count به عنوان upload user حساب می‌شود. در downstream payload، byte count به عنوان download user حساب می‌شود. اگر accounting بگوید user باید بسته شود، buffer recycle می‌شود و هر دو جهت finish می‌شوند.
+در payloadها، upload/download بر اساس origin همان line حساب می‌شود؛ جدول بالا را ببینید. اگر accounting بگوید user
+باید بسته شود، buffer recycle می‌شود و هر دو جهت finish می‌شوند.
 
 در `Finish`، نود accounting state را release می‌کند، state خودش را destroy می‌کند و finish را فقط به جهت مقابل طبق directional finish rules می‌فرستد.
+
+## Programmatic Promotion API
+
+برای نودهایی که user را فقط بعد از باز شدن line authenticate می‌کنند، `UserController` یک function در public
+`interface.h` expose می‌کند:
+
+```c
+WW_EXPORT user_admission_result_t usercontrollerTunnelTryManageLine(tunnel_t *t, line_t *l);
+```
+
+این function همان admission مسیر upstream `Init` را اجرا می‌کند: همه limitها را بررسی می‌کند و در صورت قبول شدن،
+connection slot و IP slot را reserve می‌کند؛ اما این کار را on demand انجام می‌دهد. نودی که می‌خواهد از آن استفاده کند:
+
+1. pointer به instance مربوط به `UserController` را نگه می‌دارد؛ همان مدلی که `Socks5Server` برای ساخت
+   `UserController` داخلی خودش با `nodeUserControllerGet()` و `createHandle` استفاده می‌کند.
+2. peer را authenticate می‌کند و user را با `lineAddUser()` روی line ثبت می‌کند.
+3. `usercontrollerTunnelTryManageLine(user_controller_instance, line)` را صدا می‌زند.
+
+مقدارهای برگشتی:
+
+| Result | معنی |
+|---|---|
+| `kUserAdmissionOk` | line اکنون managed شده، یا از قبل managed بوده و call idempotent بوده، یا user ندارد و به صورت unmanaged passthrough رها شده است. ادامه دادن مجاز است. |
+| هر مقدار دیگر `kUserAdmission*` | user reject شده است؛ مثلا disabled، expired، over quota، بالای connection limit یا بالای IP limit. line همچنان **unmanaged و untouched** می‌ماند. |
+
+قرارداد استفاده:
+
+- اگر نتیجه non-OK باشد، این function هیچ `Finish`ای ارسال نمی‌کند و line state را destroy نمی‌کند. **caller مالک reject
+  کردن است** و باید خودش line را close/drop کند؛ نباید یک line reject شده را admitted فرض کند. call ناموفق چیزی reserve
+  نمی‌کند، بنابراین retry بعدی امن است.
+- این function را روی worker مالک line صدا بزنید، یعنی `lineGetWID(l) == getWID()`. فقط روی normal lineای صدا زده شود
+  که قبلاً از همین `UserController` instance عبور کرده است. آن را روی packet line صدا نزنید.
+- وقتی line با این روش managed شد، traffic accounting، idle sweep و release شدن slotها هنگام `Finish` دقیقاً مثل lineای
+  که در `Init` admitted شده کار می‌کنند؛ caller نیاز به teardown wiring اضافه ندارد.
+
+نمونه sketch داخل نود authenticating، بعد از handshake موفق روی `line`:
+
+```c
+lineAddUser(line, &resolved_handle, username, password);
+
+user_admission_result_t admission = usercontrollerTunnelTryManageLine(ts->user_controller_tunnel, line);
+if (admission != kUserAdmissionOk)
+{
+    // limits exceeded (for example IP limit): reject this peer / close the line here.
+    return;
+}
+// admitted: continue bringing the peer up.
+```
 
 ## Sweep Timer
 
