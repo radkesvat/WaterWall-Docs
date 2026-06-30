@@ -1,551 +1,496 @@
 ---
 sidebar_position: 1
-title: راهنمای توسعه‌دهندگان WaterWall
-sidebar_label: راهنمای توسعه‌دهندگان
-description: راهنمای عملی توسعه tunnel و node در WaterWall با تمرکز بر lifecycle، line safety، bufferها، packet lineها و build validation.
+title: "WaterWall Developer Guide"
+sidebar_label: "Developer Guide"
+description: "Source-oriented guide for safely implementing, fixing, and reviewing WaterWall tunnels."
 ---
 
-# راهنمای توسعه‌دهندگان WaterWall
+# WaterWall Developer Guide
 
-## هدف این راهنما
+This guide is for people and coding agents who implement, fix, or review
+tunnels under `tunnels/`. WaterWall is a chain-based tunneling runtime, so a
+correct tunnel is not just a parser or encoder. It must preserve callback
+direction, line lifetime, per-line state, buffer padding, packet-line behavior,
+and composability with whatever nodes appear before or after it.
 
-WaterWall یک هسته‌ی شبکه‌ای ماژولار برای ساخت tunnel، chain و اتصال مستقیم کاربر–سرور است. ایده‌ی اصلی پروژه این است که بتوان با کنار هم گذاشتن nodeهای مستقل، رفتارهای پروتکلی پیچیده ساخت؛ بدون اینکه هر بار کل لایه‌ی شبکه از صفر نوشته شود. README پروژه هم WaterWall را به‌عنوان یک networking core ساده برای tunneling و direct user-server connections معرفی می‌کند و اشاره دارد که هر tunnel فایل `description.md` مخصوص خودش را برای جزئیات پیشرفته دارد. ([GitHub][1])
+Do not design a new lifecycle model for one tunnel. Start from the runtime
+contracts in `ww/net/`, then copy the shape of mature tunnels that already solve
+similar problems.
 
-این صفحه برای برنامه‌نویسانی نوشته شده که می‌خواهند داخل `tunnels/` تونل جدید اضافه کنند، باگ یک تونل موجود را اصلاح کنند، یا رفتار lifecycle و packet/stream bridgeها را توسعه دهند.
+## Read These Files First
 
----
+Before changing tunnel behavior, read the source that owns the contract:
 
-## تصویر کلی معماری
+| Area | Files |
+| --- | --- |
+| Tunnel callbacks and chaining | `ww/net/tunnel.h`, `ww/net/tunnel.c` |
+| Line lifetime and per-line state | `ww/net/line.h`, `ww/net/line.c` |
+| Chain finalization and packet lines | `ww/net/chain.h`, `ww/net/chain.c` |
+| Packet-tunnel defaults | `ww/net/packet_tunnel.h`, `ww/net/packet_tunnel.c` |
+| Shift buffers and padding | `ww/bufio/shiftbuffer.h`, `ww/bufio/shiftbuffer.c` |
+| Buffer pools | `ww/bufio/buffer_pool.h`, `ww/bufio/buffer_pool.c` |
+| Node metadata | `ww/objects/node.h` |
 
-WaterWall روی چند مفهوم اصلی ساخته شده است:
+Good reference tunnels:
 
-**Node** تعریف پیکربندی‌شده‌ی یک جزء در chain است. هر node نوع، نام، `next`، flags، layer group و مقدار `required_padding_left` دارد. این مقدار padding در سطح chain جمع می‌شود تا tunnelهایی که باید header یا frame را ابتدای buffer اضافه کنند، بتوانند بدون realloc اضافی از فضای رزروشده استفاده کنند. ([GitHub][2])
+- `TcpListener` and `TcpConnector` for adapter behavior.
+- `TlsClient` and `EncryptionClient` for stateful protocol wrapping.
+- `MuxClient` for internal line ownership and re-entrant safety.
+- `PacketsToStream`, `StreamToPackets`, and `PacketsToConnection` for packet to
+  stream boundaries.
+- `PingClient` and `PingServer` for packet-tunnel direction decisions.
 
-**Tunnel** نمونه‌ی runtime یک node است. در `tunnel_t` اشاره‌گرهای `next` و `prev`، callbackهای upstream/downstream، اندازه‌ی state تونل، اندازه و offset state هر line و pointer به node/chain نگهداری می‌شود. این یعنی هر tunnel هم state عمومی خودش را دارد و هم برای هر connection یک بخش state داخل `line_t`. ([GitHub][3])
+## Runtime Model
 
-**Line** نماینده‌ی یک اتصال یا یک مسیر منطقی داده است. در `line_t` فیلدهایی مثل `refc`، `alive`، worker id، routing context، buffer pools و آرایه‌ی `tunnels_line_state` وجود دارد. هر tunnel با `lineGetState(line, tunnel)` به state خودش روی آن line دسترسی پیدا می‌کند. ([GitHub][4])
-
-**Chain** ترتیب tunnelهاست. node manager ابتدا tunnelها را می‌سازد، سپس chainها را assemble می‌کند، آن‌ها را finalize می‌کند، offset state هر tunnel را محاسبه می‌کند و بعد lifecycle startup را اجرا می‌کند. در `tunnelDefaultOnChain`، node بعدی از روی `hash_next` پیدا می‌شود، `tunnelBind` انجام می‌شود و tunnel در chain درج می‌گردد. ([GitHub][5])
-
-یک chain نمونه می‌تواند شبیه این باشد:
+WaterWall chains tunnel instances together. A typical stream chain looks like:
 
 ```text
-TcpListener <--> ObfuscatorClient <--> TlsClient <--> TcpConnector
+TcpListener -> ObfuscatorClient -> TlsClient -> TcpConnector
 ```
 
-در چنین چینی، `TcpListener` و `TcpConnector` adapter هستند، چون با socket یا سیستم‌عامل تماس مستقیم دارند. tunnelهای وسط chain باید بدون فرض‌کردن نوع adapterها کار کنند و composable بمانند.
+The first and last nodes are usually adapters. They touch sockets, TUN devices,
+or other operating-system resources. Middle tunnels must stay composable: they
+transform callbacks and payloads without assuming which adapter is on either
+side.
 
----
+The important runtime objects are:
 
-## ساختار معمول یک tunnel
+| Object | Meaning |
+| --- | --- |
+| `node_t` | Parsed configuration plus metadata such as `type`, `next`, flags, layer group, and `required_padding_left`. |
+| `tunnel_t` | Runtime instance of a node. It stores callback function pointers, `next` and `prev`, tunnel state, line-state size, and chain offsets. |
+| `line_t` | One normal connection line, logical line, or worker packet line. It stores routing context, user markers, buffer pools, refcount, alive flag, and all tunnels' per-line state. |
+| `tunnel_chain_t` | Ordered set of tunnels. During finalization it computes total line-state size, total left padding, and worker packet lines. |
 
-بیشتر tunnelهای داخل `tunnels/` ساختاری شبیه این دارند:
+Each tunnel can have:
 
-```text
-tunnels/<TunnelName>/
-  include/structure.h
-  instance/
-  common/
-  upstream/
-  downstream/
-  CMakeLists.txt
-  description.md
-```
+- tunnel state: one `tstate` for the tunnel instance
+- line state: one `lstate` slot per `line_t`
 
-برای مثال `TcpConnector`، `TlsClient`، `EncryptionClient` و بسیاری از tunnelهای دیگر همین الگوی پوشه‌بندی را دارند. خود `tunnels/` شامل adapterها، tunnelهای stream، tunnelهای packet و bridgeهایی مثل `PacketsToStream` و `StreamToPackets` است. ([GitHub][6])
-
-در `include/structure.h` معمولاً این موارد تعریف می‌شود:
+Access them with the existing helpers:
 
 ```c
-typedef struct my_tstate_s {
-    // state عمومی تونل
-} my_tstate_t;
-
-typedef struct my_lstate_s {
-    // state مخصوص هر line
-} my_lstate_t;
-
-enum {
-    kTunnelStateSize = sizeof(my_tstate_t),
-    kLineStateSize = sizeof(my_lstate_t),
-};
+my_tstate_t *ts = tunnelGetState(t);
+my_lstate_t *ls = lineGetState(line, t);
 ```
 
-فایل `instance/create.c` callbackهای tunnel را تنظیم می‌کند. در CMake هر tunnel معمولاً به‌صورت یک static library با نام همان tunnel ساخته می‌شود و به `ww` لینک می‌شود؛ مثلاً `EncryptionClient` و `TcpConnector` targetهای جداگانه دارند. ([GitHub][7])
+## Callback Directions
 
----
+Direction ownership is the first rule to get right.
 
-## جهت‌ها: Upstream و Downstream
+| Flow | Meaning | Forward with |
+| --- | --- | --- |
+| Upstream | request, outbound, forward path | `tunnelNextUpStream*` |
+| Downstream | response, inbound, backward path | `tunnelPrevDownStream*` |
 
-مهم‌ترین قانون WaterWall این است که جهت‌ها را قاطی نکنید.
+For payloads:
 
-در مسیر رفت، یعنی request / outbound / forward path، داده به سمت `next` می‌رود:
+```c
+tunnelNextUpStreamPayload(t, line, buf);
+tunnelPrevDownStreamPayload(t, line, buf);
+```
+
+For lifecycle:
 
 ```c
 tunnelNextUpStreamInit(t, line);
-tunnelNextUpStreamPayload(t, line, buf);
 tunnelNextUpStreamFinish(t, line);
-```
 
-در مسیر برگشت، یعنی response / inbound / backward path، داده به سمت `prev` برمی‌گردد:
-
-```c
-tunnelPrevDownStreamPayload(t, line, buf);
+tunnelPrevDownStreamEst(t, line);
 tunnelPrevDownStreamFinish(t, line);
 ```
 
-این نام‌گذاری مستقیماً در helperهای `tunnel.h` دیده می‌شود: helperهای `tunnelNextUpStream*` روی `self->next` callback upstream را صدا می‌زنند و helperهای `tunnelPrevDownStream*` روی `self->prev` callback downstream را صدا می‌زنند. ([GitHub][3])
+Do not reverse these because a server-side tunnel "feels opposite." Draw the
+actual chain and decide which callback direction owns the transformation.
 
-یک مثال واقعی:
+## Line Startup
 
-`TcpListener` وقتی socket جدید accept می‌کند، یک `line_t` می‌سازد و با `tunnelNextUpStreamInit` chain را شروع می‌کند. وقتی socket ورودی data می‌دهد، با `tunnelNextUpStreamPayload` داده را به tunnel بعدی می‌فرستد. ([GitHub][8])
+A normal connection starts with `Init`.
 
-در سمت دیگر، `TcpConnector` وقتی از remote socket داده دریافت می‌کند، آن را با `tunnelPrevDownStreamPayload` به tunnel قبلی برمی‌گرداند. هنگام close هم به سمت پایین chain با `tunnelPrevDownStreamFinish` خبر می‌دهد. ([GitHub][9])
+1. An adapter creates a `line_t`.
+2. The adapter calls `tunnelNextUpStreamInit()`.
+3. Each tunnel initializes its own line state.
+4. The final adapter starts the real network operation.
 
-پس قانون ساده است:
+`Init` is not isolated. A downstream tunnel can synchronously call back into
+`Payload`, `Est`, `Pause`, `Resume`, or `Finish` before `Init` returns.
 
-```text
-forward/request  => next + upstream
-backward/response => prev + downstream
-```
+Rules:
 
----
+- Initialize this tunnel's line state in `Init`.
+- Later callbacks should assume that state exists.
+- Do not add an `initialized` flag to hide unsafe control flow.
+- If you call a re-entrant callback and then still need the line, protect it.
 
-## adapterها و tunnelهای وسط chain
+## Line Lifetime
 
-Adapterها معمولاً در ابتدا یا انتهای chain هستند. آن‌ها با socket، TUN device، UDP socket یا interface بیرونی ارتباط مستقیم دارند.
+`line_t` has a refcount and an `alive` flag. `lineLock()` prevents immediate
+freeing, but it does not mean the line is still logically alive after a callback.
+Check `lineIsAlive()` when you need to continue after a re-entrant call.
 
-`adapterCreate` برای adapter ابتدای chain یا انتهای chain callbackهای نامعتبر سمت مقابل را disable می‌کند؛ اگر callback اشتباه روی adapter صدا زده شود، مسیر guard با log و terminate فعال می‌شود. این رفتار عمداً برای پیدا کردن خطاهای direction طراحی شده است. ([GitHub][10])
+Only the tunnel that created a line may destroy it with `lineDestroy()`.
 
-به‌صورت ذهنی:
+Common creators:
 
-```text
-[Adapter Head] --upstream--> [Middle Tunnel] --upstream--> [Adapter End]
-[Adapter Head] <--downstream-- [Middle Tunnel] <--downstream-- [Adapter End]
-```
+- adapters such as `TcpListener`, `UdpListener`, and `TcpConnector`
+- selected middle tunnels such as `MuxServer`, `ReverseClient`,
+  `PacketsToStream`, and `PacketsToConnection`
 
-Adapter ابتدای chain معمولاً line را می‌سازد و مسئول نابودی آن است. برای نمونه، `TcpListener` در accept path با `lineCreate` line می‌سازد و در close/finish path با `lineDestroy` آن را نابود می‌کند. ([GitHub][8])
+Everyone else must propagate `Finish` and let the owner destroy the line.
 
-Adapter انتهای chain مثل `TcpConnector` line را نمی‌سازد؛ بنابراین نباید `lineDestroy()` را روی آن line صدا بزند. در close path خودش state محلی را destroy می‌کند و finish را به downstream قبلی می‌فرستد. ([GitHub][9])
+`lineDestroy()` eventually asserts that tunnel line states are already zeroed
+unless something still holds a positive reference. That is why local state must
+usually be destroyed before propagating a real line-closing finish.
 
----
+## Re-entrant Callback Safety
 
-## lifecycle یک line
+Treat inter-tunnel callbacks as dangerous. These calls can indirectly close the
+line before control returns:
 
-callbackهای اصلی WaterWall این‌ها هستند:
+- `tunnelNextUpStreamInit`
+- `tunnelNextUpStreamPayload`
+- `tunnelPrevDownStreamPayload`
+- `tunnelNextUpStreamPause`
+- `tunnelPrevDownStreamPause`
+- `tunnelNextUpStreamResume`
+- `tunnelPrevDownStreamResume`
+- `tunnelNextUpStreamEst`
+- `tunnelPrevDownStreamEst`
 
-```text
-Init
-Est
-Payload
-Pause
-Resume
-Finish
-```
-
-### Init
-
-هر tunnel باید per-line state خودش را در `Init` مقداردهی کند. در lifecycle معمول WaterWall، `Init` اولین callback برای همان tunnel است. بنابراین در callbackهای بعدی نباید با flagهایی مثل `initialized` تلاش کنید خطای control-flow را پنهان کنید.
-
-الگوی درست:
+Prefer `withLineLocked()` or `withLineLockedWithBuf()` when you need to continue
+after a callback:
 
 ```c
-void myTunnelUpStreamInit(tunnel_t *t, line_t *l) {
-    my_lstate_t *ls = lineGetState(l, t);
-    myLinestateInitialize(ls);
-
-    tunnelNextUpStreamInit(t, l);
+if (! withLineLocked(line, tunnelNextUpStreamInit, t))
+{
+    return;
 }
+
+/* The line is still alive here. Re-read state if needed. */
+my_lstate_t *ls = lineGetState(line, t);
 ```
 
-اگر بعد از `tunnelNextUpStreamInit` کاری با line یا line-state ندارید، معمولاً نیاز به `withLineLocked` نیست. اگر بعد از callback می‌خواهید state را بخوانید یا buffer را مدیریت کنید، callback را re-entrant فرض کنید و line را محافظت کنید.
-
-### Payload
-
-`Payload` جایی است که tunnel داده را transform، frame، encrypt، decrypt، compress، split یا merge می‌کند. بعد از اینکه payload را به tunnel بعدی یا قبلی دادید، نباید فرض کنید line هنوز زنده است.
-
-نمونه‌ی امن:
+For payload forwarding:
 
 ```c
-if (!withLineLockedWithBuf(l, tunnelNextUpStreamPayload, t, buf)) {
+if (! withLineLockedWithBuf(line, tunnelNextUpStreamPayload, t, buf))
+{
     return;
 }
 ```
 
-در `line.h`، `withLineLockedWithBuf` ابتدا `lineLock` می‌کند، callback را اجرا می‌کند، بعد اگر `lineIsAlive` false شده باشد false برمی‌گرداند. بنابراین false یعنی callback باعث shutdown شده و دیگر نباید به `line_t*` یا state همان tunnel دست بزنید. ([GitHub][4])
+If a helper returns `false`, do not touch `line`, do not touch this tunnel's
+line state, and do not call the line-state destroy function just to "clean up."
+The close path that killed the line is responsible for that cleanup. Only reuse
+buffers that you still own.
 
-### Est
-
-`Est` یعنی downstream واقعاً established شده است. آن را زودتر از زمان واقعی emit نکنید. مثلاً `TcpConnector` بعد از connect موفق و setup خواندن socket، `tunnelPrevDownStreamEst` را صدا می‌زند. ([GitHub][9])
-
-### Pause / Resume
-
-`Pause` و `Resume` برای backpressure هستند، نه برای signalهای دلخواه. اگر write queue پر شد یا write ناقص انجام شد، سمت مقابل باید pause شود؛ وقتی queue flush شد، resume ارسال می‌شود. `TcpListener` و `TcpConnector` هر دو همین الگو را با queue و callback write-complete پیاده می‌کنند. ([GitHub][11])
-
-### Finish
-
-`Finish` خطرناک‌ترین بخش lifecycle است. `lineDestroy()` در نهایت `alive=false` می‌کند و هنگام آزادسازی، در debug mode انتظار دارد stateهای tunnelها صفر شده باشند. ([GitHub][4])
-
-قاعده‌ی اصلی:
-
-```text
-قبل از فرستادن Finish واقعی که می‌تواند line را ببندد،
-state محلی همین tunnel را destroy کن؛ مگر اینکه عمداً line را lock کرده‌ای.
-```
-
-برای tunnel وسط chain که خودش تصمیم می‌گیرد اتصال را کامل ببندد، الگوی رایج این است:
+Use manual locking when the sequence needs explicit control:
 
 ```c
-static void myCloseBothDirections(tunnel_t *t, line_t *l) {
-    my_lstate_t *ls = lineGetState(l, t);
+lineLock(line);
 
-    myLinestateDestroy(ls);
+/* call one or more potentially re-entrant callbacks */
 
-    tunnelNextUpStreamFinish(t, l);
-    tunnelPrevDownStreamFinish(t, l);
-
-    return;
-}
-```
-
-بعد از `tunnelPrevDownStreamFinish`، مخصوصاً اگر به adapter سازنده‌ی line برسد، ممکن است line نابود شده باشد. بنابراین بعد از آن هیچ فیلدی از `line` یا `ls` را نخوانید.
-
-اگر tunnel باید قبل از بستن، final protocol bytes بفرستد، مثل آخرین HTTP chunk، trailer، یا `END_STREAM`، از lock استفاده کنید:
-
-```c
-lineLock(l);
-
-tunnelNextUpStreamPayload(t, l, final_buf);
-
-if (!lineIsAlive(l)) {
-    lineUnlock(l);
+if (! lineIsAlive(line))
+{
+    lineUnlock(line);
     return;
 }
 
-myLinestateDestroy(ls);
-tunnelNextUpStreamFinish(t, l);
-
-lineUnlock(l);
-return;
+lineUnlock(line);
 ```
 
----
+## Finish Semantics
 
-## مالکیت line و state
+`Finish` is directional. Once a tunnel has received or sent finish for a
+direction, it must not send callbacks back toward that finished side for the same
+line.
 
-line معمولاً توسط adapter ابتدای chain ساخته می‌شود. بعضی tunnelهای خاص مثل mux یا packet/stream bridge می‌توانند line عادی جدید بسازند، اما قانون مالکیت تغییر نمی‌کند:
+If a tunnel receives upstream finish, it must not reflect downstream callbacks
+back to the sender for that line. If a tunnel receives downstream finish, it must
+not reflect upstream callbacks back to the sender.
 
-```text
-فقط همان component که line را ساخته، حق دارد lineDestroy(line) را صدا بزند.
-```
+A middle tunnel that decides to close the whole connection should usually:
 
-stateها دو نوع هستند:
+1. Destroy this tunnel's local line state.
+2. Send upstream finish first.
+3. Send downstream finish second.
+4. Return immediately.
 
-```text
-tstate => state عمومی tunnel، یک بار برای instance
-lstate => state مخصوص هر line، داخل line_t
-```
+Do not read fields from `ls` after `myLinestateDestroy(ls)`.
 
-`lineGetState(l, t)` با offset اختصاصی tunnel، pointer state همان tunnel را از `tunnels_line_state` برمی‌گرداند. offsetها در زمان finalize chain محاسبه می‌شوند و مجموع آن‌ها باید با `sum_line_state_size` chain برابر باشد. ([GitHub][4])
+### Final Protocol Bytes
 
-قاعده‌های عملی:
+Some protocols must send final bytes before closing, such as TLS `close_notify`,
+HTTP final chunks, HTTP/2 `END_STREAM`, WebSocket close frames, or custom
+trailers.
 
-```text
-- lstate را در Init مقداردهی کن.
-- lstate را دقیقاً یک بار destroy کن.
-- بعد از LinestateDestroy دیگر هیچ فیلدی از آن را نخوان.
-- فرض کن LinestateDestroy حافظه را صفر می‌کند.
-- برای جبران callback اشتباه، initialized flag اضافه نکن.
-```
+The safe shape is:
 
----
+1. `lineLock(line)`.
+2. Mark the sender side as finished using existing directional state, such as
+   `prev_finished`, `next_finished`, `can_downstream`, or `can_upstream`.
+3. Send final protocol bytes toward the other side.
+4. Destroy this tunnel's local line state.
+5. Propagate the real WaterWall `Finish`.
+6. `lineUnlock(line)`.
+7. Return immediately.
 
-## re-entrancy و محافظت از line
+The directional mark matters because sending final bytes can trigger
+backpressure. For example, an adapter can emit `Pause` while writing the final
+frame. That `Pause` must not be forwarded back toward the side that already sent
+`Finish`.
 
-در WaterWall callbackهای بین tunnelها می‌توانند re-entrant باشند. یعنی ممکن است شما `tunnelNextUpStreamPayload` را صدا بزنید و در همان مسیر، tunnel دیگری `Finish` بدهد و line قبل از برگشتن callback نابود شود.
+## Buffer and Padding Contract
 
-پس این الگو خطرناک است:
+WaterWall uses `sbuf_t` buffers. A buffer has:
+
+- `curpos`: current payload start
+- `len`: current payload length
+- `capacity`: total allocation
+- `l_pad`: reserved left padding
+
+Tunnels can prepend headers efficiently with:
 
 ```c
-tunnelNextUpStreamPayload(t, l, buf);
-
-/* خطرناک: شاید line یا ls دیگر معتبر نباشد */
-ls->some_field = 1;
+assert(sbufGetLeftCapacity(buf) >= header_len);
+sbufShiftLeft(buf, header_len);
 ```
 
-الگوی امن:
+But a tunnel may only rely on padding it advertised in `node.c`:
 
 ```c
-if (!withLineLockedWithBuf(l, tunnelNextUpStreamPayload, t, buf)) {
-    return;
-}
-
-/* اینجا line هنوز alive است */
+.required_padding_left = kMyProtocolHeaderSize,
 ```
 
-اگر callback با buffer اجرا می‌شود، `withLineLockedWithBuf` را ترجیح دهید. اگر callback بدون buffer است، `withLineLocked` کافی است. اگر این helperها false برگردانند، یعنی line در طول callback نابود شده و نباید state را cleanup کنید؛ close path که در طول callback اجرا شده باید cleanup لازم را انجام داده باشد.
+During chain finalization, WaterWall sums `required_padding_left` across the
+chain and updates global buffer allocation padding. If you prepend bytes without
+advertising enough padding, the tunnel may only work in some chain layouts and
+break in others.
 
----
+Rules:
 
-## قرارداد buffer، padding و shift-buffer
+- Use `sbufShiftLeft()` only when enough left capacity is available.
+- Keep prepended bytes within this tunnel's advertised padding budget.
+- Use buffer pools (`bufferpoolGetSmallBuffer`, `bufferpoolGetLargeBuffer`,
+  `lineGetBufferPool`, `lineReuseBuffer`) for ordinary runtime buffers.
+- If a callback takes ownership of a buffer, do not reuse it afterward.
+- If an error path still owns a buffer, return it to the line or pool before
+  closing.
 
-WaterWall از `sbuf_t` برای bufferهای قابل shift استفاده می‌کند. این struct فیلدهایی مثل `curpos`، `len`، `capacity` و `l_pad` دارد. `l_pad` همان left padding رزروشده است؛ چیزی شبیه leave-room در packet bufferها. ([GitHub][12])
+## Packet Lines
 
-وقتی tunnel می‌خواهد header یا frame prefix را ابتدای payload اضافه کند، معمولاً از این الگو استفاده می‌کند:
+Packet lines are real `line_t` objects, but they are not normal connection
+lines.
+
+When a chain contains a layer-3 packet node, `tunnelchainFinalize()` allocates
+one packet line per worker. These packet lines are persistent worker helper
+lines. They are destroyed when the chain is destroyed, not during normal packet
+processing.
+
+Do not call `lineDestroy()` on a packet line during normal runtime.
+
+Packet-line state is worker-local shared state. It is reused for unrelated
+packets on the same worker. Treat these fields as scratch packet-pipeline
+metadata:
+
+- `routing_context.src_ctx`
+- `routing_context.dest_ctx`
+- `recalculate_checksum`
+- any line state stored on the packet line
+
+Do not treat packet-line state as a per-flow or per-peer identity. If a packet
+tunnel needs per-connection behavior, create or manage normal lines behind the
+packet side instead.
+
+## Pure Packet Tunnels and Packet Bridges
+
+Pure packet tunnels are created with:
 
 ```c
-assert(sbufGetLeftCapacity(buf) >= HEADER_SIZE);
-sbufShiftLeft(buf, HEADER_SIZE);
-
-uint8_t *p = sbufGetMutablePtr(buf);
-write_header(p);
+packettunnelCreate(node, sizeof(my_tstate_t), 0);
 ```
 
-`ShiftLeft` خودش assert می‌کند که left capacity کافی باشد. اگر header اضافه می‌کنید اما `required_padding_left` node را درست تنظیم نکرده باشید، chain-level padding contract را می‌شکنید. ([GitHub][12])
+`packettunnelCreate()` asserts that `lstate_size == 0`. These tunnels generally
+override packet payload callbacks and do not use connection-style line state.
+Examples include `IpOverrider`, `IpManipulator`, `PingClient`, `PingServer`, and
+`WireGuardDevice`.
 
-در زمان ساخت chain، WaterWall مقدار `required_padding_left` همه‌ی nodeها را جمع می‌کند و هنگام finalize این padding را در allocationهای global اعمال می‌کند. ([GitHub][13])
+Packet-line anchored bridges are normal tunnels that use the worker packet line
+as an anchor for bridge state. Examples:
 
-قواعد payload/framing:
+- `PacketsToStream`
+- `StreamToPackets`
+- `PacketsToConnection`
+- `PacketSplitStream`
+
+For these tunnels, remember that packet-line `Init` is a worker/bootstrap event,
+not a per-packet open event. If a chain head is a layer-3 packet node, startup
+initialization sends one upstream `Init` per worker packet line. Some bridge
+topologies must trigger packet-line initialization manually in `onStart()`.
+
+## Packet Tunnel Direction Example
+
+Paired packet tunnels often transform in opposite callback directions. Do not
+copy the client's direction into the server unless the chain flow proves it.
+
+Example:
 
 ```text
-- اگر prepend می‌کنی، required_padding_left را در node.c درست اعلام کن.
-- بدون left capacity کافی sbufShiftLeft نزن.
-- buffer را بعد از تحویل به callback بعدی دوباره استفاده نکن، مگر مالکیتش هنوز با تو باشد.
-- اگر callback باعث مرگ line شد و هنوز buffer دست توست، فقط buffer را به pool مناسب برگردان.
-- برای payloadهای بزرگ، reserve/duplicate/slice را طبق الگوی tunnelهای موجود انجام بده.
+PingClient:
+packet -> PingClient -> IPv4(ICMP(payload -> packet))
+
+PingServer:
+packet <- PingServer <- IPv4(ICMP(payload -> packet))
 ```
 
-buffer poolها large و small buffer تولید می‌کنند و هنگام ساخت buffer از `sbufCreateWithPadding` استفاده می‌کنند؛ پس padding یک قرارداد chain-wide است، نه تصمیم محلی و لحظه‌ای هر tunnel. ([GitHub][14])
+`PingClient` encapsulates on upstream payload and forwards with
+`tunnelNextUpStreamPayload()`. `PingServer` decapsulates on downstream payload
+and forwards with `tunnelPrevDownStreamPayload()`.
 
----
+Tests for packet tunnels should exercise the real intended direction. If the
+server side needs data from the opposite side, use `Bridge` or another existing
+composition tunnel instead of changing the tunnel contract.
 
-## Packet lineها
+## Typical Tunnel Layout
 
-WaterWall فقط stream line ندارد؛ packet line هم دارد. packet line یک `line_t*` واقعی است، اما معنی lifecycle آن با connection line فرق دارد.
-
-وقتی chain شامل node از layer 3 باشد، `tunnelchainFinalize` برای هر worker یک packet line می‌سازد. این packet lineها در `tunnelchainDestroy` نابود می‌شوند، نه در runtime عادی هر packet. ([GitHub][13])
-
-node manager برای chainهایی که head آن‌ها layer 3 است، برای هر worker یک upstream init روی packet line می‌فرستد. این init یک event راه‌اندازی worker/packet pipeline است، نه open شدن یک اتصال جدید. ([GitHub][15])
-
-دو نوع tunnel packet-oriented وجود دارد:
-
-### ۱. pure packet tunnel
-
-این‌ها با `packettunnelCreate` ساخته می‌شوند. در source، `packettunnelCreate` assert می‌کند که `lstate_size == 0` باشد؛ یعنی pure packet tunnel per-line state ندارد. همچنین payload پیش‌فرض packet tunnel باید override شود وگرنه terminate می‌کند. ([GitHub][16])
-
-نمونه‌ها:
+Most tunnels follow this shape:
 
 ```text
-IpOverrider
-IpManipulator
-WireGuardDevice
+tunnels/MyTunnel/
+  CMakeLists.txt
+  description.md
+  include/MyTunnel/
+    interface.h
+    structure.h
+  instance/
+    create.c
+    node.c
+    chain.c
+    index.c
+    prepair.c
+    start.c
+    stop.c
+    destroy.c
+  common/
+    helpers.c
+    line_state.c
+  upstream/
+    init.c
+    payload.c
+    fin.c
+    pause.c
+    resume.c
+    est.c
+  downstream/
+    init.c
+    payload.c
+    fin.c
+    pause.c
+    resume.c
+    est.c
 ```
 
-### ۲. packet-line anchored bridge
+`node.c` declares node metadata, including layer group and padding. `create.c`
+creates the tunnel and assigns callbacks. `line_state.c` initializes and destroys
+per-line state. Callback files should stay small and delegate shared protocol
+work to `common/helpers.c` when that makes the state machine clearer.
 
-این‌ها tunnelهای عادی‌تری هستند که packet line را به‌عنوان worker-local anchor استفاده می‌کنند. state آن‌ها per-worker یا bridge state است، نه per-connection state.
+When you destroy line state, zero the correctly aligned line-state region, as
+existing tunnels do:
 
-نمونه‌ها:
-
-```text
-PacketsToStream
-StreamToPackets
-PacketToConnection
-PacketSplitStream
+```c
+memoryZeroAligned32(ls, tunnelGetCorrectAlignedLineStateSize(sizeof(my_lstate_t)));
 ```
 
-این tunnelها در لیست `tunnels/` پروژه وجود دارند و کنار adapterهایی مثل `TunDevice` و `UdpStatelessSocket` دیده می‌شوند. ([GitHub][6])
+## Implementation Workflow
 
-قانون مهم:
+Use this workflow for new features and fixes:
 
-```text
-packet line را مثل connection line عادی نبند.
-```
+1. Draw the chain flow and mark upstream and downstream directions.
+2. Identify which side owns line creation and destruction.
+3. Read the existing tunnel implementation and adjacent tunnels.
+4. Read `ww/net/line.h`, `ww/net/tunnel.h`, and `ww/net/chain.c`.
+5. If framing or prepending is involved, read shift-buffer and buffer-pool code.
+6. Choose the closest mature tunnel pattern and stay close to it.
+7. Implement the smallest change that preserves composition.
+8. Add or update a focused test case when behavior can regress.
+9. Validate with the preset build and relevant tests.
 
-اگر برای packet traffic به lifecycle per-connection نیاز داری، پشت packet side یک line عادی بساز یا مدیریت کن. packet line باید در runtime زنده بماند و فقط هنگام destroy chain آزاد شود.
+Avoid speculative abstractions. In this codebase, correctness usually comes from
+matching the existing lifecycle pattern, not from inventing a more generic one.
 
----
+## Build and Validation
 
-## HTTP tunnelها
-
-برای `HttpClient` و `HttpServer` این قراردادها را رعایت کنید:
-
-```text
-- طراحی فعلی HTTP/1.x و HTTP/2 تک‌stream است.
-- HTTP/3 اضافه نکنید.
-- بیش از یک stream منطقی HTTP/2 اضافه نکنید.
-- اگر peer stream اضافی باز کرد، محافظه‌کارانه reject یا ignore کنید.
-```
-
-در h2c upgrade:
-
-```text
-- stream 1 همان request upgrade شده‌ی اولیه است.
-- client نباید یک request مصنوعی دوم روی stream 1 بسازد.
-- server نباید response مصنوعی fake روی stream 1 بسازد.
-```
-
-برای clean finish در HTTP، معمولاً باید final bytes پروتکل را در حالی که line lock شده است ارسال کنید، سپس local state را destroy کنید و بعد finish واقعی WaterWall را forward کنید.
-
----
-
-## چک‌لیست توسعه‌ی یک tunnel
-
-قبل از تغییر کد، این فایل‌ها را بخوانید:
-
-```text
-ww/net/line.h
-ww/net/tunnel.h
-ww/net/chain.c
-ww/net/packet_tunnel.c        اگر packet involved است
-ww/bufio/shiftbuffer.*
-ww/bufio/buffer_pool.*
-tunnels/<TunnelName>/include/structure.h
-tunnels/<TunnelName>/upstream/*
-tunnels/<TunnelName>/downstream/*
-tunnels/<TunnelName>/common/*
-```
-
-بعد این سؤال‌ها را جواب بدهید:
-
-```text
-1. این tunnel adapter است یا middle tunnel؟
-2. upstream payload را باید به next بفرستد یا downstream payload را به prev؟
-3. line را چه کسی ساخته و چه کسی باید destroy کند؟
-4. lstate در Init مقداردهی شده؟
-5. Finish می‌تواند باعث lineDestroy شود؟
-6. بعد از callback re-entrant هنوز به line/state نیاز داری؟
-7. buffer ownership بعد از callback با کیست؟
-8. آیا tunnel header prepend می‌کند؟ اگر بله required_padding_left درست است؟
-9. آیا packet line درگیر است؟ اگر بله، state per-worker است یا per-connection؟
-10. آیا Pause/Resume/Est واقعاً semantic درست دارد؟
-```
-
----
-
-## ضدالگوهای خطرناک
-
-این کارها معمولاً باگ جدی تولید می‌کنند:
-
-```text
-- صدا زدن tunnelPrevDownStreamPayload در مسیر forward.
-- صدا زدن tunnelNextUpStreamPayload در مسیر response.
-- خواندن lstate بعد از LinestateDestroy.
-- اضافه کردن initialized flag برای پوشاندن callback اشتباه.
-- صدا زدن lineDestroy توسط tunnelی که line را نساخته.
-- ادامه دادن اجرای کد بعد از Finish downstream که ممکن است line را نابود کرده باشد.
-- نگه داشتن state پروتکل بعد از clean Finish بدون lineLock.
-- recycle نکردن buffer وقتی callback line را می‌کشد.
-- استفاده از sbufShiftLeft بدون padding کافی.
-- تغییر framing بدون تنظیم required_padding_left.
-- بستن packet line در runtime عادی.
-- فرض گرفتن اینکه packet-line routing context هویت ثابت یک connection است.
-```
-
----
-
-## الگوی گزارش تغییر یا PR
-
-برای هر تغییر در tunnelها، گزارش توسعه‌دهنده یا AI coding agent بهتر است این قالب را داشته باشد:
-
-```text
-1. Flow مربوطه:
-   توضیح بده داده از کدام callback وارد می‌شود و به کدام جهت می‌رود.
-
-2. مشکل یا تغییر:
-   دقیقاً بگو bug، feature یا cleanup چیست.
-
-3. ایمنی lifecycle:
-   توضیح بده Init، Payload، Finish، Est، Pause/Resume چطور حفظ شده‌اند.
-
-4. ایمنی line:
-   بگو line را چه کسی ساخته، چه کسی destroy می‌کند، و آیا callback re-entrant محافظت شده است.
-
-5. buffer و padding:
-   بگو buffer ownership چیست و آیا required_padding_left لازم است یا نه.
-
-6. packet-line:
-   اگر packet involved است، توضیح بده packet line بسته نمی‌شود و state per-worker/per-connection اشتباه نشده است.
-
-7. validation:
-   commandهای build/test را بنویس و نتیجه را گزارش کن.
-
-8. ریسک‌های باقی‌مانده:
-   edge caseهای شناخته‌شده را صریح بنویس.
-```
-
----
-
-## build و validation
-
-ریشه‌ی پروژه `CMakePresets.json` دارد و presetهای platform-specific از جمله Linux را include می‌کند. preset لینوکس هم build presetهایی مثل `linux`، `linux-gcc-x64` و variantهای دیگر را تعریف کرده است. ([GitHub][17])
-
-برای توسعه‌ی tunnelها، مسیر پیشنهادی:
+Prefer the `linux` CMake preset:
 
 ```bash
 cmake --preset linux
-cmake --build --preset linux --target <TargetName> -j1
+cmake --build --preset linux -j8
 ```
 
-مثال:
+For a focused tunnel build:
 
 ```bash
-cmake --build --preset linux --target TcpConnector -j1
-cmake --build --preset linux --target EncryptionClient -j1
+cmake --build --preset linux --target TlsClient -j8
 ```
 
-اگر فقط یک tunnel را تغییر داده‌اید، target همان tunnel را build کنید. اگر به compile تک‌فایل نیاز دارید، از flagهای واقعی `build/linux/compile_commands.json` استفاده کنید و include pathها را دستی حدس نزنید؛ چون tunnelهای مختلف header محلی هم‌نام مثل `structure.h` دارند و include order اشتباه می‌تواند فایل غلط را وارد کند.
+For registered tests:
 
-اگر GCC با خطایی مثل internal compiler error یا bus error روی فایل‌های نامرتبط core crash کرد، اول build tree و preset را بررسی کنید، نه اینکه فوراً tunnel جدید را مقصر بدانید.
-
----
-
-## خلاصه‌ی ذهنی برای توسعه‌دهنده
-
-WaterWall را به‌صورت یک pipeline دوبل ببینید:
-
-```text
-Upstream:   head adapter -> middle tunnels -> end adapter
-Downstream: head adapter <- middle tunnels <- end adapter
+```bash
+ctest --preset linux --output-on-failure
+ctest --preset linux --output-on-failure -R '^waterwall\.tls_roundtrip$'
 ```
 
-هر tunnel فقط باید سهم خودش را انجام دهد:
+For one integration case while debugging:
 
-```text
-- در Init state خودش را بسازد.
-- در Payload داده را transform کند و مالکیت buffer را درست منتقل کند.
-- در Pause/Resume backpressure واقعی را منتقل کند.
-- در Est فقط established واقعی را اعلام کند.
-- در Finish state خودش را امن destroy کند و جهت درست را ببندد.
-- line را فقط اگر خودش ساخته destroy کند.
-- packet line را مثل connection line عادی رفتار ندهد.
+```bash
+tests/run_waterwall_case.sh \
+  build/linux/Release/Waterwall \
+  tests/cases/tls_roundtrip \
+  60
 ```
 
-اصل طلایی:
+Do not hand-assemble compile commands. If you need a syntax-only compile, use
+the exact command from `build/linux/compile_commands.json`. Be especially
+careful with tunnel-local headers named `structure.h`; adding multiple tunnel
+include directories to one manual command can silently include the wrong file.
 
-```text
-هیچ callback بین tunnelها را بی‌خطر فرض نکن.
-اگر بعد از callback هنوز به line یا state نیاز داری، line را lock کن.
-اگر Finish را forward می‌کنی، بعد از آن line/state را لمس نکن مگر دقیقاً می‌دانی چرا هنوز زنده است.
-```
+If GCC reports an internal compiler error or bus error in unrelated core files
+such as `ww/libc/wlibc.c`, treat it as a build-environment or build-tree problem
+first. Reconfigure with the `linux` preset before debugging the tunnel code.
 
-با رعایت این قراردادها، tunnel جدید فقط برای یک chain خاص کار نمی‌کند؛ بلکه در ترکیب‌های مختلف WaterWall هم composable و امن باقی می‌ماند.
+## Review Checklist
 
-[1]: https://github.com/radkesvat/WaterWall "GitHub - radkesvat/WaterWall: WaterWall is a work in progress networking-core that aims to be as flexible as possible · GitHub"
-[2]: https://raw.githubusercontent.com/radkesvat/WaterWall/main/ww/objects/node.h "raw.githubusercontent.com"
-[3]: https://raw.githubusercontent.com/radkesvat/WaterWall/main/ww/net/tunnel.h "raw.githubusercontent.com"
-[4]: https://raw.githubusercontent.com/radkesvat/WaterWall/main/ww/net/line.h "raw.githubusercontent.com"
-[5]: https://raw.githubusercontent.com/radkesvat/WaterWall/main/ww/net/tunnel.c "raw.githubusercontent.com"
-[6]: https://github.com/radkesvat/WaterWall/tree/main/tunnels "WaterWall/tunnels at main · radkesvat/WaterWall · GitHub"
-[7]: https://raw.githubusercontent.com/radkesvat/WaterWall/main/tunnels/EncryptionClient/CMakeLists.txt "raw.githubusercontent.com"
-[8]: https://raw.githubusercontent.com/radkesvat/WaterWall/main/tunnels/TcpListener/common/helpers.c "raw.githubusercontent.com"
-[9]: https://raw.githubusercontent.com/radkesvat/WaterWall/main/tunnels/TcpConnector/common/helpers.c "raw.githubusercontent.com"
-[10]: https://raw.githubusercontent.com/radkesvat/WaterWall/main/ww/net/adapter.c "raw.githubusercontent.com"
-[11]: https://raw.githubusercontent.com/radkesvat/WaterWall/main/tunnels/TcpListener/downstream/payload.c "raw.githubusercontent.com"
-[12]: https://raw.githubusercontent.com/radkesvat/WaterWall/main/ww/bufio/shiftbuffer.h "raw.githubusercontent.com"
-[13]: https://raw.githubusercontent.com/radkesvat/WaterWall/main/ww/net/chain.c "raw.githubusercontent.com"
-[14]: https://raw.githubusercontent.com/radkesvat/WaterWall/main/ww/bufio/buffer_pool.h "raw.githubusercontent.com"
-[15]: https://raw.githubusercontent.com/radkesvat/WaterWall/main/ww/managers/node_manager.c "raw.githubusercontent.com"
-[16]: https://raw.githubusercontent.com/radkesvat/WaterWall/main/ww/net/packet_tunnel.c "raw.githubusercontent.com"
-[17]: https://raw.githubusercontent.com/radkesvat/WaterWall/main/CMakePresets.json "raw.githubusercontent.com"
+Before merging a tunnel change, check:
 
+- Does `Init` initialize this tunnel's line state before any callback can use it?
+- Are upstream callbacks forwarded only with `tunnelNextUpStream*`?
+- Are downstream callbacks forwarded only with `tunnelPrevDownStream*`?
+- Does every re-entrant callback either return immediately or protect the line?
+- Does `Finish` destroy local state before propagating a real close?
+- If final protocol bytes are sent during `Finish`, is the sender side marked
+  finished before the send?
+- Are `Pause` and `Resume` blocked from reflecting toward a finished side?
+- Does only the line owner call `lineDestroy()`?
+- Are packet lines kept alive during normal runtime?
+- Is packet-line state treated as worker-local shared state?
+- Does every prepend fit inside `required_padding_left`?
+- Are buffers recycled exactly on paths that still own them?
+- Are tests exercising the intended callback direction?
+- Did validation use preset build metadata instead of guessed compiler flags?
+
+## Agent Output Expectations
+
+When using an AI coding agent on WaterWall, ask it to report:
+
+1. Its understanding of the relevant tunnel flow.
+2. The bug or requested change.
+3. How the fix preserves lifecycle ordering, line safety, direction ownership,
+   buffer and padding rules, and packet-line semantics.
+4. The implementation summary.
+5. The validation commands and results.
+6. Remaining risks or edge cases.
+
+That report format forces the important contracts into the open. If a proposed
+change cannot explain those contracts, it is not ready.
