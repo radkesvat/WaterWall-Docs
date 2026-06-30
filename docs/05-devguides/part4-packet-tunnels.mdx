@@ -1,0 +1,267 @@
+---
+sidebar_position: 4
+title: "Developer Guide Part 4: Packet Lines & Packet Tunnels"
+sidebar_label: "Part 4: Packet Tunnels"
+description: "Packet-line semantics, pure packet tunnels, packet/stream bridges, packet-line initialization, and paired-tunnel direction rules for layer-3 work."
+---
+
+# Part 4: Packet Lines & Packet Tunnels
+
+WaterWall handles layer-3 packet flows (TUN devices, WireGuard-style paths, raw
+packet processing) as well as ordinary streams. The packet model reuses the
+`line_t` type but applies a **completely different lifecycle**. Treating a packet
+line like a per-connection line is one of the most damaging mistakes you can make
+in this codebase.
+
+Read this part before touching anything under a layer-3 node. Source of truth:
+`ww/net/chain.c`, `ww/net/packet_tunnel.c`, `ww/net/line.h`, and the packet
+tunnels themselves.
+
+## What a Packet Line Is
+
+A packet line is a real `line_t`, but unlike a connection line it is:
+
+- allocated **once per worker** for any chain that contains a layer-3 node,
+- **shared** by every packet that worker processes,
+- **not** tied to a TCP/UDP connection lifecycle,
+- **not** closed during normal runtime,
+- destroyed only when the **chain itself** is destroyed.
+
+The source is explicit. In `tunnelchainFinalize()` (`ww/net/chain.c`), when the
+chain contains a packet node, one packet line is created per worker:
+
+```c
+tc->packet_lines = (line_t **) memoryAllocate(sizeof(line_t) * tc->workers_count);
+
+for (wid_t i = 0; i < tc->workers_count; i++)
+{
+    // ... create the worker line pool ...
+    if (tc->contains_packet_node)
+    {
+        tc->packet_lines[i] = lineCreateForWorker(0, tc->line_pools, i);
+    }
+}
+```
+
+And they are torn down only in `tunnelchainDestroy()`:
+
+```c
+for (uint32_t i = 0; i < tc->workers_count; i++)
+{
+    if (tc->packet_lines && tc->packet_lines[i])
+    {
+        lineDestroy(tc->packet_lines[i]);
+    }
+}
+```
+
+Reach a worker's packet line with `tunnelchainGetWorkerPacketLine(chain, wid)`.
+
+:::danger Never destroy a packet line at runtime
+Do not call `lineDestroy()` on a packet line during normal operation, and never
+design logic that expects packet lines to be recreated on `Finish`. Some packet
+adapters (`TunDevice`, `UdpStatelessSocket`) assert in debug builds that the
+packet line is still alive after forwarding a packet. If your change can let a
+packet line die at runtime, that is almost certainly a bug.
+:::
+
+## Packet Lines Are Shared Worker State
+
+Because one packet line serves many unrelated packets on a worker, anything stored
+on it is **worker-local scratch state**, not per-connection identity. Be
+especially careful with:
+
+- `routing_context.src_ctx` and `routing_context.dest_ctx`
+- `recalculate_checksum` (a per-packet scratch flag, see `lineSetRecalculateChecksum`)
+- any tunnel line state stored on the packet line
+
+These fields are overwritten packet-to-packet. Do **not** treat them as a stable
+peer, flow, or session. If you store state on a packet line, that state must make
+sense as one of:
+
+- per-worker state,
+- packet-pipeline scratch state,
+- bridge state anchored to the worker packet side.
+
+If you need real per-flow or per-connection lifecycle behind packet traffic,
+**create normal lines behind the packet side** — do not try to make the packet
+line behave like a connection.
+
+## Two Kinds of Packet Tunnels
+
+Not every tunnel that touches packet lines is the same kind of tunnel. There are
+two distinct categories, and they have different rules.
+
+### 1. Pure Packet Tunnels (`packettunnelCreate`)
+
+Some tunnels are created with `packettunnelCreate()` instead of `tunnelCreate()`.
+From `ww/net/packet_tunnel.c`:
+
+```c
+tunnel_t *packettunnelCreate(node_t *node, uint16_t tstate_size, uint16_t lstate_size)
+{
+    assert(lstate_size == 0); // packet tunnels don't have lines
+    tunnel_t *t = tunnelCreate(node, tstate_size, 0);
+    // ... installs packet-tunnel default callbacks ...
+}
+```
+
+Key facts:
+
+- `packettunnelCreate()` **asserts `lstate_size == 0`**. Pure packet tunnels have
+  no per-line state.
+- They are expected to **override the packet payload callbacks**.
+- Several default stream-style callbacks are intentionally invalid. For example,
+  the default upstream/downstream payload handlers call `LOGF(...)` and
+  `terminateProgram(1)` — they exist to crash loudly if you forget to override
+  them:
+
+```c
+void packettunnelDefaultUpStreamPayload(tunnel_t *self, line_t *line, sbuf_t *payload)
+{
+    LOGF("Unexpected call to default up stream payload for a packet tunnel, "
+         "this function must be overridden");
+    terminateProgram(1);
+}
+```
+
+Examples: `IpOverrider`, `IpManipulator`, `PingClient`, `PingServer`,
+`WireGuardDevice`.
+
+For pure packet tunnels:
+
+- Do not add connection-style line lifecycle logic casually.
+- Do not assume `Init` / `Finish` behave like normal stream tunnels — check the
+  actual callback implementations first.
+- Some default callbacks deliberately abort; know which ones you must override.
+
+### 2. Packet-Line Anchored Bridges (`tunnelCreate`)
+
+Other tunnels are ordinary `tunnelCreate()` tunnels that **use the worker packet
+line as an anchor** for worker-local bridge state. They cross the boundary between
+packet-oriented runtime and connection-oriented runtime.
+
+Examples and what they anchor:
+
+| Bridge | Role |
+| --- | --- |
+| `PacketsToStream` | packet line to a worker-local stream-facing line; stores that line and a read buffer |
+| `StreamToPackets` | a stream line to the packet line; stores the active stream line and read buffer per worker |
+| `PacketsToConnection` | packet traffic to lwIP to normal WaterWall connection lines behind the packet side |
+| `PacketSplitStream` | splits packet traffic across stream paths |
+
+State stored here is worker-local bridge state — still not per-connection state.
+If you need closable per-connection behavior behind packet traffic, create or
+manage normal lines behind the packet line instead of closing the packet line.
+
+## Packet-Line Initialization
+
+Packet lines are initialized differently from connection lines.
+
+For a chain whose **head is a layer-3 packet node**, the node manager sends one
+upstream `Init` on each worker's packet line during startup — **once per worker,
+not once per packet**. So packet-line `Init` is a worker/bootstrap event, not a
+connection-open event.
+
+But if a bridge relies on packet lines while the chain head is **not** itself a
+layer-3 packet node, that automatic init does not happen, and the bridge must
+trigger it. `StreamToPackets` does exactly this in `onStart()`, queueing the
+bootstrap onto every worker so packet-side tunnels see their `Init` after startup
+rather than re-entering init paths inline:
+
+```c
+static void streamtopacketsQueueWorkerPacketInit(void *worker, void *arg1, void *arg2, void *arg3)
+{
+    tunnel_t *t = arg1;
+    line_t   *l = tunnelchainGetWorkerPacketLine(tunnelGetChain(t), getWID());
+    tunnelNextUpStreamInit(t, l);
+    assert(lineIsAlive(l));
+}
+
+void streamtopacketsTunnelOnStart(tunnel_t *t)
+{
+    for (wid_t wi = 0; wi < getWorkersCount(); wi++)
+    {
+        sendWorkerMessageForceQueue(wi, streamtopacketsQueueWorkerPacketInit, t, NULL, NULL);
+    }
+}
+```
+
+So if you create or modify a packet bridge: do not assume packet-line init
+happened automatically. Verify whether the init comes from the node manager (chain
+head is layer-3) or whether your tunnel must trigger it in `onStart()`.
+
+## Paired Tunnel Direction (the PingClient / PingServer Rule)
+
+Paired packet tunnels frequently transform in **opposite** callback directions. Do
+not copy the client's direction into the server unless the chain flow proves it.
+
+Draw the flow first:
+
+```text
+PingClient:
+packet -> PingClient -> IPv4(ICMP(payload -> packet))
+
+PingServer:
+packet <- PingServer <- IPv4(ICMP(payload -> packet))
+```
+
+- `PingClient` **encapsulates** on the upstream payload and forwards with
+  `tunnelNextUpStreamPayload()`.
+- `PingServer` **decapsulates** on the downstream payload and forwards with
+  `tunnelPrevDownStreamPayload()`.
+
+Implementing the server as `IPv4(ICMP(...)) -> PingServer -> packet` (i.e. copying
+the client's upstream direction) is wrong.
+
+The procedure for any packet tunnel:
+
+1. Draw the packet flow with arrows.
+2. Place the encode/decode step in the callback direction that flow requires.
+3. Use `tunnelNextUpStreamPayload()` only for upstream forwarding and
+   `tunnelPrevDownStreamPayload()` only for downstream forwarding.
+4. Do not treat packet lines as per-connection lines.
+5. Do not call `lineDestroy()` on packet lines at runtime.
+6. Do not add stream-style lifecycle to a pure packet tunnel unless its design
+   requires it.
+
+## Testing Packet Tunnels
+
+Packet tunnel tests must exercise the **real intended direction**. A test that
+feeds the server from the wrong side proves nothing. When the server side needs
+data fed from the opposite side, use `Bridge` (or another existing composition
+tunnel) rather than changing the tunnel contract. A ping-style topology looks
+like:
+
+```text
+TesterClient -> PingClient -> Bridge
+TesterServer -> PingServer -> Bridge
+```
+
+Add at least one test that would **fail** if the upstream/downstream handling were
+reversed. That single test catches the most common packet-tunnel regression.
+
+## Rules for Packet-Oriented Changes (Summary)
+
+- Do not close packet lines during runtime.
+- Do not run normal per-connection `Finish` logic on packet lines unless the
+  source clearly expects it.
+- Treat packet-line state as worker-local shared state.
+- Treat routing context and `recalculate_checksum` as mutable per-packet metadata,
+  never as durable session identity.
+- For per-flow lifecycle, create normal lines behind the packet side.
+- A `packettunnelCreate()` tunnel has no per-line state (`lstate_size == 0`).
+- A bridge that anchors state on the packet line keeps that state across many
+  packets on the worker.
+- If your code depends on packet-line init, verify where that init comes from.
+
+The single most common mistake to avoid:
+
+```text
+Using packet lines as if they were normal connection lines with an ordinary
+Init -> Payload -> Finish per-connection lifecycle. They are not.
+```
+
+---
+
+Continue to **[Part 5: Anatomy of a Tunnel & Workflow](./part5-tunnel-anatomy.mdx)**.

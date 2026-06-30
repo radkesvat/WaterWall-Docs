@@ -1,0 +1,233 @@
+---
+sidebar_position: 6
+title: "Developer Guide Part 6: Building, Testing & Reviewing"
+sidebar_label: "Part 6: Build, Test & Review"
+description: "CMake presets, focused builds, the integration test harness, build-environment gotchas, the full review checklist, and the report format expected from coding agents."
+---
+
+# Part 6: Building, Testing & Reviewing
+
+A tunnel change is not done when it compiles. It is done when it builds through a
+known-good preset, passes the relevant integration tests, and survives the review
+checklist. This part covers how to validate work and how to present it.
+
+## Building
+
+Prefer the `linux` CMake preset. Configure once, then build:
+
+```bash
+cmake --preset linux
+cmake --build --preset linux -j8
+```
+
+For a focused build of one changed tunnel target (much faster while iterating):
+
+```bash
+cmake --build --preset linux --target TlsClient -j8
+```
+
+Tunnel targets are named after the tunnel directory, e.g. `TcpConnector`,
+`UdpConnector`, `TcpListener`, `TlsClient`, `MuxClient`.
+
+The configured tree lives in `build/linux/`, and the binary is produced per
+configuration, e.g. `build/linux/Release/Waterwall` (also `Debug/` and
+`RelWithDebInfo/`). Other preset trees exist under `build/` (`linux-gcc-x64`,
+`linux-clang-x64`, `linux-asan`, and more); do not mix them within a single
+verification flow.
+
+### Build Rules
+
+- Do **not** run `cmake --build build ...` against an arbitrary `build/` tree
+  unless you have confirmed it is a healthy preset-created tree you intend to use.
+- Do **not** mix build trees (`build/`, `build/linux`, `build/linux-gcc-x64`)
+  inside one verification flow — you can end up testing a stale binary.
+- Prefer preset target builds over root-tree builds.
+
+## Testing
+
+Tests are registered with CTest under names like `waterwall.<case>` and are driven
+by the harness in `tests/`. Each integration case lives in `tests/cases/<case>/`.
+
+Run the full suite:
+
+```bash
+ctest --preset linux --output-on-failure
+```
+
+Run one case by its registered name (use an anchored regex):
+
+```bash
+ctest --preset linux --output-on-failure -R '^waterwall\.tls_roundtrip$'
+```
+
+To run a single integration case directly while debugging — passing the binary,
+the case directory, and a timeout in seconds:
+
+```bash
+tests/run_waterwall_case.sh \
+  build/linux/Release/Waterwall \
+  tests/cases/tls_roundtrip \
+  60
+```
+
+There are many roundtrip cases to model new tests on, including
+`encryption_roundtrip`, `mux_*_roundtrip`, `http1_*` / `http2_*`,
+`packets_stream_bridge_roundtrip`, and the `ping_*_roundtrip` family. Pick the one
+closest to your tunnel and copy its shape.
+
+:::tip Write a test that would fail if direction were reversed
+The highest-value test for a flow or packet change is one that breaks if you swap
+upstream/downstream handling. For paired tunnels (client/server, encode/decode),
+that single assertion catches the most common regression in this codebase. See the
+direction rules in [Part 2](./part2-lines-and-callbacks.mdx) and
+[Part 4](./part4-packet-tunnels.mdx).
+:::
+
+## Syntax-Only Checks
+
+Do not hand-assemble compile commands. If you need a single-file or syntax-only
+compile, take the **exact** flags for that file from the generated
+`build/linux/compile_commands.json`.
+
+:::warning The `structure.h` collision trap
+Every tunnel has a tunnel-local header named `include/<Tunnel>/structure.h`. If you
+write a manual compile command that adds several tunnels' `include/` directories
+at once, the wrong `structure.h` can be picked up silently, producing confusing
+errors or — worse — a build that links the wrong layout. Validate one tunnel in
+isolation, or preserve the target's original include order from
+`compile_commands.json`. This is the single biggest reason to avoid hand-rolled
+compiles.
+:::
+
+Common manual-compile failure modes: missing generated dependency headers, wrong
+build-tree include roots, and the `structure.h` collision above.
+
+## When the Compiler Itself Crashes
+
+There is a known build-environment issue where an ad-hoc or non-preset build tree
+can trigger a GCC internal compiler error, for example:
+
+```text
+internal compiler error: Bus error
+```
+
+This often happens while compiling **core** files such as `ww/libc/wlibc.c` —
+before your edited tunnel is even reached.
+
+Treat a GCC ICE / bus error as a **build-environment problem first**, not as
+evidence that your tunnel code is wrong. Do not start debugging tunnel source over
+it.
+
+### Fallback Strategy When Compilation Is Blocked
+
+Work down this list:
+
+1. `cmake --preset linux`
+2. `cmake --build --preset linux --target <ChangedTargets> -j8`
+3. `cmake --build --preset linux -j8`
+4. If GCC still crashes, report it as a compiler/build-environment issue.
+5. Continue with the strongest verification that still works:
+   - preset-based target builds,
+   - syntax-only checks using `build/linux/compile_commands.json`,
+   - focused code review against the contracts in this guide.
+
+Summary of build priorities:
+
+- prefer the `linux` preset,
+- prefer preset target builds over the root `build/` tree,
+- prefer `build/linux/compile_commands.json` over guessed compile flags,
+- treat a GCC ICE / bus error as an environment problem first.
+
+## The Review Checklist
+
+Before merging a tunnel change, confirm every item that applies:
+
+**Lifecycle and direction**
+
+- `Init` initializes this tunnel's line state before any callback can use it.
+- Upstream callbacks are forwarded only with `tunnelNextUpStream*`.
+- Downstream callbacks are forwarded only with `tunnelPrevDownStream*`.
+- No `initialized` flag was added that the source does not require.
+
+**Line safety**
+
+- Every re-entrant callback either returns immediately or protects the line
+  (`withLineLocked()` / manual lock + `lineIsAlive()`).
+- On a `false` from `withLineLocked()`, the code does not touch `line`, line state,
+  or `LinestateDestroy()`.
+- Only the line **owner** calls `lineDestroy()`.
+
+**Finish**
+
+- `Finish` destroys local state before propagating a real close.
+- Middle-tunnel teardown finishes upstream first, then downstream, then returns.
+- `Pause`/`Resume` are blocked from reflecting toward a finished side.
+- If final protocol bytes are sent during `Finish`, the sender side is marked
+  finished before the send.
+
+**Buffers and padding**
+
+- Every prepend fits inside the tunnel's advertised `required_padding_left`.
+- `sbufShiftLeft()` is only used when enough left capacity exists.
+- Buffers are recycled exactly on the paths that still own them; none leak.
+
+**Packet semantics (if applicable)**
+
+- Packet lines are kept alive during normal runtime.
+- Packet-line state is treated as worker-local shared state.
+- Packet-line init source (node manager vs. manual `onStart`) is verified.
+
+**Validation**
+
+- Tests exercise the intended callback direction.
+- Validation used preset build metadata, not guessed compiler flags.
+
+## Common Pitfalls (Master List)
+
+A consolidated list of the failure modes this guide exists to prevent:
+
+- Accessing tunnel line state after `LinestateDestroy()` (or reading zeroed
+  fields).
+- Adding `initialized` flags to compensate for unsafe control flow.
+- Touching `line_t*` after an inter-tunnel callback without protection.
+- Calling `tunnelNext*` vs `tunnelPrev*` in the wrong direction.
+- Reflecting `Pause`/`Resume`/`Finish` back toward a finished direction.
+- Emitting `Est`, `Pause`, `Resume`, or `Finish` at the wrong time.
+- Keeping a line alive across `Finish` without `lineLock()`.
+- Forgetting that `lineDestroy()` expects tunnel states to be zeroed unless the
+  refcount is still positive.
+- Leaking buffers when a callback kills the line.
+- Misusing `sbufShiftLeft()` or ignoring `required_padding_left`.
+- Behavior that only works in one chain arrangement but breaks general
+  composition.
+- Treating packet-line state as per-connection state, or destroying packet lines
+  at runtime.
+- Hand-assembling compile commands when preset build metadata exists.
+
+## Expected Output From a Coding Agent
+
+When an AI coding agent works on WaterWall, its response should follow this
+structure. The format forces the important contracts into the open; a change that
+cannot articulate them is not ready.
+
+1. **Understanding** — a brief statement of the relevant tunnel flow (draw the
+   chain, mark directions, name the line owner).
+2. **The change** — the bug or requested feature, precisely.
+3. **How it stays correct** — how the change preserves:
+   - lifecycle ordering,
+   - line safety,
+   - direction ownership,
+   - buffer and padding rules,
+   - packet-line semantics (if relevant).
+4. **Implementation** — the actual change, matching the closest mature tunnel
+   pattern.
+5. **Validation** — commands run, build result, tests, and any fallback checks.
+6. **Risks** — remaining edge cases or follow-ups.
+
+If something is unclear, infer conservatively from the source and existing
+WaterWall patterns. Do not invent a new lifecycle model.
+
+---
+
+This is the end of the WaterWall Developer Guide. Return to
+**[Part 1: Overview & Mental Model](./doc1.mdx)** for the map of all six parts.

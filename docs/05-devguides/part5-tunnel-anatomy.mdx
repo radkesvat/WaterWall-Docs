@@ -1,0 +1,271 @@
+---
+sidebar_position: 5
+title: "Developer Guide Part 5: Anatomy of a Tunnel & Workflow"
+sidebar_label: "Part 5: Anatomy & Workflow"
+description: "The on-disk layout of a WaterWall tunnel, what each file owns, node.c metadata, the create/line-state patterns, HTTP constraints, and the implementation workflow."
+---
+
+# Part 5: Anatomy of a Tunnel & Workflow
+
+This part maps the contracts from Parts 1-4 onto the actual files you edit. Once
+you know which file owns which responsibility, adding or fixing a tunnel becomes
+mechanical: change the smallest thing in the right place and keep the lifecycle
+intact.
+
+## Directory Layout
+
+Most tunnels follow this shape (this is the real layout of `TcpListener`,
+`TlsClient`, `MuxClient`, and the `template`):
+
+```text
+tunnels/MyTunnel/
+  CMakeLists.txt
+  description.md
+  include/MyTunnel/
+    interface.h          # public WW_EXPORT API + all callback prototypes
+    structure.h          # tstate / lstate structs, size enums, helpers
+  instance/
+    create.c             # tunnelCreate(), assign callbacks, parse + validate settings
+    node.c               # node metadata: type, flags, layer group, padding, createHandle
+    chain.c              # onChain hook (usually delegates to the default)
+    index.c              # onIndex hook (usually delegates to the default)
+    prepair.c            # onPrepare hook
+    start.c              # onStart hook
+    stop.c               # onStop hook
+    destroy.c            # onDestroy hook: free state, then tunnelDestroy()
+    api.c                # runtime API entry (tunnelApi)
+  common/
+    helpers.c            # shared protocol/state-machine helpers
+    line_state.c         # initialize + destroy per-line state
+  upstream/
+    init.c  est.c  payload.c  pause.c  resume.c  fin.c
+  downstream/
+    init.c  est.c  payload.c  pause.c  resume.c  fin.c
+```
+
+:::note Real layout vs. the old summary
+Two details matter in practice: every tunnel has an `instance/api.c`, and the
+prepare hook file is spelled **`prepair.c`** (the function is `...OnPrepair`). The
+upstream/downstream finish files are `fin.c`, not `finish.c`.
+:::
+
+The split into one file per `{direction}/{event}` keeps each callback small.
+Shared protocol logic and the state machine live in `common/helpers.c` so the
+callback files stay readable. Follow that convention; reviewers expect it.
+
+## What Each File Owns
+
+| File | Responsibility |
+| --- | --- |
+| `instance/node.c` | Returns the `node_t` describing this tunnel type: `type`, `version`, `createHandle`, `flags`, `required_padding_left`, `layer_group`, and neighbor layer constraints. |
+| `instance/create.c` | `tunnelCreate(node, sizeof(tstate), sizeof(lstate))`, assign the twelve flow callbacks and the lifecycle hooks, parse and validate JSON settings, allocate per-worker resources, clean up on any failure. |
+| `instance/chain.c` / `index.c` | The `onChain` / `onIndex` hooks. Most tunnels keep the framework defaults; adapter stubs here may just abort to prove the default is used. |
+| `instance/prepair.c` / `start.c` / `stop.c` | `onPrepare` / `onStart` / `onStop`. Begin/stop real work; bootstrap packet lines in `onStart` when needed (see [Part 4](./part4-packet-tunnels.mdx)). |
+| `instance/destroy.c` | `onDestroy`: free settings, SSL contexts, pools, thread-local arrays, then call `tunnelDestroy(t)`. |
+| `instance/api.c` | The `tunnelApi` runtime entry. It receives an `sbuf_t` message, must recycle it, and returns an `api_result_t`. |
+| `common/line_state.c` | `LinestateInitialize` (called from `Init`) and `LinestateDestroy` (zeroes the aligned line-state region). |
+| `common/helpers.c` | Shared protocol parsing, framing, and the close/finish helpers used by the callback files. |
+| `upstream/*.c`, `downstream/*.c` | One flow callback each. Keep them thin; delegate to `helpers.c`. |
+| `include/MyTunnel/structure.h` | `mytunnel_tstate_t`, `mytunnel_lstate_t`, size enums, and small inline helpers. |
+| `include/MyTunnel/interface.h` | `WW_EXPORT` create/destroy/api prototypes plus every callback prototype. |
+
+## `node.c`: Declaring the Node
+
+`node.c` is where a tunnel announces itself to the runtime. Here is
+`TcpListener`'s, which is a good template for an adapter:
+
+```c
+node_t nodeTcpListenerGet(void)
+{
+    const char *type_name = "TcpListener";
+    node_t node = {
+        .type                  = stringDuplicate(type_name),
+        .hash_type             = calcHashBytes(type_name, stringLength(type_name)),
+        .version               = 0001,
+        .createHandle          = tcplistenerTunnelCreate,
+        .flags                 = kNodeFlagChainHead,
+        .required_padding_left = 0,
+        .layer_group           = kNodeLayer4,
+        .layer_group_next_node = kNodeLayerAnything,
+        .layer_group_prev_node = kNodeLayerAnything,
+        .can_have_next         = true,
+        .can_have_prev         = true,
+    };
+    return node;
+}
+```
+
+The fields you will set most often (all defined in `ww/objects/node.h`):
+
+| Field | Meaning |
+| --- | --- |
+| `type` / `hash_type` | The string used in JSON `"type"`, plus its precomputed hash. |
+| `createHandle` | The `TunnelCreateHandle` that builds the instance. |
+| `flags` | One or more `node_flags`: `kNodeFlagChainHead`, `kNodeFlagChainEnd`, `kNodeFlagNoChain`, `kNodeFlagSingleton`. |
+| `required_padding_left` | Left-padding budget this tunnel may prepend into (see [Part 3](./part3-buffers-and-padding.mdx)). |
+| `layer_group` | `kNodeLayer3` (packet), `kNodeLayer4` (stream), or `kNodeLayerAnything`. A `kNodeLayer3` node makes the chain a packet chain (allocates packet lines). |
+| `layer_group_next_node` / `layer_group_prev_node` | Which layer a neighbor is allowed to be; the loader validates these. |
+| `can_have_next` / `can_have_prev` | Whether a neighbor is permitted on each side. |
+
+### Node Flags
+
+| Flag | Meaning |
+| --- | --- |
+| `kNodeFlagChainHead` | May start a chain (an ingress adapter). |
+| `kNodeFlagChainEnd` | May end a chain (an egress adapter). |
+| `kNodeFlagNoChain` | Works without being in a chain (e.g. a database/user-auth node). |
+| `kNodeFlagSingleton` | Only one instance allowed in the whole config. |
+
+## `create.c`: Building the Instance
+
+`create.c` is the only place a tunnel is allocated. The pattern, distilled from
+`TlsClient`:
+
+1. `tunnel_t *t = tunnelCreate(node, sizeof(tstate), sizeof(lstate));`
+2. Assign all twelve flow callbacks and the lifecycle hooks.
+3. Read settings from `node->node_settings_json`, validating each one.
+4. Allocate per-worker resources (e.g. one SSL context per worker).
+5. **On any failure, clean up and bail out** — destroy partial state and the
+   tunnel, return `NULL`.
+
+The cleanup discipline is real and worth copying. `TlsClient` frees the tunnel
+state and the tunnel itself on every error edge:
+
+```c
+tunnel_t *tlsclientTunnelCreate(node_t *node)
+{
+    tunnel_t *t = tunnelCreate(node, sizeof(tlsclient_tstate_t), sizeof(tlsclient_lstate_t));
+    configureTunnelCallbacks(t);
+
+    tlsclient_tstate_t *ts       = tunnelGetState(t);
+    const cJSON        *settings = node->node_settings_json;
+
+    if (! getandvalidateSniSetting(ts, settings, t))
+    {
+        return NULL;   // helper already destroyed t
+    }
+    // ... more validated settings ...
+
+    if (! createSslContextPool(&ts->threadlocal_ssl_contexts, /* ... */))
+    {
+        tlsclientTunnelstateDestroy(ts);
+        tunnelDestroy(t);
+        return NULL;
+    }
+
+    return t;
+}
+```
+
+Use the project's JSON helpers (`getStringFromJsonObject`,
+`getBoolFromJsonObjectOrDefault`, `getIntFromJsonObjectOrDefault`, etc.) and
+`LOGF` a clear message on bad config — misconfiguration should fail loudly at
+startup, not silently at runtime.
+
+## `structure.h`: tstate and lstate
+
+`structure.h` defines the two state structs and their sizes. Keep settings and
+runtime fields clearly grouped, as `TlsClient` does:
+
+```c
+typedef struct tlsclient_tstate_s
+{
+    // settings (parsed once in create.c)
+    char *sni;
+    char *alpn;
+    bool  verify;
+    // runtime, shared across all lines
+    SSL_CTX **threadlocal_ssl_contexts;   // one per worker
+} tlsclient_tstate_t;
+
+typedef struct tlsclient_lstate_s
+{
+    SSL           *ssl;
+    BIO           *rbio;
+    BIO           *wbio;
+    buffer_queue_t bq;
+    bool           handshake_completed;
+    bool           resources_released;
+} tlsclient_lstate_t;
+```
+
+Per-worker arrays (like `threadlocal_ssl_contexts`) live in **tstate** and are
+indexed by `getWID()`. Per-connection state lives in **lstate**.
+
+## `line_state.c`: Initialize and Destroy
+
+Line state is initialized in `Init` and destroyed exactly once. The destroy
+function must zero the **aligned** region so the line-free debug assertion
+(`debugAssertZeroBuf`, see [Part 2](./part2-lines-and-callbacks.mdx)) is satisfied:
+
+```c
+void templateLinestateInitialize(template_lstate_t *ls)
+{
+    // set up this connection's state
+}
+
+void templateLinestateDestroy(template_lstate_t *ls)
+{
+    memoryZeroAligned32(ls, tunnelGetCorrectAlignedLineStateSize(sizeof(template_lstate_t)));
+}
+```
+
+Rules (from [Part 2](./part2-lines-and-callbacks.mdx), restated where you write the
+code):
+
+- Initialize in `Init`; later callbacks assume the state exists.
+- Destroy once; after `LinestateDestroy()` consider the state dead and zeroed.
+- Never read a field after destroying the state.
+- Do not add an `initialized` boolean unless the source proves it is required.
+
+## HTTP-Specific Rules
+
+If you work on `HttpClient` or `HttpServer`, these source-backed constraints
+apply:
+
+- WaterWall targets HTTP/1.x and **single-stream** HTTP/2 only. Do not add HTTP/3.
+  Do not support more than one logical HTTP/2 stream. If a peer opens extra
+  streams, reject or ignore them conservatively per the existing design.
+- **h2c upgrade** (`nghttp2_session_upgrade2()`): stream `1` is the original
+  upgraded request. The client must not submit a second synthetic request on
+  stream `1`; the server must not auto-generate a fake synthetic response on
+  stream `1`.
+- **h2c with a request body**: upgrade-with-body on the original HTTP/1.1 request
+  is not safely supported in the single-stream design. The client should reject
+  it; the server should ignore or reject an upgrade whose HTTP/1.1 request carries
+  a body.
+- **Clean finish**: an upstream `Finish` for the request side may require final
+  HTTP bytes first. Send them while holding a line reference, then destroy local
+  state, then forward the real `Finish` — the general final-bytes pattern from
+  [Part 2](./part2-lines-and-callbacks.mdx). Do not keep HTTP line state alive
+  after a clean finish unless you intentionally locked the line for that purpose.
+
+## The Implementation Workflow
+
+Use this order for any new feature or fix:
+
+1. **Draw the chain flow.** Mark the Up-end and Down-end, and label which callback
+   direction owns the transformation.
+2. **Identify the line owner.** Which tunnel creates and destroys the line?
+3. **Read the existing tunnel** and its immediate neighbors.
+4. **Read the contracts:** `ww/net/line.h`, `ww/net/tunnel.h`, and
+   `ww/net/chain.c`.
+5. **If framing/prepending is involved,** read `ww/bufio/shiftbuffer.h` and
+   `buffer_pool.h`, plus nearby tunnels' `node.c` padding.
+6. **Pick the closest mature tunnel pattern** and stay close to it.
+7. **Implement the smallest change** that preserves composition.
+8. **Add or update a focused test** for any behavior that can regress —
+   especially one that would fail if a direction were reversed.
+9. **Validate** with the preset build and the relevant tests (see
+   [Part 6](./part6-build-test-review.mdx)).
+
+:::warning Avoid speculative abstractions
+A new generic layer is rarely the fix here. Correctness comes from matching the
+existing lifecycle, not from a cleverer abstraction. If you find yourself
+introducing a new lifecycle concept to make one tunnel work, stop and re-read the
+closest reference tunnel.
+:::
+
+---
+
+Continue to **[Part 6: Building, Testing & Reviewing](./part6-build-test-review.mdx)**.

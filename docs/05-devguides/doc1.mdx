@@ -1,25 +1,46 @@
 ---
 sidebar_position: 1
-title: "WaterWall Developer Guide"
-sidebar_label: "Developer Guide"
-description: "Source-oriented guide for safely implementing, fixing, and reviewing WaterWall tunnels."
+title: "Developer Guide Part 1: Overview & Mental Model"
+sidebar_label: "Part 1: Overview & Mental Model"
+description: "The runtime model, core objects, callback directions, and tunnel lifecycle you must understand before changing any WaterWall tunnel."
 ---
 
 # WaterWall Developer Guide
 
-This guide is for people and coding agents who implement, fix, or review
-tunnels under `tunnels/`. WaterWall is a chain-based tunneling runtime, so a
-correct tunnel is not just a parser or encoder. It must preserve callback
-direction, line lifetime, per-line state, buffer padding, packet-line behavior,
-and composability with whatever nodes appear before or after it.
+This is a source-oriented guide for people and coding agents who implement, fix,
+or review tunnels under [`tunnels/`](https://github.com/radkesvat/WaterWall). It
+is split into six parts. This page (Part 1) builds the mental model. The
+remaining parts go deep on the contracts you must not break.
 
+WaterWall is a chain-based tunneling runtime, so a correct tunnel is never "just"
+a parser or an encoder. A tunnel must preserve **callback direction**, **line
+lifetime**, **per-line state**, **buffer padding**, **packet-line behavior**, and
+**composability** with whatever nodes happen to sit before or after it in a
+user's configuration.
+
+:::tip The single most important rule
 Do not design a new lifecycle model for one tunnel. Start from the runtime
-contracts in `ww/net/`, then copy the shape of mature tunnels that already solve
-similar problems.
+contracts in [`ww/net/`](https://github.com/radkesvat/WaterWall/tree/main/ww/net),
+then copy the shape of a mature tunnel that already solves a similar problem.
+In this codebase, correctness comes from matching the existing lifecycle pattern,
+not from inventing a more general one.
+:::
+
+## How This Guide Is Organized
+
+| Part | Topic | When you need it |
+| --- | --- | --- |
+| **Part 1 (this page)** | Overview, core objects, directions, lifecycle | Always read first |
+| [Part 2: Lines, Callbacks & Lifetime Safety](./part2-lines-and-callbacks.mdx) | `Init`/`Est`/`Payload`/`Pause`/`Resume`/`Finish`, re-entrancy, locking, clean close | Any change that touches connection flow |
+| [Part 3: Buffers, Padding & Shift Buffers](./part3-buffers-and-padding.mdx) | `sbuf_t`, buffer pools, `required_padding_left`, prepending headers | Any change that frames, prepends, or rewrites payload |
+| [Part 4: Packet Lines & Packet Tunnels](./part4-packet-tunnels.mdx) | Packet-line semantics, pure packet tunnels, packet/stream bridges | Any layer-3 / packet work |
+| [Part 5: Anatomy of a Tunnel & Workflow](./part5-tunnel-anatomy.mdx) | Directory layout, `node.c` metadata, `create.c`, line state, HTTP rules | When you add or restructure a tunnel |
+| [Part 6: Building, Testing & Reviewing](./part6-build-test-review.mdx) | CMake presets, ctest, validation, review checklist, agent output | Before you call a change "done" |
 
 ## Read These Files First
 
-Before changing tunnel behavior, read the source that owns the contract:
+Before changing tunnel behavior, read the source that owns the contract. These
+are short, dense, and authoritative.
 
 | Area | Files |
 | --- | --- |
@@ -31,466 +52,273 @@ Before changing tunnel behavior, read the source that owns the contract:
 | Buffer pools | `ww/bufio/buffer_pool.h`, `ww/bufio/buffer_pool.c` |
 | Node metadata | `ww/objects/node.h` |
 
-Good reference tunnels:
+## Good Reference Tunnels
 
-- `TcpListener` and `TcpConnector` for adapter behavior.
-- `TlsClient` and `EncryptionClient` for stateful protocol wrapping.
-- `MuxClient` for internal line ownership and re-entrant safety.
-- `PacketsToStream`, `StreamToPackets`, and `PacketsToConnection` for packet to
-  stream boundaries.
-- `PingClient` and `PingServer` for packet-tunnel direction decisions.
+Pick the closest existing pattern and stay near it. These tunnels are mature and
+exercise specific contracts cleanly:
 
-## Runtime Model
+| Reference | Read it for |
+| --- | --- |
+| `TcpListener`, `TcpConnector` | Adapter behavior: a real socket on one end, line creation/destruction |
+| `TlsClient`, `EncryptionClient` | Stateful protocol wrapping, per-line state, clean finish with final bytes |
+| `MuxClient` | Internal line ownership, parent/child lines, re-entrant safety |
+| `PacketsToStream`, `StreamToPackets`, `PacketsToConnection` | Packet-to-stream boundaries and packet-line anchored bridges |
+| `PingClient`, `PingServer` | Packet-tunnel direction decisions (paired tunnels in opposite directions) |
+| `template` | The minimal skeleton every tunnel starts from |
 
-WaterWall chains tunnel instances together. A typical stream chain looks like:
+## The Runtime Model
+
+WaterWall composes **tunnel instances** into an ordered **chain**. A typical
+stream chain looks like this:
 
 ```text
 TcpListener -> ObfuscatorClient -> TlsClient -> TcpConnector
 ```
 
-The first and last nodes are usually adapters. They touch sockets, TUN devices,
-or other operating-system resources. Middle tunnels must stay composable: they
-transform callbacks and payloads without assuming which adapter is on either
-side.
+The first and last nodes are usually **adapters**. They own an operating-system
+resource: a TCP socket, a UDP socket, a TUN device, a raw socket, and so on. They
+are the only nodes that read from or write to the outside world.
 
-The important runtime objects are:
+Everything between the adapters is a **middle tunnel**. Middle tunnels must stay
+**composable**: they transform callbacks and payloads without assuming which
+adapter is on either side. A middle tunnel that only works when a specific
+adapter sits next to it is broken, even if its own tests pass.
 
-| Object | Meaning |
+```text
+ -------------- chain --------------------------------------------------
+
+   ------------          ------------          ------------
+   |          | -- up -> |          | -- up -> |          |
+   | Tunnel 1 |          | Tunnel 2 |          | Tunnel 3 |
+   |          | <- down- |          | <- down- |          |
+   ------------          ------------          ------------
+   (adapter)              (middle)              (adapter)
+
+ -----------------------------------------------------------------------
+```
+
+Each connection is one `line_t`. A line has two ends, described in
+`ww/net/line.h` as `Down-end <----> Up-end`. The chain head (first adapter) faces
+the Down-end; the chain tail (last adapter) faces the Up-end. Backpressure is
+symmetric: if a write on the Down-end blocks, the Up-end is paused, and vice
+versa.
+
+## The Four Core Objects
+
+| Object | What it is |
 | --- | --- |
-| `node_t` | Parsed configuration plus metadata such as `type`, `next`, flags, layer group, and `required_padding_left`. |
-| `tunnel_t` | Runtime instance of a node. It stores callback function pointers, `next` and `prev`, tunnel state, line-state size, and chain offsets. |
-| `line_t` | One normal connection line, logical line, or worker packet line. It stores routing context, user markers, buffer pools, refcount, alive flag, and all tunnels' per-line state. |
-| `tunnel_chain_t` | Ordered set of tunnels. During finalization it computes total line-state size, total left padding, and worker packet lines. |
+| `node_t` | Parsed configuration plus metadata: `type`, `next`, `flags`, `layer_group`, `required_padding_left`, `createHandle`. One per node in the JSON config. Defined in `ww/objects/node.h`. |
+| `tunnel_t` | The runtime instance of a node. Holds the twelve callback function pointers, `next`/`prev` links, tunnel state, line-state size, and chain offsets. Defined in `ww/net/tunnel.h`. |
+| `line_t` | One connection: a normal connection line, a logical line, or a worker packet line. Holds routing context, user/auth markers, the owning worker id, a refcount, an `alive` flag, and **every tunnel's per-line state**. Defined in `ww/net/line.h`. |
+| `tunnel_chain_t` | The ordered set of tunnels. During finalization it computes total line-state size, total left padding, and the per-worker packet lines. Defined in `ww/net/chain.h`. |
 
-Each tunnel can have:
+### Tunnel State vs Line State
 
-- tunnel state: one `tstate` for the tunnel instance
-- line state: one `lstate` slot per `line_t`
+Each tunnel can own two kinds of state:
 
-Access them with the existing helpers:
+- **Tunnel state (`tstate`)** — one block per tunnel instance, shared by every
+  connection that flows through it. Size is fixed at `tunnelCreate()` time.
+- **Line state (`lstate`)** — one slot per `line_t`, private to this tunnel for
+  that one connection.
 
-```c
-my_tstate_t *ts = tunnelGetState(t);
-my_lstate_t *ls = lineGetState(line, t);
-```
-
-## Callback Directions
-
-Direction ownership is the first rule to get right.
-
-| Flow | Meaning | Forward with |
-| --- | --- | --- |
-| Upstream | request, outbound, forward path | `tunnelNextUpStream*` |
-| Downstream | response, inbound, backward path | `tunnelPrevDownStream*` |
-
-For payloads:
+Access them with the existing helpers (never reach into the structs by hand):
 
 ```c
-tunnelNextUpStreamPayload(t, line, buf);
-tunnelPrevDownStreamPayload(t, line, buf);
+my_tstate_t *ts = tunnelGetState(t);        // tunnel-wide state
+my_lstate_t *ls = lineGetState(line, t);    // this tunnel's state for this line
 ```
 
-For lifecycle:
-
-```c
-tunnelNextUpStreamInit(t, line);
-tunnelNextUpStreamFinish(t, line);
-
-tunnelPrevDownStreamEst(t, line);
-tunnelPrevDownStreamFinish(t, line);
-```
-
-Do not reverse these because a server-side tunnel "feels opposite." Draw the
-actual chain and decide which callback direction owns the transformation.
-
-## Line Startup
-
-A normal connection starts with `Init`.
-
-1. An adapter creates a `line_t`.
-2. The adapter calls `tunnelNextUpStreamInit()`.
-3. Each tunnel initializes its own line state.
-4. The final adapter starts the real network operation.
-
-`Init` is not isolated. A downstream tunnel can synchronously call back into
-`Payload`, `Est`, `Pause`, `Resume`, or `Finish` before `Init` returns.
-
-Rules:
-
-- Initialize this tunnel's line state in `Init`.
-- Later callbacks should assume that state exists.
-- Do not add an `initialized` flag to hide unsafe control flow.
-- If you call a re-entrant callback and then still need the line, protect it.
-
-## Line Lifetime
-
-`line_t` has a refcount and an `alive` flag. `lineLock()` prevents immediate
-freeing, but it does not mean the line is still logically alive after a callback.
-Check `lineIsAlive()` when you need to continue after a re-entrant call.
-
-Only the tunnel that created a line may destroy it with `lineDestroy()`.
-
-Common creators:
-
-- adapters such as `TcpListener`, `UdpListener`, and `TcpConnector`
-- selected middle tunnels such as `MuxServer`, `ReverseClient`,
-  `PacketsToStream`, and `PacketsToConnection`
-
-Everyone else must propagate `Finish` and let the owner destroy the line.
-
-`lineDestroy()` eventually asserts that tunnel line states are already zeroed
-unless something still holds a positive reference. That is why local state must
-usually be destroyed before propagating a real line-closing finish.
-
-## Re-entrant Callback Safety
-
-Treat inter-tunnel callbacks as dangerous. These calls can indirectly close the
-line before control returns:
-
-- `tunnelNextUpStreamInit`
-- `tunnelNextUpStreamPayload`
-- `tunnelPrevDownStreamPayload`
-- `tunnelNextUpStreamPause`
-- `tunnelPrevDownStreamPause`
-- `tunnelNextUpStreamResume`
-- `tunnelPrevDownStreamResume`
-- `tunnelNextUpStreamEst`
-- `tunnelPrevDownStreamEst`
-
-Prefer `withLineLocked()` or `withLineLockedWithBuf()` when you need to continue
-after a callback:
-
-```c
-if (! withLineLocked(line, tunnelNextUpStreamInit, t))
-{
-    return;
-}
-
-/* The line is still alive here. Re-read state if needed. */
-my_lstate_t *ls = lineGetState(line, t);
-```
-
-For payload forwarding:
-
-```c
-if (! withLineLockedWithBuf(line, tunnelNextUpStreamPayload, t, buf))
-{
-    return;
-}
-```
-
-If a helper returns `false`, do not touch `line`, do not touch this tunnel's
-line state, and do not call the line-state destroy function just to "clean up."
-The close path that killed the line is responsible for that cleanup. Only reuse
-buffers that you still own.
-
-Use manual locking when the sequence needs explicit control:
-
-```c
-lineLock(line);
-
-/* call one or more potentially re-entrant callbacks */
-
-if (! lineIsAlive(line))
-{
-    lineUnlock(line);
-    return;
-}
-
-lineUnlock(line);
-```
-
-## Finish Semantics
-
-`Finish` is directional. Once a tunnel has received or sent finish for a
-direction, it must not send callbacks back toward that finished side for the same
-line.
-
-If a tunnel receives upstream finish, it must not reflect downstream callbacks
-back to the sender for that line. If a tunnel receives downstream finish, it must
-not reflect upstream callbacks back to the sender.
-
-A middle tunnel that decides to close the whole connection should usually:
-
-1. Destroy this tunnel's local line state.
-2. Send upstream finish first.
-3. Send downstream finish second.
-4. Return immediately.
-
-Do not read fields from `ls` after `myLinestateDestroy(ls)`.
-
-### Final Protocol Bytes
-
-Some protocols must send final bytes before closing, such as TLS `close_notify`,
-HTTP final chunks, HTTP/2 `END_STREAM`, WebSocket close frames, or custom
-trailers.
-
-The safe shape is:
-
-1. `lineLock(line)`.
-2. Mark the sender side as finished using existing directional state, such as
-   `prev_finished`, `next_finished`, `can_downstream`, or `can_upstream`.
-3. Send final protocol bytes toward the other side.
-4. Destroy this tunnel's local line state.
-5. Propagate the real WaterWall `Finish`.
-6. `lineUnlock(line)`.
-7. Return immediately.
-
-The directional mark matters because sending final bytes can trigger
-backpressure. For example, an adapter can emit `Pause` while writing the final
-frame. That `Pause` must not be forwarded back toward the side that already sent
-`Finish`.
-
-## Buffer and Padding Contract
-
-WaterWall uses `sbuf_t` buffers. A buffer has:
-
-- `curpos`: current payload start
-- `len`: current payload length
-- `capacity`: total allocation
-- `l_pad`: reserved left padding
-
-Tunnels can prepend headers efficiently with:
-
-```c
-assert(sbufGetLeftCapacity(buf) >= header_len);
-sbufShiftLeft(buf, header_len);
-```
-
-But a tunnel may only rely on padding it advertised in `node.c`:
-
-```c
-.required_padding_left = kMyProtocolHeaderSize,
-```
-
-During chain finalization, WaterWall sums `required_padding_left` across the
-chain and updates global buffer allocation padding. If you prepend bytes without
-advertising enough padding, the tunnel may only work in some chain layouts and
-break in others.
-
-Rules:
-
-- Use `sbufShiftLeft()` only when enough left capacity is available.
-- Keep prepended bytes within this tunnel's advertised padding budget.
-- Use buffer pools (`bufferpoolGetSmallBuffer`, `bufferpoolGetLargeBuffer`,
-  `lineGetBufferPool`, `lineReuseBuffer`) for ordinary runtime buffers.
-- If a callback takes ownership of a buffer, do not reuse it afterward.
-- If an error path still owns a buffer, return it to the line or pool before
-  closing.
-
-## Packet Lines
-
-Packet lines are real `line_t` objects, but they are not normal connection
-lines.
-
-When a chain contains a layer-3 packet node, `tunnelchainFinalize()` allocates
-one packet line per worker. These packet lines are persistent worker helper
-lines. They are destroyed when the chain is destroyed, not during normal packet
-processing.
-
-Do not call `lineDestroy()` on a packet line during normal runtime.
-
-Packet-line state is worker-local shared state. It is reused for unrelated
-packets on the same worker. Treat these fields as scratch packet-pipeline
-metadata:
-
-- `routing_context.src_ctx`
-- `routing_context.dest_ctx`
-- `recalculate_checksum`
-- any line state stored on the packet line
-
-Do not treat packet-line state as a per-flow or per-peer identity. If a packet
-tunnel needs per-connection behavior, create or manage normal lines behind the
-packet side instead.
-
-## Pure Packet Tunnels and Packet Bridges
-
-Pure packet tunnels are created with:
-
-```c
-packettunnelCreate(node, sizeof(my_tstate_t), 0);
-```
-
-`packettunnelCreate()` asserts that `lstate_size == 0`. These tunnels generally
-override packet payload callbacks and do not use connection-style line state.
-Examples include `IpOverrider`, `IpManipulator`, `PingClient`, `PingServer`, and
-`WireGuardDevice`.
-
-Packet-line anchored bridges are normal tunnels that use the worker packet line
-as an anchor for bridge state. Examples:
-
-- `PacketsToStream`
-- `StreamToPackets`
-- `PacketsToConnection`
-- `PacketSplitStream`
-
-For these tunnels, remember that packet-line `Init` is a worker/bootstrap event,
-not a per-packet open event. If a chain head is a layer-3 packet node, startup
-initialization sends one upstream `Init` per worker packet line. Some bridge
-topologies must trigger packet-line initialization manually in `onStart()`.
-
-## Packet Tunnel Direction Example
-
-Paired packet tunnels often transform in opposite callback directions. Do not
-copy the client's direction into the server unless the chain flow proves it.
-
-Example:
-
-```text
-PingClient:
-packet -> PingClient -> IPv4(ICMP(payload -> packet))
-
-PingServer:
-packet <- PingServer <- IPv4(ICMP(payload -> packet))
-```
-
-`PingClient` encapsulates on upstream payload and forwards with
-`tunnelNextUpStreamPayload()`. `PingServer` decapsulates on downstream payload
-and forwards with `tunnelPrevDownStreamPayload()`.
-
-Tests for packet tunnels should exercise the real intended direction. If the
-server side needs data from the opposite side, use `Bridge` or another existing
-composition tunnel instead of changing the tunnel contract.
-
-## Typical Tunnel Layout
-
-Most tunnels follow this shape:
-
-```text
-tunnels/MyTunnel/
-  CMakeLists.txt
-  description.md
-  include/MyTunnel/
-    interface.h
-    structure.h
-  instance/
-    create.c
-    node.c
-    chain.c
-    index.c
-    prepair.c
-    start.c
-    stop.c
-    destroy.c
-  common/
-    helpers.c
-    line_state.c
-  upstream/
-    init.c
-    payload.c
-    fin.c
-    pause.c
-    resume.c
-    est.c
-  downstream/
-    init.c
-    payload.c
-    fin.c
-    pause.c
-    resume.c
-    est.c
-```
-
-`node.c` declares node metadata, including layer group and padding. `create.c`
-creates the tunnel and assigns callbacks. `line_state.c` initializes and destroys
-per-line state. Callback files should stay small and delegate shared protocol
-work to `common/helpers.c` when that makes the state machine clearer.
-
-When you destroy line state, zero the correctly aligned line-state region, as
-existing tunnels do:
+How does `lineGetState()` find the right slot? During chain indexing, the runtime
+assigns each tunnel an `lstate_offset` and reserves `lstate_size` bytes inside
+every line (see `tunnelDefaultOnIndex` in `ww/net/tunnel.c`). `lineGetState()` is
+then just `line->tunnels_line_state + t->lstate_offset`. This is why **line state
+must be initialized in `Init`** and treated as dead after you destroy it: the
+memory is shared real estate inside the line, sized once for the whole chain.
+
+State sizes are cache-line aligned. When you zero line state, zero the *aligned*
+region, exactly as existing tunnels do:
 
 ```c
 memoryZeroAligned32(ls, tunnelGetCorrectAlignedLineStateSize(sizeof(my_lstate_t)));
 ```
 
-## Implementation Workflow
+## Callback Directions
 
-Use this workflow for new features and fixes:
+Direction ownership is the first thing to get right, and the most common thing
+to get wrong.
 
-1. Draw the chain flow and mark upstream and downstream directions.
-2. Identify which side owns line creation and destruction.
-3. Read the existing tunnel implementation and adjacent tunnels.
-4. Read `ww/net/line.h`, `ww/net/tunnel.h`, and `ww/net/chain.c`.
-5. If framing or prepending is involved, read shift-buffer and buffer-pool code.
-6. Choose the closest mature tunnel pattern and stay close to it.
-7. Implement the smallest change that preserves composition.
-8. Add or update a focused test case when behavior can regress.
-9. Validate with the preset build and relevant tests.
+| Flow | Meaning | Forward with |
+| --- | --- | --- |
+| **Upstream** | request, outbound, forward path (toward the Up-end / `next`) | `tunnelNextUpStream*` |
+| **Downstream** | response, inbound, backward path (toward the Down-end / `prev`) | `tunnelPrevDownStream*` |
 
-Avoid speculative abstractions. In this codebase, correctness usually comes from
-matching the existing lifecycle pattern, not from inventing a more generic one.
+Every tunnel exposes twelve flow callbacks, one per `{event} x {direction}`:
 
-## Build and Validation
-
-Prefer the `linux` CMake preset:
-
-```bash
-cmake --preset linux
-cmake --build --preset linux -j8
+```c
+fnInitU  fnEstU  fnPayloadU  fnPauseU  fnResumeU  fnFinU    // upstream handlers
+fnInitD  fnEstD  fnPayloadD  fnPauseD  fnResumeD  fnFinD    // downstream handlers
 ```
 
-For a focused tunnel build:
+You almost never call those pointers directly. You call the forwarding helpers,
+which simply invoke the matching handler on the neighbor:
 
-```bash
-cmake --build --preset linux --target TlsClient -j8
+```c
+// "Next, upstream": calls self->next->fnPayloadU(self->next, line, buf)
+tunnelNextUpStreamPayload(t, line, buf);
+
+// "Prev, downstream": calls self->prev->fnPayloadD(self->prev, line, buf)
+tunnelPrevDownStreamPayload(t, line, buf);
 ```
 
-For registered tests:
+Lifecycle forwarding follows the same naming:
 
-```bash
-ctest --preset linux --output-on-failure
-ctest --preset linux --output-on-failure -R '^waterwall\.tls_roundtrip$'
+```c
+tunnelNextUpStreamInit(t, line);      // start the rest of the chain forward
+tunnelNextUpStreamFinish(t, line);    // close the forward direction
+
+tunnelPrevDownStreamEst(t, line);     // tell the backward side it is established
+tunnelPrevDownStreamFinish(t, line);  // close the backward direction
 ```
 
-For one integration case while debugging:
+A tunnel that does not override a given callback gets the framework default,
+which is a pure pass-through to the neighbor in the same direction (see
+`tunnelDefaultUpStreamPayload` / `tunnelDefaultDownStreamPayload` in
+`ww/net/tunnel.c`). So an "obfuscation only on upstream" tunnel can leave its
+downstream payload handler at the default and let bytes flow straight through.
 
-```bash
-tests/run_waterwall_case.sh \
-  build/linux/Release/Waterwall \
-  tests/cases/tls_roundtrip \
-  60
+:::warning Do not reverse directions
+Do not flip these because a server-side tunnel "feels opposite." Draw the actual
+chain, mark the Up-end and Down-end, and decide which callback direction owns the
+transformation. Paired client/server tunnels frequently transform in **opposite**
+directions — see the `PingClient` / `PingServer` example in
+[Part 4](./part4-packet-tunnels.mdx).
+:::
+
+### Which Forwarding Function Do I Call?
+
+| You are handling... | and you want to send the event... | call |
+| --- | --- | --- |
+| anything | further up the chain (toward `next`) | `tunnelNextUpStream{Init,Payload,Est,Pause,Resume,Finish}` |
+| anything | back down the chain (toward `prev`) | `tunnelPrevDownStream{Init,Payload,Est,Pause,Resume,Finish}` |
+
+The mirror helpers `tunnelUpStream*` / `tunnelDownStream*` (without `Next`/`Prev`)
+invoke a handler on a tunnel **you hold a pointer to directly** — used when a
+tunnel drives a branch it bound below itself (a route target, fallback, or helper
+branch). Resolve such a branch's real entry with `tunnelGetBranchEntry()`; do not
+assume the raw node you were handed is the callable head.
+
+## The Tunnel Lifecycle
+
+A tunnel instance moves through a fixed set of lifecycle hooks. They are distinct
+from the per-connection flow callbacks above — these run at configuration,
+startup, and shutdown time, once per tunnel (or once per worker), not per packet.
+
+The runtime drives them in roughly this order (see the header comment in
+`ww/net/tunnel.h` and the defaults in `ww/net/tunnel.c`):
+
+```text
+createHandle(node)         // node.c -> create.c: allocate, assign callbacks, parse settings
+      |
+   onChain                 // bind to next/prev, insert into the chain (default walks node->next)
+      |
+   onIndex                 // assign chain_index + lstate_offset, reserve line-state bytes
+      |
+   onPrepare               // pre-start preparation (was "onChainingComplete")
+      |
+   onStart                 // chain is fully built; start real work / bootstrap packet lines
+      |
+    ...                     // runtime: flow callbacks run here
+      |
+   onStop  /  onWorkerStop // stop tunnel / stop per-worker resources
+      |
+   onDestroy               // free tunnel and its state
 ```
 
-Do not hand-assemble compile commands. If you need a syntax-only compile, use
-the exact command from `build/linux/compile_commands.json`. Be especially
-careful with tunnel-local headers named `structure.h`; adding multiple tunnel
-include directories to one manual command can silently include the wrong file.
+What each hook is for:
 
-If GCC reports an internal compiler error or bus error in unrelated core files
-such as `ww/libc/wlibc.c`, treat it as a build-environment or build-tree problem
-first. Reconfigure with the `linux` preset before debugging the tunnel code.
+| Hook | Default | Typical override |
+| --- | --- | --- |
+| `createHandle` | (required) | Allocate the tunnel with `tunnelCreate(node, sizeof(tstate), sizeof(lstate))`, wire up the twelve callbacks, parse and validate JSON settings, allocate per-worker resources. |
+| `onChain` | `tunnelDefaultOnChain` builds the chain by following `node->next` | Rarely overridden. Adapters keep the default. |
+| `onIndex` | `tunnelDefaultOnIndex` assigns the line-state offset | Rarely overridden. |
+| `onPrepare` | no-op | Pre-start setup that needs the chain to exist. |
+| `onStart` | no-op | Begin listening/connecting; bootstrap packet lines (see Part 4). |
+| `onStop` | no-op | Stop accepting work, begin teardown. |
+| `onWorkerStop` | no-op | Release worker-local resources for one worker id. |
+| `onDestroy` | `tunnelDestroy` frees the instance | Free settings, SSL contexts, pools, then call `tunnelDestroy`. |
 
-## Review Checklist
+Most tunnels only override `onPrepare`, `onStart`, `onStop`, and `onDestroy`, plus
+the flow callbacks. The chaining and indexing defaults are correct for almost
+everything; leave them alone unless the source of a reference tunnel proves you
+need otherwise.
 
-Before merging a tunnel change, check:
+## A Minimal Tunnel Skeleton
 
-- Does `Init` initialize this tunnel's line state before any callback can use it?
-- Are upstream callbacks forwarded only with `tunnelNextUpStream*`?
-- Are downstream callbacks forwarded only with `tunnelPrevDownStream*`?
-- Does every re-entrant callback either return immediately or protect the line?
-- Does `Finish` destroy local state before propagating a real close?
-- If final protocol bytes are sent during `Finish`, is the sender side marked
-  finished before the send?
-- Are `Pause` and `Resume` blocked from reflecting toward a finished side?
-- Does only the line owner call `lineDestroy()`?
-- Are packet lines kept alive during normal runtime?
-- Is packet-line state treated as worker-local shared state?
-- Does every prepend fit inside `required_padding_left`?
-- Are buffers recycled exactly on paths that still own them?
-- Are tests exercising the intended callback direction?
-- Did validation use preset build metadata instead of guessed compiler flags?
+Every tunnel starts from the same shape (this is the `template` tunnel's
+`create.c`, lightly trimmed):
 
-## Agent Output Expectations
+```c
+tunnel_t *templateTunnelCreate(node_t *node)
+{
+    tunnel_t *t = tunnelCreate(node, sizeof(template_tstate_t), sizeof(template_lstate_t));
 
-When using an AI coding agent on WaterWall, ask it to report:
+    t->fnInitU    = &templateTunnelUpStreamInit;
+    t->fnEstU     = &templateTunnelUpStreamEst;
+    t->fnFinU     = &templateTunnelUpStreamFinish;
+    t->fnPayloadU = &templateTunnelUpStreamPayload;
+    t->fnPauseU   = &templateTunnelUpStreamPause;
+    t->fnResumeU  = &templateTunnelUpStreamResume;
 
-1. Its understanding of the relevant tunnel flow.
-2. The bug or requested change.
-3. How the fix preserves lifecycle ordering, line safety, direction ownership,
-   buffer and padding rules, and packet-line semantics.
-4. The implementation summary.
-5. The validation commands and results.
-6. Remaining risks or edge cases.
+    t->fnInitD    = &templateTunnelDownStreamInit;
+    t->fnEstD     = &templateTunnelDownStreamEst;
+    t->fnFinD     = &templateTunnelDownStreamFinish;
+    t->fnPayloadD = &templateTunnelDownStreamPayload;
+    t->fnPauseD   = &templateTunnelDownStreamPause;
+    t->fnResumeD  = &templateTunnelDownStreamResume;
 
-That report format forces the important contracts into the open. If a proposed
-change cannot explain those contracts, it is not ready.
+    t->onPrepare = &templateTunnelOnPrepair;
+    t->onStart   = &templateTunnelOnStart;
+    t->onStop    = &templateTunnelOnStop;
+    t->onDestroy = &templateTunnelDestroy;
+
+    return t;
+}
+```
+
+Part 5 walks the full directory layout behind this skeleton, including `node.c`
+metadata, `line_state.c`, and where each callback lives.
+
+## What "Correct" Means Here
+
+A correct tunnel change preserves **all** of the following at once:
+
+- tunnel composability (works regardless of neighbors)
+- line lifecycle rules (init in `Init`, destroy once, owner-only destruction)
+- direction ownership (`Next*`/`Prev*` never reversed)
+- buffer padding assumptions (`required_padding_left` honored)
+- shift-buffer usage (`sbufShiftLeft` only with available left capacity)
+- lock / refcount safety (no use-after-free of `line_t` or line state)
+- packet-line semantics (worker-local, never destroyed at runtime)
+- existing chain behavior (no regression in other layouts)
+
+If a proposed change cannot explain how it preserves each of these, it is not
+ready. The rest of this guide is, in effect, a detailed expansion of that list.
+
+## Glossary
+
+| Term | Meaning |
+| --- | --- |
+| **Adapter** | A chain-head or chain-end tunnel that owns an OS resource (socket, TUN, raw socket). Creates and destroys lines. |
+| **Middle tunnel** | A non-adapter tunnel that transforms callbacks/payloads and must stay composable. |
+| **Line** | One `line_t`; a single connection (or a worker packet line). Holds all tunnels' per-line state. |
+| **Upstream** | The forward/outbound direction, toward `next` (the Up-end). |
+| **Downstream** | The backward/inbound direction, toward `prev` (the Down-end). |
+| **tstate** | Tunnel state: per-instance, shared across all lines. |
+| **lstate** | Line state: per-line, private to one tunnel. |
+| **Packet line** | A persistent, per-worker `line_t` used by layer-3 chains; not a per-connection line. |
+| **Re-entrancy** | An inter-tunnel callback synchronously calling back into your tunnel, possibly closing the line before control returns. |
+| **Reflection** | Incorrectly forwarding a callback back toward a direction that has already finished. A common crash source. |
+
+---
+
+Continue to **[Part 2: Lines, Callbacks & Lifetime Safety](./part2-lines-and-callbacks.mdx)**.

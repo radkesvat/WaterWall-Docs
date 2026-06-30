@@ -1,0 +1,398 @@
+---
+sidebar_position: 2
+title: "Developer Guide Part 2: Lines, Callbacks & Lifetime Safety"
+sidebar_label: "Part 2: Lines & Lifetime"
+description: "The connection lifecycle, re-entrancy hazards, line locking, and the clean-finish patterns that keep WaterWall tunnels free of use-after-free bugs."
+---
+
+# Part 2: Lines, Callbacks & Lifetime Safety
+
+This part covers the contracts that cause the most crashes when they are broken:
+the per-connection callback lifecycle, who owns a line, and how to survive the
+re-entrant callbacks that can destroy a line out from under you.
+
+If you read only one part of this guide before touching connection flow, read
+this one. Prerequisite: [Part 1](./doc1.mdx) (objects, directions, lifecycle).
+
+## The Six Flow Callbacks
+
+Every connection is driven by six events, each in two directions (upstream toward
+`next`, downstream toward `prev`):
+
+| Event | Meaning | Direction notes |
+| --- | --- | --- |
+| `Init` | A line is starting; initialize this tunnel's per-line state. | Flows upstream from the creating adapter. |
+| `Est` | The far side is actually established (e.g. the remote socket connected). | Usually flows downstream, back toward the originator. |
+| `Payload` | A chunk of data (`sbuf_t`) to transform and forward. | Either direction. |
+| `Pause` | Backpressure: stop sending in this direction for now. | Either direction. |
+| `Resume` | Backpressure released: you may send again. | Either direction. |
+| `Finish` | This direction is closing. | Directional and destructive. See below. |
+
+A tunnel implements only the handlers it cares about and leaves the rest at the
+framework default (a pass-through to the neighbor). For example, an encryptor
+overrides `Payload` in both directions but can leave `Pause`/`Resume` at default.
+
+## How a Line Starts
+
+A normal connection begins with `Init`, originated by an adapter:
+
+1. An adapter (e.g. `TcpListener`) accepts a socket and creates a `line_t`.
+2. It calls `tunnelNextUpStreamInit()`.
+3. That invokes the next tunnel's `fnInitU`, which initializes its own line state
+   and forwards `Init` further upstream.
+4. Each middle tunnel initializes its per-line state in turn.
+5. The final adapter (e.g. `TcpConnector`) starts the real network operation.
+
+:::danger Init is not isolated
+A tunnel's `Init` can synchronously trigger more callbacks **before it returns** —
+`Payload`, `Est`, `Pause`, `Resume`, or even `Finish` — because the downstream
+tunnel it called into may immediately push data back or close. This is the same
+re-entrancy hazard described below; it simply starts at line birth.
+:::
+
+Rules for `Init`:
+
+- Initialize **this tunnel's** line state in `Init`. Later callbacks are allowed
+  to assume that state already exists.
+- Do **not** add an `initialized` boolean to guard later callbacks. In the normal
+  WaterWall lifecycle `Init` always runs first for a tunnel; an `initialized`
+  flag is almost always a band-aid over unsafe control flow. Add one only if the
+  source clearly proves it is required.
+- If your `Init` calls a re-entrant forwarding helper and then still needs to
+  touch the line afterward, protect it (see [Line Locking](#protecting-a-line-across-re-entrant-callbacks)).
+  If your `Init` just forwards and returns, you do not need to lock.
+
+## Line Lifetime: refcount and `alive`
+
+A `line_t` carries an atomic `refc` and a boolean `alive` (see `ww/net/line.h`).
+These are two different ideas, and conflating them causes bugs:
+
+- `lineLock(line)` increments `refc`. It guarantees the memory will not be freed
+  while you hold the reference.
+- `lineUnlock(line)` decrements `refc`, freeing the line when it reaches zero.
+- `lineDestroy(line)` sets `alive = false` and drops the creator's reference.
+- `lineIsAlive(line)` reports whether the line is still **logically** open.
+
+The crucial distinction:
+
+> Holding a lock keeps the **memory** valid. It does **not** mean the line is
+> still logically alive. After a re-entrant callback, a locked line may be
+> `alive == false`. Always re-check `lineIsAlive()` before continuing.
+
+### Who May Destroy a Line
+
+Only the tunnel that **created** a line may call `lineDestroy()` on it. Common
+creators:
+
+- adapters such as `TcpListener`, `UdpListener`, `TcpConnector`
+- a few middle tunnels that legitimately create their own lines, such as
+  `MuxServer`, `ReverseClient`, `PacketsToStream`, and `PacketsToConnection`
+
+Every other tunnel must **propagate `Finish`** and let the owner destroy the
+line. Calling `lineDestroy()` on a line you did not create is a serious bug.
+
+There is also a debug invariant to respect: when a line is finally freed,
+`lineUnRefInternal()` asserts that every tunnel's line state is already zeroed
+(`debugAssertZeroBuf`). That is why each tunnel must destroy its own line state
+before the real line-closing `Finish` propagates — unless it is intentionally
+holding a positive reference across the close.
+
+## Protecting a Line Across Re-entrant Callbacks
+
+These inter-tunnel calls can indirectly close the line before they return. Treat
+every one of them as dangerous:
+
+```c
+tunnelNextUpStreamInit       tunnelNextUpStreamPayload
+tunnelPrevDownStreamInit     tunnelPrevDownStreamPayload
+tunnelNextUpStreamEst        tunnelNextUpStreamPause      tunnelNextUpStreamResume
+tunnelPrevDownStreamEst      tunnelPrevDownStreamPause    tunnelPrevDownStreamResume
+```
+
+After any of these returns:
+
+- the line may already be dead,
+- this tunnel's line state may already be destroyed and zeroed,
+- any code that touches `line` or `ls` is unsafe unless you protected the line.
+
+Never reason: *"the call returned, so my line state is still valid."*
+
+### Method A — `withLineLocked()` (preferred)
+
+`withLineLocked()` and `withLineLockedWithBuf()` hold a temporary reference across
+the callback and tell you whether the line survived. Their actual implementation
+(see `ww/net/line.h`) is:
+
+```c
+static inline bool withLineLocked(line_t *const line, LineTaskFnNoBuf task, tunnel_t *t)
+{
+    lineLock(line);
+    task(t, line);
+    if (! lineIsAlive(line))
+    {
+        lineUnlock(line);
+        return false;   // line died during the callback
+    }
+    lineUnlock(line);
+    return true;        // line still alive; safe to continue
+}
+```
+
+Use it whenever you must keep working with the line after a re-entrant call:
+
+```c
+if (! withLineLocked(line, tunnelNextUpStreamInit, t))
+{
+    return;   // line died; do not touch line or ls
+}
+
+// Still alive here. Re-read state if you need it.
+my_lstate_t *ls = lineGetState(line, t);
+```
+
+For payload forwarding, use the buffered variant:
+
+```c
+if (! withLineLockedWithBuf(line, tunnelNextUpStreamPayload, t, buf))
+{
+    return;
+}
+```
+
+When a helper returns `false`:
+
+- do **not** touch `line`,
+- do **not** touch this tunnel's line state,
+- do **not** call your `LinestateDestroy()` "just to clean up" — the close path
+  that killed the line already did that,
+- if you still own a buffer you did not hand off, recycle it without touching the
+  dead line state.
+
+:::tip When you do *not* need the wrapper
+If you call a forwarding helper and then immediately `return` with no further work
+on the line, wrapping it in `withLineLocked()` buys you nothing — the boolean
+result would not change your behavior. This is common for plain `Init` and
+`Finish` pass-throughs.
+:::
+
+### Method B — Manual `lineLock()` / `lineUnlock()`
+
+Use manual locking when you need explicit control across several calls:
+
+```c
+lineLock(line);
+
+// one or more potentially re-entrant callbacks ...
+
+if (! lineIsAlive(line))
+{
+    lineUnlock(line);
+    return;
+}
+
+// still alive: safe to continue
+lineUnlock(line);
+```
+
+Rules: always unlock what you lock; never read tunnel state after destroying it;
+if a helper both destroys your line state and propagates `Finish`, the caller must
+return immediately afterward.
+
+## Finish Semantics
+
+`Finish` is **directional** and **destructive**, and it has one property that
+makes it special among all the callbacks:
+
+:::warning Finish is guaranteed non-re-entrant
+All other flow callbacks may be re-entrant. `Finish` is the exception. If
+Tunnel A sends `Finish` to Tunnel B for a line, Tunnel B must not call **any**
+callback (including `Finish`) back in that same direction for that `line_t`.
+:::
+
+Concretely:
+
+- A tunnel that **receives upstream `Finish`** must not send `tunnelPrevDownStream*`
+  (Init/Payload/Est/Pause/Resume/Finish) back toward the sender for that line.
+- A tunnel that **receives downstream `Finish`** must not send `tunnelNextUpStream*`
+  back toward the sender for that line.
+
+This is called **reflection**, and it is a frequent crash source precisely because
+tunnels destroy their line state before propagating `Finish` — reflecting a
+callback calls into a tunnel whose state for that line is already gone.
+
+Also remember the destruction direction: a downstream `Finish` that reaches the
+adapter which created the line will lead to `lineDestroy()`. So after you
+propagate a downstream `Finish`, assume the line can be gone.
+
+### The Simplest Clean Finish
+
+A middle tunnel with nothing to flush just destroys its own line state and
+forwards. This is `EncryptionClient`'s upstream finish, verbatim:
+
+```c
+void encryptionclientTunnelUpStreamFinish(tunnel_t *t, line_t *l)
+{
+    encryptionclient_lstate_t *ls = lineGetState(l, t);
+    encryptionclientLinestateDestroy(ls);   // destroy local state first
+    tunnelNextUpStreamFinish(t, l);          // then propagate
+}
+```
+
+Order matters: destroy local state **before** propagating the real close. Do not
+read any field of `ls` after `LinestateDestroy(ls)` — assume it is zeroed.
+
+### Closing Both Directions From the Middle
+
+When a middle tunnel itself decides to tear down the connection (a protocol error,
+a limit hit), it is responsible for closing **both** sides. The safe ordering is:
+
+1. Destroy this tunnel's own line state.
+2. Send the **upstream** `Finish` first. (`Finish` is non-re-entrant, so the line
+   is still alive after this.)
+3. Send the **downstream** `Finish` second. (This one can lead to the line dying.)
+4. Return immediately.
+
+```c
+my_lstate_t *ls = lineGetState(l, t);
+myLinestateDestroy(ls);          // 1. local state gone
+
+tunnelNextUpStreamFinish(t, l);  // 2. close forward (line still alive)
+tunnelPrevDownStreamFinish(t, l); // 3. close backward (line may die now)
+return;                          // 4. do not touch l or ls again
+```
+
+Adapters are simpler: sitting at one end of the chain, they only ever send
+`Finish` once, toward the opposite direction.
+
+Lines you **own** are different again. A creator such as `MuxClient` destroys its
+state, forwards `Finish`, and then — because it is the owner — destroys the line
+if it is still alive:
+
+```c
+muxclientLinestateDestroy(parent_ls);
+tunnelNextUpStreamFinish(t, parent_l);
+if (lineIsAlive(parent_l))
+{
+    lineDestroy(parent_l);   // only the owner may do this
+}
+```
+
+### Final Protocol Bytes Before Closing
+
+Some protocols must emit closing bytes before the transport closes: TLS
+`close_notify`, an HTTP final chunk, HTTP/2 `END_STREAM`, a WebSocket close frame,
+a KCP close frame. Sending those bytes during `Finish` opens a dangerous
+re-entrant window.
+
+The hazard, step by step:
+
+```text
+1. Tunnel receives Finish from side A.
+2. It sends final protocol bytes toward side B.
+3. Side B's adapter blocks while writing and emits Pause (or later Resume).
+4. That Pause/Resume travels back through the tunnel...
+5. ...and if the tunnel reflects it toward side A — whose state was already
+   destroyed by the original Finish — it calls into freed/zeroed state. Crash.
+```
+
+The required safe shape:
+
+1. `lineLock(line)` — you are about to send bytes re-entrantly.
+2. **Mark the sender side finished first**, using the tunnel's existing
+   directional state (`prev_finished`, `next_finished`, `can_downstream = false`,
+   `can_upstream = false`, etc.). Your `Pause`/`Resume` handlers must check this
+   and refuse to reflect toward a finished side.
+3. Send the final protocol bytes toward the other side.
+4. Destroy this tunnel's local line state.
+5. Propagate the real WaterWall `Finish`.
+6. `lineUnlock(line)`.
+7. Return immediately. Do not touch local line state afterward.
+
+Direction examples:
+
+- Handling **upstream** `Finish`, sending final bytes upstream to `next`: any
+  **downstream** `Pause`/`Resume` caused by that send must not be forwarded back
+  to `prev`.
+- Handling **downstream** `Finish`, sending final bytes downstream to `prev`: any
+  **upstream** `Pause`/`Resume` caused by that send must not be forwarded back to
+  `next`.
+
+Do not invent a new `initialized` flag for this. Reuse the tunnel's existing
+directional finish/close state, or add an explicit directional close flag only if
+the tunnel genuinely lacks one.
+
+### Adapters Flush On Their Own
+
+Adapters such as `TcpConnector` and `TcpListener` may flush queued bytes before
+they actually close the socket after receiving `Finish`. So a middle tunnel
+should: send its final protocol bytes, destroy local state, forward `Finish` —
+and then trust the adapter to flush. Do **not** keep protocol state alive just to
+"wait for the socket to drain."
+
+## Est, Pause, and Resume
+
+- **`Est`** signals that the downstream side is genuinely established. Do not emit
+  it early. A tunnel that needs to know when its line is up can also check
+  `lineIsEstablished()` / `lineMarkEstablished()` (see `ww/net/line.h`).
+- **`Pause` / `Resume`** are backpressure signals. Emit them only when
+  semantically correct and directionally consistent, and never reflect them back
+  toward a finished direction (see above). Do not emit them casually; spurious
+  pause/resume can deadlock a stream.
+
+## Worked Example: Tracing a Payload
+
+Consider the chain:
+
+```text
+TcpListener -> ObfuscatorClient -> TlsClient -> TcpConnector
+   (head)         (middle)          (middle)      (tail)
+```
+
+**Upstream (client to remote):**
+
+```text
+client bytes arrive at TcpListener's socket
+  TcpListener: tunnelNextUpStreamPayload(t, line, buf)
+    -> ObfuscatorClient.fnPayloadU: scramble bytes, forward upstream
+      -> TlsClient.fnPayloadU: encrypt via BoringSSL, forward upstream
+        -> TcpConnector.fnPayloadU: write ciphertext to the remote socket
+```
+
+**Downstream (remote to client):**
+
+```text
+remote bytes arrive at TcpConnector's socket
+  TcpConnector: tunnelPrevDownStreamPayload(t, line, buf)
+    -> TlsClient.fnPayloadD: decrypt, forward downstream
+      -> ObfuscatorClient.fnPayloadD: unscramble, forward downstream
+        -> TcpListener.fnPayloadD: write plaintext to the accepted client
+```
+
+Notice that the **same** `TlsClient` instance handles encrypt on `fnPayloadU` and
+decrypt on `fnPayloadD`. The direction, not the tunnel, decides the
+transformation. If `TlsClient`'s upstream payload write blocks at `TcpConnector`,
+backpressure flows back as a `Pause` in the downstream direction — and must not be
+reflected past a side that has already finished.
+
+## Checklist for This Part
+
+Before you call a flow change done:
+
+- Does `Init` initialize this tunnel's line state before any callback can use it?
+- Are upstream callbacks forwarded only with `tunnelNextUpStream*`, and downstream
+  only with `tunnelPrevDownStream*`?
+- Does every re-entrant call either return immediately or protect the line with
+  `withLineLocked()` / manual lock + `lineIsAlive()`?
+- On a `false` from `withLineLocked()`, do you avoid touching `line`, `ls`, and
+  `LinestateDestroy()`?
+- Does `Finish` destroy local state **before** propagating the real close?
+- When closing from the middle, do you finish upstream first, then downstream,
+  then return?
+- If you send final protocol bytes during `Finish`, do you mark the sender side
+  finished before the send and block reflected `Pause`/`Resume`?
+- Does only the line **owner** ever call `lineDestroy()`?
+- Did you avoid adding an `initialized` flag the source does not require?
+
+---
+
+Continue to **[Part 3: Buffers, Padding & Shift Buffers](./part3-buffers-and-padding.mdx)**.

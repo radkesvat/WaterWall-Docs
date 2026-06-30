@@ -1,0 +1,232 @@
+---
+sidebar_position: 3
+title: "Developer Guide Part 3: Buffers, Padding & Shift Buffers"
+sidebar_label: "Part 3: Buffers & Padding"
+description: "The sbuf_t buffer model, worker buffer pools, left-padding budgets, and how to prepend protocol headers without breaking chain composition."
+---
+
+# Part 3: Buffers, Padding & Shift Buffers
+
+If your change frames payloads, prepends a header, rewrites bytes in place, or
+allocates working memory, you must understand `sbuf_t`, the buffer pools, and the
+chain-wide left-padding contract. Getting this wrong produces tunnels that work in
+one chain layout and corrupt memory in another.
+
+Source of truth: `ww/bufio/shiftbuffer.h`, `ww/bufio/buffer_pool.h`, and the
+`required_padding_left` field in `ww/objects/node.h`.
+
+## The `sbuf_t` Anatomy
+
+WaterWall payloads are carried in `sbuf_t` ("shift buffer"), a padded, shiftable
+byte buffer. Its header is exactly 32 bytes and the data area is 32-byte aligned
+(so AVX2 copies stay aligned):
+
+```c
+struct sbuf_s
+{
+    uint32_t curpos;       // offset of the current payload start within buf[]
+    uint32_t len;          // current payload length, in bytes
+    uint32_t capacity;     // total allocation of buf[] (constant for the buffer's life)
+    uint16_t l_pad;        // reserved left padding (constant once created)
+    bool     is_temporary; // stack/view buffer: never freed or pooled
+    uint8_t  _padding1;
+    uint8_t  buf[];        // 32-byte aligned data
+};
+```
+
+The mental model is a cursor inside a fixed allocation:
+
+```text
+   |<-- left capacity -->|<------- payload (len) ------->|<-- writeable tail -->|
+   +---------------------+-------------------------------+----------------------+
+buf[0]                curpos                        curpos+len             capacity
+   |<------ l_pad ------>|
+   (reserved padding)
+```
+
+- **`curpos`** moves left when you prepend (shift left) and right when you consume
+  from the front.
+- **`len`** is how many payload bytes are valid starting at `curpos`.
+- **Left capacity** (`sbufGetLeftCapacity` = `curpos`) is how many bytes you can
+  still prepend by shifting left.
+- **Writeable tail** (`sbufGetMaximumWriteableSize` = `capacity - curpos`) is how
+  much you can address forward from the cursor — note this is **not** the spare
+  room beyond the current payload; to append `extra` bytes compare against
+  `len + extra`.
+
+### Key Accessors
+
+| Call | Returns |
+| --- | --- |
+| `sbufGetLength(b)` | current payload length (`len`) |
+| `sbufGetRawPtr(b)` / `sbufGetMutablePtr(b)` | pointer to the payload start (`buf + curpos`) |
+| `sbufGetLeftCapacity(b)` | bytes available to prepend (`curpos`) |
+| `sbufGetMaximumWriteableSize(b)` | bytes addressable from the cursor (`capacity - curpos`) |
+| `sbufGetTotalCapacity(b)` | full allocation (constant) |
+| `sbufGetLeftPadding(b)` | the original `l_pad` value |
+
+### Reading and Writing
+
+Aligned and unaligned integer helpers exist for header fields:
+
+```c
+sbufWriteUI16(b, port);            // aligned 16-bit write at the cursor
+sbufWriteUnAlignedUI32(b, value);  // unaligned 32-bit write
+uint16_t v; sbufReadUI16(b, &v);   // aligned read
+sbufWrite(b, src, n);              // raw copy of n bytes at the cursor
+sbufConsume(b, n);                 // drop n bytes from the payload tail count
+sbufShiftRight(b, n);              // advance cursor: consume n bytes from the front
+```
+
+## Prepending a Header: `sbufShiftLeft`
+
+The whole reason `l_pad` exists is so a tunnel can prepend a protocol header
+**without reallocating or memmoving** the payload. You move the cursor left and
+write into the freed space:
+
+```c
+// Reserve room and move the cursor back by header_len bytes.
+assert(sbufGetLeftCapacity(buf) >= header_len);
+sbufShiftLeft(buf, header_len);     // curpos -= header_len; len += header_len
+
+// Now write the header at the new front.
+sbufWriteUI16(buf, htons(payload_len));
+// ... fill the rest of the header ...
+```
+
+`sbufShiftLeft` asserts that enough left capacity exists:
+
+```c
+static inline void sbufShiftLeft(sbuf_t *const b, const uint32_t bytes)
+{
+    assert(sbufGetLeftCapacity(b) >= bytes);
+    b->curpos -= bytes;
+    b->len    += bytes;
+}
+```
+
+If the assertion fires (or, in a release build, if you shift left past the start),
+you have prepended more than your padding budget allows — which is the next
+section.
+
+## The Padding Contract: `required_padding_left`
+
+A tunnel may only rely on left padding it **advertised** in its `node.c`:
+
+```c
+.required_padding_left = kMyProtocolHeaderSize,
+```
+
+During chain finalization, the runtime sums `required_padding_left` across every
+node in the chain and reserves that much left padding in the buffers it hands out
+(`tunnelchainInsert` accumulates `sum_padding_left`; `tunnelchainFinalize` calls
+`globalstateUpdateAllocationPadding`). In other words:
+
+> The left capacity available to your tunnel at runtime is the sum of the padding
+> budgets of **your tunnel and every tunnel closer to the adapter that produced
+> the buffer**. If you prepend bytes you never advertised, you are spending
+> someone else's budget, and the buffer may not have it in a different chain.
+
+This is why a framing tunnel that "works on my machine" can corrupt memory once a
+user puts a different node in front of it. Advertise what you prepend.
+
+Rules:
+
+- Use `sbufShiftLeft()` only when `sbufGetLeftCapacity()` is at least the header
+  size you need.
+- Keep every prepend within this tunnel's advertised `required_padding_left`.
+- If you must prepend more than your budget, either raise
+  `required_padding_left` to match, or build a fresh buffer (see below) instead of
+  shifting.
+
+## Buffer Pools
+
+For ordinary runtime buffers, do not `malloc`. Use the worker-local buffer pool so
+allocations are recycled and correctly padded. The pool is reachable from any
+line:
+
+```c
+buffer_pool_t *pool = lineGetBufferPool(line);     // this line's worker pool
+
+sbuf_t *big   = bufferpoolGetLargeBuffer(pool);    // large working buffer
+sbuf_t *small = bufferpoolGetSmallBuffer(pool);    // small working buffer
+
+// ... use the buffer ...
+
+bufferpoolReuseBuffer(pool, buf);                  // return it to the pool
+lineReuseBuffer(line, buf);                        // convenience: pool of line's worker
+```
+
+Pools are **per worker**. A line belongs to exactly one worker (`lineGetWID`), so
+always use that line's pool — never a different worker's. Buffers from a pool
+already carry the chain's reserved left padding, so a pooled buffer is the correct
+place to build a payload you intend to prepend onto.
+
+If you need a buffer bigger than the current one for an append, use
+`sbufReserveSpace()` (it reallocates and copies only when necessary) rather than
+hand-rolling growth.
+
+## Buffer Ownership
+
+Buffer lifetime bugs are as common as line lifetime bugs. The rules:
+
+- **A callback takes ownership of the buffer you pass it.** After
+  `tunnelNextUpStreamPayload(t, line, buf)` (or the downstream form), `buf` is no
+  longer yours. Do not read it, reuse it, or free it.
+- **If you keep a buffer, you own it.** You are responsible for eventually
+  recycling it with `bufferpoolReuseBuffer` / `lineReuseBuffer`, or handing it to
+  a callback.
+- **On an error path that still owns a buffer**, return it to the pool (or the
+  line) before you close. Do not leak it, and do not touch it after the line dies.
+- **If a re-entrant callback killed the line** (a `false` from
+  `withLineLocked()`), only recycle buffers you still hold; do not touch the dead
+  line's state to do it.
+
+The `is_temporary` flag marks stack/view buffers that must never be freed or
+pooled. Do not pass a temporary buffer to anything that may try to recycle it, and
+do not set the flag on pooled buffers.
+
+In debug builds, `BUFFER_WONT_BE_REUSED(x)` swaps a buffer for a fresh duplicate
+and destroys the original, so any stale pointer to the old buffer is caught
+quickly. If you see it in reference tunnels, it marks "this buffer must not be
+touched again after this point."
+
+## A Complete Prepend Example
+
+Putting it together — a framing tunnel that prefixes a 2-byte big-endian length on
+the upstream path, having advertised `.required_padding_left = 2` in `node.c`:
+
+```c
+void myTunnelUpStreamPayload(tunnel_t *t, line_t *l, sbuf_t *buf)
+{
+    const uint16_t payload_len = (uint16_t) sbufGetLength(buf);
+
+    // We advertised 2 bytes of left padding, so this is guaranteed to fit.
+    assert(sbufGetLeftCapacity(buf) >= sizeof(uint16_t));
+    sbufShiftLeft(buf, sizeof(uint16_t));
+    sbufWriteUI16(buf, payload_len);      // (use the project's endianness helper as needed)
+
+    // Hand the buffer upstream; we no longer own it.
+    tunnelNextUpStreamPayload(t, l, buf);
+}
+```
+
+On the downstream side the paired tunnel reads and strips the header with
+`sbufReadUI16` + `sbufShiftRight`, then forwards with
+`tunnelPrevDownStreamPayload`.
+
+## Common Buffer Mistakes
+
+- Prepending without advertising padding, then relying on left capacity that only
+  exists in one chain layout.
+- Misusing `sbufShiftLeft` when left capacity is insufficient (the assert is your
+  friend in debug; release builds corrupt memory).
+- Reusing or reading a buffer after passing it to a forwarding callback.
+- Leaking a buffer on an error/close path.
+- Using a different worker's pool than the line's own.
+- Treating `sbufGetMaximumWriteableSize` as "spare room beyond the payload" — it
+  is room from the cursor, so subtract the current length first.
+
+---
+
+Continue to **[Part 4: Packet Lines & Packet Tunnels](./part4-packet-tunnels.mdx)**.
