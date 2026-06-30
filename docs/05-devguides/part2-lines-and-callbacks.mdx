@@ -220,6 +220,13 @@ This is called **reflection**, and it is a frequent crash source precisely becau
 tunnels destroy their line state before propagating `Finish` — reflecting a
 callback calls into a tunnel whose state for that line is already gone.
 
+Turn the guarantee around and it becomes a simple, load-bearing rule: **because
+`Finish` is non-re-entrant, you are promised you will not be called back on the
+finished side — so you must extend the same promise and send nothing back.** The
+instant you receive `Finish` from a direction, that direction is closed for that
+line. No `Payload`, no `Est`, no `Pause`/`Resume`, no second `Finish`, for **any**
+reason, on **any** later event for that `line_t`.
+
 Also remember the destruction direction: a downstream `Finish` that reaches the
 adapter which created the line will lead to `lineDestroy()`. So after you
 propagate a downstream `Finish`, assume the line can be gone.
@@ -277,6 +284,34 @@ if (lineIsAlive(parent_l))
 }
 ```
 
+### Most Tunnels Need No Directional-Finish State
+
+A direct consequence of non-re-entrancy: **do not give a tunnel
+`prev_finished` / `next_finished` (or `can_upstream` / `can_downstream`) flags by
+default.** A tunnel that simply forwards `Finish` is guaranteed never to be called
+back on the finished side, so it has nothing to remember. A speculative
+"did this side finish?" boolean is almost always a control-flow problem being
+patched instead of fixed — the same anti-pattern as an `initialized` flag.
+
+There is exactly **one** situation that justifies directional-close state: the
+tunnel must **send final bytes before it closes** (the next subsection). That send
+re-enters the adapter, which can emit `Pause`/`Resume`, and the flag is what lets
+your pause/resume handlers drop anything that would reflect toward the
+already-finished side. The flag is bookkeeping for *that* hazard and nothing else.
+
+Real tunnels carry exactly this state and no more. The names differ; the role is
+identical:
+
+| Tunnel | Directional-close state | Why it needs it |
+| --- | --- | --- |
+| `TlsServer` | `upstream_finished`, `downstream_finishing` | Sends TLS alert / close and resolves fallback before closing |
+| `TcpOverUdpClient` | `can_downstream` | Must finish its reliable-stream teardown before closing |
+| `TcpOverUdpServer` | `can_upstream` | The same, in the opposite direction |
+| `HttpClient`, `HttpServer`, `Socks5Server` | `prev_finished`, `next_finished` | Send final protocol bytes before transport close |
+
+If your tunnel does **not** send final bytes during `Finish`, it should not carry
+any of these flags. Destroy local state and forward — that is the whole job.
+
 ### Final Protocol Bytes Before Closing
 
 Some protocols must emit closing bytes before the transport closes: TLS
@@ -318,8 +353,9 @@ Direction examples:
   `next`.
 
 Do not invent a new `initialized` flag for this. Reuse the tunnel's existing
-directional finish/close state, or add an explicit directional close flag only if
-the tunnel genuinely lacks one.
+directional finish/close state, or — if the tunnel genuinely lacks one and this is
+the final-bytes case — add an explicit directional close flag. As stressed above,
+this is the **only** place such a flag belongs.
 
 ### Adapters Flush On Their Own
 
