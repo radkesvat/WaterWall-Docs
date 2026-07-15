@@ -5,11 +5,11 @@ sidebar_label: "RealityServer"
 description: "راهنمای نود RealityServer در WaterWall."
 ---
 
-<!-- Written from version 106 of the English doc. -->
+<!-- Written from version 107 of the English doc. -->
 
 # RealityServer
 
-`RealityServer` tunnel سمت server برای Reality در واتروال است. این نود هر line ورودی را در ابتدا ترافیک عادی visitor در نظر می‌گیرد و آن را به شاخه `destination` می‌فرستد؛ هم‌زمان recordهای TLS در جهت client-to-server را زیر نظر دارد تا یک Reality record معتبر پیدا کند. پس از احراز اصالت موفق، شاخه visitor بسته می‌شود و همان line به chain محافظت‌شده `next` تغییر مسیر می‌دهد.
+`RealityServer` tunnel سمت server برای Reality v2 است. این نود هر line ورودی را در ابتدا ترافیک عادی visitor در نظر می‌گیرد، آن را به شاخه `destination` می‌فرستد، binding واقعی TLS handshake را به‌صورت passive استخراج می‌کند و فقط پس از آن recordهای client-to-server را با keyهای تازه مخصوص همان connection بررسی می‌کند. پس از احراز اصالت موفق، شاخه visitor بسته می‌شود و همان line واتروال به chain محافظت‌شده `next` تغییر مسیر می‌دهد.
 
 سرور TLS مربوط به visitorها را خاتمه نمی‌دهد؛ فقط به اندازه‌ای recordهای شبیه TLS را بررسی می‌کند که تشخیص دهد peer یک Reality client معتبر است یا ترافیک عادی visitor.
 
@@ -84,11 +84,13 @@ TcpListener -> RealityServer -> protected-chain
 
 تا قبل از authorization:
 
-1. بایت‌های upstream به شکل TLS recordهای محتمل خوانده می‌شوند
-2. recordهای handshake، alert و change-cipher-spec و سایر recordهای TLS که candidate نیستند به `destination` می‌روند
-3. از application-data recordهایی که ممکن است Reality باشند یک کپی گرفته می‌شود و احراز اصالت روی همان کپی انجام می‌گیرد
-4. اگر احراز اصالت شکست بخورد، record اصلی به `destination` فرستاده می‌شود
-5. اگر احراز اصالت موفق باشد، شاخه visitor با `Finish` بسته و chain محافظت‌شده `next` مقداردهی اولیه می‌شود
+1. یک streaming parser محدود، پیام‌های ClientHello و ServerHello تکه‌تکه‌شده را در حالی مشاهده می‌کند که بایت‌ها همچنان به شاخه visitor فرستاده می‌شوند
+2. extension مربوط به TLS 1.3 `supported_versions` رعایت می‌شود و HelloRetryRequest تا رسیدن ServerHello نهایی نادیده گرفته می‌شود
+3. handshake نامعتبر یا پشتیبانی‌نشده، line را به رفتار عادی visitor منتقل می‌کند
+4. پیش از آماده شدن هر دو hello، recordهایی که شبیه application-data هستند همچنان ترافیک visitor محسوب می‌شوند و هرگز با root key آزمایش نمی‌شوند
+5. پس از مشتق‌کردن keyهای هر جهت در v2، از candidate recordها کپی گرفته می‌شود و احراز اصالت با sequence دقیق بعدی client-to-server انجام می‌گیرد
+6. اگر احراز اصالت در حالت pending شکست بخورد، record اصلی به `destination` فرستاده می‌شود و هیچ trial decrypt مربوط به v1 انجام نمی‌شود
+7. اگر احراز اصالت موفق باشد، شاخه visitor با `Finish` بسته و chain محافظت‌شده `next` مقداردهی اولیه می‌شود
 
 بعد از authorization:
 
@@ -112,7 +114,7 @@ line در یکی از این حالت‌ها به ترافیک visitor تبدی�
 
 ```text
 TLS record header (5 bytes)
-nonce             (12 bytes)
+cover prefix      (12 bytes)
 ciphertext
 AEAD tag          (16 bytes)
 ```
@@ -123,15 +125,17 @@ header شبیه TLS از این مقادیر استفاده می‌کند:
 |---|---|
 | Content type | `0x17` application data |
 | Version | `0x0303` |
-| Length | `12-byte nonce + ciphertext + 16-byte tag` |
+| Length | `12-byte cover prefix + ciphertext + 16-byte tag` |
 
-TLS record header به‌عنوان associated data مربوط به AEAD احراز اصالت می‌شود. nonce هر record رمزنگاری‌شده downstream به‌طور مستقل تصادفی است.
+پیشوند قابل‌مشاهده، cover data تصادفی و احرازشده است و AEAD nonce نیست. nonce از IV پایه مخصوص هر جهت و sequence number ضمنی ۶۴ بیتی ساخته می‌شود. associated data شامل domain مربوط به recordهای v2، جهت، sequence، session ID، TLS header و cover prefix است.
+
+هر جهت فقط sequence دقیق بعدی خود را می‌پذیرد؛ بنابراین recordهای تکراری، حذف‌شده، جابه‌جاشده، بازتاب‌یافته یا متعلق به connection دیگر شکست می‌خورند. شکست authentication پس از authorization خطای نهایی است و counterها پیش از امکان استفاده از `UINT64_MAX` بسته می‌شوند.
 
 ## نکته‌های Buffer و Lifecycle
 
-- `RealityServer` به‌ازای هر line state نگه می‌دارد که شامل record parser، mode فعلی، state initialization شاخه destination/protected و transition flagها است.
+- `RealityServer` به‌ازای هر line state نگه می‌دارد که شامل parser محدود hello، TLS binding، session ID، keyها و IVها و counterهای هر جهت، mode فعلی و state مربوط به انتقال میان شاخه‌ها است.
 - این نود line معمولی را نه ایجاد می‌کند و نه از بین می‌برد و فقط state خودش را پیش از فرستادن callbackهای `Finish` پاک می‌کند.
-- این نود `17` بایت required left padding اعلام می‌کند: `5` بایت برای TLS-like record header و `12` بایت برای پیشوند nonce.
+- این نود `17` بایت required left padding اعلام می‌کند: `5` بایت برای TLS-like record header و `12` بایت برای cover prefix.
 - bufferهای خالی payload در جهت downstream از chain محافظت‌شده، بدون فرستادن Reality record به pool برگردانده می‌شوند.
 - payloadهایی بزرگ‌تر از `max-frame-size` به چند record رمزنگاری‌شده تقسیم می‌شوند.
 - هنگام انتقال به حالت authorized، callbackهای downstream ناشی از بستن شاخه visitor نادیده گرفته می‌شوند تا به سمتی که در حال تغییر مسیر است بازتاب پیدا نکنند.
@@ -141,6 +145,8 @@ TLS record header به‌عنوان associated data مربوط به AEAD احر�
 - `destination` برای ترافیک عادی visitor است و بهتر است همان visitor domain مربوط به `RealityClient.settings.sni` را سرو یا proxy کند.
 - `next` فقط برای ترافیک مجاز واتروال است.
 - `password`، `salt`، `kdf-iterations` و `algorithm` باید با `RealityClient` یکی باشند.
+- Reality v2 با فرمت static-key قبلی در سطح wire سازگار نیست. هر دو peer را هم‌زمان ارتقا دهید؛ مسیر امن هیچ‌گاه به v1 fallback نمی‌کند.
+- مقدار مشتق‌شده از password یک root key برای material مستقل هر جهت در هر نشست TLS است. چرخش password نشست‌های آینده را نامعتبر می‌کند و به replay database در سمت server نیازی نیست.
 - این نود یک stream tunnel است، نه packet tunnel.
 
 ## مشخصات نود
