@@ -5,13 +5,13 @@ sidebar_label: "UdpStatelessSocket"
 description: "مستندات مرجع نود UdpStatelessSocket."
 ---
 
-<!-- Written from version 106 of the English doc. -->
+<!-- Written from version 107 of the English doc. -->
 
 # UdpStatelessSocket
 
-`UdpStatelessSocket` یک UDP edge adapter دوطرفه است. این نود یک UDP socket bind می‌کند، datagram را از هر peer دریافت می‌کند و datagramهای خروجی را به مقصدی می‌فرستد که داخل routing context خط فعلی قرار دارد.
+`UdpStatelessSocket` یک UDP edge adapter دوطرفه است. این نود یک UDP socket bind می‌کند، datagram را از peerهای مختلف دریافت می‌کند، و برای flowهای ورودی peerها line معمولی واتروال می‌سازد.
 
-این نود عمدا stateless است: برای هر peer line جدا نمی‌سازد، session نگه نمی‌دارد، و مثل ترکیب `UdpListener` و `UdpConnector` رفتار نمی‌کند. کاربرد اصلی آن کنار nodeهایی مثل `WireGuardDevice` است که یک UDP socket مشترک برای send و receive لازم دارند.
+کاربرد اصلی آن کنار nodeهایی مثل `WireGuardDevice` است؛ جایی که یک UDP socket باید هم به peerهای تنظیم‌شده ارسال کند و هم packetهایی را بپذیرد که peerها ابتدا به socket می‌فرستند. datagramهای ورودی بر اساس هویت endpoint peer/local گروه‌بندی می‌شوند، ولی lineهایی که متعلق به این نود نیستند همچنان برای ارسال خروجی از routing context استفاده می‌کنند.
 
 ## جایگاه رایج
 
@@ -22,7 +22,7 @@ TunDevice -> WireGuardDevice -> UdpStatelessSocket
 UdpStatelessSocket -> WireGuardDevice -> TunDevice
 ```
 
-از این نود در edge سمت UDP یک packet chain استفاده کنید؛ مخصوصا وقتی نود کناری می‌تواند routing context را برای مقصد خروجی تنظیم کند.
+از این نود در edge سمت UDP یک packet chain استفاده کنید وقتی نود کناری به یک UDP socket مشترک برای send/receive نیاز دارد، و peerهای دریافتی باید lifetime جداگانه در lineهای واتروال داشته باشند. مثال اصلی `WireGuardDevice` است: قبل از ارسال datagramهای رمزنگاری‌شده، endpoint peer را در destination routing context می‌نویسد، در حالی که datagramهای دریافتی peer می‌توانند روی lineهای per-peer وارد chain شوند.
 
 ## نمونه تنظیم
 
@@ -78,27 +78,28 @@ UdpStatelessSocket -> WireGuardDevice -> TunDevice
 وقتی UDP datagram برسد:
 
 1. worker مالک socket datagram را دریافت می‌کند
-2. نود worker packet line همان worker را می‌گیرد
-3. آدرس و پورت فرستنده داخل `routing_context.src_ctx` نوشته می‌شود
-4. local listener port هم در routing context ثبت می‌شود
-5. body datagram به سمت chain کناری forward می‌شود
+2. `UdpStatelessSocket` از endpoint peer، endpoint محلی، و هویت tunnel یک flow key می‌سازد
+3. اگر flow متناظر وجود نداشته باشد، یک line معمولی می‌سازد و `Init` را به سمت متصل chain می‌فرستد
+4. آدرس و پورت فرستنده داخل `routing_context.src_ctx` نوشته می‌شود و local listener port هم ثبت می‌شود
+5. body datagram روی line همان peer forward می‌شود
 
-اگر این نود آخر chain باشد، packetها به سمت previous می‌روند؛ در غیر این صورت به سمت next می‌روند.
+اگر این نود آخر chain باشد، datagramهای دریافتی از سمت next/tail شروع می‌شوند و downstream به سمت previous می‌روند. در غیر این صورت از سمت previous/head شروع می‌شوند و upstream به سمت next می‌روند.
 
-در buildهای debug، بعد از forward بررسی می‌شود که packet line هنوز alive باشد. نابود شدن packet line در runtime نقض قرارداد packet tunnel است.
+lineهای idle peer برای init timeout برابر `30 seconds` و keepalive timeout برابر `300 seconds` استفاده می‌کنند.
 
 ## مسیر ارسال
 
 وقتی payload از هر جهت به این نود برسد:
 
-1. مقصد از `line->routing_context.dest_ctx` خوانده می‌شود
-2. اگر مقصد domain resolve نشده باشد، async DNS شروع می‌شود
-3. اگر مقصد IP و port آماده باشد، به socket address تبدیل می‌شود
-4. datagram با همان UDP socket ارسال می‌شود
+1. اگر line یک inbound peer line متعلق به همین tunnel باشد، datagram به endpoint ذخیره‌شده همان peer ارسال می‌شود
+2. در غیر این صورت مقصد از `line->routing_context.dest_ctx` خوانده می‌شود
+3. اگر مقصد domain resolve نشده باشد، async DNS شروع می‌شود
+4. اگر مقصد IP و port آماده باشد، به socket address تبدیل می‌شود
+5. datagram با همان UDP socket ارسال می‌شود
 
 اگر destination context آماده نباشد یا port نداشته باشد، datagram drop می‌شود و warning/error log می‌شود.
 
-برای domainهای resolve نشده، نتیجه DNS به مدت `30 minutes` بر اساس domain، port و domain strategy cache می‌شود.
+برای domainهای resolve نشده، نتیجه DNS به مدت `30 minutes` بر اساس domain، port و domain strategy cache می‌شود. این موضوع مهم است چون routing context در packet lineها metadata موقت است و ممکن است با packet بعدی بازنویسی شود.
 
 ## Worker Ownership
 
@@ -106,29 +107,29 @@ UDP socket فقط متعلق به یک worker loop است. اگر payload برا
 
 ## چرا UdpListener یا UdpConnector نه؟
 
-در WireGuard و سناریوهای مشابه، یک socket باید هم به peer ارسال کند و هم از هر peer دریافت کند. `UdpListener` رفتار listener اتصال‌محور دارد و `UdpConnector` رفتار connector. `UdpStatelessSocket` بدون session state و فقط بر اساس routing context ارسال می‌کند.
+در WireGuard و سناریوهای مشابه، یک socket باید هم به peer ارسال کند و هم از هر peer دریافت کند. `UdpListener` listener-oriented است و `UdpConnector` connector-oriented. `UdpStatelessSocket` مدل adapter تک-socket را نگه می‌دارد، برای datagramهای دریافتی lineهای per-peer اضافه می‌کند، و ارسال بر اساس routing context را برای lineهایی که متعلق به خودش نیستند حفظ می‌کند.
 
 ## Packet-Line Semantics
 
-این نود adapter اطراف یک packet chain است. برای datagramهای دریافتی از worker packet line استفاده می‌کند و برای peerها connection line جدا نمی‌سازد.
+`UdpStatelessSocket` یک adapter اطراف UDP datagramهاست. datagramهای دریافتی به جای packet-line payload callback، lineهای معمولی peer می‌سازند.
 
-callbackهای connection-style مثل `Init`، `Est`، `Finish`، `Pause` و `Resume` نادیده گرفته می‌شوند. مسیر اصلی runtime، callbackهای payload است.
+Packet lineها هنوز برای ارسال‌های outbound بر اساس routing context پشتیبانی می‌شوند، و این tunnel در runtime packet lineها را نابود نمی‌کند.
 
 ## متادیتای نود
 
 | ویژگی | مقدار |
 |---|---|
-| Runtime model | Stateless UDP adapter |
+| Runtime model | UDP edge adapter با inbound lineهای per-peer |
 | Socket count | یک UDP socket bound به ازای هر node instance |
-| Per-peer state | ندارد |
-| Packet-line use | Worker packet line در receive |
+| Per-peer state | line معمولی به ازای هر inbound peer flow |
+| Packet-line use | سازگاری outbound با routing context |
 | Required left padding | `0` |
 | DNS cache freshness | `30 minutes` |
 
 ## خطاهای رایج
 
 - ارسال payload قبل از اینکه `dest_ctx` مقصد IP/domain و port داشته باشد.
-- انتظار یک line جدا برای هر UDP peer.
+- در نظر گرفتن lineهای peer دریافتی به عنوان packet line.
 - استفاده از این نود مثل stream adapter عمومی.
 - تکیه به `source-ip` برای override کردن loop-protection؛ در این حالت `interface` را صریح تنظیم کنید.
 - فراموش کردن وابستگی `fwmark` و interface binding به پلتفرم.

@@ -6,15 +6,15 @@ description: "Reference documentation for the UdpStatelessSocket node."
 ---
 
 <!--
-Documentation version: 106
+Documentation version: 107
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/UdpStatelessSocket/description.md, and both files must keep the same documentation version.
 -->
 
 # UdpStatelessSocket
 
-`UdpStatelessSocket` is a bidirectional UDP edge adapter. It binds one UDP socket, receives datagrams from arbitrary peers, and sends datagrams to the destination stored in the current line routing context.
+`UdpStatelessSocket` is a bidirectional UDP edge adapter. It binds one UDP socket, receives datagrams from arbitrary peers, and creates normal Waterwall lines for inbound peer flows.
 
-It is intentionally stateless: it does not create one line per peer, does not track sessions, and does not behave like `UdpListener` plus `UdpConnector`. It exists mainly for packet-oriented nodes such as `WireGuardDevice`, where the same UDP socket must send and receive peer datagrams.
+It exists mainly for packet-oriented nodes such as `WireGuardDevice`, where the same UDP socket must send to configured peers and also accept packets from peers that contact the socket first. Inbound datagrams are now grouped by peer/local endpoint identity, while non-owned outbound lines still send by routing context.
 
 ## Typical Placement
 
@@ -25,7 +25,7 @@ TunDevice -> WireGuardDevice -> UdpStatelessSocket
 UdpStatelessSocket -> WireGuardDevice -> TunDevice
 ```
 
-Use it at the UDP edge of a packet chain when the adjacent node knows how to set or consume routing context. `WireGuardDevice` is the main example: it writes peer endpoints into destination routing context before sending encrypted datagrams.
+Use it at the UDP edge of a packet chain when the adjacent node needs one UDP socket for send/receive, and when received peers should have distinct Waterwall line lifetimes. `WireGuardDevice` is the main example: it writes peer endpoints into destination routing context before sending encrypted datagrams, while received peer datagrams can enter the chain on per-peer lines.
 
 ## Basic Example
 
@@ -81,23 +81,24 @@ If `TunDevice` loop protection has published an automatic egress pin, `source-ip
 When a UDP datagram arrives:
 
 1. the socket-owning worker receives the datagram
-2. `UdpStatelessSocket` gets that worker's packet line
-3. the sender address and port are written into `routing_context.src_ctx`
-4. the local listener port is recorded in the line routing context
-5. the datagram body is forwarded into the adjacent chain side
+2. `UdpStatelessSocket` builds a flow key from peer endpoint, local endpoint, and tunnel identity
+3. if no matching flow exists, it creates a normal line and sends `Init` into the connected side of the chain
+4. the sender address and port are written into `routing_context.src_ctx`, and the local listener port is recorded
+5. the datagram body is forwarded over that peer's line
 
-If this node is the last node in the chain, received datagrams are forwarded toward the previous node. Otherwise, they are forwarded toward the next node.
+If this node is the last node in the chain, received datagrams start from the next/tail side and are sent downstream toward the previous node. Otherwise, they start from the previous/head side and are sent upstream toward the next node.
 
-In debug builds, the node asserts that the worker packet line is still alive after forwarding. Destroying packet lines during runtime is a packet-tunnel contract violation.
+Idle peer lines use an init timeout of `30 seconds` and a keepalive timeout of `300 seconds`.
 
 ## Send Path
 
 When payload reaches `UdpStatelessSocket` from either direction:
 
-1. the destination is read from `line->routing_context.dest_ctx`
-2. if the destination is an unresolved domain, async DNS resolution is started
-3. otherwise, the destination IP and port are converted to a socket address
-4. the datagram is sent using the bound UDP socket
+1. if the line is an inbound peer line owned by this tunnel, the datagram is sent back to the stored peer endpoint
+2. otherwise, the destination is read from `line->routing_context.dest_ctx`
+3. if the destination is an unresolved domain, async DNS resolution is started
+4. otherwise, the destination IP and port are converted to a socket address
+5. the datagram is sent using the bound UDP socket
 
 If the destination context is not ready or has no port, the datagram is dropped and a warning/error is logged.
 
@@ -111,29 +112,29 @@ This keeps socket ownership stable while still allowing packet-line traffic to o
 
 ## Why Not UdpListener Or UdpConnector?
 
-WireGuard-style UDP needs one socket that can both send to a peer and receive from any peer. `UdpListener` is connection-oriented listener behavior, and `UdpConnector` is connector behavior. `UdpStatelessSocket` deliberately avoids both models and sends by routing context instead.
+WireGuard-style UDP needs one socket that can both send to a peer and receive from any peer. `UdpListener` is listener-oriented and `UdpConnector` is connector-oriented. `UdpStatelessSocket` keeps the single-socket adapter model, adds per-peer lines for received datagrams, and preserves routing-context sends for non-owned lines.
 
 ## Packet-Line Semantics
 
-`UdpStatelessSocket` is an adapter around a packet chain. It uses worker packet lines for received datagrams and does not create per-peer connection lines.
+`UdpStatelessSocket` is an adapter around UDP datagrams. Received datagrams create normal peer lines, not packet-line payload callbacks.
 
-Connection-style callbacks such as `Init`, `Est`, `Finish`, `Pause`, and `Resume` are ignored. Payload callbacks are the meaningful runtime path.
+Packet lines are still supported for outbound routing-context sends, and the tunnel does not destroy packet lines during runtime.
 
 ## Node Metadata
 
 | Property | Value |
 |---|---|
-| Runtime model | Stateless UDP adapter |
+| Runtime model | UDP edge adapter with per-peer inbound lines |
 | Socket count | One bound UDP socket per node instance |
-| Per-peer state | none |
-| Packet-line use | Worker packet line on receive |
+| Per-peer state | normal line per inbound peer flow |
+| Packet-line use | outbound routing-context compatibility |
 | Required left padding | `0` |
 | DNS cache freshness | `30 minutes` |
 
 ## Common Mistakes
 
 - Sending payload before `dest_ctx` contains a destination IP/domain and port.
-- Expecting one Waterwall line per UDP peer. This node is stateless.
+- Treating received peer lines as packet lines.
 - Using it as a general stream adapter. It forwards datagram payloads.
 - Relying on `source-ip` to override `TunDevice` loop-protection pinning. Set `interface` explicitly.
 - Forgetting that `fwmark` and interface binding are platform-dependent.
