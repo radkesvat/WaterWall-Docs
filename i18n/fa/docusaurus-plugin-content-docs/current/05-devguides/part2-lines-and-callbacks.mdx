@@ -1,15 +1,450 @@
 ---
 sidebar_position: 2
-title: "راهنمای توسعه‌دهندگان WaterWall"
-sidebar_label: "راهنمای توسعه‌دهندگان"
-description: "نسخه فارسی راهنمای توسعه‌دهندگان نگهداری نمی‌شود؛ لطفاً نسخه انگلیسی را بخوانید."
-unlisted: true
+title: "راهنمای توسعه، بخش ۲: Lineها، Callbackها و ایمنی طول عمر"
+sidebar_label: "بخش ۲: Line و طول عمر"
+description: "چرخه‌ی عمر اتصال، خطرهای Re-entrancy، قفل‌کردن Line و الگوهای Finish صحیح که جلوی خطاهای Use-after-free را در تونل‌های WaterWall می‌گیرند."
 ---
 
-# راهنمای توسعه‌دهندگان WaterWall
+# بخش ۲: Lineها، Callbackها و ایمنی طول عمر
 
-نسخه فارسی راهنمای توسعه‌دهندگان نگهداری نمی‌شود.
+این بخش قراردادهایی را توضیح می‌دهد که نقض آن‌ها بیش از هر چیز باعث Crash می‌شود:
+چرخه‌ی عمر Callbackهای هر اتصال، مالکیت Line و راه محافظت در برابر Callbackهای
+Re-entrant که ممکن است Line را در میانه‌ی کار شما نابود کنند.
 
-لطفاً نسخه انگلیسی را از صفحه اول راهنما بخوانید:
+اگر پیش از دست‌زدن به جریان اتصال فقط فرصت خواندن یک بخش را دارید، همین بخش را
+بخوانید. پیش‌نیاز: [بخش ۱](./doc1.mdx)، شامل Objectها، جهت‌ها و چرخه‌ی عمر.
 
-[Developer Guide Part 1: Overview & Mental Model](https://radkesvat.github.io/WaterWall-Docs/docs/devguides/doc1)
+## شش Callback جریان
+
+هر اتصال با شش رویداد در دو جهت هدایت می‌شود: upstream به‌سمت `next` و downstream
+به‌سمت `prev`.
+
+| رویداد | مفهوم | نکته‌ی جهت |
+| --- | --- | --- |
+| `Init` | یک Line در حال شروع است؛ State مختص Line این تونل را مقداردهی کنید. | از Adapter سازنده در جهت upstream حرکت می‌کند. |
+| `Est` | سمت دور واقعاً برقرار شده است؛ برای مثال Socket راه دور متصل شده. | معمولاً در جهت downstream و به‌سمت آغازکننده بازمی‌گردد. |
+| `Payload` | بخشی از داده در قالب `sbuf_t` که باید Transform و Forward شود. | هر دو جهت. |
+| `Pause` | Backpressure؛ فعلاً فرستادن در این جهت را متوقف کنید. | هر دو جهت. |
+| `Resume` | Backpressure رفع شده است و ارسال می‌تواند ادامه یابد. | هر دو جهت. |
+| `Finish` | این جهت در حال بسته‌شدن است. | جهت‌دار و مخرب؛ توضیح آن در ادامه آمده است. |
+
+تونل فقط Handlerهای موردنیاز خود را پیاده‌سازی می‌کند و بقیه را روی رفتار پیش‌فرض
+فریم‌ورک، یعنی Pass-through به همسایه، می‌گذارد. برای مثال، یک Encryptor می‌تواند
+`Payload` را در هر دو جهت Override کند و `Pause`/`Resume` را به رفتار پیش‌فرض
+بسپارد.
+
+## یک Line چگونه آغاز می‌شود؟
+
+یک اتصال معمولی با `Init` آغاز می‌شود و Adapter آن را ایجاد می‌کند:
+
+1. یک Adapter، مانند `TcpListener`، ‏Socket را Accept و یک `line_t` ایجاد می‌کند.
+2. تابع `tunnelNextUpStreamInit()` را فراخوانی می‌کند.
+3. این فراخوانی `fnInitU` تونل بعدی را اجرا می‌کند؛ تونل State مختص Line خود را
+   مقداردهی و `Init` را در upstream به جلو Forward می‌کند.
+4. هر تونل میانی به‌ترتیب State مختص Line خود را مقداردهی می‌کند.
+5. Adapter انتهایی، مانند `TcpConnector`، عملیات واقعی شبکه را آغاز می‌کند.
+
+:::danger Init ایزوله نیست
+`Init` یک تونل می‌تواند **پیش از بازگشت**، Callbackهای دیگری مانند `Payload`،
+`Est`، ‏`Pause`، ‏`Resume` یا حتی `Finish` را به‌صورت Synchronous فعال کند؛ زیرا
+تونل پایین‌دستی ممکن است بلافاصله داده را برگرداند یا اتصال را ببندد. این همان
+خطر Re-entrancy است که در ادامه توضیح داده می‌شود، با این تفاوت که از لحظه‌ی تولد
+Line آغاز می‌شود.
+:::
+
+قواعد `Init`:
+
+- State مختص Line **همین تونل** را در `Init` مقداردهی کنید. Callbackهای بعدی حق
+  دارند فرض کنند این State از قبل وجود دارد.
+- برای محافظت از Callbackهای بعدی یک Boolean به نام `initialized` اضافه نکنید.
+  در چرخه‌ی عمر معمول WaterWall، ‏`Init` همیشه برای تونل زودتر اجرا می‌شود و چنین
+  Flagای تقریباً همیشه راه‌حلی موقت برای Control Flow ناامن است. فقط زمانی آن را
+  اضافه کنید که Source Code به‌روشنی ضرورتش را ثابت کند.
+- اگر `Init` یک Helper مربوط به Forwarding و Re-entrant را صدا می‌زند و پس از آن
+  هنوز باید به Line دسترسی داشته باشد، از آن محافظت کنید؛ بخش
+  [قفل‌کردن Line](#protecting-a-line-across-re-entrant-callbacks) را ببینید. اگر
+  `Init` فقط Forward می‌کند و برمی‌گردد، نیازی به Lock نیست.
+
+## طول عمر Line: ‏`refcount` و `alive`
+
+هر `line_t` یک `refc` اتمیک و یک Boolean به نام `alive` دارد؛ به `ww/net/line.h`
+نگاه کنید. این دو مفهوم جدا هستند و یکی‌گرفتن آن‌ها باعث Bug می‌شود:
+
+- `lineLock(line)` مقدار `refc` را افزایش می‌دهد و تضمین می‌کند تا زمانی که این
+  Reference را دارید، حافظه آزاد نشود.
+- `lineUnlock(line)` مقدار `refc` را کم می‌کند و وقتی به صفر برسد Line را آزاد
+  می‌کند.
+- `lineDestroy(line)` مقدار `alive = false` را تنظیم و Reference سازنده را آزاد
+  می‌کند.
+- `lineIsAlive(line)` می‌گوید آیا Line از نظر **منطقی** هنوز باز است یا نه.
+
+تفاوت مهم:
+
+> داشتن Lock فقط اعتبار **حافظه** را حفظ می‌کند؛ به این معنا نیست که Line از نظر
+> منطقی هنوز زنده است. پس از یک Callback از نوع Re-entrant، ممکن است Line قفل‌شده
+> `alive == false` باشد. پیش از ادامه همیشه دوباره `lineIsAlive()` را بررسی کنید.
+
+### چه کسی اجازه دارد Line را نابود کند؟
+
+فقط تونلی که Line را **ساخته است** اجازه دارد `lineDestroy()` را روی آن فراخوانی
+کند. سازنده‌های رایج عبارت‌اند از:
+
+- Adapterهایی مانند `TcpListener`، ‏`UdpListener` و `TcpConnector`
+- چند تونل میانی که به‌طور قانونی Lineهای خود را می‌سازند، مانند `MuxServer`،
+  ‏`ReverseClient`، ‏`PacketsToStream` و `PacketsToConnection`
+
+همه‌ی تونل‌های دیگر باید `Finish` را **Propagate** کنند و نابودکردن Line را به
+مالک بسپارند. فراخوانی `lineDestroy()` روی Lineای که خودتان نساخته‌اید یک Bug
+جدی است.
+
+Invariant مهمی نیز در حالت Debug وجود دارد: وقتی Line سرانجام آزاد می‌شود،
+`lineUnRefInternal()` با `debugAssertZeroBuf` بررسی می‌کند که Line State همه‌ی
+تونل‌ها Zero شده باشد. از همین رو هر تونل باید پیش از رسیدن `Finish` واقعیِ
+بستن Line، ‏Line State خود را نابود کند؛ مگر آنکه عمداً در طول بسته‌شدن یک Reference
+مثبت نگه داشته باشد.
+
+## محافظت از Line هنگام Callbackهای Re-entrant {#protecting-a-line-across-re-entrant-callbacks}
+
+فراخوانی‌های میان‌تونلی زیر می‌توانند پیش از بازگشت، غیرمستقیم Line را ببندند.
+تک‌تک آن‌ها را خطرناک در نظر بگیرید:
+
+```c
+tunnelNextUpStreamInit       tunnelNextUpStreamPayload
+tunnelPrevDownStreamInit     tunnelPrevDownStreamPayload
+tunnelNextUpStreamEst        tunnelNextUpStreamPause      tunnelNextUpStreamResume
+tunnelPrevDownStreamEst      tunnelPrevDownStreamPause    tunnelPrevDownStreamResume
+```
+
+پس از بازگشت هرکدام:
+
+- ممکن است Line از قبل مرده باشد؛
+- ممکن است Line State این تونل از قبل Destroy و Zero شده باشد؛
+- هر دسترسی به `line` یا `ls` ناامن است، مگر آنکه از Line محافظت کرده باشید.
+
+هرگز این‌گونه استدلال نکنید: *«فراخوانی برگشته است، پس Line State من هنوز معتبر
+است.»*
+
+### روش A — ‏`withLineLocked()`؛ روش پیشنهادی
+
+`withLineLocked()` و `withLineLockedWithBuf()` در طول Callback یک Reference موقت
+نگه می‌دارند و به شما می‌گویند Line زنده مانده است یا نه. پیاده‌سازی واقعی آن‌ها
+در `ww/net/line.h` چنین است:
+
+```c
+static inline bool withLineLocked(line_t *const line, LineTaskFnNoBuf task, tunnel_t *t)
+{
+    lineLock(line);
+    task(t, line);
+    if (! lineIsAlive(line))
+    {
+        lineUnlock(line);
+        return false;   // line died during the callback
+    }
+    lineUnlock(line);
+    return true;        // line still alive; safe to continue
+}
+```
+
+هر زمان پس از یک فراخوانی Re-entrant هنوز باید با Line کار کنید، از این Helper
+استفاده کنید:
+
+```c
+if (! withLineLocked(line, tunnelNextUpStreamInit, t))
+{
+    return;   // line died; do not touch line or ls
+}
+
+// Still alive here. Re-read state if you need it.
+my_lstate_t *ls = lineGetState(line, t);
+```
+
+برای Forwardکردن Payload، نسخه‌ی دارای Buffer را به کار ببرید:
+
+```c
+if (! withLineLockedWithBuf(line, tunnelNextUpStreamPayload, t, buf))
+{
+    return;
+}
+```
+
+وقتی Helper مقدار `false` برمی‌گرداند:
+
+- به `line` دست نزنید؛
+- به Line State این تونل دست نزنید؛
+- برای «تمیزکاری» تابع `LinestateDestroy()` خود را صدا نزنید؛ مسیر Close که Line
+  را کشته، این کار را قبلاً انجام داده است؛
+- اگر هنوز مالک Bufferای هستید که تحویل نداده‌اید، بدون دسترسی به State مرده‌ی
+  Line آن را Recycle کنید.
+
+:::tip چه زمانی به Wrapper نیازی نیست؟
+اگر Helper مربوط به Forwarding را فراخوانی و بلافاصله `return` می‌کنید، بدون آنکه
+کار دیگری با Line داشته باشید، قرار دادن آن در `withLineLocked()` سودی ندارد؛
+نتیجه‌ی Boolean رفتار شما را عوض نمی‌کند. این حالت برای Pass-through ساده‌ی
+`Init` و `Finish` رایج است.
+:::
+
+### روش B — ‏`lineLock()` / `lineUnlock()` دستی
+
+وقتی روی چند فراخوانی به کنترل صریح نیاز دارید، به‌صورت دستی Lock کنید:
+
+```c
+lineLock(line);
+
+// one or more potentially re-entrant callbacks ...
+
+if (! lineIsAlive(line))
+{
+    lineUnlock(line);
+    return;
+}
+
+// still alive: safe to continue
+lineUnlock(line);
+```
+
+قواعد: هر چیزی را که Lock می‌کنید حتماً Unlock کنید؛ پس از Destroyکردن Tunnel
+State آن را نخوانید؛ و اگر Helper هم Line State شما را نابود و هم `Finish` را
+Propagate می‌کند، Caller باید بلافاصله برگردد.
+
+## معنای Finish
+
+`Finish` **جهت‌دار** و **مخرب** است و یک ویژگی آن را از همه‌ی Callbackهای دیگر
+متمایز می‌کند:
+
+:::warning تضمین می‌شود که Finish از نوع Re-entrant نباشد
+همه‌ی Callbackهای دیگر جریان ممکن است Re-entrant باشند؛ `Finish` تنها استثناست.
+اگر Tunnel A برای یک Line، ‏`Finish` را به Tunnel B بفرستد، Tunnel B نباید برای
+همان `line_t` **هیچ** Callbackی، حتی `Finish`، در همان جهت به Tunnel A برگرداند.
+:::
+
+به‌طور مشخص:
+
+- تونلی که **`Finish` در upstream دریافت می‌کند** نباید هیچ‌یک از
+  `tunnelPrevDownStream*`ها، شامل Init/Payload/Est/Pause/Resume/Finish، را برای آن
+  Line به‌سمت فرستنده برگرداند.
+- تونلی که **`Finish` در downstream دریافت می‌کند** نباید هیچ‌یک از
+  `tunnelNextUpStream*`ها را برای آن Line به‌سمت فرستنده برگرداند.
+
+این خطا **Reflection** نام دارد و یکی از علت‌های رایج Crash است؛ زیرا تونل‌ها پیش
+از Propagateکردن `Finish`، ‏Line State خود را نابود می‌کنند. بازتاب یک Callback،
+تونلی را فراخوانی می‌کند که State آن برای این Line دیگر وجود ندارد.
+
+اگر تضمین بالا را از زاویه‌ی دیگر ببینید، به قاعده‌ای ساده و حیاتی می‌رسید:
+**چون `Finish` از نوع Re-entrant نیست، تضمین دارید از سمتی که Finish شده Callback
+دریافت نکنید؛ شما نیز باید همین تضمین را ادامه دهید و هیچ‌چیز به آن سمت
+نفرستید.** به‌محض دریافت `Finish` از یک جهت، آن جهت برای آن Line بسته است. در
+هیچ رویداد بعدی برای آن `line_t` و تحت **هیچ** شرایطی، ‏`Payload`، ‏`Est`،
+`Pause`/`Resume` یا `Finish` دوم را به آن سمت نفرستید.
+
+جهت نابودی را نیز به‌خاطر بسپارید: اگر `Finish` در downstream به Adapter سازنده‌ی
+Line برسد، در نهایت `lineDestroy()` اجرا می‌شود. بنابراین پس از Propagateکردن
+`Finish` در downstream فرض کنید Line ممکن است از بین رفته باشد.
+
+### ساده‌ترین Finish صحیح
+
+تونل میانی‌ای که چیزی برای Flushکردن ندارد، فقط Line State خود را نابود می‌کند و
+رویداد را Forward می‌کند. کد زیر عین پیاده‌سازی Finish در upstream برای
+`EncryptionClient` است:
+
+```c
+void encryptionclientTunnelUpStreamFinish(tunnel_t *t, line_t *l)
+{
+    encryptionclient_lstate_t *ls = lineGetState(l, t);
+    encryptionclientLinestateDestroy(ls);   // destroy local state first
+    tunnelNextUpStreamFinish(t, l);          // then propagate
+}
+```
+
+ترتیب اهمیت دارد: State محلی را **پیش از** Propagateکردن Close واقعی نابود کنید.
+پس از `LinestateDestroy(ls)` هیچ فیلدی از `ls` را نخوانید؛ فرض کنید تمام آن Zero
+شده است.
+
+### بستن هر دو جهت از میانه‌ی زنجیره
+
+وقتی خود یک تونل میانی تصمیم می‌گیرد اتصال را به‌علت خطای پروتکل یا رسیدن به یک
+محدودیت Tear Down کند، مسئول بستن **هر دو** سمت است. ترتیب امن:
+
+1. Line State خود تونل را نابود کنید.
+2. ابتدا `Finish` را در **upstream** بفرستید. چون `Finish` ‏Re-entrant نیست، Line
+   پس از آن هنوز زنده است.
+3. سپس `Finish` را در **downstream** بفرستید. این فراخوانی ممکن است Line را از بین
+   ببرد.
+4. بلافاصله `return` کنید.
+
+```c
+my_lstate_t *ls = lineGetState(l, t);
+myLinestateDestroy(ls);          // 1. local state gone
+
+tunnelNextUpStreamFinish(t, l);  // 2. close forward (line still alive)
+tunnelPrevDownStreamFinish(t, l); // 3. close backward (line may die now)
+return;                          // 4. do not touch l or ls again
+```
+
+کار Adapterها ساده‌تر است: چون در یک انتهای زنجیره قرار دارند، `Finish` را فقط یک
+بار و به‌سمت جهت مخالف می‌فرستند.
+
+Lineهایی که **مالکشان هستید** حالت دیگری دارند. سازنده‌ای مانند `MuxClient` ابتدا
+State خود را نابود و `Finish` را Forward می‌کند و سپس، چون مالک Line است، اگر Line
+هنوز زنده باشد آن را نابود می‌کند:
+
+```c
+muxclientLinestateDestroy(parent_ls);
+tunnelNextUpStreamFinish(t, parent_l);
+if (lineIsAlive(parent_l))
+{
+    lineDestroy(parent_l);   // only the owner may do this
+}
+```
+
+### بیشتر تونل‌ها به State جهت‌دار Finish نیاز ندارند
+
+نتیجه‌ی مستقیم Non-re-entrancy این است: **به‌صورت پیش‌فرض Flagهایی مانند
+`prev_finished` / `next_finished` یا `can_upstream` / `can_downstream` به تونل
+اضافه نکنید.** تونلی که فقط `Finish` را Forward می‌کند تضمین دارد از سمت
+Finishشده دوباره فراخوانی نشود؛ پس چیزی برای به‌خاطرسپردن ندارد. Boolean احتمالی
+برای اینکه «آیا این سمت Finish شده؟» تقریباً همیشه پوششی روی مشکل Control Flow
+است، نه راه‌حل آن؛ درست مانند Anti-pattern مربوط به `initialized`.
+
+دقیقاً **یک** موقعیت وجود دارد که State مربوط به Close جهت‌دار را توجیه می‌کند:
+تونل باید **پیش از بسته‌شدن Byteهای پایانی بفرستد**؛ موضوع بخش بعد. این ارسال دوباره
+وارد Adapter می‌شود و Adapter می‌تواند `Pause`/`Resume` تولید کند. Flag به Handlerهای
+Pause/Resume اجازه می‌دهد هر رویدادی را که به‌سمت Finishشده Reflection می‌کند کنار
+بگذارند. وظیفه‌ی این Flag فقط ثبت همین خطر است، نه چیز دیگر.
+
+تونل‌های واقعی دقیقاً همین مقدار State و نه بیشتر را نگه می‌دارند. نام‌ها متفاوت،
+اما نقش یکسان است:
+
+| تونل | State مربوط به Close جهت‌دار | دلیل نیاز |
+| --- | --- | --- |
+| `TlsServer` | `upstream_finished`، `downstream_finishing` | پیش از Close، ‏TLS Alert/Close را می‌فرستد و Fallback را Resolve می‌کند. |
+| `TcpOverUdpClient` | `can_downstream` | باید پیش از Close، ‏Teardown مربوط به Reliable Stream را به پایان برساند. |
+| `TcpOverUdpServer` | `can_upstream` | همان رفتار در جهت مخالف. |
+| `HttpClient`، `HttpServer`، `Socks5Server` | `prev_finished`، `next_finished` | پیش از بسته‌شدن Transport، ‏Byteهای پایانی پروتکل را می‌فرستند. |
+
+اگر تونل شما هنگام `Finish` هیچ Byte پایانی نمی‌فرستد، نباید هیچ‌یک از این Flagها
+را داشته باشد. State محلی را نابود و رویداد را Forward کنید؛ تمام وظیفه همین است.
+
+### فرستادن Byteهای پایانی پروتکل پیش از Close
+
+برخی پروتکل‌ها باید پیش از بسته‌شدن Transport، ‏Byteهای پایانی بفرستند: پیام
+`close_notify` در TLS، ‏Final Chunk در HTTP، ‏`END_STREAM` در HTTP/2، ‏Close Frame
+در WebSocket یا KCP. فرستادن این Byteها هنگام `Finish` یک بازه‌ی خطرناک
+Re-entrant ایجاد می‌کند.
+
+خطر به‌ترتیب رخداد:
+
+```text
+1. Tunnel receives Finish from side A.
+2. It sends final protocol bytes toward side B.
+3. Side B's adapter blocks while writing and emits Pause (or later Resume).
+4. That Pause/Resume travels back through the tunnel...
+5. ...and if the tunnel reflects it toward side A — whose state was already
+   destroyed by the original Finish — it calls into freed/zeroed state. Crash.
+```
+
+ساختار امن الزامی:
+
+1. `lineLock(line)` را فراخوانی کنید، چون قرار است Byteها را به‌شکل Re-entrant
+   بفرستید.
+2. **ابتدا سمت فرستنده را Finishشده علامت بزنید**. از State جهت‌دار موجود تونل،
+   مانند `prev_finished`، ‏`next_finished`، ‏`can_downstream = false` یا
+   `can_upstream = false` استفاده کنید. Handlerهای `Pause`/`Resume` باید این State
+   را بررسی کنند و اجازه ندهند چیزی به سمت Finishشده Reflection شود.
+3. Byteهای پایانی پروتکل را به‌سمت دیگر بفرستید.
+4. Line State محلی این تونل را نابود کنید.
+5. `Finish` واقعی WaterWall را Propagate کنید.
+6. `lineUnlock(line)` را فراخوانی کنید.
+7. بلافاصله برگردید و پس از آن به Line State محلی دست نزنید.
+
+نمونه‌های جهت:
+
+- هنگام Handleکردن `Finish` در **upstream** و فرستادن Byteهای پایانی به `next`،
+  هیچ `Pause`/`Resume` در **downstream** که بر اثر آن ارسال تولید می‌شود نباید به
+  `prev` Forward شود.
+- هنگام Handleکردن `Finish` در **downstream** و فرستادن Byteهای پایانی به `prev`،
+  هیچ `Pause`/`Resume` در **upstream** که بر اثر آن ارسال تولید می‌شود نباید به
+  `next` Forward شود.
+
+برای این کار Flag تازه‌ای به نام `initialized` نسازید. از State موجود تونل برای
+Finish/Close جهت‌دار استفاده کنید؛ یا اگر واقعاً چنین Stateای ندارد و این مورد
+همان سناریوی Byteهای پایانی است، Flag صریحی برای Close جهت‌دار بیفزایید. همان‌طور
+که تأکید شد، این **تنها** جای درست چنین Flagی است.
+
+### Adapterها خودشان Flush می‌کنند
+
+Adapterهایی مانند `TcpConnector` و `TcpListener` ممکن است پس از دریافت `Finish`،
+پیش از بستن واقعی Socket، ‏Byteهای موجود در Queue را Flush کنند. بنابراین تونل
+میانی باید Byteهای پایانی پروتکل را بفرستد، State محلی را نابود کند، `Finish` را
+Forward کند و برای Flush به Adapter اعتماد کند. State پروتکل را صرفاً برای «منتظر
+ماندن تا Socket تخلیه شود» زنده نگه ندارید.
+
+## ‏Est، ‏Pause و Resume
+
+- **`Est`** نشان می‌دهد سمت downstream واقعاً برقرار شده است؛ آن را زودتر از موعد
+  نفرستید. تونلی که باید وضعیت Line را بداند می‌تواند `lineIsEstablished()` و
+  `lineMarkEstablished()` را نیز بررسی کند؛ به `ww/net/line.h` نگاه کنید.
+- **`Pause` / `Resume`** سیگنال‌های Backpressure هستند. فقط زمانی آن‌ها را تولید
+  کنید که از نظر معنایی و جهت درست باشد و هرگز به‌سمت جهت Finishشده Reflection
+  نکنید. این سیگنال‌ها را بی‌دلیل نفرستید؛ Pause/Resume اضافی ممکن است Stream را
+  در Deadlock قرار دهد.
+
+## مثال عملی: دنبال‌کردن یک Payload
+
+زنجیره‌ی زیر را در نظر بگیرید:
+
+```text
+TcpListener -> ObfuscatorClient -> TlsClient -> TcpConnector
+   (head)         (middle)          (middle)      (tail)
+```
+
+**Upstream، از Client به مقصد راه دور:**
+
+```text
+client bytes arrive at TcpListener's socket
+  TcpListener: tunnelNextUpStreamPayload(t, line, buf)
+    -> ObfuscatorClient.fnPayloadU: scramble bytes, forward upstream
+      -> TlsClient.fnPayloadU: encrypt via BoringSSL, forward upstream
+        -> TcpConnector.fnPayloadU: write ciphertext to the remote socket
+```
+
+**Downstream، از مقصد راه دور به Client:**
+
+```text
+remote bytes arrive at TcpConnector's socket
+  TcpConnector: tunnelPrevDownStreamPayload(t, line, buf)
+    -> TlsClient.fnPayloadD: decrypt, forward downstream
+      -> ObfuscatorClient.fnPayloadD: unscramble, forward downstream
+        -> TcpListener.fnPayloadD: write plaintext to the accepted client
+```
+
+توجه کنید که **همان** Instance از `TlsClient`، روی `fnPayloadU` رمزنگاری و روی
+`fnPayloadD` رمزگشایی می‌کند. جهت، نه خود تونل، Transform را تعیین می‌کند. اگر
+نوشتن Payload در upstreamِ `TlsClient` روی `TcpConnector` متوقف شود، Backpressure
+به‌شکل `Pause` در جهت downstream بازمی‌گردد و نباید از سمتی که Finish شده است
+عبور داده شود.
+
+## Checklist این بخش
+
+پیش از تمام‌شده‌دانستن تغییر در جریان، موارد زیر را بررسی کنید:
+
+- آیا `Init` پیش از آنکه Callback دیگری State را به کار بگیرد، Line State همین
+  تونل را مقداردهی می‌کند؟
+- آیا Callbackهای upstream فقط با `tunnelNextUpStream*` و Callbackهای downstream
+  فقط با `tunnelPrevDownStream*` Forward می‌شوند؟
+- آیا هر فراخوانی Re-entrant یا بلافاصله Return می‌کند، یا با `withLineLocked()` /
+  Lock دستی و `lineIsAlive()` از Line محافظت می‌کند؟
+- اگر `withLineLocked()` مقدار `false` برگرداند، آیا از دست‌زدن به `line`، ‏`ls` و
+  `LinestateDestroy()` خودداری می‌کنید؟
+- آیا `Finish`، ‏State محلی را **پیش از** Propagateکردن Close واقعی نابود می‌کند؟
+- هنگام Close از میانه، آیا ابتدا upstream، سپس downstream را Finish می‌کنید و
+  بعد بلافاصله برمی‌گردید؟
+- اگر هنگام `Finish` ‏Byteهای پایانی پروتکل را می‌فرستید، آیا پیش از ارسال سمت
+  فرستنده را Finishشده علامت می‌زنید و Reflection مربوط به `Pause`/`Resume` را
+  مسدود می‌کنید؟
+- آیا فقط **مالک** Line تابع `lineDestroy()` را فراخوانی می‌کند؟
+- آیا از افزودن Flagی به نام `initialized` که Source Code نیازی به آن ندارد،
+  خودداری کرده‌اید؟
+
+---
+
+ادامه: **[بخش ۳: بافرها، Padding و Shift Bufferها](./part3-buffers-and-padding.mdx)**.

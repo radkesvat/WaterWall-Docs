@@ -1,15 +1,277 @@
 ---
 sidebar_position: 5
-title: "راهنمای توسعه‌دهندگان WaterWall"
-sidebar_label: "راهنمای توسعه‌دهندگان"
-description: "نسخه فارسی راهنمای توسعه‌دهندگان نگهداری نمی‌شود؛ لطفاً نسخه انگلیسی را بخوانید."
-unlisted: true
+title: "راهنمای توسعه، بخش ۵: ساختار یک تونل و روند کار"
+sidebar_label: "بخش ۵: ساختار و روند کار"
+description: "چیدمان فایل‌های یک تونل WaterWall، مسئولیت هر فایل، Metadata در node.c، الگوهای Create و Line State، محدودیت‌های HTTP و روند پیاده‌سازی."
 ---
 
-# راهنمای توسعه‌دهندگان WaterWall
+# بخش ۵: ساختار یک تونل و روند کار
 
-نسخه فارسی راهنمای توسعه‌دهندگان نگهداری نمی‌شود.
+این بخش قراردادهای بخش‌های ۱ تا ۴ را به فایل‌هایی مرتبط می‌کند که در عمل تغییر
+می‌دهید. وقتی مسئولیت هر فایل را بدانید، افزودن یا اصلاح تونل به کاری مشخص تبدیل
+می‌شود: کوچک‌ترین تغییر لازم را در جای درست انجام دهید و چرخه‌ی عمر را دست‌نخورده
+نگه دارید.
 
-لطفاً نسخه انگلیسی را از صفحه اول راهنما بخوانید:
+## چیدمان دایرکتوری
 
-[Developer Guide Part 1: Overview & Mental Model](https://radkesvat.github.io/WaterWall-Docs/docs/devguides/doc1)
+بیشتر تونل‌ها از ساختار زیر پیروی می‌کنند. این چیدمان واقعی `TcpListener`،
+`TlsClient`، ‏`MuxClient` و `template` است:
+
+```text
+tunnels/MyTunnel/
+  CMakeLists.txt
+  description.md
+  include/MyTunnel/
+    interface.h          # public WW_EXPORT API + all callback prototypes
+    structure.h          # tstate / lstate structs, size enums, helpers
+  instance/
+    create.c             # tunnelCreate(), assign callbacks, parse + validate settings
+    node.c               # node metadata: type, flags, layer group, padding, createHandle
+    chain.c              # onChain hook (usually delegates to the default)
+    index.c              # onIndex hook (usually delegates to the default)
+    prepair.c            # onPrepare hook
+    start.c              # onStart hook
+    stop.c               # onStop hook
+    destroy.c            # onDestroy hook: free state, then tunnelDestroy()
+    api.c                # runtime API entry (tunnelApi)
+  common/
+    helpers.c            # shared protocol/state-machine helpers
+    line_state.c         # initialize + destroy per-line state
+  upstream/
+    init.c  est.c  payload.c  pause.c  resume.c  fin.c
+  downstream/
+    init.c  est.c  payload.c  pause.c  resume.c  fin.c
+```
+
+:::note چیدمان واقعی در برابر خلاصه‌ی قدیمی
+دو نکته در عمل مهم است: همه‌ی تونل‌ها یک `instance/api.c` دارند و نام فایل Hook
+مربوط به Prepare به‌شکل **`prepair.c`** نوشته می‌شود؛ نام تابع نیز
+`...OnPrepair` است. فایل‌های Finish در upstream/downstream نیز `fin.c` هستند، نه
+`finish.c`.
+:::
+
+تقسیم هر ترکیب `{direction}/{event}` در فایلی جدا باعث می‌شود هر Callback کوچک
+بماند. منطق مشترک پروتکل و State Machine در `common/helpers.c` قرار می‌گیرد تا
+فایل‌های Callback خوانا باشند. این Convention را رعایت کنید؛ Reviewکننده‌ها
+انتظار همین ساختار را دارند.
+
+## مسئولیت هر فایل
+
+| فایل | مسئولیت |
+| --- | --- |
+| `instance/node.c` | برگرداندن `node_t` توصیف‌کننده‌ی نوع تونل: `type`، ‏`version`، ‏`createHandle`، ‏`flags`، ‏`required_padding_left`، ‏`layer_group` و محدودیت Layer همسایه‌ها. |
+| `instance/create.c` | فراخوانی `tunnelCreate(node, sizeof(tstate), sizeof(lstate))`، تنظیم دوازده Callback جریان و Lifecycle Hookها، ‏Parse و اعتبارسنجی تنظیمات JSON، تخصیص منابع هر Worker و پاک‌سازی در هر مسیر خطا. |
+| `instance/chain.c` / `index.c` | Hookهای `onChain` / `onIndex`. بیشتر تونل‌ها رفتار پیش‌فرض فریم‌ورک را حفظ می‌کنند؛ Stub مربوط به Adapter ممکن است فقط Abort کند تا نشان دهد رفتار پیش‌فرض باید استفاده شود. |
+| `instance/prepair.c` / `start.c` / `stop.c` | Hookهای `onPrepare` / `onStart` / `onStop`. آغاز و توقف کار واقعی و در صورت نیاز Bootstrapکردن Packet Lineها در `onStart`؛ [بخش ۴](./part4-packet-tunnels.mdx) را ببینید. |
+| `instance/destroy.c` | Hook مربوط به `onDestroy`: آزادکردن تنظیمات، SSL Contextها، Poolها و Arrayهای Thread-local و سپس فراخوانی `tunnelDestroy(t)`. |
+| `instance/api.c` | ورودی Runtime برای `tunnelApi`. یک پیام `sbuf_t` دریافت می‌کند، باید آن را Recycle کند و یک `api_result_t` برگرداند. |
+| `common/line_state.c` | `LinestateInitialize` که از `Init` فراخوانی می‌شود و `LinestateDestroy` که ناحیه‌ی هم‌تراز Line State را Zero می‌کند. |
+| `common/helpers.c` | منطق مشترک Parse و Framing پروتکل و Helperهای Close/Finish که فایل‌های Callback به کار می‌برند. |
+| `upstream/*.c`، `downstream/*.c` | هر فایل یک Callback جریان. آن‌ها را کوچک نگه دارید و منطق را به `helpers.c` بسپارید. |
+| `include/MyTunnel/structure.h` | تعریف `mytunnel_tstate_t`، ‏`mytunnel_lstate_t`، ‏Enumهای اندازه و Helperهای Inline کوچک. |
+| `include/MyTunnel/interface.h` | Prototypeهای Exportشده‌ی Create/Destroy/API با `WW_EXPORT` و Prototype همه‌ی Callbackها. |
+
+## ‏`node.c`: معرفی Node
+
+تونل در `node.c` خود را به Runtime معرفی می‌کند. نمونه‌ی زیر متعلق به
+`TcpListener` است و الگوی مناسبی برای Adapter به شمار می‌رود:
+
+```c
+node_t nodeTcpListenerGet(void)
+{
+    const char *type_name = "TcpListener";
+    node_t node = {
+        .type                  = stringDuplicate(type_name),
+        .hash_type             = calcHashBytes(type_name, stringLength(type_name)),
+        .version               = 0001,
+        .createHandle          = tcplistenerTunnelCreate,
+        .flags                 = kNodeFlagChainHead,
+        .required_padding_left = 0,
+        .layer_group           = kNodeLayer4,
+        .layer_group_next_node = kNodeLayerAnything,
+        .layer_group_prev_node = kNodeLayerAnything,
+        .can_have_next         = true,
+        .can_have_prev         = true,
+    };
+    return node;
+}
+```
+
+فیلدهایی که بیشتر تنظیم می‌کنید، همگی در `ww/objects/node.h` تعریف شده‌اند:
+
+| فیلد | مفهوم |
+| --- | --- |
+| `type` / `hash_type` | String مورد استفاده در `"type"` فایل JSON و Hash ازپیش‌محاسبه‌شده‌ی آن. |
+| `createHandle` | تابع `TunnelCreateHandle` که Instance را می‌سازد. |
+| `flags` | یک یا چند `node_flags`: ‏`kNodeFlagChainHead`، ‏`kNodeFlagChainEnd`، ‏`kNodeFlagNoChain`، ‏`kNodeFlagSingleton`. |
+| `required_padding_left` | بودجه‌ی Padding سمت چپ که تونل اجازه دارد داخل آن Prepend کند؛ [بخش ۳](./part3-buffers-and-padding.mdx) را ببینید. |
+| `layer_group` | یکی از `kNodeLayer3` برای Packet، ‏`kNodeLayer4` برای Stream یا `kNodeLayerAnything`. وجود Node از نوع `kNodeLayer3` زنجیره را Packet Chain می‌کند و باعث تخصیص Packet Lineها می‌شود. |
+| `layer_group_next_node` / `layer_group_prev_node` | Layerهای مجاز برای همسایه؛ Loader آن‌ها را اعتبارسنجی می‌کند. |
+| `can_have_next` / `can_have_prev` | مجازبودن همسایه در هر سمت. |
+
+### Flagهای Node
+
+| Flag | مفهوم |
+| --- | --- |
+| `kNodeFlagChainHead` | می‌تواند زنجیره را آغاز کند؛ Ingress Adapter. |
+| `kNodeFlagChainEnd` | می‌تواند زنجیره را پایان دهد؛ Egress Adapter. |
+| `kNodeFlagNoChain` | بدون حضور در زنجیره کار می‌کند؛ مانند Node مربوط به Database/User-auth. |
+| `kNodeFlagSingleton` | در کل فایل پیکربندی فقط یک Instance از آن مجاز است. |
+
+## ‏`create.c`: ساخت Instance
+
+`create.c` تنها جایی است که تونل در آن تخصیص می‌یابد. الگوی خلاصه‌شده از
+`TlsClient`:
+
+1. اجرای `tunnel_t *t = tunnelCreate(node, sizeof(tstate), sizeof(lstate));`
+2. تنظیم هر دوازده Callback جریان و Lifecycle Hookها.
+3. خواندن و اعتبارسنجی تک‌تک تنظیمات از `node->node_settings_json`.
+4. تخصیص منابع هر Worker، مانند یک SSL Context به‌ازای هر Worker.
+5. **در صورت هر خطایی، پاک‌سازی و خروج**: State ناقص و تونل را نابود و `NULL`
+   برگردانید.
+
+رعایت Cleanup واقعی و مهم است و ارزش الگوبرداری دارد. `TlsClient` در همه‌ی شاخه‌های
+خطا Tunnel State و خود تونل را آزاد می‌کند:
+
+```c
+tunnel_t *tlsclientTunnelCreate(node_t *node)
+{
+    tunnel_t *t = tunnelCreate(node, sizeof(tlsclient_tstate_t), sizeof(tlsclient_lstate_t));
+    configureTunnelCallbacks(t);
+
+    tlsclient_tstate_t *ts       = tunnelGetState(t);
+    const cJSON        *settings = node->node_settings_json;
+
+    if (! getandvalidateSniSetting(ts, settings, t))
+    {
+        return NULL;   // helper already destroyed t
+    }
+    // ... more validated settings ...
+
+    if (! createSslContextPool(&ts->threadlocal_ssl_contexts, /* ... */))
+    {
+        tlsclientTunnelstateDestroy(ts);
+        tunnelDestroy(t);
+        return NULL;
+    }
+
+    return t;
+}
+```
+
+از Helperهای JSON پروژه، مانند `getStringFromJsonObject`،
+`getBoolFromJsonObjectOrDefault` و `getIntFromJsonObjectOrDefault` استفاده کنید و
+برای پیکربندی نادرست پیام روشنی با `LOGF` بنویسید. خطای پیکربندی باید هنگام Startup
+با صدای بلند Fail شود، نه اینکه در Runtime بی‌صدا باقی بماند.
+
+## ‏`structure.h`: ‏tstate و lstate
+
+دو Struct مربوط به State و اندازه‌هایشان در `structure.h` تعریف می‌شوند. تنظیمات
+و فیلدهای Runtime را مانند `TlsClient` به‌وضوح گروه‌بندی کنید:
+
+```c
+typedef struct tlsclient_tstate_s
+{
+    // settings (parsed once in create.c)
+    char *sni;
+    char *alpn;
+    bool  verify;
+    // runtime, shared across all lines
+    SSL_CTX **threadlocal_ssl_contexts;   // one per worker
+} tlsclient_tstate_t;
+
+typedef struct tlsclient_lstate_s
+{
+    SSL           *ssl;
+    BIO           *rbio;
+    BIO           *wbio;
+    buffer_queue_t bq;
+    bool           handshake_completed;
+    bool           resources_released;
+} tlsclient_lstate_t;
+```
+
+Arrayهای مختص Worker، مانند `threadlocal_ssl_contexts`، در **tstate** قرار می‌گیرند
+و با `getWID()` Index می‌شوند. State مختص اتصال در **lstate** قرار می‌گیرد.
+
+## ‏`line_state.c`: مقداردهی و نابودی
+
+Line State در `Init` مقداردهی و دقیقاً یک بار نابود می‌شود. تابع Destroy باید کل
+ناحیه‌ی **هم‌تراز** را Zero کند تا Assert مربوط به آزادشدن Line در حالت Debug،
+یعنی `debugAssertZeroBuf`، برقرار باشد؛ [بخش ۲](./part2-lines-and-callbacks.mdx)
+را ببینید:
+
+```c
+void templateLinestateInitialize(template_lstate_t *ls)
+{
+    // set up this connection's state
+}
+
+void templateLinestateDestroy(template_lstate_t *ls)
+{
+    memoryZeroAligned32(ls, tunnelGetCorrectAlignedLineStateSize(sizeof(template_lstate_t)));
+}
+```
+
+قواعد [بخش ۲](./part2-lines-and-callbacks.mdx)، در همان جایی که کد را می‌نویسید:
+
+- در `Init` مقداردهی کنید؛ Callbackهای بعدی وجود State را فرض می‌کنند.
+- فقط یک بار Destroy کنید؛ پس از `LinestateDestroy()`، ‏State را مرده و Zeroشده
+  در نظر بگیرید.
+- پس از نابودی State هیچ فیلدی از آن نخوانید.
+- مگر آنکه Source Code ضرورتش را ثابت کند، Boolean به نام `initialized` اضافه
+  نکنید.
+
+## قواعد مختص HTTP
+
+اگر روی `HttpClient` یا `HttpServer` کار می‌کنید، محدودیت‌های زیر که از Source
+Code به دست آمده‌اند برقرارند:
+
+- هدف WaterWall پشتیبانی از HTTP/1.x و HTTP/2 **تک‌Stream** است. HTTP/3 اضافه
+  نکنید. بیش از یک Stream منطقی HTTP/2 را پشتیبانی نکنید. اگر Peer، ‏Streamهای
+  اضافه باز کرد، مطابق طراحی موجود آن‌ها را با رویکردی محافظه‌کارانه رد یا نادیده
+  بگیرید.
+- در **ارتقای h2c** با `nghttp2_session_upgrade2()`، ‏Stream شماره‌ی `1` همان
+  Request اصلی است که Upgrade شده است. Client نباید Request ساختگی دومی را روی
+  Stream ‏`1` Submit کند و Server نباید Response ساختگی و جعلی را خودکار روی
+  Stream ‏`1` بسازد.
+- در **h2c همراه با Request Body**، ارتقای Request اصلی HTTP/1.1 که Body دارد در
+  طراحی تک‌Stream به‌شکل امن پشتیبانی نمی‌شود. Client باید آن را رد کند؛ Server
+  نیز باید Upgrade مربوط به Request دارای Body در HTTP/1.1 را نادیده بگیرد یا رد
+  کند.
+- برای **Finish صحیح**، دریافت `Finish` در upstream و سمت Request ممکن است ابتدا
+  نیازمند Byteهای پایانی HTTP باشد. آن‌ها را در حالی بفرستید که Reference مربوط
+  به Line را نگه داشته‌اید، سپس State محلی را نابود و `Finish` واقعی را Forward
+  کنید؛ الگوی عمومی Byteهای پایانی در
+  [بخش ۲](./part2-lines-and-callbacks.mdx). پس از Finish صحیح، ‏Line State مربوط به
+  HTTP را زنده نگه ندارید، مگر آنکه عمداً برای این هدف Line را Lock کرده باشید.
+
+## روند پیاده‌سازی
+
+برای هر قابلیت یا اصلاح جدید، این ترتیب را دنبال کنید:
+
+1. **جریان زنجیره را رسم کنید.** Up-end و Down-end را علامت بزنید و مشخص کنید
+   کدام جهت Callback مالک Transform است.
+2. **مالک Line را مشخص کنید.** کدام تونل Line را می‌سازد و نابود می‌کند؟
+3. **تونل موجود** و همسایه‌های مستقیمش را بخوانید.
+4. **قراردادها را بخوانید:** `ww/net/line.h`، ‏`ww/net/tunnel.h` و
+   `ww/net/chain.c`.
+5. **اگر Framing یا Prepend در کار است،** فایل‌های `ww/bufio/shiftbuffer.h` و
+   `buffer_pool.h` و همچنین Padding موجود در `node.c` تونل‌های نزدیک را بخوانید.
+6. **نزدیک‌ترین الگوی تونل پایدار را انتخاب کنید** و به آن نزدیک بمانید.
+7. **کوچک‌ترین تغییر ممکن** را که قابلیت ترکیب را حفظ می‌کند پیاده‌سازی کنید.
+8. برای هر رفتاری که ممکن است Regression داشته باشد، **Test متمرکزی اضافه یا
+   به‌روز کنید**؛ به‌ویژه Testی که با برعکس‌شدن جهت Fail شود.
+9. با Preset ساخت و Testهای مرتبط **اعتبارسنجی کنید**؛
+   [بخش ۶](./part6-build-test-review.mdx) را ببینید.
+
+:::warning از Abstractionهای حدسی دوری کنید
+به‌ندرت یک لایه‌ی Generic تازه راه‌حل اینجا است. درستی از تطبیق با چرخه‌ی عمر
+موجود می‌آید، نه Abstraction هوشمندانه‌تر. اگر برای کارکردن یک تونل مجبور شده‌اید
+مفهوم جدیدی برای چرخه‌ی عمر بسازید، دست نگه دارید و نزدیک‌ترین تونل مرجع را دوباره
+بخوانید.
+:::
+
+---
+
+ادامه: **[بخش ۶: Build، آزمایش و Review](./part6-build-test-review.mdx)**.

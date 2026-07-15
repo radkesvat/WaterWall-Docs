@@ -1,14 +1,329 @@
 ---
 sidebar_position: 1
-title: "راهنمای توسعه‌دهندگان WaterWall"
-sidebar_label: "راهنمای توسعه‌دهندگان"
-description: "نسخه فارسی راهنمای توسعه‌دهندگان نگهداری نمی‌شود؛ لطفاً نسخه انگلیسی را بخوانید."
+title: "راهنمای توسعه، بخش ۱: نمای کلی و مدل ذهنی"
+sidebar_label: "بخش ۱: نمای کلی و مدل ذهنی"
+description: "مدل Runtime، Objectهای اصلی، جهت Callbackها و چرخه‌ی عمر تونل که باید پیش از تغییر هر تونل WaterWall بشناسید."
 ---
 
-# راهنمای توسعه‌دهندگان WaterWall
+# راهنمای توسعه‌ی WaterWall
 
-نسخه فارسی راهنمای توسعه‌دهندگان نگهداری نمی‌شود.
+این راهنما با تمرکز بر Source Code برای افرادی نوشته شده است که تونل‌های موجود در
+[`tunnels/`](https://github.com/radkesvat/WaterWall) را پیاده‌سازی، اصلاح یا Review
+می‌کنند؛ چه توسعه‌دهنده باشند و چه Coding Agent. راهنما شش بخش دارد. این صفحه
+(بخش ۱) مدل ذهنی لازم را می‌سازد و بخش‌های بعدی قراردادهایی را با جزئیات توضیح
+می‌دهند که نباید نقض شوند.
 
-لطفاً نسخه انگلیسی را از صفحه اول راهنما بخوانید:
+WaterWall یک Runtime زنجیره‌محور برای تونل‌سازی است؛ بنابراین یک تونل درست هیچ‌گاه
+«فقط» Parser یا Encoder نیست. تونل باید **جهت Callbackها**، **طول عمر Line**،
+**State مختص هر Line**، **Padding بافر**، **رفتار Packet Line** و **قابلیت ترکیب**
+با هر Node پیش و پس از خود در پیکربندی کاربر را حفظ کند.
 
-[Developer Guide Part 1: Overview & Mental Model](https://radkesvat.github.io/WaterWall-Docs/docs/devguides/doc1)
+:::tip مهم‌ترین قاعده
+برای یک تونل، مدل چرخه‌ی عمر تازه‌ای طراحی نکنید. کار را از قراردادهای Runtime در
+[`ww/net/`](https://github.com/radkesvat/WaterWall/tree/main/ww/net) آغاز کنید و
+سپس ساختار یک تونل پایدار را که مسئله‌ای مشابه حل کرده است الگو قرار دهید. در این
+Codebase، درستی از هماهنگی با الگوی موجود چرخه‌ی عمر به دست می‌آید، نه از ابداع
+یک مدل عمومی‌تر.
+:::
+
+## ساختار این راهنما
+
+| بخش | موضوع | چه زمانی به آن نیاز دارید؟ |
+| --- | --- | --- |
+| **بخش ۱ (همین صفحه)** | نمای کلی، Objectهای اصلی، جهت‌ها و چرخه‌ی عمر | همیشه ابتدا این بخش را بخوانید. |
+| [بخش ۲: Lineها، Callbackها و ایمنی طول عمر](./part2-lines-and-callbacks.mdx) | `Init`/`Est`/`Payload`/`Pause`/`Resume`/`Finish`، Re-entrancy، Lock و بستن صحیح | هر تغییری که جریان اتصال را دست‌کاری می‌کند. |
+| [بخش ۳: بافرها، Padding و Shift Bufferها](./part3-buffers-and-padding.mdx) | `sbuf_t`، Buffer Poolها، `required_padding_left` و Prependکردن Header | هر تغییری که Payload را Frame، Prepend یا بازنویسی می‌کند. |
+| [بخش ۴: Packet Lineها و تونل‌های Packet](./part4-packet-tunnels.mdx) | معنای Packet Line، تونل‌های Packet خالص و پل‌های Packet/Stream | هر کار مربوط به Layer 3 یا Packet. |
+| [بخش ۵: ساختار یک تونل و روند کار](./part5-tunnel-anatomy.mdx) | چیدمان دایرکتوری، Metadata در `node.c`، فایل `create.c`، Line State و قواعد HTTP | هنگام افزودن یا بازسازی ساختار یک تونل. |
+| [بخش ۶: Build، آزمایش و Review](./part6-build-test-review.mdx) | Presetهای CMake، ‏ctest، اعتبارسنجی، Checklist بازبینی و خروجی Agent | پیش از آنکه تغییری را «تمام‌شده» بدانید. |
+
+## ابتدا این فایل‌ها را بخوانید
+
+پیش از تغییر رفتار تونل، Source Codeای را بخوانید که مالک قرارداد است. این فایل‌ها
+کوتاه، فشرده و مرجع اصلی‌اند.
+
+| حوزه | فایل‌ها |
+| --- | --- |
+| Callbackهای تونل و ساخت زنجیره | `ww/net/tunnel.h`، `ww/net/tunnel.c` |
+| طول عمر Line و State مختص هر Line | `ww/net/line.h`، `ww/net/line.c` |
+| نهایی‌سازی زنجیره و Packet Lineها | `ww/net/chain.h`، `ww/net/chain.c` |
+| رفتار پیش‌فرض تونل Packet | `ww/net/packet_tunnel.h`، `ww/net/packet_tunnel.c` |
+| Shift Bufferها و Padding | `ww/bufio/shiftbuffer.h`، `ww/bufio/shiftbuffer.c` |
+| Buffer Poolها | `ww/bufio/buffer_pool.h`، `ww/bufio/buffer_pool.c` |
+| Metadata مربوط به Node | `ww/objects/node.h` |
+
+## تونل‌های مرجع مناسب
+
+نزدیک‌ترین الگوی موجود را انتخاب کنید و از آن فاصله نگیرید. تونل‌های زیر پایدارند
+و هرکدام قرارداد مشخصی را به‌خوبی به نمایش می‌گذارند:
+
+| مرجع | برای چه چیزی بخوانید؟ |
+| --- | --- |
+| `TcpListener`، `TcpConnector` | رفتار Adapter: وجود Socket واقعی در یک سمت و ساختن/نابودکردن Line. |
+| `TlsClient`، `EncryptionClient` | بسته‌بندی Stateful پروتکل، State مختص Line و Finish صحیح همراه با Byteهای پایانی. |
+| `MuxClient` | مالکیت داخلی Line، Lineهای Parent/Child و ایمنی در برابر Re-entrancy. |
+| `PacketsToStream`، `StreamToPackets`، `PacketsToConnection` | مرزهای Packet-to-Stream و پل‌هایی که به Packet Line متکی‌اند. |
+| `PingClient`، `PingServer` | تصمیم‌گیری درباره‌ی جهت تونل Packet؛ تونل‌های جفت در جهت‌های مخالف. |
+| `template` | اسکلت حداقلی که نقطه‌ی شروع همه‌ی تونل‌هاست. |
+
+## مدل Runtime
+
+WaterWall **Instanceهای تونل** را در یک **زنجیره‌ی** مرتب کنار هم قرار می‌دهد.
+یک زنجیره‌ی معمول Stream چنین است:
+
+```text
+TcpListener -> ObfuscatorClient -> TlsClient -> TcpConnector
+```
+
+Node اول و آخر معمولاً **Adapter** هستند. آن‌ها مالک یک منبع سیستم‌عامل، مانند
+Socket نوع TCP یا UDP، دستگاه TUN، ‏Raw Socket و موارد مشابه‌اند. فقط همین Nodeها
+از دنیای بیرون داده می‌خوانند یا در آن می‌نویسند.
+
+هر چیزی میان Adapterها یک **تونل میانی** است. تونل‌های میانی باید **قابل ترکیب**
+بمانند: Callbackها و Payloadها را بدون هیچ فرضی درباره‌ی Adapter دو طرف تغییر
+دهند. تونل میانی‌ای که فقط در کنار یک Adapter خاص کار می‌کند معیوب است، حتی اگر
+آزمایش‌های خودش موفق باشند.
+
+```text
+ -------------- chain --------------------------------------------------
+
+   ------------          ------------          ------------
+   |          | -- up -> |          | -- up -> |          |
+   | Tunnel 1 |          | Tunnel 2 |          | Tunnel 3 |
+   |          | <- down- |          | <- down- |          |
+   ------------          ------------          ------------
+   (adapter)              (middle)              (adapter)
+
+ -----------------------------------------------------------------------
+```
+
+هر اتصال یک `line_t` است. Line دو انتها دارد که در `ww/net/line.h` با
+`Down-end <----> Up-end` توصیف شده‌اند. Chain Head، یعنی نخستین Adapter، رو به
+Down-end قرار می‌گیرد و Chain Tail، یعنی آخرین Adapter، رو به Up-end. سازوکار
+Backpressure متقارن است: اگر نوشتن در Down-end متوقف شود، Up-end در حالت Pause
+قرار می‌گیرد و برعکس.
+
+## چهار Object اصلی
+
+| Object | تعریف |
+| --- | --- |
+| `node_t` | پیکربندی Parseشده به‌همراه Metadata شامل `type`، `next`، `flags`، `layer_group`، `required_padding_left` و `createHandle`. برای هر Node در پیکربندی JSON یک نمونه وجود دارد. تعریف در `ww/objects/node.h`. |
+| `tunnel_t` | Instance اجرایی یک Node. دوازده Function Pointer مربوط به Callbackها، لینک‌های `next`/`prev`، ‏Tunnel State، اندازه‌ی Line State و Offsetهای زنجیره را نگه می‌دارد. تعریف در `ww/net/tunnel.h`. |
+| `line_t` | یک اتصال: Line عادی اتصال، Line منطقی یا Packet Line مربوط به Worker. شامل Routing Context، نشانه‌های User/Auth، شناسه‌ی Worker مالک، Reference Count، ‏Flag مربوط به `alive` و **State مختص Line برای همه‌ی تونل‌ها** است. تعریف در `ww/net/line.h`. |
+| `tunnel_chain_t` | مجموعه‌ی مرتب تونل‌ها. هنگام نهایی‌سازی، اندازه‌ی کل Line State، مجموع Padding سمت چپ و Packet Lineهای هر Worker را محاسبه می‌کند. تعریف در `ww/net/chain.h`. |
+
+### تفاوت Tunnel State و Line State
+
+هر تونل می‌تواند مالک دو نوع State باشد:
+
+- **Tunnel State یا `tstate`** — یک Block به‌ازای هر Instance تونل که میان همه‌ی
+  اتصال‌های عبوری مشترک است. اندازه‌ی آن هنگام `tunnelCreate()` ثابت می‌شود.
+- **Line State یا `lstate`** — یک Slot به‌ازای هر `line_t` که برای همان اتصال و
+  همین تونل خصوصی است.
+
+با Helperهای موجود به آن‌ها دسترسی بگیرید و مستقیماً وارد Structها نشوید:
+
+```c
+my_tstate_t *ts = tunnelGetState(t);        // tunnel-wide state
+my_lstate_t *ls = lineGetState(line, t);    // this tunnel's state for this line
+```
+
+`lineGetState()` چگونه Slot درست را پیدا می‌کند؟ هنگام Indexشدن زنجیره، Runtime
+به هر تونل یک `lstate_offset` می‌دهد و به‌اندازه‌ی `lstate_size` در هر Line فضا
+رزرو می‌کند؛ به `tunnelDefaultOnIndex` در `ww/net/tunnel.c` نگاه کنید.
+`lineGetState()` پس از آن فقط برابر است با
+`line->tunnels_line_state + t->lstate_offset`. به همین دلیل **Line State باید در
+`Init` مقداردهی اولیه شود** و پس از نابودشدن دیگر معتبر دانسته نشود: این حافظه
+بخشی مشترک از فضای داخلی Line است و اندازه‌ی آن فقط یک بار برای کل زنجیره تعیین
+می‌شود.
+
+اندازه‌ی Stateها با Cache Line هم‌تراز است. هنگام Zeroکردن Line State، دقیقاً
+مانند تونل‌های موجود، تمام ناحیه‌ی *هم‌تراز‌شده* را پاک کنید:
+
+```c
+memoryZeroAligned32(ls, tunnelGetCorrectAlignedLineStateSize(sizeof(my_lstate_t)));
+```
+
+## جهت Callbackها
+
+مالکیت جهت اولین نکته‌ای است که باید درست فهمیده شود و رایج‌ترین منشأ خطاست.
+
+| جریان | مفهوم | Helper مربوط به Forward |
+| --- | --- | --- |
+| **Upstream** | مسیر Request، خروجی یا رو به جلو؛ به‌سمت Up-end و `next` | `tunnelNextUpStream*` |
+| **Downstream** | مسیر Response، ورودی یا رو به عقب؛ به‌سمت Down-end و `prev` | `tunnelPrevDownStream*` |
+
+هر تونل دوازده Callback مربوط به جریان دارد؛ برای هر ترکیب `{event} x {direction}`
+یک Callback:
+
+```c
+fnInitU  fnEstU  fnPayloadU  fnPauseU  fnResumeU  fnFinU    // upstream handlers
+fnInitD  fnEstD  fnPayloadD  fnPauseD  fnResumeD  fnFinD    // downstream handlers
+```
+
+تقریباً هیچ‌گاه این Pointerها را مستقیماً صدا نمی‌زنید. از Helperهای Forwarding
+استفاده می‌کنید که Handler متناظر را روی همسایه فراخوانی می‌کنند:
+
+```c
+// "Next, upstream": calls self->next->fnPayloadU(self->next, line, buf)
+tunnelNextUpStreamPayload(t, line, buf);
+
+// "Prev, downstream": calls self->prev->fnPayloadD(self->prev, line, buf)
+tunnelPrevDownStreamPayload(t, line, buf);
+```
+
+Forwardکردن رویدادهای چرخه‌ی عمر نیز از همین نام‌گذاری پیروی می‌کند:
+
+```c
+tunnelNextUpStreamInit(t, line);      // start the rest of the chain forward
+tunnelNextUpStreamFinish(t, line);    // close the forward direction
+
+tunnelPrevDownStreamEst(t, line);     // tell the backward side it is established
+tunnelPrevDownStreamFinish(t, line);  // close the backward direction
+```
+
+اگر تونل Callback مشخصی را Override نکند، رفتار پیش‌فرض فریم‌ورک را می‌گیرد که
+صرفاً رویداد را در همان جهت به همسایه Pass-through می‌کند؛ به
+`tunnelDefaultUpStreamPayload` و `tunnelDefaultDownStreamPayload` در
+`ww/net/tunnel.c` نگاه کنید. بنابراین تونلی که فقط در upstream عمل Obfuscation را
+انجام می‌دهد، می‌تواند Handler مربوط به Payload در downstream را روی مقدار پیش‌فرض
+بگذارد تا Byteها بدون تغییر عبور کنند.
+
+:::warning جهت‌ها را برعکس نکنید
+صرفاً چون تونل سمت Server «برعکس به نظر می‌رسد»، این جهت‌ها را جابه‌جا نکنید.
+زنجیره‌ی واقعی را رسم کنید، Up-end و Down-end را علامت بزنید و مشخص کنید کدام جهت
+Callback مالک Transform است. تونل‌های جفت Client/Server اغلب Transform را در
+**جهت‌های مخالف** انجام می‌دهند؛ مثال `PingClient` و `PingServer` را در
+[بخش ۴](./part4-packet-tunnels.mdx) ببینید.
+:::
+
+### کدام تابع Forwarding را صدا بزنم؟
+
+| در حال Handleکردن... | و قصد فرستادن رویداد به... | تابع مناسب |
+| --- | --- | --- |
+| هر چیزی | بخش بالاتر زنجیره، به‌سمت `next` | `tunnelNextUpStream{Init,Payload,Est,Pause,Resume,Finish}` |
+| هر چیزی | بخش پایین‌تر زنجیره، به‌سمت `prev` | `tunnelPrevDownStream{Init,Payload,Est,Pause,Resume,Finish}` |
+
+Helperهای قرینه‌ی `tunnelUpStream*` و `tunnelDownStream*` که `Next`/`Prev` ندارند،
+Handler را روی تونلی فراخوانی می‌کنند که **Pointer مستقیم آن را در اختیار دارید**.
+این حالت زمانی به کار می‌رود که تونل شاخه‌ای را هدایت می‌کند که در پایین خود Bind
+کرده است؛ مانند Route Target، ‏Fallback یا شاخه‌ی کمکی. ورودی واقعی چنین شاخه‌ای
+را با `tunnelGetBranchEntry()` پیدا کنید و فرض نکنید Node خامی که دریافت کرده‌اید
+همان Head قابل‌فراخوانی است.
+
+## چرخه‌ی عمر تونل
+
+Instance تونل از مجموعه‌ای ثابت از Lifecycle Hookها عبور می‌کند. این Hookها با
+Callbackهای جریانِ مختص اتصال که در بالا دیدیم متفاوت‌اند: در زمان پیکربندی،
+راه‌اندازی و خاموش‌شدن و به‌ازای هر تونل یا Worker یک بار اجرا می‌شوند، نه برای
+هر Packet.
+
+Runtime تقریباً با ترتیب زیر آن‌ها را اجرا می‌کند؛ Comment ابتدای `ww/net/tunnel.h`
+و پیاده‌سازی‌های پیش‌فرض در `ww/net/tunnel.c` را ببینید:
+
+```text
+createHandle(node)         // node.c -> create.c: allocate, assign callbacks, parse settings
+      |
+   onChain                 // bind to next/prev, insert into the chain (default walks node->next)
+      |
+   onIndex                 // assign chain_index + lstate_offset, reserve line-state bytes
+      |
+   onPrepare               // pre-start preparation (was "onChainingComplete")
+      |
+   onStart                 // chain is fully built; start real work / bootstrap packet lines
+      |
+    ...                     // runtime: flow callbacks run here
+      |
+   onStop  /  onWorkerStop // stop tunnel / stop per-worker resources
+      |
+   onDestroy               // free tunnel and its state
+```
+
+کاربرد هر Hook:
+
+| Hook | رفتار پیش‌فرض | مورد معمول Override |
+| --- | --- | --- |
+| `createHandle` | الزامی است | ساخت تونل با `tunnelCreate(node, sizeof(tstate), sizeof(lstate))`، تنظیم دوازده Callback، ‏Parse و اعتبارسنجی تنظیمات JSON و تخصیص منابع هر Worker. |
+| `onChain` | `tunnelDefaultOnChain` با دنبال‌کردن `node->next` زنجیره را می‌سازد | به‌ندرت Override می‌شود. Adapterها نیز مقدار پیش‌فرض را حفظ می‌کنند. |
+| `onIndex` | `tunnelDefaultOnIndex`، ‏Offset مربوط به Line State را تعیین می‌کند | به‌ندرت Override می‌شود. |
+| `onPrepare` | بدون عملیات | آماده‌سازی پیش از Start که به وجود زنجیره نیاز دارد. |
+| `onStart` | بدون عملیات | آغاز Listen/Connect و Bootstrapکردن Packet Lineها؛ بخش ۴ را ببینید. |
+| `onStop` | بدون عملیات | نپذیرفتن کار جدید و آغاز Teardown. |
+| `onWorkerStop` | بدون عملیات | آزادکردن منابع محلی یک Worker ID. |
+| `onDestroy` | `tunnelDestroy`، ‏Instance را آزاد می‌کند | آزادکردن تنظیمات، SSL Contextها و Poolها و سپس فراخوانی `tunnelDestroy`. |
+
+بیشتر تونل‌ها فقط `onPrepare`، ‏`onStart`، ‏`onStop` و `onDestroy` را در کنار
+Callbackهای جریان Override می‌کنند. رفتار پیش‌فرض Chaining و Indexing تقریباً
+همیشه درست است؛ مگر آنکه Source Code یک تونل مرجع نیاز دیگری را ثابت کند، آن‌ها
+را تغییر ندهید.
+
+## اسکلت حداقلی تونل
+
+همه‌ی تونل‌ها از یک ساختار یکسان آغاز می‌شوند. نمونه‌ی زیر نسخه‌ی کمی خلاصه‌شده‌ی
+`create.c` در تونل `template` است:
+
+```c
+tunnel_t *templateTunnelCreate(node_t *node)
+{
+    tunnel_t *t = tunnelCreate(node, sizeof(template_tstate_t), sizeof(template_lstate_t));
+
+    t->fnInitU    = &templateTunnelUpStreamInit;
+    t->fnEstU     = &templateTunnelUpStreamEst;
+    t->fnFinU     = &templateTunnelUpStreamFinish;
+    t->fnPayloadU = &templateTunnelUpStreamPayload;
+    t->fnPauseU   = &templateTunnelUpStreamPause;
+    t->fnResumeU  = &templateTunnelUpStreamResume;
+
+    t->fnInitD    = &templateTunnelDownStreamInit;
+    t->fnEstD     = &templateTunnelDownStreamEst;
+    t->fnFinD     = &templateTunnelDownStreamFinish;
+    t->fnPayloadD = &templateTunnelDownStreamPayload;
+    t->fnPauseD   = &templateTunnelDownStreamPause;
+    t->fnResumeD  = &templateTunnelDownStreamResume;
+
+    t->onPrepare = &templateTunnelOnPrepair;
+    t->onStart   = &templateTunnelOnStart;
+    t->onStop    = &templateTunnelOnStop;
+    t->onDestroy = &templateTunnelDestroy;
+
+    return t;
+}
+```
+
+بخش ۵ ساختار کامل دایرکتوری پشت این اسکلت، از جمله Metadata در `node.c`، فایل
+`line_state.c` و محل هر Callback را بررسی می‌کند.
+
+## «درست‌بودن» در اینجا یعنی چه؟
+
+یک تغییر درست در تونل باید **هم‌زمان** همه‌ی موارد زیر را حفظ کند:
+
+- قابلیت ترکیب تونل، مستقل از همسایه‌های آن
+- قواعد چرخه‌ی عمر Line: مقداردهی در `Init`، یک بار Destroyشدن و فقط به‌دست مالک
+- مالکیت جهت: جابه‌جانشدن `Next*` و `Prev*`
+- فرض‌های مربوط به Padding بافر: رعایت `required_padding_left`
+- استفاده‌ی صحیح از Shift Buffer: فراخوانی `sbufShiftLeft` فقط با ظرفیت کافی در چپ
+- ایمنی Lock و Reference Count: جلوگیری از Use-after-free برای `line_t` و Line State
+- معنای Packet Line: محلی برای Worker و بدون Destroy در زمان Runtime
+- رفتار موجود زنجیره: نبود Regression در چیدمان‌های دیگر
+
+اگر یک تغییر پیشنهادی نتواند توضیح دهد که تک‌تک این موارد را چگونه حفظ می‌کند،
+هنوز آماده نیست. ادامه‌ی این راهنما در واقع شرح مفصل همین فهرست است.
+
+## واژه‌نامه
+
+| اصطلاح | مفهوم |
+| --- | --- |
+| **Adapter** | تونلی در Chain Head یا Chain End که مالک یک منبع سیستم‌عامل، مانند Socket، ‏TUN یا Raw Socket، است و Lineها را می‌سازد و نابود می‌کند. |
+| **تونل میانی** | تونلی غیر از Adapter که Callbackها یا Payloadها را تغییر می‌دهد و باید قابل ترکیب بماند. |
+| **Line** | یک `line_t`؛ یک اتصال یا یک Packet Line مربوط به Worker که State مختص Line همه‌ی تونل‌ها را نگه می‌دارد. |
+| **Upstream** | جهت رو به جلو یا خروجی، به‌سمت `next` و Up-end. |
+| **Downstream** | جهت رو به عقب یا ورودی، به‌سمت `prev` و Down-end. |
+| **tstate** | Tunnel State؛ مختص Instance و مشترک میان همه‌ی Lineها. |
+| **lstate** | Line State؛ مختص Line و خصوصی برای یک تونل. |
+| **Packet Line** | یک `line_t` پایدار به‌ازای هر Worker در زنجیره‌های Layer 3؛ Line اتصال نیست. |
+| **Re-entrancy** | حالتی که Callback میان‌تونلی پیش از بازگشت کنترل، به‌صورت Synchronous دوباره وارد تونل شما می‌شود و ممکن است Line را ببندد. |
+| **Reflection** | Forwardکردن اشتباه Callback به‌سمتی که قبلاً Finish شده است؛ یکی از علت‌های رایج Crash. |
+
+---
+
+ادامه: **[بخش ۲: Lineها، Callbackها و ایمنی طول عمر](./part2-lines-and-callbacks.mdx)**.

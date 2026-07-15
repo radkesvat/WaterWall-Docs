@@ -1,15 +1,235 @@
 ---
 sidebar_position: 3
-title: "راهنمای توسعه‌دهندگان WaterWall"
-sidebar_label: "راهنمای توسعه‌دهندگان"
-description: "نسخه فارسی راهنمای توسعه‌دهندگان نگهداری نمی‌شود؛ لطفاً نسخه انگلیسی را بخوانید."
-unlisted: true
+title: "راهنمای توسعه، بخش ۳: بافرها، Padding و Shift Bufferها"
+sidebar_label: "بخش ۳: بافر و Padding"
+description: "مدل بافر sbuf_t، ‏Buffer Poolهای Worker، بودجه‌ی Padding سمت چپ و روش افزودن Header پروتکل بدون شکستن قابلیت ترکیب زنجیره."
 ---
 
-# راهنمای توسعه‌دهندگان WaterWall
+# بخش ۳: بافرها، Padding و Shift Bufferها
 
-نسخه فارسی راهنمای توسعه‌دهندگان نگهداری نمی‌شود.
+اگر تغییر شما Payloadها را Frame می‌کند، Header را در ابتدای آن‌ها می‌گذارد،
+Byteها را In-place بازنویسی می‌کند یا حافظه‌ی کاری می‌گیرد، باید `sbuf_t`، ‏Buffer
+Poolها و قرارداد Padding سمت چپ در کل زنجیره را بشناسید. اشتباه در این بخش تونلی
+می‌سازد که در یک چیدمان زنجیره درست کار می‌کند و در چیدمانی دیگر حافظه را خراب
+می‌کند.
 
-لطفاً نسخه انگلیسی را از صفحه اول راهنما بخوانید:
+مراجع اصلی: `ww/bufio/shiftbuffer.h`، ‏`ww/bufio/buffer_pool.h` و فیلد
+`required_padding_left` در `ww/objects/node.h`.
 
-[Developer Guide Part 1: Overview & Mental Model](https://radkesvat.github.io/WaterWall-Docs/docs/devguides/doc1)
+## ساختار `sbuf_t`
+
+Payloadهای WaterWall در `sbuf_t`، مخفف Shift Buffer، جابه‌جا می‌شوند؛ بافری دارای
+Padding که قابلیت Shift دارد. Header آن دقیقاً ۳۲ Byte است و ناحیه‌ی داده نیز با
+مرز ۳۲ Byte هم‌تراز می‌شود تا Copyهای AVX2 هم‌تراز بمانند:
+
+```c
+struct sbuf_s
+{
+    uint32_t curpos;       // offset of the current payload start within buf[]
+    uint32_t len;          // current payload length, in bytes
+    uint32_t capacity;     // total allocation of buf[] (constant for the buffer's life)
+    uint16_t l_pad;        // reserved left padding (constant once created)
+    bool     is_temporary; // stack/view buffer: never freed or pooled
+    uint8_t  _padding1;
+    uint8_t  buf[];        // 32-byte aligned data
+};
+```
+
+برای درک آن، یک Cursor را داخل Allocation ثابتی در نظر بگیرید:
+
+```text
+   |<-- left capacity -->|<------- payload (len) ------->|<-- writeable tail -->|
+   +---------------------+-------------------------------+----------------------+
+buf[0]                curpos                        curpos+len             capacity
+   |<------ l_pad ------>|
+   (reserved padding)
+```
+
+- هنگام Prepend یا Shift به چپ، **`curpos`** به چپ می‌رود؛ هنگام مصرف داده از
+  ابتدای بافر به راست حرکت می‌کند.
+- **`len`** تعداد Byteهای معتبر Payload از محل `curpos` به بعد است.
+- **ظرفیت سمت چپ** (`sbufGetLeftCapacity` = `curpos`) تعداد Byteهایی است که هنوز
+  می‌توانید با Shift به چپ در ابتدای بافر اضافه کنید.
+- **بخش قابل‌نوشتن انتهایی**
+  (`sbufGetMaximumWriteableSize` = `capacity - curpos`) مقدار فضایی است که از Cursor
+  به بعد می‌توان Address کرد. توجه کنید که این مقدار، فضای خالی پس از Payload
+  فعلی **نیست**؛ برای افزودن `extra` ‏Byte باید آن را با `len + extra` مقایسه کنید.
+
+### Accessorهای اصلی
+
+| فراخوانی | مقدار بازگشتی |
+| --- | --- |
+| `sbufGetLength(b)` | طول فعلی Payload یا `len`. |
+| `sbufGetRawPtr(b)` / `sbufGetMutablePtr(b)` | Pointer ابتدای Payload یا `buf + curpos`. |
+| `sbufGetLeftCapacity(b)` | تعداد Byteهای در دسترس برای Prepend یا `curpos`. |
+| `sbufGetMaximumWriteableSize(b)` | تعداد Byteهای قابل Address از Cursor یا `capacity - curpos`. |
+| `sbufGetTotalCapacity(b)` | کل Allocation که ثابت است. |
+| `sbufGetLeftPadding(b)` | مقدار اولیه‌ی `l_pad`. |
+
+### خواندن و نوشتن
+
+برای فیلدهای Integer در Header، ‏Helperهای هم‌تراز و بدون الزام هم‌ترازی وجود دارد:
+
+```c
+sbufWriteUI16(b, port);            // aligned 16-bit write at the cursor
+sbufWriteUnAlignedUI32(b, value);  // unaligned 32-bit write
+uint16_t v; sbufReadUI16(b, &v);   // aligned read
+sbufWrite(b, src, n);              // raw copy of n bytes at the cursor
+sbufConsume(b, n);                 // drop n bytes from the payload tail count
+sbufShiftRight(b, n);              // advance cursor: consume n bytes from the front
+```
+
+## افزودن Header در ابتدا با `sbufShiftLeft`
+
+دلیل وجود `l_pad` این است که تونل بتواند Header پروتکل را **بدون Reallocation یا
+Memmoveکردن** Payload در ابتدای آن قرار دهد. کافی است Cursor را به چپ ببرید و در
+فضای تازه‌آزادشده بنویسید:
+
+```c
+// Reserve room and move the cursor back by header_len bytes.
+assert(sbufGetLeftCapacity(buf) >= header_len);
+sbufShiftLeft(buf, header_len);     // curpos -= header_len; len += header_len
+
+// Now write the header at the new front.
+sbufWriteUI16(buf, htons(payload_len));
+// ... fill the rest of the header ...
+```
+
+`sbufShiftLeft` با Assert بررسی می‌کند که ظرفیت سمت چپ کافی باشد:
+
+```c
+static inline void sbufShiftLeft(sbuf_t *const b, const uint32_t bytes)
+{
+    assert(sbufGetLeftCapacity(b) >= bytes);
+    b->curpos -= bytes;
+    b->len    += bytes;
+}
+```
+
+اگر Assert فعال شود، یا در Build نوع Release از ابتدای بافر به چپ‌تر بروید، بیش
+از بودجه‌ی Padding خود Prepend کرده‌اید؛ موضوع بخش بعد.
+
+## قرارداد Padding: ‏`required_padding_left`
+
+هر تونل فقط می‌تواند به Padding سمت چپی تکیه کند که در `node.c` خود **اعلام کرده
+است**:
+
+```c
+.required_padding_left = kMyProtocolHeaderSize,
+```
+
+هنگام نهایی‌شدن زنجیره، Runtime مقدار `required_padding_left` همه‌ی Nodeهای زنجیره
+را جمع می‌کند و همین مقدار Padding سمت چپ را در بافرهای تحویلی رزرو می‌کند؛
+`tunnelchainInsert` مقدار `sum_padding_left` را افزایش می‌دهد و
+`tunnelchainFinalize` تابع `globalstateUpdateAllocationPadding` را صدا می‌زند.
+به بیان دیگر:
+
+> ظرفیت سمت چپ در دسترس تونل هنگام Runtime، برابر مجموع بودجه‌ی Padding **تونل
+> شما و همه‌ی تونل‌هایی است که از آن به Adapter سازنده‌ی بافر نزدیک‌ترند**. اگر
+> Byteهایی را Prepend کنید که اعلام نکرده‌اید، بودجه‌ی تونل دیگری را خرج کرده‌اید؛
+> بودجه‌ای که ممکن است در زنجیره‌ای دیگر وجود نداشته باشد.
+
+به همین دلیل یک تونل Framing که «روی سیستم من کار می‌کند» ممکن است با قرارگرفتن
+Node دیگری پیش از آن حافظه را خراب کند. هر مقداری را که Prepend می‌کنید اعلام
+کنید.
+
+قواعد:
+
+- فقط زمانی `sbufShiftLeft()` را فراخوانی کنید که `sbufGetLeftCapacity()` دست‌کم
+  به‌اندازه‌ی Header موردنیاز باشد.
+- هر Prepend را در محدوده‌ی `required_padding_left` اعلام‌شده‌ی همین تونل نگه
+  دارید.
+- اگر باید بیش از بودجه‌ی خود Prepend کنید، `required_padding_left` را متناسب
+  افزایش دهید یا به‌جای Shiftکردن یک بافر تازه بسازید؛ بخش بعد را ببینید.
+
+## Buffer Poolها
+
+برای بافرهای معمول Runtime از `malloc` استفاده نکنید. Buffer Pool محلی Worker
+باعث Recycleشدن Allocationها می‌شود و Padding درست را نیز فراهم می‌کند. از طریق
+هر Line می‌توان به Pool دسترسی داشت:
+
+```c
+buffer_pool_t *pool = lineGetBufferPool(line);     // this line's worker pool
+
+sbuf_t *big   = bufferpoolGetLargeBuffer(pool);    // large working buffer
+sbuf_t *small = bufferpoolGetSmallBuffer(pool);    // small working buffer
+
+// ... use the buffer ...
+
+bufferpoolReuseBuffer(pool, buf);                  // return it to the pool
+lineReuseBuffer(line, buf);                        // convenience: pool of line's worker
+```
+
+Poolها **مختص هر Worker** هستند. هر Line دقیقاً به یک Worker تعلق دارد که با
+`lineGetWID` مشخص می‌شود؛ پس همیشه Pool همان Line را به کار ببرید و هرگز از Pool
+Worker دیگری استفاده نکنید. بافرهای گرفته‌شده از Pool، ‏Padding سمت چپ رزروشده‌ی
+زنجیره را از قبل دارند؛ بنابراین برای ساخت Payloadی که قرار است چیزی به ابتدای
+آن افزوده شود، جای درستی هستند.
+
+اگر برای Append به بافری بزرگ‌تر از بافر فعلی نیاز دارید، به‌جای پیاده‌سازی دستی
+رشد بافر از `sbufReserveSpace()` استفاده کنید. این تابع فقط در صورت نیاز
+Reallocate و Copy می‌کند.
+
+## مالکیت بافر
+
+Bugهای طول عمر بافر به‌اندازه‌ی Bugهای طول عمر Line رایج‌اند. قواعد:
+
+- **Callback مالکیت بافری را که به آن می‌دهید تحویل می‌گیرد.** پس از
+  `tunnelNextUpStreamPayload(t, line, buf)` یا شکل downstream آن، دیگر مالک `buf`
+  نیستید. آن را نخوانید، Reuse یا Free نکنید.
+- **اگر بافر را نگه می‌دارید، مالک آن هستید.** مسئولید در نهایت با
+  `bufferpoolReuseBuffer` / `lineReuseBuffer` آن را Recycle یا به Callback دیگری
+  تحویل دهید.
+- **در مسیر خطایی که هنوز مالک بافر هستید**، پیش از Close آن را به Pool یا Line
+  برگردانید. بافر را Leak نکنید و پس از مرگ Line به آن دست نزنید.
+- **اگر Callback نوع Re-entrant، ‏Line را از بین برده است**، یعنی
+  `withLineLocked()` مقدار `false` داده، فقط بافرهایی را Recycle کنید که همچنان
+  در اختیار دارید؛ برای این کار به State مرده‌ی Line دست نزنید.
+
+Flag مربوط به `is_temporary` بافرهای Stack/View را مشخص می‌کند که هرگز نباید Free
+شوند یا وارد Pool شوند. بافر موقت را به چیزی که ممکن است آن را Recycle کند ندهید
+و این Flag را روی بافرهای Pool تنظیم نکنید.
+
+در Buildهای Debug، ‏`BUFFER_WONT_BE_REUSED(x)` بافر را با یک Duplicate تازه عوض و
+نسخه‌ی اصلی را نابود می‌کند تا Pointer قدیمی به بافر قبلی سریعاً شناسایی شود. دیدن
+این Macro در تونل مرجع یعنی «از این نقطه به بعد نباید دوباره به این بافر دست زد».
+
+## نمونه‌ی کامل Prepend
+
+همه‌ی نکات را کنار هم بگذاریم: تونلی برای Framing که در مسیر upstream طول Payload
+را به‌صورت Big-endian و در ۲ Byte ابتدای آن می‌نویسد و در `node.c` مقدار
+`.required_padding_left = 2` را اعلام کرده است:
+
+```c
+void myTunnelUpStreamPayload(tunnel_t *t, line_t *l, sbuf_t *buf)
+{
+    const uint16_t payload_len = (uint16_t) sbufGetLength(buf);
+
+    // We advertised 2 bytes of left padding, so this is guaranteed to fit.
+    assert(sbufGetLeftCapacity(buf) >= sizeof(uint16_t));
+    sbufShiftLeft(buf, sizeof(uint16_t));
+    sbufWriteUI16(buf, payload_len);      // (use the project's endianness helper as needed)
+
+    // Hand the buffer upstream; we no longer own it.
+    tunnelNextUpStreamPayload(t, l, buf);
+}
+```
+
+در سمت downstream، تونل جفت Header را با `sbufReadUI16` و `sbufShiftRight` می‌خواند
+و حذف می‌کند، سپس با `tunnelPrevDownStreamPayload` آن را Forward می‌کند.
+
+## اشتباه‌های رایج در کار با بافر
+
+- افزودن داده در ابتدا بدون اعلام Padding و تکیه بر ظرفیت چپی که فقط در یک
+  چیدمان خاص زنجیره وجود دارد.
+- استفاده از `sbufShiftLeft` با ظرفیت ناکافی در سمت چپ؛ Assert در Debug به شما
+  کمک می‌کند، اما Build نوع Release حافظه را خراب خواهد کرد.
+- خواندن یا Reuseکردن بافر پس از تحویل آن به Callback مربوط به Forwarding.
+- Leakکردن بافر در مسیر Error یا Close.
+- استفاده از Pool یک Worker دیگر به‌جای Worker متعلق به Line.
+- درنظرگرفتن `sbufGetMaximumWriteableSize` به‌عنوان «فضای خالی پس از Payload»؛ این
+  مقدار فضای موجود از Cursor است، پس ابتدا طول فعلی را از آن کم کنید.
+
+---
+
+ادامه: **[بخش ۴: Packet Lineها و تونل‌های Packet](./part4-packet-tunnels.mdx)**.

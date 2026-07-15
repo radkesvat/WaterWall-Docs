@@ -1,15 +1,275 @@
 ---
 sidebar_position: 4
-title: "راهنمای توسعه‌دهندگان WaterWall"
-sidebar_label: "راهنمای توسعه‌دهندگان"
-description: "نسخه فارسی راهنمای توسعه‌دهندگان نگهداری نمی‌شود؛ لطفاً نسخه انگلیسی را بخوانید."
-unlisted: true
+title: "راهنمای توسعه، بخش ۴: Packet Lineها و تونل‌های Packet"
+sidebar_label: "بخش ۴: تونل‌های Packet"
+description: "معنای Packet Line، تونل‌های Packet خالص، پل‌های Packet/Stream، مقداردهی Packet Line و قواعد جهت در تونل‌های جفت برای کارهای Layer 3."
 ---
 
-# راهنمای توسعه‌دهندگان WaterWall
+# بخش ۴: Packet Lineها و تونل‌های Packet
 
-نسخه فارسی راهنمای توسعه‌دهندگان نگهداری نمی‌شود.
+WaterWall علاوه بر Streamهای معمول، جریان Packetهای Layer 3 مانند دستگاه TUN،
+مسیرهای WireGuard-style و پردازش Raw Packet را نیز مدیریت می‌کند. مدل Packet از
+نوع `line_t` استفاده می‌کند، اما چرخه‌ی عمر آن **کاملاً متفاوت** است. یکی از
+مخرب‌ترین اشتباه‌ها در این Codebase آن است که Packet Line را Line مختص اتصال
+در نظر بگیرید.
 
-لطفاً نسخه انگلیسی را از صفحه اول راهنما بخوانید:
+پیش از تغییر هر چیزی زیر یک Node از نوع Layer 3، این بخش را بخوانید. مراجع اصلی:
+`ww/net/chain.c`، ‏`ww/net/packet_tunnel.c`، ‏`ww/net/line.h` و خود تونل‌های
+Packet.
 
-[Developer Guide Part 1: Overview & Mental Model](https://radkesvat.github.io/WaterWall-Docs/docs/devguides/doc1)
+## Packet Line چیست؟
+
+Packet Line یک `line_t` واقعی است، اما برخلاف Line اتصال:
+
+- برای هر زنجیره‌ی دارای Node از نوع Layer 3، **یک بار به‌ازای هر Worker** تخصیص
+  می‌یابد؛
+- میان **همه‌ی Packetهایی** که آن Worker پردازش می‌کند مشترک است؛
+- به چرخه‌ی عمر اتصال TCP/UDP وابسته نیست؛
+- در Runtime عادی بسته نمی‌شود؛
+- فقط زمانی نابود می‌شود که **خود زنجیره** نابود شود.
+
+Source Code در این مورد صریح است. در `tunnelchainFinalize()` از
+`ww/net/chain.c`، اگر زنجیره Node از نوع Packet داشته باشد، یک Packet Line برای
+هر Worker ساخته می‌شود:
+
+```c
+tc->packet_lines = (line_t **) memoryAllocate(sizeof(line_t) * tc->workers_count);
+
+for (wid_t i = 0; i < tc->workers_count; i++)
+{
+    // ... create the worker line pool ...
+    if (tc->contains_packet_node)
+    {
+        tc->packet_lines[i] = lineCreateForWorker(0, tc->line_pools, i);
+    }
+}
+```
+
+این Lineها فقط در `tunnelchainDestroy()` از بین می‌روند:
+
+```c
+for (uint32_t i = 0; i < tc->workers_count; i++)
+{
+    if (tc->packet_lines && tc->packet_lines[i])
+    {
+        lineDestroy(tc->packet_lines[i]);
+    }
+}
+```
+
+Packet Line هر Worker را با `tunnelchainGetWorkerPacketLine(chain, wid)` بگیرید.
+
+:::danger Packet Line را هرگز در Runtime نابود نکنید
+در کارکرد عادی روی Packet Line تابع `lineDestroy()` را فراخوانی نکنید و هیچ
+منطقی طراحی نکنید که انتظار داشته باشد Packet Line پس از `Finish` دوباره ساخته
+شود. برخی Adapterهای Packet مانند `TunDevice` و `UdpStatelessSocket` در Buildهای
+Debug با Assert بررسی می‌کنند که Packet Line پس از Forwardشدن یک Packet همچنان
+زنده باشد. اگر تغییر شما اجازه می‌دهد Packet Line هنگام Runtime بمیرد، تقریباً
+به‌طور قطع Bug دارد.
+:::
+
+## Packet Lineها State مشترک Worker هستند
+
+از آنجا که یک Packet Line در هر Worker به تعداد زیادی Packet نامرتبط سرویس می‌دهد،
+هر چیزی که روی آن ذخیره شود **Scratch State محلی Worker** است، نه هویت مختص اتصال.
+به‌ویژه مراقب این موارد باشید:
+
+- `routing_context.src_ctx` و `routing_context.dest_ctx`
+- `recalculate_checksum` که Scratch Flag مختص Packet است؛
+  `lineSetRecalculateChecksum` را ببینید
+- هر Line State مربوط به تونل که روی Packet Line ذخیره شده است
+
+این فیلدها با هر Packet بازنویسی می‌شوند. آن‌ها را Peer، ‏Flow یا Session پایدار
+در نظر نگیرید. State ذخیره‌شده روی Packet Line باید در یکی از این دسته‌ها معنا
+داشته باشد:
+
+- State مختص Worker؛
+- Scratch State مربوط به Packet Pipeline؛
+- State پل که به سمت Packet در Worker متصل است.
+
+اگر پشت ترافیک Packet واقعاً به چرخه‌ی عمر مختص Flow یا اتصال نیاز دارید، **در
+پشت سمت Packet، ‏Lineهای عادی بسازید**؛ Packet Line را وادار نکنید مانند اتصال
+رفتار کند.
+
+## دو نوع تونل Packet
+
+همه‌ی تونل‌هایی که با Packet Line سروکار دارند از یک نوع نیستند. دو دسته‌ی
+متمایز با قواعد متفاوت وجود دارد.
+
+### ۱. تونل‌های Packet خالص با `packettunnelCreate`
+
+برخی تونل‌ها به‌جای `tunnelCreate()` با `packettunnelCreate()` ساخته می‌شوند.
+کد `ww/net/packet_tunnel.c`:
+
+```c
+tunnel_t *packettunnelCreate(node_t *node, uint16_t tstate_size, uint16_t lstate_size)
+{
+    assert(lstate_size == 0); // packet tunnels don't have lines
+    tunnel_t *t = tunnelCreate(node, tstate_size, 0);
+    // ... installs packet-tunnel default callbacks ...
+}
+```
+
+نکات اصلی:
+
+- `packettunnelCreate()` با Assert الزام می‌کند که **`lstate_size == 0`** باشد.
+  تونل Packet خالص State مختص Line ندارد.
+- انتظار می‌رود این تونل‌ها **Callbackهای Payload مربوط به Packet** را Override
+  کنند.
+- چند Callback پیش‌فرض Stream-style عمداً نامعتبرند. برای مثال، Handlerهای
+  پیش‌فرض Payload در upstream/downstream تابع `LOGF(...)` و سپس
+  `terminateProgram(1)` را اجرا می‌کنند تا در صورت فراموش‌کردن Override، برنامه
+  با خطایی روشن Crash کند:
+
+```c
+void packettunnelDefaultUpStreamPayload(tunnel_t *self, line_t *line, sbuf_t *payload)
+{
+    LOGF("Unexpected call to default up stream payload for a packet tunnel, "
+         "this function must be overridden");
+    terminateProgram(1);
+}
+```
+
+نمونه‌ها: `IpOverrider`، ‏`IpManipulator`، ‏`PingClient`، ‏`PingServer` و
+`WireGuardDevice`.
+
+برای تونل‌های Packet خالص:
+
+- بی‌دلیل منطق چرخه‌ی عمر Line شبیه اتصال را اضافه نکنید.
+- فرض نکنید `Init` / `Finish` مانند تونل‌های معمول Stream عمل می‌کنند؛ ابتدا
+  پیاده‌سازی واقعی Callbackها را ببینید.
+- برخی Callbackهای پیش‌فرض عمداً Abort می‌کنند؛ دقیقاً بدانید کدام‌ها را باید
+  Override کنید.
+
+### ۲. پل‌های متکی به Packet Line با `tunnelCreate`
+
+تونل‌های دیگری با `tunnelCreate()` معمولی ساخته می‌شوند، اما **Packet Line مربوط
+به Worker را Anchor** برای State پل در همان Worker قرار می‌دهند. این تونل‌ها از
+مرز Runtime مبتنی بر Packet و Runtime مبتنی بر اتصال عبور می‌کنند.
+
+نمونه‌ها و چیزی که Anchor می‌کنند:
+
+| پل | نقش |
+| --- | --- |
+| `PacketsToStream` | اتصال Packet Line به یک Line سمت Stream و مختص Worker؛ همان Line و یک Read Buffer را ذخیره می‌کند. |
+| `StreamToPackets` | اتصال یک Stream Line به Packet Line؛ Stream Line فعال و Read Buffer را به‌ازای هر Worker ذخیره می‌کند. |
+| `PacketsToConnection` | انتقال ترافیک Packet از طریق lwIP به Lineهای عادی اتصال WaterWall در پشت سمت Packet. |
+| `PacketSplitStream` | تقسیم ترافیک Packet میان مسیرهای Stream. |
+
+State ذخیره‌شده در اینجا نیز State پل و محلی Worker است، نه State مختص اتصال. اگر
+در پشت ترافیک Packet به رفتار قابل‌بستن و مختص اتصال نیاز دارید، به‌جای بستن Packet
+Line، ‏Lineهای عادی را پشت آن بسازید یا مدیریت کنید.
+
+## مقداردهی اولیه‌ی Packet Line
+
+مقداردهی Packet Line با Line اتصال متفاوت است.
+
+در زنجیره‌ای که **Head آن یک Node از نوع Packet در Layer 3 است**، ‏Node Manager
+هنگام راه‌اندازی روی Packet Line هر Worker یک `Init` در upstream می‌فرستد؛ **یک
+بار برای هر Worker، نه یک بار برای هر Packet**. بنابراین `Init` مربوط به Packet
+Line یک رویداد Bootstrap/Worker است، نه بازشدن اتصال.
+
+اما اگر پلی به Packet Lineها متکی باشد و Head زنجیره **خودش** Node از نوع Layer 3
+نباشد، Init خودکار رخ نمی‌دهد و Bridge باید آن را فعال کند. `StreamToPackets`
+دقیقاً همین کار را در `onStart()` انجام می‌دهد: Bootstrap را در Queue همه‌ی
+Workerها می‌گذارد تا تونل‌های سمت Packet بعد از Startup، ‏`Init` خود را ببینند و
+مسیرهای Init به‌صورت Inline دوباره وارد یکدیگر نشوند:
+
+```c
+static void streamtopacketsQueueWorkerPacketInit(void *worker, void *arg1, void *arg2, void *arg3)
+{
+    tunnel_t *t = arg1;
+    line_t   *l = tunnelchainGetWorkerPacketLine(tunnelGetChain(t), getWID());
+    tunnelNextUpStreamInit(t, l);
+    assert(lineIsAlive(l));
+}
+
+void streamtopacketsTunnelOnStart(tunnel_t *t)
+{
+    for (wid_t wi = 0; wi < getWorkersCount(); wi++)
+    {
+        sendWorkerMessageForceQueue(wi, streamtopacketsQueueWorkerPacketInit, t, NULL, NULL);
+    }
+}
+```
+
+بنابراین هنگام ساخت یا تغییر Bridge مربوط به Packet، فرض نکنید Packet Line از
+قبل به‌صورت خودکار Init شده است. بررسی کنید آیا Init را Node Manager می‌فرستد،
+چون Chain Head از نوع Layer 3 است، یا تونل شما باید در `onStart()` آن را فعال کند.
+
+## جهت تونل‌های جفت: قاعده‌ی PingClient / PingServer
+
+تونل‌های Packet جفت اغلب Transform را در **جهت‌های مخالف Callback** انجام می‌دهند.
+جهت Client را برای Server کپی نکنید، مگر آنکه جریان زنجیره درستی آن را ثابت کند.
+
+ابتدا جریان را رسم کنید:
+
+```text
+PingClient:
+packet -> PingClient -> IPv4(ICMP(payload -> packet))
+
+PingServer:
+packet <- PingServer <- IPv4(ICMP(payload -> packet))
+```
+
+- `PingClient` در Payload مربوط به upstream عمل **Encapsulation** را انجام می‌دهد
+  و با `tunnelNextUpStreamPayload()` آن را Forward می‌کند.
+- `PingServer` در Payload مربوط به downstream عمل **Decapsulation** را انجام
+  می‌دهد و با `tunnelPrevDownStreamPayload()` آن را Forward می‌کند.
+
+پیاده‌سازی Server با مسیر
+`IPv4(ICMP(...)) -> PingServer -> packet`، یعنی کپی‌کردن جهت upstream سمت Client،
+اشتباه است.
+
+روش کار برای هر تونل Packet:
+
+1. جریان Packet را همراه با پیکان‌ها رسم کنید.
+2. مرحله‌ی Encode/Decode را در جهت Callback متناسب با جریان قرار دهید.
+3. فقط برای Forward در upstream از `tunnelNextUpStreamPayload()` و فقط برای
+   Forward در downstream از `tunnelPrevDownStreamPayload()` استفاده کنید.
+4. Packet Line را Line مختص اتصال در نظر نگیرید.
+5. در Runtime روی Packet Line تابع `lineDestroy()` را صدا نزنید.
+6. به تونل Packet خالص چرخه‌ی عمر Stream-style اضافه نکنید، مگر آنکه طراحی‌اش
+   واقعاً به آن نیاز داشته باشد.
+
+## آزمایش تونل‌های Packet
+
+آزمایش تونل Packet باید **جهت واقعی موردنظر** را پوشش دهد. آزمایشی که داده را از
+سمت اشتباه به Server می‌دهد چیزی را ثابت نمی‌کند. اگر سمت Server باید داده را از
+جهت مخالف دریافت کند، به‌جای تغییر قرارداد تونل از `Bridge` یا تونل ترکیبی موجود
+دیگری استفاده کنید. یک توپولوژی Ping-style چنین است:
+
+```text
+TesterClient -> PingClient -> Bridge
+TesterServer -> PingServer -> Bridge
+```
+
+دست‌کم یک Test اضافه کنید که در صورت برعکس‌شدن Handle مربوط به
+upstream/downstream **Fail** شود. همین یک Test رایج‌ترین Regression در تونل‌های
+Packet را پیدا می‌کند.
+
+## خلاصه‌ی قواعد تغییرات Packet-oriented
+
+- Packet Lineها را هنگام Runtime نبندید.
+- منطق معمول `Finish` مختص اتصال را روی Packet Line اجرا نکنید، مگر آنکه Source
+  Code صریحاً انتظارش را داشته باشد.
+- State مربوط به Packet Line را State محلی و مشترک Worker در نظر بگیرید.
+- Routing Context و `recalculate_checksum` را Metadata تغییرپذیر مختص Packet
+  بدانید، نه هویت پایدار Session.
+- برای چرخه‌ی عمر مختص Flow، پشت سمت Packet یک Line عادی بسازید.
+- تونلی که با `packettunnelCreate()` ساخته می‌شود State مختص Line ندارد و
+  `lstate_size == 0` است.
+- پلی که State را روی Packet Line متصل می‌کند، آن State را در طول پردازش تعداد
+  زیادی Packet همان Worker نگه می‌دارد.
+- اگر کد شما به Init مربوط به Packet Line وابسته است، منشأ این Init را بررسی کنید.
+
+مهم‌ترین اشتباهی که باید از آن دوری کنید:
+
+```text
+Using packet lines as if they were normal connection lines with an ordinary
+Init -> Payload -> Finish per-connection lifecycle. They are not.
+```
+
+---
+
+ادامه: **[بخش ۵: ساختار یک تونل و روند کار](./part5-tunnel-anatomy.mdx)**.
