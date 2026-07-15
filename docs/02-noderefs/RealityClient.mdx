@@ -6,13 +6,13 @@ description: "Reference documentation for the RealityClient node."
 ---
 
 <!--
-Documentation version: 106
+Documentation version: 107
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/RealityClient/description.md, and both files must keep the same documentation version.
 -->
 
 # RealityClient
 
-`RealityClient` is the client-side WaterWall Reality tunnel. It starts each line with a real client TLS handshake through an internal `TlsClient`, takes over the established raw connection after the handshake, and then carries WaterWall payload inside TLS-like application-data records protected by AEAD.
+`RealityClient` is the client-side Reality v2 tunnel. It starts each line with a real client TLS handshake through an internal `TlsClient`, derives fresh directional session material from that handshake, takes over the established raw connection, and then carries WaterWall payload inside TLS-like application-data records protected by AEAD.
 
 Use it when the first bytes on the wire must look like a normal TLS client session to a visitor domain, while accepted WaterWall payload is protected by a shared Reality password.
 
@@ -90,7 +90,7 @@ On upstream `Init`, `RealityClient`:
 2. forwards `Init` into the internal `TlsClient`
 3. waits for the internal TLS handshake to complete
 
-Upstream payload that arrives before the TLS takeover is queued. When the internal `TlsClient` reports downstream `Est`, `RealityClient` deinitializes the internal TLS line without closing the underlying connection, marks the line as Reality-ready, flushes queued upstream payload as encrypted Reality records, and then emits downstream `Est` to the previous node.
+Upstream payload that arrives before the TLS takeover is queued. When the internal `TlsClient` reports downstream `Est`, `RealityClient` captures the negotiated TLS version, IANA cipher suite, client random, and server random while the SSL object is still available. It then deinitializes the internal TLS line, derives independent client-to-server and server-to-client keys and IVs from the captured binding and password-derived root key, flushes queued upstream payload as encrypted v2 records, and emits downstream `Est`.
 
 After takeover:
 
@@ -107,7 +107,7 @@ Reality records are shaped like TLS application-data records:
 
 ```text
 TLS record header (5 bytes)
-nonce             (12 bytes)
+cover prefix      (12 bytes)
 ciphertext
 AEAD tag          (16 bytes)
 ```
@@ -118,15 +118,17 @@ The TLS-like header uses:
 |---|---|
 | Content type | `0x17` application data |
 | Version | `0x0303` |
-| Length | `12-byte nonce + ciphertext + 16-byte tag` |
+| Length | `12-byte cover prefix + ciphertext + 16-byte tag` |
 
-The TLS record header is authenticated as AEAD associated data. The nonce is random per record.
+The cover prefix is random visible data retained for the existing frame shape. It is authenticated but is not the AEAD nonce. Each direction starts at implicit sequence zero; the nonce is its 12-byte base IV with the big-endian sequence number XORed into the final eight bytes.
+
+The associated data binds the v2 record domain, direction, sequence number, session ID, TLS header, and cover prefix. The receive side authenticates only the exact next sequence. Therefore duplicate, deleted, reordered, reflected, and cross-connection records fail authentication. A counter value of `UINT64_MAX` is rejected before use, so it cannot wrap.
 
 ## Buffer And Lifecycle Notes
 
-- `RealityClient` has per-line state for the downstream record parser, queued pre-handshake upstream payload, and TLS-ready flag.
+- `RealityClient` has per-line state for the downstream record parser, queued pre-handshake upstream payload, session ID, directional keys/IVs, and send/receive counters.
 - It does not create or destroy the normal line. It only destroys its own line state when the line finishes or when it closes both directions after a Reality error.
-- The node advertises `17` bytes of required left padding: `5` bytes for the TLS-like record header and `12` bytes for the nonce prefix.
+- The node advertises `17` bytes of required left padding: `5` bytes for the TLS-like record header and `12` bytes for the cover prefix.
 - Empty payload buffers are recycled without sending a Reality record.
 - Payloads larger than `max-frame-size` are split into multiple encrypted records.
 
@@ -135,6 +137,8 @@ The TLS record header is authenticated as AEAD associated data. The nonce is ran
 - `RealityClient` depends on `TlsClient`; the build requires `INCLUDE_TLS_CLIENT=ON`.
 - The first phase is a real TLS client handshake, so the `sni`, certificate verification behavior, and TLS fingerprinting options matter.
 - `password`, `salt`, `kdf-iterations`, and `algorithm` must match `RealityServer`.
+- Reality v2 is wire-incompatible with the previous static-key format. Upgrade both peers together; there is no automatic v1 fallback.
+- The password-derived value is a root key, not a record key. Every real TLS connection derives fresh directional material, and password rotation invalidates future sessions without requiring a replay database.
 - This node is a stream tunnel, not a packet tunnel.
 
 ## Node Metadata

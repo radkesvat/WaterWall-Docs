@@ -6,13 +6,13 @@ description: "Reference documentation for the RealityServer node."
 ---
 
 <!--
-Documentation version: 106
+Documentation version: 107
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/RealityServer/description.md, and both files must keep the same documentation version.
 -->
 
 # RealityServer
 
-`RealityServer` is the server-side WaterWall Reality tunnel. It starts every incoming line as ordinary visitor traffic, forwards that traffic to a configured `destination` branch, and watches client-to-server TLS records for an authenticated Reality record. When authentication succeeds, it closes the visitor branch and switches the same WaterWall line to the protected `next` chain.
+`RealityServer` is the server-side Reality v2 tunnel. It starts every incoming line as ordinary visitor traffic, forwards that traffic to a configured `destination` branch, passively extracts the real TLS handshake binding, and only then tests client-to-server records with fresh per-connection session keys. When authentication succeeds, it closes the visitor branch and switches the same WaterWall line to the protected `next` chain.
 
 The server does not terminate TLS for visitors. It only sniffs enough TLS-like records to decide whether a peer is a Reality client or ordinary visitor traffic.
 
@@ -87,11 +87,13 @@ On upstream `Init`, `RealityServer` initializes its line state and immediately i
 
 While the line is pending:
 
-1. incoming upstream bytes are parsed as plausible TLS records
-2. handshake, alert, change-cipher-spec, and ordinary non-candidate TLS records are forwarded to `destination`
-3. application-data records that look like possible Reality records are duplicated and authentication is attempted
-4. if authentication fails, the original record is forwarded to `destination`
-5. if authentication succeeds, the visitor branch is finished and the protected `next` chain is initialized
+1. a bounded streaming parser observes fragmented ClientHello and ServerHello messages while bytes continue to the visitor branch
+2. TLS 1.3 `supported_versions` is honored and HelloRetryRequest is ignored until the final ServerHello
+3. malformed or unsupported handshake input switches the line to ordinary visitor behavior
+4. before both hello values are ready, application-data-looking records remain visitor traffic and are never tested with the root key
+5. after deriving v2 directional session keys, candidate records are duplicated and authenticated at the exact expected client-to-server sequence
+6. if authentication fails while pending, the original record is forwarded to `destination`; there is no v1 trial decrypt
+7. if authentication succeeds, the visitor branch is finished and the protected `next` chain is initialized
 
 After authorization:
 
@@ -117,7 +119,7 @@ Authorized Reality traffic uses TLS-like application-data records:
 
 ```text
 TLS record header (5 bytes)
-nonce             (12 bytes)
+cover prefix      (12 bytes)
 ciphertext
 AEAD tag          (16 bytes)
 ```
@@ -128,15 +130,17 @@ The TLS-like header uses:
 |---|---|
 | Content type | `0x17` application data |
 | Version | `0x0303` |
-| Length | `12-byte nonce + ciphertext + 16-byte tag` |
+| Length | `12-byte cover prefix + ciphertext + 16-byte tag` |
 
-The TLS record header is authenticated as AEAD associated data. The nonce is random per encrypted downstream record.
+The visible prefix is random authenticated cover data, not the AEAD nonce. The nonce is derived from a per-direction base IV and an implicit 64-bit sequence number. Associated data binds the v2 record domain, direction, sequence, session ID, TLS header, and cover prefix.
+
+Each direction accepts exactly its next sequence number. Duplicate, deleted, reordered, reflected, and cross-connection records therefore fail. Authentication failure is fatal after authorization, and counters close before `UINT64_MAX` can be used.
 
 ## Buffer And Lifecycle Notes
 
-- `RealityServer` has per-line state for the record parser, current mode, destination/protected initialization state, and visitor-to-authorized transition flags.
+- `RealityServer` has per-line state for bounded hello parsing, the TLS binding, session ID, directional keys/IVs and counters, current mode, and branch-transition state.
 - It does not create or destroy the normal line. It destroys only its own line state before propagating finish callbacks.
-- The node advertises `17` bytes of required left padding: `5` bytes for the TLS-like record header and `12` bytes for the nonce prefix.
+- The node advertises `17` bytes of required left padding: `5` bytes for the TLS-like record header and `12` bytes for the cover prefix.
 - Empty downstream payload buffers from the protected chain are recycled without sending a Reality record.
 - Payloads larger than `max-frame-size` are split into multiple encrypted records.
 - During the authorized transition, downstream callbacks caused by closing the visitor branch are suppressed so they do not reflect back into the already-switching side.
@@ -146,6 +150,8 @@ The TLS record header is authenticated as AEAD associated data. The nonce is ran
 - `destination` is for ordinary visitor traffic. It should normally be a branch that can serve or proxy the same visitor domain used by `RealityClient.settings.sni`.
 - `next` is for authorized WaterWall traffic only.
 - `password`, `salt`, `kdf-iterations`, and `algorithm` must match `RealityClient`.
+- Reality v2 is wire-incompatible with the previous static-key format. Upgrade both peers together; the secure path never falls back to v1.
+- The password-derived value is a root key for per-TLS-session directional material. Password rotation invalidates future sessions, and no server-side replay database is required.
 - This node is a stream tunnel, not a packet tunnel.
 
 ## Node Metadata
