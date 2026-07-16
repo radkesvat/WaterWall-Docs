@@ -6,7 +6,7 @@ description: "Reference documentation for the RealityServer node."
 ---
 
 <!--
-Documentation version: 107
+Documentation version: 111
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/RealityServer/description.md, and both files must keep the same documentation version.
 -->
 
@@ -78,6 +78,7 @@ Visitor destination:
 | `max-frame-size` | `16356` | Maximum plaintext bytes per Reality record. Valid range is `1` through `16356`. Larger downstream payload buffers are split into multiple records. |
 | `sniffing-attempts` | `8` | Number of failed Reality application-record candidates to try before permanently treating the line as visitor traffic. Valid range is `1` through `1024`. |
 | `sniffing-counter` | same as `sniffing-attempts` | Legacy alias used only when `sniffing-attempts` is absent. |
+| `tls12-gcm-server-nonce-policy` | `auto` | Downstream AES-GCM explicit-nonce policy: `auto`, `sequence`, `counter`, or `random`. |
 
 `aes-gcm` requires AES-GCM support in the active crypto backend. If it is unavailable, tunnel creation fails.
 
@@ -87,7 +88,7 @@ On upstream `Init`, `RealityServer` initializes its line state and immediately i
 
 While the line is pending:
 
-1. a bounded streaming parser observes fragmented ClientHello and ServerHello messages while bytes continue to the visitor branch
+1. bounded streaming parsers observe fragmented ClientHello/ServerHello messages and, for TLS 1.2, each direction's protected-record epoch while bytes continue to the visitor branch
 2. TLS 1.3 `supported_versions` is honored and HelloRetryRequest is ignored until the final ServerHello
 3. malformed or unsupported handshake input switches the line to ordinary visitor behavior
 4. before both hello values are ready, application-data-looking records remain visitor traffic and are never tested with the root key
@@ -102,7 +103,9 @@ After authorization:
 | Upstream payload | Must be valid Reality records. Records are authenticated, decrypted, and forwarded as cleartext to `next`. |
 | Downstream payload | Cleartext from `next` is encrypted and sent back to the previous node as TLS-like application-data records. |
 
-If upstream traffic is invalid after authorization, if a non-Reality TLS record arrives after authorization, or if Reality authentication fails after authorization, the server closes the line in both directions.
+If upstream traffic is invalid after authorization, if a non-Reality TLS record arrives after authorization, or if Reality authentication fails after authorization, the server queues at most one authenticated fatal `bad_record_mac` when the wire remains writable and then closes both directions.
+
+The server owns orderly Reality shutdown. A protected-side orderly `Finish` queues exactly one `close_notify`, then immediately finishes the wire side without waiting for a reply. RealityClient consumes that record without replying and closes its TCP side immediately, even if a later server FIN is withheld. Normal clients close with raw transport FIN and do not send `close_notify`. A client `close_notify` is still recognized defensively, including as the first takeover record: the server authorizes the secure path, consumes the alert, sends one server `close_notify` when possible, and immediately closes both sides without forwarding control bytes. Received fatal alerts are not answered. A raw wire `Finish` cannot be answered and only closes the remaining protected path.
 
 ## Visitor Fallback Rules
 
@@ -113,16 +116,19 @@ The line becomes visitor traffic when:
 
 After a line switches to visitor mode, upstream payload is forwarded to the visitor `destination`, and downstream payload from that branch is forwarded back to the previous node. The protected `next` chain is not initialized for that line.
 
+Pending or Visitor failures never generate Reality alerts. A failed Pending candidate remains byte-for-byte owned by `destination`; any response is therefore the real cover endpoint's response rather than a Reality-specific oracle.
+
 ## Record Format
 
-Authorized Reality traffic uses TLS-like application-data records:
+Authorized Reality traffic uses the profile selected from the real cover handshake:
 
-```text
-TLS record header (5 bytes)
-cover prefix      (12 bytes)
-ciphertext
-AEAD tag          (16 bytes)
-```
+| Negotiated cover | Visible Reality body |
+|---|---|
+| TLS 1.3 or TLS 1.2 ChaCha20-Poly1305 | `12-byte random prefix + Reality ciphertext + 16-byte tag` |
+| TLS 1.2 AES-GCM | `8-byte explicit nonce + Reality ciphertext + 16-byte tag` |
+| TLS 1.2 AES-CBC/SHA-1 | `16-byte random explicit IV + block-aligned opaque body` |
+
+CBC public lengths reproduce the suite's TLS MAC and minimum-padding formula using an authenticated inner payload length and zero filler; Reality does not implement CBC encryption.
 
 The TLS-like header uses:
 
@@ -130,9 +136,22 @@ The TLS-like header uses:
 |---|---|
 | Content type | `0x17` application data |
 | Version | `0x0303` |
-| Length | `12-byte cover prefix + ciphertext + 16-byte tag` |
+| Length | Selected profile's visible prefix plus authenticated opaque body |
 
-The visible prefix is random authenticated cover data, not the AEAD nonce. The nonce is derived from a per-direction base IV and an implicit 64-bit sequence number. Associated data binds the v2 record domain, direction, sequence, session ID, TLS header, and cover prefix.
+Authenticated alerts use BoringSSL-compatible public shapes:
+
+| Negotiated cover | Alert header and body |
+|---|---|
+| TLS 1.3 | Outer `0x17`, version `0x0303`, 19-byte body with encrypted inner alert type `0x15`. |
+| TLS 1.2 AES-GCM | Outer `0x15`, version `0x0303`, 26-byte body with the continued 8-byte explicit-nonce policy. |
+| TLS 1.2 AES-CBC/SHA-1 | Outer `0x15`, version `0x0303`, 48-byte body with a fresh 16-byte IV. |
+| TLS 1.2 ChaCha20-Poly1305 | Outer `0x15`, version `0x0303`, 18-byte body. |
+
+The encrypted semantic values are `01 00` (`close_notify`) and `02 14` (fatal `bad_record_mac`). Alerts and data share one strict sequence per direction. Associated data binds record kind and negotiated TLS version as well as the profile and visible record image. These are Reality-AEAD camouflage records, not genuine TLS closure or TLS-key alert encryption.
+
+The visible prefix is authenticated camouflage, not the Reality AEAD nonce. The nonce is derived from a per-direction secret IV and independent Reality replay sequence. Associated data also binds the record profile ID and visible-prefix length.
+
+For downstream TLS 1.2 GCM, `auto` selects `sequence` when observed cover nonces match protected-record sequences, otherwise `counter` when at least two samples increment, and otherwise `random`. Explicit `sequence` continues the tracked TLS record sequence; `counter` increments the last observed nonce and requires a sample; `random` uses fresh CSPRNG bytes. `auto` cannot distinguish an arbitrary fixed-prefix counter from random output with one non-sequence sample, so operators who know the cover convention may set an explicit policy.
 
 Each direction accepts exactly its next sequence number. Duplicate, deleted, reordered, reflected, and cross-connection records therefore fail. Authentication failure is fatal after authorization, and counters close before `UINT64_MAX` can be used.
 
@@ -140,17 +159,18 @@ Each direction accepts exactly its next sequence number. Duplicate, deleted, reo
 
 - `RealityServer` has per-line state for bounded hello parsing, the TLS binding, session ID, directional keys/IVs and counters, current mode, and branch-transition state.
 - It does not create or destroy the normal line. It destroys only its own line state before propagating finish callbacks.
-- The node advertises `17` bytes of required left padding: `5` bytes for the TLS-like record header and `12` bytes for the cover prefix.
+- The node advertises `21` bytes of required left padding: `5` bytes for the header and the worst-case `16`-byte CBC explicit IV.
 - Empty downstream payload buffers from the protected chain are recycled without sending a Reality record.
 - Payloads larger than `max-frame-size` are split into multiple encrypted records.
 - During the authorized transition, downstream callbacks caused by closing the visitor branch are suppressed so they do not reflect back into the already-switching side.
+- Final alerts are transferred before `Finish`; terminal guards suppress synchronous Pause/Resume/Payload/Est reflection and abort further teardown if the line dies during the send or first finish.
 
 ## Operational Notes
 
 - `destination` is for ordinary visitor traffic. It should normally be a branch that can serve or proxy the same visitor domain used by `RealityClient.settings.sni`.
 - `next` is for authorized WaterWall traffic only.
 - `password`, `salt`, `kdf-iterations`, and `algorithm` must match `RealityClient`.
-- Reality v2 is wire-incompatible with the previous static-key format. Upgrade both peers together; the secure path never falls back to v1.
+- The profile-aware format remains Reality v2 but replaces the earlier unpublished fixed-prefix v2 layout. Kind-aware AAD changes every v2 record tag, so upgrade both peers together; the secure path never falls back to an older layout or v1.
 - The password-derived value is a root key for per-TLS-session directional material. Password rotation invalidates future sessions, and no server-side replay database is required.
 - This node is a stream tunnel, not a packet tunnel.
 
@@ -166,4 +186,4 @@ Each direction accepts exactly its next sequence number. Duplicate, deleted, reo
 | Per-line state | Yes |
 | Creates lines | No |
 | Destroys lines | No |
-| Required left padding | `17` |
+| Required left padding | `21` |

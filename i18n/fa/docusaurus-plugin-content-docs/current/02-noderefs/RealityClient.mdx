@@ -5,7 +5,7 @@ sidebar_label: "RealityClient"
 description: "راهنمای نود RealityClient در WaterWall."
 ---
 
-<!-- Written from version 107 of the English doc. -->
+<!-- Written from version 111 of the English doc. -->
 
 # RealityClient
 
@@ -96,18 +96,21 @@ payloadهای upstream که پیش از TLS takeover برسند در صف می�
 | Upstream payload | cleartext نود قبلی رمزنگاری و در قالب recordهای شبیه TLS application-data به `next` فرستاده می‌شود. |
 | Downstream payload | recordهای Reality از `next` parse، احراز اصالت و رمزگشایی می‌شوند و cleartext به نود قبلی می‌رود. |
 
-اگر payload جهت downstream پیش از TLS takeover برسد، record نامعتبر باشد یا احراز اصالت شکست بخورد، هر دو جهت line بسته می‌شوند.
+اگر payload جهت downstream پیش از TLS takeover برسد، line بدون alert مصنوعی بسته می‌شود، چون هنوز کانال Reality احرازشده‌ای وجود ندارد. پس از takeover، framing نامعتبر، شکست authentication یا semantic احرازشده نامعتبر، در صورت writable بودن سمت wire حداکثر یک alert محافظت‌شده fatal از نوع `bad_record_mac` می‌فرستد و سپس هر دو جهت را می‌بندد.
+
+سیاست shutdown به نقش هر سمت وابسته است. `Finish` محلی upstream پس از پاک‌کردن state مربوط به Reality فقط `next` را می‌بندد و هرگز `close_notify` مصنوعی تولید نمی‌کند. `close_notify` احرازشده server بدون پاسخ مصرف می‌شود؛ سپس RealityClient فوراً state خودش و هر دو سمت باز را می‌بندد. client منتظر `Finish` بعدی TCP نمی‌ماند، بنابراین peer احرازشده نمی‌تواند با نفرستادن FIN connection را باز نگه دارد. تنها مسیر تولید alert در client، تشخیص محلی خطای record احرازشده است که حداکثر یک fatal `bad_record_mac` می‌فرستد و سپس هر دو سمت را می‌بندد. fatal alert دریافتی نیز بدون پاسخ فوراً هر دو سمت را می‌بندد. `Finish` خام transport فقط سمت محلی باقی‌مانده را می‌بندد. این رفتار setting جدیدی ندارد.
 
 ## قالب Record
 
-Reality recordها شکل TLS application-data record دارند:
+شکل visible هر Reality record بر اساس cipher suite واقعی TLS انتخاب می‌شود:
 
-```text
-TLS record header (5 bytes)
-cover prefix      (12 bytes)
-ciphertext
-AEAD tag          (16 bytes)
-```
+| cover مذاکره‌شده | body قابل‌مشاهده Reality |
+|---|---|
+| TLS 1.3 یا TLS 1.2 ChaCha20-Poly1305 | `12-byte random prefix + Reality ciphertext + 16-byte tag` |
+| TLS 1.2 AES-GCM | `8-byte explicit nonce + Reality ciphertext + 16-byte tag` |
+| TLS 1.2 AES-CBC/SHA-1 | `16-byte random explicit IV + block-aligned opaque body` |
+
+در GCM، explicit nonce جهت client-to-server ادامه sequence واقعی ثبت‌شده BoringSSL است. در CBC، inner plaintext احرازشده شامل طول دو بایتی payload و zero filler است تا طول visible با فرمول MAC و minimum padding در TLS سازگار باشد؛ Reality عملیات CBC encryption انجام نمی‌دهد.
 
 TLS-like header از این مقادیر استفاده می‌کند:
 
@@ -115,17 +118,29 @@ TLS-like header از این مقادیر استفاده می‌کند:
 |---|---|
 | Content type | `0x17` application data |
 | Version | `0x0303` |
-| Length | `12-byte cover prefix + ciphertext + 16-byte tag` |
+| Length | visible prefix پروفایل انتخاب‌شده به‌علاوه opaque body احرازشده |
 
-cover prefix داده تصادفی و قابل‌مشاهده‌ای است که برای حفظ شکل فعلی frame باقی مانده است. این پیشوند احراز اصالت می‌شود، اما AEAD nonce نیست. sequence هر جهت به‌صورت ضمنی از صفر آغاز می‌شود؛ nonce از IV پایه ۱۲ بایتی همان جهت ساخته می‌شود و مقدار big-endian مربوط به sequence number با هشت بایت پایانی آن XOR می‌شود.
+visible prefix احراز اصالت می‌شود اما AEAD nonce نیست. Reality sequence مستقل هر جهت از صفر آغاز می‌شود و nonce از IV محرمانه همان جهت ساخته می‌شود. TLS facade sequence در GCM مستقل از Reality replay sequence نگه داشته می‌شود.
 
-associated data شامل domain مربوط به recordهای v2، جهت، sequence number، session ID، TLS header و cover prefix است. سمت دریافت‌کننده فقط sequence دقیق بعدی را احراز اصالت می‌کند؛ بنابراین recordهای تکراری، حذف‌شده، جابه‌جاشده، بازتاب‌یافته یا متعلق به connection دیگر شکست می‌خورند. مقدار `UINT64_MAX` پیش از استفاده رد می‌شود و counter نمی‌تواند wrap شود.
+associated data شامل profile ID، domain مربوط به v2، جهت، Reality sequence، session ID، TLS header، طول visible prefix و خود prefix است. بنابراین replay، reorder، reflection، cross-profile و cross-connection شکست می‌خورند و counterها پیش از wrap بسته می‌شوند.
+
+alertهای کنترلی شکل public سازگار با BoringSSL دارند:
+
+| cover مذاکره‌شده | header و body مربوط به alert |
+|---|---|
+| TLS 1.3 | outer type برابر `0x17` و body برابر 19 بایت؛ plaintext رمز‌شده شامل alert دو بایتی و inner type برابر `0x15` است. |
+| TLS 1.2 AES-GCM | outer type برابر `0x15` و body برابر 26 بایت با explicit nonce هشت‌بایتی. |
+| TLS 1.2 AES-CBC/SHA-1 | outer type برابر `0x15` و body برابر 48 بایت با IV تازه 16 بایتی. |
+| TLS 1.2 ChaCha20-Poly1305 | outer type برابر `0x15` و body برابر 18 بایت. |
+
+مقادیر semantic رمز‌شده `01 00` برای `close_notify` و `02 14` برای fatal `bad_record_mac` هستند. data و alert در هر جهت یک sequence مشترک دارند. record kind و نسخه TLS نیز وارد associated data می‌شوند تا تبدیل data به alert یا برعکس معتبر نباشد. این‌ها recordهای camouflage محافظت‌شده با Reality AEAD هستند، نه TLS closure واقعی یا alert رمز‌شده با keyهای TLS.
 
 ## نکته‌های Buffer و Lifecycle
 
 - `RealityClient` به‌ازای هر line یک state دارد که شامل parser مربوط به recordهای downstream، payloadهای upstream صف‌شده پیش از handshake، session ID، keyها و IVهای هر جهت و counterهای ارسال و دریافت است.
 - این نود line معمولی را نه ایجاد می‌کند و نه از بین می‌برد؛ هنگام `Finish` یا زمانی که به‌دلیل خطای Reality هر دو جهت را می‌بندد، فقط state خودش را پاک می‌کند.
-- این نود `17` بایت required left padding اعلام می‌کند: `5` بایت برای TLS-like record header و `12` بایت برای cover prefix.
+- پیش از فرستادن fatal alert تولیدشده به‌صورت محلی، state وارد حالت terminal می‌شود؛ callbackهای re-entrant مربوط به Payload/Pause/Resume/Est بازتاب داده نمی‌شوند، مسیر ارسال مالک پاک‌سازی state در صورت مرگ line است و teardown اضافه متوقف می‌شود.
+- این نود `21` بایت required left padding اعلام می‌کند: `5` بایت header و حداکثر `16` بایت explicit IV مربوط به CBC.
 - buffer خالی payload بدون فرستادن Reality record به pool برگردانده می‌شود.
 - payloadهایی بزرگ‌تر از `max-frame-size` به چند record رمزنگاری‌شده تقسیم می‌شوند.
 
@@ -134,7 +149,7 @@ associated data شامل domain مربوط به recordهای v2، جهت، seque
 - `RealityClient` به `TlsClient` وابسته است و build باید `INCLUDE_TLS_CLIENT=ON` داشته باشد.
 - اولین مرحله یک TLS client handshake واقعی است، بنابراین `sni`، رفتار certificate verification و گزینه‌های TLS fingerprinting اهمیت دارند.
 - `password`، `salt`، `kdf-iterations` و `algorithm` باید با `RealityServer` یکی باشند.
-- Reality v2 با فرمت static-key قبلی در سطح wire سازگار نیست. هر دو peer را هم‌زمان ارتقا دهید؛ fallback خودکار به v1 وجود ندارد.
+- Reality v2 با فرمت static-key قبلی در سطح wire سازگار نیست. kind-aware AAD tag همه recordهای v2 را تغییر می‌دهد؛ هر دو peer را هم‌زمان ارتقا دهید و انتظار fallback خودکار به v1 یا v2 قدیمی نداشته باشید.
 - مقدار مشتق‌شده از password یک root key است، نه record key. هر connection واقعی TLS، material مستقل هر جهت را به‌صورت تازه مشتق می‌کند و چرخش password نشست‌های آینده را بدون نیاز به replay database نامعتبر می‌کند.
 - این نود یک stream tunnel است، نه packet tunnel.
 
@@ -149,4 +164,4 @@ associated data شامل domain مربوط به recordهای v2، جهت، seque
 | Per-line state | دارد |
 | ایجاد line | خیر |
 | از بین بردن line | خیر |
-| Required left padding | `17` |
+| Required left padding | `21` |

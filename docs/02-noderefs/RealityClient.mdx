@@ -6,7 +6,7 @@ description: "Reference documentation for the RealityClient node."
 ---
 
 <!--
-Documentation version: 107
+Documentation version: 111
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/RealityClient/description.md, and both files must keep the same documentation version.
 -->
 
@@ -90,7 +90,7 @@ On upstream `Init`, `RealityClient`:
 2. forwards `Init` into the internal `TlsClient`
 3. waits for the internal TLS handshake to complete
 
-Upstream payload that arrives before the TLS takeover is queued. When the internal `TlsClient` reports downstream `Est`, `RealityClient` captures the negotiated TLS version, IANA cipher suite, client random, and server random while the SSL object is still available. It then deinitializes the internal TLS line, derives independent client-to-server and server-to-client keys and IVs from the captured binding and password-derived root key, flushes queued upstream payload as encrypted v2 records, and emits downstream `Est`.
+Upstream payload that arrives before the TLS takeover is queued. When the internal `TlsClient` reports downstream `Est`, `RealityClient` captures the negotiated TLS version, IANA cipher suite, client random, server random, and TLS 1.2 next read/write record sequences while the SSL object is still available. It selects the shared record profile before deinitializing the internal TLS line, derives independent client-to-server and server-to-client keys and IVs from the captured binding and password-derived root key, flushes queued upstream payload as encrypted v2 records, and emits downstream `Est`. An unsupported suite aborts takeover rather than using a catch-all layout.
 
 After takeover:
 
@@ -99,18 +99,21 @@ After takeover:
 | Upstream payload | Cleartext payload from the previous node is encrypted and framed as TLS-like application-data records, then sent to `next`. |
 | Downstream payload | Reality records from `next` are parsed, authenticated, decrypted, and forwarded as cleartext to the previous node. |
 
-If downstream payload arrives before TLS takeover, if a Reality record is invalid, or if authentication fails, the node closes both directions for that line.
+If downstream payload arrives before TLS takeover, the line closes without a synthetic alert because no authenticated Reality channel exists yet. After takeover, invalid framing, authentication failure, or invalid authenticated semantics produces at most one protected fatal `bad_record_mac` before both sides close when the wire remains writable.
+
+Shutdown is role-specific. A local upstream `Finish` destroys Reality state and finishes only `next`; it never fabricates `close_notify`. A received authenticated server `close_notify` is consumed without a response, then RealityClient immediately destroys its state and closes both still-open sides. It never waits for a later TCP `Finish`, so an authenticated peer cannot pin the connection open by withholding FIN. A locally detected authenticated-record failure is the client's only alert-producing path and sends at most one fatal `bad_record_mac` before both sides close. A received fatal alert likewise closes both sides immediately without a response. A raw transport `Finish` closes only the remaining local side. No additional setting controls this behavior.
 
 ## Record Format
 
-Reality records are shaped like TLS application-data records:
+Reality records are shaped according to the negotiated cover suite:
 
-```text
-TLS record header (5 bytes)
-cover prefix      (12 bytes)
-ciphertext
-AEAD tag          (16 bytes)
-```
+| Negotiated cover | Visible Reality body |
+|---|---|
+| TLS 1.3 or TLS 1.2 ChaCha20-Poly1305 | `12-byte random prefix + Reality ciphertext + 16-byte tag` |
+| TLS 1.2 AES-GCM | `8-byte explicit nonce + Reality ciphertext + 16-byte tag` |
+| TLS 1.2 AES-CBC/SHA-1 | `16-byte random explicit IV + block-aligned opaque body` |
+
+For GCM, client-to-server explicit nonces continue BoringSSL's captured next TLS write sequence in big-endian form. For CBC, the opaque body length is `round_up(payload + TLS MAC length + 1, block size)`. An encrypted two-byte payload length and zero filler make the Reality AEAD result match that length; no CBC encryption or TLS CBC MAC is performed.
 
 The TLS-like header uses:
 
@@ -118,17 +121,29 @@ The TLS-like header uses:
 |---|---|
 | Content type | `0x17` application data |
 | Version | `0x0303` |
-| Length | `12-byte cover prefix + ciphertext + 16-byte tag` |
+| Length | Selected profile's visible prefix plus authenticated opaque body |
 
-The cover prefix is random visible data retained for the existing frame shape. It is authenticated but is not the AEAD nonce. Each direction starts at implicit sequence zero; the nonce is its 12-byte base IV with the big-endian sequence number XORed into the final eight bytes.
+Control alerts use BoringSSL-compatible public shapes:
 
-The associated data binds the v2 record domain, direction, sequence number, session ID, TLS header, and cover prefix. The receive side authenticates only the exact next sequence. Therefore duplicate, deleted, reordered, reflected, and cross-connection records fail authentication. A counter value of `UINT64_MAX` is rejected before use, so it cannot wrap.
+| Negotiated cover | Alert header and body |
+|---|---|
+| TLS 1.3 | Outer `0x17`, version `0x0303`, 19-byte body; encrypted plaintext is the two-byte alert plus inner type `0x15`. |
+| TLS 1.2 AES-GCM | Outer `0x15`, version `0x0303`, 26-byte body with an 8-byte explicit nonce. |
+| TLS 1.2 AES-CBC/SHA-1 | Outer `0x15`, version `0x0303`, 48-byte body with a fresh 16-byte IV and block-aligned ciphertext. |
+| TLS 1.2 ChaCha20-Poly1305 | Outer `0x15`, version `0x0303`, 18-byte body. |
+
+The encrypted semantic values are `01 00` for `close_notify` and `02 14` for fatal `bad_record_mac`. Data and alerts share one strict sequence per direction. The associated data binds the semantic record kind and negotiated TLS version in addition to the profile and public record image, preventing data/alert substitution. These are Reality-AEAD camouflage records, not genuine TLS closure or TLS-key alert encryption.
+
+The visible prefix is authenticated camouflage but is not the AEAD nonce. Each direction has an independent Reality sequence starting at zero; the nonce is its secret 12-byte base IV with the big-endian Reality sequence XORed into the final eight bytes. The TLS 1.2 GCM facade sequence is tracked separately.
+
+The associated data binds the profile ID, v2 record domain, direction, Reality sequence number, session ID, TLS header, visible-prefix length, and visible prefix. The receive side authenticates only the exact next Reality sequence. Therefore duplicate, deleted, reordered, reflected, cross-profile, and cross-connection records fail authentication. Counters close before wrap.
 
 ## Buffer And Lifecycle Notes
 
 - `RealityClient` has per-line state for the downstream record parser, queued pre-handshake upstream payload, session ID, directional keys/IVs, and send/receive counters.
 - It does not create or destroy the normal line. It only destroys its own line state when the line finishes or when it closes both directions after a Reality error.
-- The node advertises `17` bytes of required left padding: `5` bytes for the TLS-like record header and `12` bytes for the cover prefix.
+- During a locally generated fatal alert it enters terminal state before transmission, suppresses re-entrant payload/flow-control callbacks, owns state destruction if the send kills the line, and stops further teardown immediately.
+- The node advertises `21` bytes of required left padding: `5` bytes for the header and the worst-case `16`-byte CBC explicit IV.
 - Empty payload buffers are recycled without sending a Reality record.
 - Payloads larger than `max-frame-size` are split into multiple encrypted records.
 
@@ -137,7 +152,7 @@ The associated data binds the v2 record domain, direction, sequence number, sess
 - `RealityClient` depends on `TlsClient`; the build requires `INCLUDE_TLS_CLIENT=ON`.
 - The first phase is a real TLS client handshake, so the `sni`, certificate verification behavior, and TLS fingerprinting options matter.
 - `password`, `salt`, `kdf-iterations`, and `algorithm` must match `RealityServer`.
-- Reality v2 is wire-incompatible with the previous static-key format. Upgrade both peers together; there is no automatic v1 fallback.
+- The profile-aware format remains Reality v2 but replaces the earlier unpublished fixed-prefix v2 layout. Kind-aware AAD changes every v2 record tag, so upgrade both peers together; there is no old-layout or v1 fallback.
 - The password-derived value is a root key, not a record key. Every real TLS connection derives fresh directional material, and password rotation invalidates future sessions without requiring a replay database.
 - This node is a stream tunnel, not a packet tunnel.
 
@@ -152,4 +167,4 @@ The associated data binds the v2 record domain, direction, sequence number, sess
 | Per-line state | Yes |
 | Creates lines | No |
 | Destroys lines | No |
-| Required left padding | `17` |
+| Required left padding | `21` |
