@@ -6,7 +6,7 @@ description: "Reference documentation for the RealityServer node."
 ---
 
 <!--
-Documentation version: 111
+Documentation version: 112
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/RealityServer/description.md, and both files must keep the same documentation version.
 -->
 
@@ -75,7 +75,6 @@ Visitor destination:
 | `method` | same as `algorithm` | Alias for `algorithm`. Used only when `algorithm` is absent. |
 | `salt` | `waterwall-reality` | Salt used in the password-based key derivation. Must match the client. |
 | `kdf-iterations` | `12000` | Key derivation rounds. Valid range is `1` through `1000000`. |
-| `max-frame-size` | `16356` | Maximum plaintext bytes per Reality record. Valid range is `1` through `16356`. Larger downstream payload buffers are split into multiple records. |
 | `sniffing-attempts` | `8` | Number of failed Reality application-record candidates to try before permanently treating the line as visitor traffic. Valid range is `1` through `1024`. |
 | `sniffing-counter` | same as `sniffing-attempts` | Legacy alias used only when `sniffing-attempts` is absent. |
 | `tls12-gcm-server-nonce-policy` | `auto` | Downstream AES-GCM explicit-nonce policy: `auto`, `sequence`, `counter`, or `random`. |
@@ -124,9 +123,10 @@ Authorized Reality traffic uses the profile selected from the real cover handsha
 
 | Negotiated cover | Visible Reality body |
 |---|---|
-| TLS 1.3 or TLS 1.2 ChaCha20-Poly1305 | `12-byte random prefix + Reality ciphertext + 16-byte tag` |
-| TLS 1.2 AES-GCM | `8-byte explicit nonce + Reality ciphertext + 16-byte tag` |
-| TLS 1.2 AES-CBC/SHA-1 | `16-byte random explicit IV + block-aligned opaque body` |
+| TLS 1.3 | `Reality-AEAD(payload + encrypted inner type 0x17) + 16-byte tag`; no visible nonce/prefix; body length `P + 17`, maximum `16401`. |
+| TLS 1.2 ChaCha20-Poly1305 | `Reality-AEAD(payload) + 16-byte tag`; no visible nonce/prefix; body length `P + 16`, maximum `16400`. |
+| TLS 1.2 AES-GCM | `8-byte explicit nonce + Reality ciphertext + 16-byte tag`; maximum `16408`. |
+| TLS 1.2 AES-CBC/SHA-1 | `16-byte random explicit IV + block-aligned opaque body`; maximum `16432`. |
 
 CBC public lengths reproduce the suite's TLS MAC and minimum-padding formula using an authenticated inner payload length and zero filler; Reality does not implement CBC encryption.
 
@@ -161,7 +161,7 @@ Each direction accepts exactly its next sequence number. Duplicate, deleted, reo
 - It does not create or destroy the normal line. It destroys only its own line state before propagating finish callbacks.
 - The node advertises `21` bytes of required left padding: `5` bytes for the header and the worst-case `16`-byte CBC explicit IV.
 - Empty downstream payload buffers from the protected chain are recycled without sending a Reality record.
-- Payloads larger than `max-frame-size` are split into multiple encrypted records.
+- Application plaintext fragments are automatically capped at the native TLS limit of `16384` bytes. Larger WaterWall payload callbacks are split immediately; `32768` bytes becomes exactly two full records, with no cross-callback buffering.
 - During the authorized transition, downstream callbacks caused by closing the visitor branch are suppressed so they do not reflect back into the already-switching side.
 - Final alerts are transferred before `Finish`; terminal guards suppress synchronous Pause/Resume/Payload/Est reflection and abort further teardown if the line dies during the send or first finish.
 
@@ -170,7 +170,7 @@ Each direction accepts exactly its next sequence number. Duplicate, deleted, reo
 - `destination` is for ordinary visitor traffic. It should normally be a branch that can serve or proxy the same visitor domain used by `RealityClient.settings.sni`.
 - `next` is for authorized WaterWall traffic only.
 - `password`, `salt`, `kdf-iterations`, and `algorithm` must match `RealityClient`.
-- The profile-aware format remains Reality v2 but replaces the earlier unpublished fixed-prefix v2 layout. Kind-aware AAD changes every v2 record tag, so upgrade both peers together; the secure path never falls back to an older layout or v1.
+- The native-sized profile-aware format remains Reality v2 but replaces the earlier unpublished 12-byte-prefix application layout. Upgrade both peers together; the secure path never falls back to an older layout or v1. The obsolete `max-frame-size` setting is rejected rather than ignored.
 - The password-derived value is a root key for per-TLS-session directional material. Password rotation invalidates future sessions, and no server-side replay database is required.
 - This node is a stream tunnel, not a packet tunnel.
 

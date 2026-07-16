@@ -6,7 +6,7 @@ description: "Reference documentation for the RealityClient node."
 ---
 
 <!--
-Documentation version: 111
+Documentation version: 112
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/RealityClient/description.md, and both files must keep the same documentation version.
 -->
 
@@ -78,7 +78,6 @@ Paired with a normal TCP transport:
 | `method` | same as `algorithm` | Alias for `algorithm`. Used only when `algorithm` is absent. |
 | `salt` | `waterwall-reality` | Salt used in the password-based key derivation. Must match the server. |
 | `kdf-iterations` | `12000` | Key derivation rounds. Valid range is `1` through `1000000`. |
-| `max-frame-size` | `16356` | Maximum plaintext bytes per Reality record. Valid range is `1` through `16356`. Larger payload buffers are split into multiple records. |
 
 `aes-gcm` requires AES-GCM support in the active crypto backend. If it is unavailable, tunnel creation fails.
 
@@ -109,9 +108,10 @@ Reality records are shaped according to the negotiated cover suite:
 
 | Negotiated cover | Visible Reality body |
 |---|---|
-| TLS 1.3 or TLS 1.2 ChaCha20-Poly1305 | `12-byte random prefix + Reality ciphertext + 16-byte tag` |
-| TLS 1.2 AES-GCM | `8-byte explicit nonce + Reality ciphertext + 16-byte tag` |
-| TLS 1.2 AES-CBC/SHA-1 | `16-byte random explicit IV + block-aligned opaque body` |
+| TLS 1.3 | `Reality-AEAD(payload + encrypted inner type 0x17) + 16-byte tag`; no visible nonce/prefix; body length `P + 17`, maximum `16401`. |
+| TLS 1.2 ChaCha20-Poly1305 | `Reality-AEAD(payload) + 16-byte tag`; no visible nonce/prefix; body length `P + 16`, maximum `16400`. |
+| TLS 1.2 AES-GCM | `8-byte explicit nonce + Reality ciphertext + 16-byte tag`; maximum `16408`. |
+| TLS 1.2 AES-CBC/SHA-1 | `16-byte random explicit IV + block-aligned opaque body`; maximum `16432`. |
 
 For GCM, client-to-server explicit nonces continue BoringSSL's captured next TLS write sequence in big-endian form. For CBC, the opaque body length is `round_up(payload + TLS MAC length + 1, block size)`. An encrypted two-byte payload length and zero filler make the Reality AEAD result match that length; no CBC encryption or TLS CBC MAC is performed.
 
@@ -145,14 +145,14 @@ The associated data binds the profile ID, v2 record domain, direction, Reality s
 - During a locally generated fatal alert it enters terminal state before transmission, suppresses re-entrant payload/flow-control callbacks, owns state destruction if the send kills the line, and stops further teardown immediately.
 - The node advertises `21` bytes of required left padding: `5` bytes for the header and the worst-case `16`-byte CBC explicit IV.
 - Empty payload buffers are recycled without sending a Reality record.
-- Payloads larger than `max-frame-size` are split into multiple encrypted records.
+- Application plaintext fragments are automatically capped at the native TLS limit of `16384` bytes. Larger WaterWall payload callbacks are split immediately; `32768` bytes becomes exactly two full records, with no cross-callback buffering.
 
 ## Operational Notes
 
 - `RealityClient` depends on `TlsClient`; the build requires `INCLUDE_TLS_CLIENT=ON`.
 - The first phase is a real TLS client handshake, so the `sni`, certificate verification behavior, and TLS fingerprinting options matter.
 - `password`, `salt`, `kdf-iterations`, and `algorithm` must match `RealityServer`.
-- The profile-aware format remains Reality v2 but replaces the earlier unpublished fixed-prefix v2 layout. Kind-aware AAD changes every v2 record tag, so upgrade both peers together; there is no old-layout or v1 fallback.
+- The native-sized profile-aware format remains Reality v2 but replaces the earlier unpublished 12-byte-prefix application layout. Upgrade both peers together; there is no old-layout or v1 fallback. The obsolete `max-frame-size` setting is rejected rather than ignored.
 - The password-derived value is a root key, not a record key. Every real TLS connection derives fresh directional material, and password rotation invalidates future sessions without requiring a replay database.
 - This node is a stream tunnel, not a packet tunnel.
 
