@@ -6,13 +6,13 @@ description: "Reference documentation for the RealityServer node."
 ---
 
 <!--
-Documentation version: 112
+Documentation version: 113
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/RealityServer/description.md, and both files must keep the same documentation version.
 -->
 
 # RealityServer
 
-`RealityServer` is the server-side Reality v2 tunnel. It starts every incoming line as ordinary visitor traffic, forwards that traffic to a configured `destination` branch, passively extracts the real TLS handshake binding, and only then tests client-to-server records with fresh per-connection session keys. When authentication succeeds, it closes the visitor branch and switches the same WaterWall line to the protected `next` chain.
+`RealityServer` is the server-side Reality v2 tunnel. It starts every incoming line as ordinary visitor traffic, forwards that traffic to a configured `destination` branch, passively extracts the real TLS handshake binding, and only then tests client-to-server records with fresh per-connection session keys. TLS 1.3 requires an authenticated request/ack/confirm handoff before the visitor branch closes and the same WaterWall line switches to protected `next`; TLS 1.2 retains immediate profile-aware authorization.
 
 The server does not terminate TLS for visitors. It only sniffs enough TLS-like records to decide whether a peer is a Reality client or ordinary visitor traffic.
 
@@ -93,7 +93,9 @@ While the line is pending:
 4. before both hello values are ready, application-data-looking records remain visitor traffic and are never tested with the root key
 5. after deriving v2 directional session keys, candidate records are duplicated and authenticated at the exact expected client-to-server sequence
 6. if authentication fails while pending, the original record is forwarded to `destination`; there is no v1 trial decrypt
-7. if authentication succeeds, the visitor branch is finished and the protected `next` chain is initialized
+7. TLS 1.2 keeps its immediate authorization path; for TLS 1.3 only `HANDOFF_REQUEST` at sequence `0` may begin handoff
+
+After a TLS 1.3 request authenticates, the server finishes forwarding only the already-started destination TLS record. A streaming boundary tracker splits at the first safe record boundary, suppresses every later destination downstream byte, enters the ACK-waiting state, and sends `HANDOFF_ACK` at server-to-client sequence `0`. Late genuine TLS protocol output from the client may still travel upstream to the destination before confirmation. Failed `HANDOFF_CONFIRM` trials preserve the original record and sequence but are bounded by record count and bytes. Confirmation at client-to-server sequence `1` closes the remaining destination direction, initializes protected `next` exactly once, and enables strict Authorized behavior. Application records cannot authorize TLS 1.3 directly.
 
 After authorization:
 
@@ -104,7 +106,7 @@ After authorization:
 
 If upstream traffic is invalid after authorization, if a non-Reality TLS record arrives after authorization, or if Reality authentication fails after authorization, the server queues at most one authenticated fatal `bad_record_mac` when the wire remains writable and then closes both directions.
 
-The server owns orderly Reality shutdown. A protected-side orderly `Finish` queues exactly one `close_notify`, then immediately finishes the wire side without waiting for a reply. RealityClient consumes that record without replying and closes its TCP side immediately, even if a later server FIN is withheld. Normal clients close with raw transport FIN and do not send `close_notify`. A client `close_notify` is still recognized defensively, including as the first takeover record: the server authorizes the secure path, consumes the alert, sends one server `close_notify` when possible, and immediately closes both sides without forwarding control bytes. Received fatal alerts are not answered. A raw wire `Finish` cannot be answered and only closes the remaining protected path.
+The server owns orderly Reality shutdown after authorization. A protected-side orderly `Finish` queues exactly one `close_notify`, then immediately finishes the wire side without waiting for a reply. RealityClient consumes that record without replying and closes its TCP side immediately, even if a later server FIN is withheld. Normal clients close with raw transport FIN and do not send `close_notify`. Received fatal alerts are not answered, and a raw wire `Finish` cannot be answered. Pending, Visitor, and both TLS 1.3 handoff phases close silently without synthetic Reality alerts because the client may still be interpreting downstream bytes as cover TLS.
 
 ## Visitor Fallback Rules
 
@@ -149,6 +151,8 @@ Authenticated alerts use BoringSSL-compatible public shapes:
 
 The encrypted semantic values are `01 00` (`close_notify`) and `02 14` (fatal `bad_record_mac`). Alerts and data share one strict sequence per direction. Associated data binds record kind and negotiated TLS version as well as the profile and visible record image. These are Reality-AEAD camouflage records, not genuine TLS closure or TLS-key alert encryption.
 
+TLS 1.3 `HANDOFF_REQUEST`, `HANDOFF_ACK`, and `HANDOFF_CONFIRM` use outer and inner application-data types. Their versioned plaintext binds the expected control code and includes authenticated CSPRNG padding. The TLS body length is sampled uniformly from `22..1172` bytes (`3..1153` padding bytes), the range observed across the covered BoringSSL post-handshake paths. Controls are consumed internally, share the normal directional Reality sequence, and have no JSON-configurable size. Their visible timing and length distribution remain part of the wire-camouflage review.
+
 The visible prefix is authenticated camouflage, not the Reality AEAD nonce. The nonce is derived from a per-direction secret IV and independent Reality replay sequence. Associated data also binds the record profile ID and visible-prefix length.
 
 For downstream TLS 1.2 GCM, `auto` selects `sequence` when observed cover nonces match protected-record sequences, otherwise `counter` when at least two samples increment, and otherwise `random`. Explicit `sequence` continues the tracked TLS record sequence; `counter` increments the last observed nonce and requires a sample; `random` uses fresh CSPRNG bytes. `auto` cannot distinguish an arbitrary fixed-prefix counter from random output with one non-sequence sample, so operators who know the cover convention may set an explicit policy.
@@ -170,7 +174,7 @@ Each direction accepts exactly its next sequence number. Duplicate, deleted, reo
 - `destination` is for ordinary visitor traffic. It should normally be a branch that can serve or proxy the same visitor domain used by `RealityClient.settings.sni`.
 - `next` is for authorized WaterWall traffic only.
 - `password`, `salt`, `kdf-iterations`, and `algorithm` must match `RealityClient`.
-- The native-sized profile-aware format remains Reality v2 but replaces the earlier unpublished 12-byte-prefix application layout. Upgrade both peers together; the secure path never falls back to an older layout or v1. The obsolete `max-frame-size` setting is rejected rather than ignored.
+- The authenticated TLS 1.3 handoff replaces the earlier unpublished main-handshake cutover. Upgrade both peers together; TLS 1.2 layouts and counters remain unchanged, the secure path never falls back to an older layout or v1, and obsolete `max-frame-size` remains a startup error.
 - The password-derived value is a root key for per-TLS-session directional material. Password rotation invalidates future sessions, and no server-side replay database is required.
 - This node is a stream tunnel, not a packet tunnel.
 

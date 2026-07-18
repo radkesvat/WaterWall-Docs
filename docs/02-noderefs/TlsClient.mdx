@@ -6,7 +6,7 @@ description: "Reference documentation for the TlsClient node."
 ---
 
 <!--
-Documentation version: 108
+Documentation version: 109
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/TlsClient/description.md, and both files must keep the same documentation version.
 -->
 
@@ -198,6 +198,8 @@ finish later when downstream TLS records arrive. If the previous tunnel sends ap
 is complete, `TlsClient` queues it and flushes it through `SSL_write()` after the handshake finishes.
 
 In handshake-takeover mode, `TlsClient` suppresses the normal downstream `Est` until the TLS handshake completes.
+It also frames takeover input one TLS record at a time and stops feeding BoringSSL at the exact record that completes the
+handshake, leaving later records outside the SSL object for explicit dispatch.
 
 ## Payload Flow
 
@@ -235,9 +237,19 @@ Internal WaterWall code can use `TlsClient` in handshake-takeover mode:
 | --- | --- |
 | `tlsclientTunnelEnableHandshakeTakeover()` | Enables takeover behavior on the tunnel. |
 | `tlsclientTunnelIsHandshakeCompleted()` | Checks whether a line has completed TLS handshake. |
-| `tlsclientTunnelDeinitAfterHandshake()` | Releases BoringSSL state after handshake and turns the line into raw pass-through. |
+| `tlsclientTunnelGetHandshakeBinding()` | Captures the negotiated version, cipher, randoms, and TLS 1.2 sequence state while BoringSSL is retained. |
+| `tlsclientTunnelDeinitAfterHandshake()` | TLS 1.2-only immediate release into raw pass-through. It rejects TLS 1.3. |
+| `tlsclientTunnelBeginTakeoverDrain()` | Starts TLS 1.3 external post-handshake dispatch and returns accumulated raw bytes while retaining SSL/BIO state. |
+| `tlsclientTunnelConsumePostHandshakeRecord()` | Consumes exactly one complete TLS 1.3 record, discards cover plaintext, and flushes generated protocol output upstream. |
+| `tlsclientTunnelCompleteTakeover()` | Releases retained TLS state after the owner authenticates its handoff boundary and enters raw pass-through. |
 
-This is an internal integration path. In normal configuration usage, `TlsClient` remains a TLS wrapper for the whole line.
+The phased TLS 1.3 API allows legal `NewSessionTicket` and `KeyUpdate` records to remain genuine TLS until an external
+authenticated handoff completes. The record that finishes the handshake must leave both the read BIO and BoringSSL's
+internal TLS read buffer empty; otherwise takeover fails. Owner-formatted raw controls and BoringSSL-generated protocol
+output share the same upstream transport path and retain callback order.
+
+This is an internal integration path with no JSON setting. In normal configuration usage, `TlsClient` remains a TLS
+wrapper for the whole line.
 
 ## Finish Behavior
 

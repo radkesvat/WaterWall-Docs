@@ -5,11 +5,11 @@ sidebar_label: "RealityClient"
 description: "راهنمای نود RealityClient در WaterWall."
 ---
 
-<!-- Written from version 112 of the English doc. -->
+<!-- Written from version 113 of the English doc. -->
 
 # RealityClient
 
-`RealityClient` tunnel سمت client برای Reality v2 است. این نود هر line را با یک TLS handshake واقعی از طریق `TlsClient` داخلی آغاز می‌کند، از همان handshake برای هر نشست key و IV مستقل هر جهت را به‌صورت تازه مشتق می‌کند، کنترل connection خام برقرارشده را تحویل می‌گیرد و سپس payloadهای واتروال را در recordهایی شبیه TLS application-data و محافظت‌شده با AEAD حمل می‌کند.
+`RealityClient` tunnel سمت client برای Reality v2 است. هر line با TLS handshake واقعی از طریق `TlsClient` داخلی آغاز می‌شود و material مستقل هر جهت از همان handshake مشتق می‌گردد. در TLS 1.3، پیش از takeover خام یک handoff احرازشده request/ack/confirm انجام می‌شود؛ TLS 1.2 مسیر فوری و profile-aware فعلی را حفظ می‌کند.
 
 زمانی از این نود استفاده کنید که بایت‌های ابتدایی روی wire باید برای یک visitor domain شبیه نشست عادی TLS client به نظر برسند، در حالی که payload اصلی واتروال با secret مشترک Reality محافظت می‌شود.
 
@@ -86,7 +86,9 @@ TcpListener -> RealityClient -> TcpConnector
 2. `Init` را به `TlsClient` داخلی می‌فرستد
 3. منتظر کامل شدن TLS handshake داخلی می‌ماند
 
-payloadهای upstream که پیش از TLS takeover برسند در صف می‌مانند. وقتی `TlsClient` داخلی downstream `Est` را اعلام کند، `RealityClient` نسخه TLS مذاکره‌شده، IANA cipher suite، client random و server random را در حالی که SSL object هنوز در دسترس است ثبت می‌کند. سپس line داخلی TLS را بدون بستن connection از بین می‌برد، keyها و IVهای مستقل client-to-server و server-to-client را از binding ثبت‌شده و root key مشتق‌شده از password تولید می‌کند، payloadهای upstream صف‌شده را به‌صورت recordهای رمزنگاری‌شده v2 می‌فرستد و downstream `Est` را اعلام می‌کند.
+payloadهای upstream تا پایان takeover در صف می‌مانند. با کامل شدن handshake داخلی، `RealityClient` نسخه TLS، IANA cipher suite، client random، server random و sequenceهای بعدی TLS 1.2 را در حالی که SSL object هنوز موجود است ثبت می‌کند و key/IV مستقل هر جهت را مشتق می‌سازد.
+
+TLS 1.2 سپس state داخلی TLS را فوراً آزاد می‌کند. در TLS 1.3، BoringSSL حفظ می‌شود و `HANDOFF_REQUEST` با sequence صفر client-to-server ارسال می‌گردد. تا رسیدن `HANDOFF_ACK`، هر record کامل فقط روی یک duplicate به‌عنوان ACK مورد انتظار آزمایش می‌شود. شکست این trial نه sequence را جلو می‌برد و نه record اصلی را تغییر می‌دهد؛ record اصلی برای پردازش عادی `NewSessionTicket`، `KeyUpdate`، application-data یا alert مربوط به cover به BoringSSL داده می‌شود. protocol output تولیدشده پیش از control بعدی upstream می‌رود. پس از ACK با sequence صفر server-to-client، client BoringSSL را آزاد می‌کند، `HANDOFF_CONFIRM` را با sequence یک client-to-server می‌فرستد، downstream `Est` را اعلام می‌کند و payloadهای صف‌شده را از sequence دو آغاز می‌کند.
 
 بعد از takeover:
 
@@ -95,7 +97,7 @@ payloadهای upstream که پیش از TLS takeover برسند در صف می�
 | Upstream payload | cleartext نود قبلی رمزنگاری و در قالب recordهای شبیه TLS application-data به `next` فرستاده می‌شود. |
 | Downstream payload | recordهای Reality از `next` parse، احراز اصالت و رمزگشایی می‌شوند و cleartext به نود قبلی می‌رود. |
 
-اگر payload جهت downstream پیش از TLS takeover برسد، line بدون alert مصنوعی بسته می‌شود، چون هنوز کانال Reality احرازشده‌ای وجود ندارد. پس از takeover، framing نامعتبر، شکست authentication یا semantic احرازشده نامعتبر، در صورت writable بودن سمت wire حداکثر یک alert محافظت‌شده fatal از نوع `bad_record_mac` می‌فرستد و سپس هر دو جهت را می‌بندد.
+پیش از ACK احرازشده TLS 1.3، خطای cover TLS، finish محلی یا ورودی malformed بدون alert مصنوعی Reality بسته می‌شود، چون peer ممکن است هنوز stream را TLS واقعی بداند. پس از handoff، framing نامعتبر، شکست authentication یا semantic احرازشده نامعتبر، در صورت writable بودن سمت wire حداکثر یک alert محافظت‌شده fatal از نوع `bad_record_mac` می‌فرستد و سپس هر دو جهت را می‌بندد.
 
 سیاست shutdown به نقش هر سمت وابسته است. `Finish` محلی upstream پس از پاک‌کردن state مربوط به Reality فقط `next` را می‌بندد و هرگز `close_notify` مصنوعی تولید نمی‌کند. `close_notify` احرازشده server بدون پاسخ مصرف می‌شود؛ سپس RealityClient فوراً state خودش و هر دو سمت باز را می‌بندد. client منتظر `Finish` بعدی TCP نمی‌ماند، بنابراین peer احرازشده نمی‌تواند با نفرستادن FIN connection را باز نگه دارد. تنها مسیر تولید alert در client، تشخیص محلی خطای record احرازشده است که حداکثر یک fatal `bad_record_mac` می‌فرستد و سپس هر دو سمت را می‌بندد. fatal alert دریافتی نیز بدون پاسخ فوراً هر دو سمت را می‌بندد. `Finish` خام transport فقط سمت محلی باقی‌مانده را می‌بندد. این رفتار setting جدیدی ندارد.
 
@@ -135,6 +137,8 @@ alertهای کنترلی شکل public سازگار با BoringSSL دارند:
 
 مقادیر semantic رمز‌شده `01 00` برای `close_notify` و `02 14` برای fatal `bad_record_mac` هستند. data و alert در هر جهت یک sequence مشترک دارند. record kind و نسخه TLS نیز وارد associated data می‌شوند تا تبدیل data به alert یا برعکس معتبر نباشد. این‌ها recordهای camouflage محافظت‌شده با Reality AEAD هستند، نه TLS closure واقعی یا alert رمز‌شده با keyهای TLS.
 
+سه control مربوط به handoff در TLS 1.3 از outer type و inner type برابر application-data استفاده می‌کنند. plaintext نسخه‌دار آن‌ها شامل control code مطابق AAD و padding احرازشده CSPRNG بر اساس policy مشترک طول عمومی است. طول body در TLS به‌طور یکنواخت از بازه `22..1172` byte نمونه‌برداری می‌شود (`3..1153` byte padding)؛ این بازه در مسیرهای post-handshake تحت پوشش BoringSSL مشاهده شده است. padding به application داده نمی‌شود. request، ACK، confirm، data و alert یک sequence سخت‌گیرانه مشترک در هر جهت دارند و قابل جایگزینی نیستند. setting JSON برای طول control وجود ندارد.
+
 ## نکته‌های Buffer و Lifecycle
 
 - `RealityClient` به‌ازای هر line یک state دارد که شامل parser مربوط به recordهای downstream، payloadهای upstream صف‌شده پیش از handshake، session ID، keyها و IVهای هر جهت و counterهای ارسال و دریافت است.
@@ -149,7 +153,7 @@ alertهای کنترلی شکل public سازگار با BoringSSL دارند:
 - `RealityClient` به `TlsClient` وابسته است و build باید `INCLUDE_TLS_CLIENT=ON` داشته باشد.
 - اولین مرحله یک TLS client handshake واقعی است، بنابراین `sni`، رفتار certificate verification و گزینه‌های TLS fingerprinting اهمیت دارند.
 - `password`، `salt`، `kdf-iterations` و `algorithm` باید با `RealityServer` یکی باشند.
-- فرمت native-sized در Reality v2 جای layout منتشرنشده قبلی با prefix دوازده‌بایتی را می‌گیرد. هر دو peer را هم‌زمان ارتقا دهید؛ fallback به v1 یا layout قدیمی وجود ندارد و setting منسوخ `max-frame-size` در startup رد می‌شود.
+- handoff احرازشده TLS 1.3 با buildهای منتشرنشده قبلی که در پایان handshake اصلی takeover می‌کردند ناسازگار است. هر دو peer را هم‌زمان ارتقا دهید؛ layoutهای TLS 1.2 تغییر نکرده‌اند، fallback به v1 یا layout قدیمی وجود ندارد و setting منسوخ `max-frame-size` در startup رد می‌شود.
 - مقدار مشتق‌شده از password یک root key است، نه record key. هر connection واقعی TLS، material مستقل هر جهت را به‌صورت تازه مشتق می‌کند و چرخش password نشست‌های آینده را بدون نیاز به replay database نامعتبر می‌کند.
 - این نود یک stream tunnel است، نه packet tunnel.
 
