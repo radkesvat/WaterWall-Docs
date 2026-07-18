@@ -6,7 +6,7 @@ description: "Reference documentation for the RealityServer node."
 ---
 
 <!--
-Documentation version: 113
+Documentation version: 116
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/RealityServer/description.md, and both files must keep the same documentation version.
 -->
 
@@ -63,23 +63,25 @@ Visitor destination:
 | `next` | string | Node that receives authorized, decrypted Reality payload. |
 | `settings` | object | Must be a non-empty object. |
 | `settings.destination` | string | Node name for visitor traffic. The node must exist and must not be `RealityServer` itself or its authorized `next` node. |
-| `settings.password` | string | Non-empty shared Reality secret. Must match the client. |
+| `settings.password` | string | Shared Reality secret containing 1 through 32 UTF-8 bytes. Must match the client. |
 
 ## Settings
 
 | Field | Default | Description |
 |---|---|---|
 | `destination` | required | Visitor branch node name. Handshake records, ordinary visitor TLS, invalid probes, and failed Reality candidates are forwarded here while the line is not authorized. |
-| `password` | required | Shared Reality secret used for key derivation. |
+| `password` | required | Shared Reality secret containing 1 through 32 UTF-8 bytes. |
 | `algorithm` | `chacha20-poly1305` | AEAD algorithm. Accepts `chacha20-poly1305`, `chacha20poly1305`, `aes-gcm`, `aes-256-gcm`, or `aes256gcm`. |
 | `method` | same as `algorithm` | Alias for `algorithm`. Used only when `algorithm` is absent. |
-| `salt` | `waterwall-reality` | Salt used in the password-based key derivation. Must match the client. |
-| `kdf-iterations` | `12000` | Key derivation rounds. Valid range is `1` through `1000000`. |
-| `sniffing-attempts` | `8` | Number of failed Reality application-record candidates to try before permanently treating the line as visitor traffic. Valid range is `1` through `1024`. |
-| `sniffing-counter` | same as `sniffing-attempts` | Legacy alias used only when `sniffing-attempts` is absent. |
+| `salt` | `waterwall-reality` | Salt used in key derivation. An explicitly configured value must contain 1 through 32 UTF-8 bytes and match the client. |
+| `kdf-iterations` | `12000` | Integer key derivation rounds. Valid range is `1` through `1000000`; fractional numbers are rejected. |
+| `sniffing-attempts` | `8` | Integer number of failed Reality candidates after the one-record TLS 1.3 pre-request cover allowance before permanently treating the line as visitor traffic. Valid range is `1` through `1024`; TLS 1.2 has no allowance. |
+| `sniffing-counter` | same as `sniffing-attempts` | Legacy integer alias used only when `sniffing-attempts` is absent, with the same range. |
 | `tls12-gcm-server-nonce-policy` | `auto` | Downstream AES-GCM explicit-nonce policy: `auto`, `sequence`, `counter`, or `random`. |
 
 `aes-gcm` requires AES-GCM support in the active crypto backend. If it is unavailable, tunnel creation fails.
+
+Credential limits are measured in UTF-8 bytes, not characters, using the same byte length supplied to BLAKE2s. Optional defaults apply only when a key is absent; a present key with the wrong JSON type is a startup error. Primary fields win over aliases even when malformed: `method` cannot rescue an invalid `algorithm`, and `sniffing-counter` cannot rescue an invalid `sniffing-attempts`.
 
 ## Visitor And Protected Branches
 
@@ -94,6 +96,8 @@ While the line is pending:
 5. after deriving v2 directional session keys, candidate records are duplicated and authenticated at the exact expected client-to-server sequence
 6. if authentication fails while pending, the original record is forwarded to `destination`; there is no v1 trial decrypt
 7. TLS 1.2 keeps its immediate authorization path; for TLS 1.3 only `HANDOFF_REQUEST` at sequence `0` may begin handoff
+
+After TLS 1.3 session keys are derived, the server grants one internal, non-resettable pre-request cover-record allowance for the genuine encrypted client Finished record. A failed candidate that uses this allowance is forwarded byte-for-byte without incrementing `sniffing-attempts` or advancing the Reality sequence. The allowance cannot authenticate a client, is discarded when `HANDOFF_REQUEST` authenticates, and is not used by TLS 1.2. Later failed candidates consume the configured budget normally.
 
 After a TLS 1.3 request authenticates, the server finishes forwarding only the already-started destination TLS record. A streaming boundary tracker splits at the first safe record boundary, suppresses every later destination downstream byte, enters the ACK-waiting state, and sends `HANDOFF_ACK` at server-to-client sequence `0`. Late genuine TLS protocol output from the client may still travel upstream to the destination before confirmation. Failed `HANDOFF_CONFIRM` trials preserve the original record and sequence but are bounded by record count and bytes. Confirmation at client-to-server sequence `1` closes the remaining destination direction, initializes protected `next` exactly once, and enables strict Authorized behavior. Application records cannot authorize TLS 1.3 directly.
 
@@ -113,7 +117,9 @@ The server owns orderly Reality shutdown after authorization. A protected-side o
 The line becomes visitor traffic when:
 
 - the pending bytes are not a plausible TLS record
-- enough Reality candidate records fail authentication to reach `sniffing-attempts`
+- enough Reality candidate records fail authentication to reach `sniffing-attempts` after the bounded TLS 1.3 pre-request allowance, if applicable
+
+The public TLS record prefix is classified progressively without consuming it: an unsupported content type is decisive after byte one, an invalid legacy-version major after byte two, and a minor greater than `0x04` after byte three. A plausible one- through four-byte prefix remains Pending while the connection is open. If upstream `Finish` arrives in Pending mode, those exact buffered bytes are transferred to `destination` before the destination receives `Finish`.
 
 After a line switches to visitor mode, upstream payload is forwarded to the visitor `destination`, and downstream payload from that branch is forwarded back to the previous node. The protected `next` chain is not initialized for that line.
 
