@@ -6,7 +6,7 @@ description: "Reference documentation for the IpManipulator node."
 ---
 
 <!--
-Documentation version: 106
+Documentation version: 108
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/IpManipulator/description.md, and both files must keep the same documentation version.
 -->
 
@@ -110,7 +110,7 @@ Mixed advanced example:
     "first-sni-final-delay": 50,
     "first-sni-ttl": 1,
     "packet-duplicate": 1,
-    "carry-original-tcp-flags": true,
+    "preserve-tcp-bitflags": true,
     "up-tcp-bit-ack": "packet->fin",
     "up-tcp-bit-fin": "packet->ack",
     "dw-tcp-bit-ack": "packet->fin",
@@ -237,15 +237,66 @@ copying each one from the other original bit.
 When a TCP flag changes, `IpManipulator` marks the packet for checksum
 recalculation.
 
-### Carry Original TCP Flags
+### Preserve TCP Bitflags
 
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
-| `carry-original-tcp-flags` | boolean | `false` | Rewrite directions append the original TCP flags byte to the packet payload. Directions without rewrite actions can restore flags from that byte. |
-| `bit-transport` | boolean | `false` | Compatibility alias for `carry-original-tcp-flags`. |
+| `preserve-tcp-bitflags` | boolean | `false` | Backs up the original TCP flags byte before rewriting it, so the opposite packet direction can restore the packet later. |
 
-This mode only applies to whole IPv4 TCP packets. Fragmented IPv4 packets are
-skipped.
+This mode is useful when you want a packet to travel through one side of a
+path with altered TCP control bits, then return to its original TCP flag shape
+on the reverse direction.
+
+Direction workflow:
+
+1. In a direction with configured TCP-bit rewrite actions, `IpManipulator`
+   stores the original full TCP flags byte as the last byte of the IPv4 packet.
+2. It then rewrites the live TCP flags according to `up-tcp-bit-*` or
+   `dw-tcp-bit-*`.
+3. It increases the IPv4 total length by one byte and marks the packet for
+   checksum recalculation.
+4. On the opposite direction, when that direction has no TCP-bit rewrite actions
+   but the other direction does, `IpManipulator` reads the final packet byte,
+   restores the TCP flags field from it, removes that byte, shrinks the IPv4
+   total length, and marks checksums for recalculation.
+
+The configured TCP-bit actions select which direction backs up and which
+direction restores. Enabling this option does not assign a fixed role to
+upstream or downstream:
+
+| Configured TCP-bit actions | Upstream behavior | Downstream behavior |
+| --- | --- | --- |
+| Upstream only | Back up the original flags, append one byte, and apply the upstream actions. | Restore the flags from the final byte and remove it. |
+| Downstream only | Restore the flags from the final byte and remove it. | Back up the original flags, append one byte, and apply the downstream actions. |
+| Upstream and downstream | Back up, append, and apply the upstream actions. | Back up, append, and apply the downstream actions. Neither direction restores. |
+| Neither direction | No backup or restoration. | No backup or restoration. |
+
+Example upstream rewrite with downstream restore:
+
+```json
+{
+  "preserve-tcp-bitflags": true,
+  "up-tcp-bit-ack": "packet->fin",
+  "up-tcp-bit-fin": "packet->ack"
+}
+```
+
+With that shape, upstream TCP packets carry their original flags in the final
+packet byte before ACK/FIN are remapped. Downstream packets handled by the same
+configuration have no `dw-tcp-bit-*` rewrite actions, so the final byte is used
+to restore the original TCP flags and is then removed.
+
+This mode only applies to whole, non-fragmented IPv4 TCP packets with complete
+IP and TCP headers. It assumes the extra final byte survives the path unchanged.
+If another node or network device strips, rewrites, pads, or interprets trailing
+payload bytes, restoration can fail or restore the wrong flags.
+
+Because rewritten packets grow by one byte, reduce `misc.mtu` in `core.json` by
+`1` when the current MTU is already `1500` or the maximum value supported by the
+network card or packet path. For example, use `1499` instead of `1500`.
+
+In particular, enabling this option by itself does not append or remove bytes;
+at least one direction must have a TCP-bit rewrite action configured.
 
 ## SNI Blender
 

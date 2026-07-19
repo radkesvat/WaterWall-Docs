@@ -5,7 +5,7 @@ sidebar_label: "IpManipulator"
 description: "راهنمای نود IpManipulator در WaterWall."
 ---
 
-<!-- Written from version 106 of the English doc. -->
+<!-- Written from version 108 of the English doc. -->
 
 # IpManipulator
 
@@ -111,7 +111,7 @@ SNI Blender:
     "first-sni-final-delay": 50,
     "first-sni-ttl": 1,
     "packet-duplicate": 1,
-    "carry-original-tcp-flags": true,
+    "preserve-tcp-bitflags": true,
     "up-tcp-bit-ack": "packet->fin",
     "up-tcp-bit-fin": "packet->ack",
     "dw-tcp-bit-ack": "packet->fin",
@@ -231,14 +231,63 @@ packet اصلی خوانده می‌شوند، نه از نسخه‌ای که د
 
 اگر flagی تغییر کند، packet برای محاسبه دوباره checksum علامت می‌خورد.
 
-### حمل Flag اصلی
+### حفظ TCP Bitflagها
 
 | گزینه | نوع | پیش‌فرض | توضیح |
 | --- | --- | --- | --- |
-| `carry-original-tcp-flags` | boolean | `false` | در جهت بازنویسی‌شده، بایت اصلی flagهای TCP را به انتهای payload می‌افزاید تا سمت مقابل بتواند آن را بازیابی کند. |
-| `bit-transport` | boolean | `false` | نام مستعار سازگار با `carry-original-tcp-flags`. |
+| `preserve-tcp-bitflags` | boolean | `false` | پیش از بازنویسی، بایت اصلی flagهای TCP را ذخیره می‌کند تا جهت مقابل بتواند packet را بازیابی کند. |
 
-این حالت فقط روی packet کامل IPv4 TCP کار می‌کند و packetهای fragmentشده را نادیده می‌گیرد.
+این حالت زمانی مفید است که می‌خواهید packet در یک جهت با TCP flagهای تغییرکرده
+عبور کند و سپس در جهت برگشت به شکل اصلی TCP flags برگردد.
+
+روند جهت‌ها:
+
+1. در جهتی که actionهای `up-tcp-bit-*` یا `dw-tcp-bit-*` دارد، `IpManipulator`
+   بایت کامل flagهای اصلی TCP را به‌عنوان آخرین بایت packet IPv4 ذخیره می‌کند.
+2. سپس TCP flagهای فعال packet را طبق actionهای همان جهت بازنویسی می‌کند.
+3. طول کل IPv4 را یک بایت زیاد می‌کند و packet را برای محاسبه دوباره checksum
+   علامت می‌زند.
+4. در جهت مقابل، اگر آن جهت action بازنویسی TCP-bit نداشته باشد ولی جهت دیگر
+   action داشته باشد، آخرین بایت packet خوانده می‌شود، TCP flags از آن بازیابی
+   می‌شود، آن بایت حذف می‌شود، طول IPv4 یک بایت کم می‌شود و checksumها باید
+   دوباره محاسبه شوند.
+
+این actionهای تنظیم‌شده TCP-bit هستند که مشخص می‌کنند کدام جهت بایت پشتیبان را
+اضافه و کدام جهت آن را بازیابی کند. صرفاً فعال‌کردن این گزینه، نقش ثابتی به
+upstream یا downstream نمی‌دهد:
+
+| actionهای تنظیم‌شده TCP-bit | رفتار upstream | رفتار downstream |
+| --- | --- | --- |
+| فقط upstream | flagهای اصلی را پشتیبان می‌گیرد، یک بایت اضافه می‌کند و actionهای upstream را اعمال می‌کند. | flagها را از آخرین بایت بازیابی و آن بایت را حذف می‌کند. |
+| فقط downstream | flagها را از آخرین بایت بازیابی و آن بایت را حذف می‌کند. | flagهای اصلی را پشتیبان می‌گیرد، یک بایت اضافه می‌کند و actionهای downstream را اعمال می‌کند. |
+| upstream و downstream | پشتیبان می‌گیرد، بایت را اضافه می‌کند و actionهای upstream را اعمال می‌کند. | پشتیبان می‌گیرد، بایت را اضافه می‌کند و actionهای downstream را اعمال می‌کند؛ هیچ جهتی بازیابی نمی‌کند. |
+| هیچ‌کدام | پشتیبان‌گیری یا بازیابی انجام نمی‌شود. | پشتیبان‌گیری یا بازیابی انجام نمی‌شود. |
+
+نمونه بازنویسی upstream و بازیابی downstream:
+
+```json
+{
+  "preserve-tcp-bitflags": true,
+  "up-tcp-bit-ack": "packet->fin",
+  "up-tcp-bit-fin": "packet->ack"
+}
+```
+
+در این شکل، packetهای upstream پیش از جابه‌جایی ACK و FIN، flagهای اصلی را در
+آخرین بایت packet حمل می‌کنند. در downstream چون هیچ `dw-tcp-bit-*`ای تنظیم
+نشده است، همان بایت برای بازیابی TCP flags استفاده و سپس حذف می‌شود.
+
+این حالت فقط روی packet کامل و fragmentنشده IPv4 TCP با header کامل IP و TCP
+کار می‌کند. همچنین فرض می‌کند آخرین بایت اضافه‌شده در مسیر بدون تغییر باقی
+می‌ماند. اگر نود یا دستگاه شبکه‌ای trailing payload را حذف، بازنویسی، padding یا
+تفسیر کند، بازیابی ممکن است شکست بخورد یا flag اشتباه برگردد.
+
+چون packetهای بازنویسی‌شده یک بایت بزرگ‌تر می‌شوند، اگر مقدار فعلی `misc.mtu`
+در `core.json` برابر `1500` یا حداکثر مقدار قابل پشتیبانی کارت شبکه یا مسیر است،
+آن را یک واحد کمتر کنید؛ برای نمونه به‌جای `1500` از `1499` استفاده کنید.
+
+در نتیجه، فعال‌کردن این گزینه به‌تنهایی بایتی اضافه یا حذف نمی‌کند؛ حداقل در یکی
+از جهت‌ها باید یک action بازنویسی TCP-bit تنظیم شده باشد.
 
 ## SNI Blender
 
