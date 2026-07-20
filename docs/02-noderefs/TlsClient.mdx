@@ -6,7 +6,7 @@ description: "Reference documentation for the TlsClient node."
 ---
 
 <!--
-Documentation version: 110
+Documentation version: 112
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/TlsClient/description.md, and both files must keep the same documentation version.
 -->
 
@@ -17,7 +17,7 @@ It receives cleartext from the previous tunnel, encrypts it into TLS records for
 TLS records back into cleartext.
 
 This node performs a real TLS client handshake. Its handshake is shaped to stay close to modern Chrome behavior, including
-Chrome-like ALPN, ALPS, GREASE, extension permutation, certificate compression support, and the optional
+Chrome-like ALPN defaults, ALPS, GREASE, extension permutation, certificate compression support, and the optional
 `X25519MLKEM768` hybrid group.
 
 ## Typical Placement
@@ -47,6 +47,7 @@ encrypted TLS bytes to the remote server.
     "type": "TlsClient",
     "settings": {
       "sni": "example.com",
+      "alpns": ["http/1.1"],
       "verify": true,
       "ech-sni-trick": "example.net",
       "x25519mlkem768": true,
@@ -89,6 +90,7 @@ Required `settings` field:
 
 | Field | Default | Description |
 | --- | --- | --- |
+| `alpns` | `["h2", "http/1.1"]` | Ordered ALPN protocol offer. The JSON order is preserved in the ClientHello. |
 | `verify` | `true` | Enables BoringSSL peer certificate verification. |
 | `ech-sni-trick` | not set | Generates a fake inner ClientHello with this hostname and embeds it as GREASE ECH payload. |
 | `x25519mlkem768` | `true` | Advertises the `X25519MLKEM768` hybrid group for Chrome-like behavior. |
@@ -101,24 +103,52 @@ instance.
 `ech-sni-trick` must be a non-empty string when provided. It does not change the outer cleartext SNI; the outer SNI
 remains `settings.sni`.
 
-Optional defaults apply only when their keys are absent. Present `verify`, `x25519mlkem768`, and `verbose` values must be JSON booleans, and a present `ech-sni-trick` must be a non-empty JSON string. A wrong type is a startup error rather than a request to use the default.
+Optional defaults apply only when their keys are absent. A present `alpns` value must be an array of strings. Each name
+must contain between 1 and 255 bytes, duplicate names are rejected, and the complete list must fit in the TLS ALPN
+extension. Present `verify`, `x25519mlkem768`, and `verbose` values must be JSON booleans, and a present `ech-sni-trick`
+must be a non-empty JSON string. A wrong type is a startup error rather than a request to use the default.
 
 `x25519mlkem768` should usually stay enabled. Disabling it makes the ClientHello smaller, but also makes it less close to
 current Chrome behavior.
 
-## ALPN And Chrome-Like Defaults
+## Ordered ALPN And Application-Protocol Responsibility
 
-The active create path does not use a JSON ALPN setting.
+`alpns` controls the ordered ALPN offer in the TLS ClientHello. For example:
 
-`TlsClient` always advertises this ALPN list:
-
-```text
-h2
-http/1.1
+```json
+"alpns": ["http/1.1"]
 ```
 
-The source still contains older helper code for a single `alpn` string, but that path is not active in normal node
-creation. Do not rely on a JSON `alpn` setting for this node.
+The array order is preserved. If `alpns` is absent, the Chrome-like default is:
+
+```json
+"alpns": ["h2", "http/1.1"]
+```
+
+An explicit empty array disables ALPN. The singular key `alpn` is not supported.
+
+The configured order expresses the client's offer, but the TLS server selects the negotiated protocol. `TlsClient` does
+not report that selection to the previous WaterWall node, does not switch that node's HTTP mode, and does not verify that
+the cleartext application protocol matches the selected ALPN. The user is responsible for making these configurations
+agree.
+
+This matters especially in an `HttpClient -> TlsClient` chain:
+
+- For HTTP/1.1 WebSocket Upgrade, configure `HttpClient` for HTTP/1.1 and configure `TlsClient` with only
+  `"alpns": ["http/1.1"]`.
+- For WebSocket over HTTP/2, configure `HttpClient` for HTTP/2 so it uses the HTTP/2 CONNECT path, and configure
+  `TlsClient` with only `"alpns": ["h2"]`.
+- Offering both `h2` and `http/1.1` is unsafe when the preceding `HttpClient` is committed to one version. The server may
+  choose either protocol, but `HttpClient` cannot learn which one was selected. It can then send HTTP/1.1 over a
+  connection negotiated as `h2`, or send HTTP/2 over one negotiated as `http/1.1`.
+
+Only offer multiple protocols when the preceding application layer can safely handle every possible selection without
+ALPN-selection feedback from `TlsClient`. Changing `alpns` also changes a fingerprint-relevant part of the otherwise
+Chrome-like ClientHello.
+
+When the handshake completes, `TlsClient` writes the negotiated TLS version, cipher, and ALPN to the debug log. A selected
+protocol appears as `alpn="..."`; a handshake without negotiated ALPN appears as `alpn=<none>`. This is diagnostic output
+only. The selected value is still not passed to the preceding application tunnel.
 
 The TLS context is configured with:
 
@@ -151,7 +181,8 @@ work for cipher ordering and ClientHello layout.
 
 ## ALPS Handling
 
-`TlsClient` adds ALPS application settings for both advertised protocols:
+`TlsClient` adds its known Chrome-like ALPS application setting only when the corresponding protocol is present in
+`alpns`:
 
 | Protocol | ALPS payload |
 | --- | --- |
@@ -159,7 +190,8 @@ work for cipher ordering and ClientHello layout.
 | `http/1.1` | empty payload |
 
 The `h2` ALPS value is the raw Chrome payload, not a serialized HTTP/2 `SETTINGS` frame. BoringSSL builds the final ALPS
-wire representation after the per-protocol values are registered.
+wire representation after the per-protocol values are registered. Custom ALPN values are offered without a
+TlsClient-defined ALPS payload.
 
 ## ECH SNI Trick
 
@@ -169,7 +201,7 @@ embedded as the GREASE `encrypted_client_hello` payload of the real outer Client
 Important details:
 
 - the outer SNI remains `settings.sni`
-- the embedded fake ClientHello uses the same hardcoded ALPN list
+- the embedded fake ClientHello uses the same configured `alpns` list and order
 - the embedded fake ClientHello disables `x25519mlkem768` to keep the payload smaller
 - this is meant to coordinate with packet-side tricks such as `IpManipulator`
 
@@ -228,8 +260,8 @@ Certificate verification failures are logged with the BoringSSL verify result an
 generateTlsHello:<sni>
 ```
 
-The generated ClientHello uses this tunnel instance's configured behavior, including `x25519mlkem768` and any configured
-`ech-sni-trick`.
+The generated ClientHello uses this tunnel instance's configured behavior, including `alpns`, `x25519mlkem768`, and any
+configured `ech-sni-trick`.
 
 ## Handshake Takeover API
 
@@ -306,7 +338,6 @@ TLS record construction happens through BoringSSL memory BIO output buffers.
 
 This implementation does not support:
 
-- JSON-configured ALPN selection
 - server-side TLS termination
 - dynamic certificate selection
 - TLS over packet lines
@@ -318,6 +349,8 @@ Use separate WaterWall nodes for those layers.
 
 - Do not expect `TlsClient` to connect to the remote server by itself; put a connector after it.
 - Do not assume WaterWall `Est` means the TLS handshake has completed.
-- Do not configure `alpn` expecting it to change the active ALPN list.
+- Do not use the singular `alpn` key; configure the ordered `alpns` array.
+- Do not offer application protocols that the preceding node cannot actually speak. `TlsClient` does not communicate the
+  server's ALPN choice back to that node.
 - Do not disable `verify` for public connections unless you intentionally want to skip certificate validation.
 - Do not disable `x25519mlkem768` if your goal is the closest current Chrome-like handshake.
