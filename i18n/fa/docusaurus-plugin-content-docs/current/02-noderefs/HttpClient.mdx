@@ -5,7 +5,7 @@ sidebar_label: "HttpClient"
 description: "راهنمای نود HttpClient در WaterWall."
 ---
 
-<!-- Written from version 106 of the English doc. -->
+<!-- Written from version 109 of the English doc. -->
 
 # HttpClient
 
@@ -34,6 +34,49 @@ TcpListener -> MuxClient -> HttpClient -> TlsClient -> TcpConnector
 TcpListener -> MuxClient -> HttpClient -> TcpConnector
 ```
 
+## سازگاری با ALPN در TlsClient
+
+وقتی `TlsClient` بعد از `HttpClient` قرار می‌گیرد، HTTP version تنظیم‌شده و protocolهایی که از طریق TLS ALPN پیشنهاد
+می‌شوند باید با هم یکسان باشند. `HttpClient` protocol روی wire را فقط بر اساس `http-version` انتخاب می‌کند. این نود ALPN
+انتخاب‌شده توسط server را از `TlsClient` دریافت نمی‌کند و پس از TLS handshake نیز نمی‌تواند mode مربوط به HTTP را تغییر
+دهد. مسئولیت هماهنگ نگه داشتن تنظیمات دو نود با کاربر است.
+
+وقتی به یک پیشنهاد قطعی تک‌protocol نیاز دارید، از این ترکیب‌ها استفاده کنید:
+
+| protocol موردنظر | تنظیم `HttpClient` | تنظیم `TlsClient` |
+|---|---|---|
+| HTTP/1.1، حالت split در HTTP/1.1 یا WebSocket Upgrade کلاسیک | `"http-version": 1` | `"alpns": ["http/1.1"]` |
+| HTTP/2 مستقیم یا WebSocket روی extended `CONNECT` در HTTP/2 | `"http-version": 2` | `"alpns": ["h2"]` |
+
+برای WebSocket روی HTTP/2، مقدار `"http-version": 2` را همراه با `"websocket": true` تنظیم کنید. در این حالت
+`HttpClient` از مسیر extended `CONNECT` استفاده می‌کند. فقط زمانی HTTP/1.1 را انتخاب کنید که peer منتظر upgrade کلاسیک
+با `GET` و `101 Switching Protocols` باشد.
+
+:::caution
+پیشنهاد هم‌زمان `h2` و `http/1.1` در `TlsClient` معتبر و رایج است و ClientHello را به پیش‌فرض Chrome نزدیک‌تر نگه
+می‌دارد. هنگام استفاده از این پیشنهاد، کاربر باید بداند target server کدام protocol را انتخاب می‌کند و این `HttpClient`
+را برای همان version تنظیم کند. برای مثال، یک hostname معمولی پروکسی‌شده Cloudflare با HTTP/2 فعال، وقتی `h2` پیشنهاد
+شود آن را انتخاب می‌کند؛ بنابراین `HttpClient` باید روی HTTP/2 باشد. اگر انتخاب target نامشخص یا متغیر است، فقط protocol
+هماهنگ با `HttpClient` را پیشنهاد کنید.
+
+`http-version: "both"` و نام‌های مستعار آن نیز ALPN-aware نیستند. این حالت فقط upgrade لایه application از HTTP/1.1 به
+`h2c` را پیاده‌سازی می‌کند و از نتیجه TLS ALPN پیروی نمی‌کند. وقتی نود بعدی `TlsClient` است، یک HTTP version مشخص را
+انتخاب کنید.
+:::
+
+:::caution
+تا ژوئیه ۲۰۲۶، فرض انتخاب `h2` در بالا برای HTTPS معمولی از طریق hostname پروکسی‌شده Cloudflare با [HTTP/2
+فعال](https://developers.cloudflare.com/speed/optimization/protocol/http2/) است و برای WebSocket صدق نمی‌کند. [رفتار
+فعلی مستندشده Cloudflare برای WebSocketهای proxyشده](https://developers.cloudflare.com/network/websockets/) از extended
+`CONNECT` مربوط به WebSocket روی HTTP/2 (RFC 8441) پشتیبانی نمی‌کند.
+
+برای WebSocket پشت Cloudflare، ‏`HttpClient` را روی WebSocket Upgrade در HTTP/1.1 قرار دهید و در `TlsClient` بعدی فقط
+`"alpns": ["http/1.1"]` را پیشنهاد کنید. پیشنهاد هم‌زمان هر دو مقدار باعث می‌شود Cloudflare مقدار `h2` را انتخاب کند؛
+در این حالت `HttpClient` روی HTTP/1.1 با protocol مذاکره‌شده ناسازگار می‌شود و `HttpClient` روی HTTP/2 نیز وارد مسیر
+پشتیبانی‌نشده extended `CONNECT` خواهد شد. چون تنظیمات و پشتیبانی provider ممکن است تغییر کند، پیش از تکیه بر هرکدام از
+این رفتارها قابلیت‌های فعلی Cloudflare را دوباره بررسی کنید.
+:::
+
 ## نمونه تنظیم
 
 ```json
@@ -46,8 +89,7 @@ TcpListener -> MuxClient -> HttpClient -> TcpConnector
     "scheme": "https",
     "port": 443,
     "method": "POST",
-    "http-version": "both",
-    "upgrade": true,
+    "http-version": 2,
     "headers": {
       "x-client-name": "waterwall"
     }
@@ -240,6 +282,15 @@ Upgrade در HTTP/1.1 همراه با body درخواست، برای طراحی 
 `http-version: "both"` همراه `websocket: true`، WebSocket opening handshake را روی HTTP/1.1 نگه می‌دارد.
 :::
 
+وقتی `TlsClient` بعد از این نود قرار دارد، مسیر WebSocket را با ALPNای هماهنگ کنید که target server انتخاب خواهد کرد:
+
+- WebSocket Upgrade روی HTTP/1.1: مقدار `"http-version": 1` همراه با `"alpns": ["http/1.1"]`
+- WebSocket روی extended `CONNECT` در HTTP/2: مقدار `"http-version": 2` همراه با `"alpns": ["h2"]`
+
+پیشنهاد Chrome-like شامل هر دو مقدار نیز وقتی انتخاب target شناخته‌شده و ثابت است معتبر است، اما `HttpClient` باید برای
+همان نتیجه شناخته‌شده تنظیم شود، زیرا انتخاب server را نمی‌بیند. WebSocket پشت Cloudflare استثنای توضیح‌داده‌شده در
+بالاست و باید روی HTTP/1.1 اجبار شود.
+
 ## رفتار Finish و Lifecycle
 
 `HttpClient` باید پیش از انتشار بعضی رویدادهای Finish در WaterWall، بایت‌های پایانی پروتکل را بفرستد:
@@ -257,6 +308,9 @@ Upgrade در HTTP/1.1 همراه با body درخواست، برای طراحی 
 ## اشتباه‌های رایج
 
 - تنظیم `scheme: "https"` بدون افزودن `TlsClient`؛ scheme فقط metadata مربوط به HTTP است.
+- پیشنهاد چند protocol در ALPN بدون دانستن اینکه target کدام را انتخاب می‌کند؛ پیشنهاد دوگانه Chrome-like معتبر است،
+  اما `HttpClient` باید برای نتیجه شناخته‌شده تنظیم شود، زیرا انتخاب ALPN به این نود برگردانده نمی‌شود.
+- استفاده از `http-version: "both"` به‌عنوان negotiation مربوط به TLS؛ این گزینه mode ارتقا از HTTP/1.1 به `h2c` است.
 - استفاده از `http1-mode: "split"` با HTTP/2 یا WebSocket؛ split mode فقط برای HTTP/1.1 است.
 - انتظار اینکه `HttpClient` headerهای HTTP را در اختیار نود قبلی بگذارد؛ فقط payloadِ body عبور داده می‌شود.
 - انتظار multiplex شدن تعداد زیادی stream در HTTP/2؛ برای multiplexing در سطح WaterWall، پیش از HTTP از `MuxClient` استفاده کنید.
