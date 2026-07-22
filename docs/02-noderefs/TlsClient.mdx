@@ -6,7 +6,7 @@ description: "Reference documentation for the TlsClient node."
 ---
 
 <!--
-Documentation version: 114
+Documentation version: 115
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/TlsClient/description.md, and both files must keep the same documentation version.
 -->
 
@@ -49,7 +49,6 @@ encrypted TLS bytes to the remote server.
       "sni": "example.com",
       "alpns": ["http/1.1"],
       "verify": true,
-      "ech-sni-trick": "example.net",
       "x25519mlkem768": true,
       "verbose": false
     },
@@ -92,7 +91,6 @@ Required `settings` field:
 | --- | --- | --- |
 | `alpns` | `["h2", "http/1.1"]` | Ordered ALPN protocol offer. The JSON order is preserved in the ClientHello. |
 | `verify` | `true` | Enables BoringSSL peer certificate verification. |
-| `ech-sni-trick` | not set | Generates a fake inner ClientHello with this hostname and embeds it as GREASE ECH payload. |
 | `x25519mlkem768` | `true` | Advertises the `X25519MLKEM768` hybrid group for Chrome-like behavior. |
 | `verbose` | `false` | Enables extra TLS state logging. |
 
@@ -100,13 +98,10 @@ When `verify` is `true`, `TlsClient` loads the built-in CA bundle from `utils/ca
 `verify` is `false`, the TLS handshake is still real, but certificate-chain verification is disabled for this tunnel
 instance.
 
-`ech-sni-trick` must be a non-empty string when provided. It does not change the outer cleartext SNI; the outer SNI
-remains `settings.sni`.
-
 Optional defaults apply only when their keys are absent. A present `alpns` value must be an array of strings. Each name
 must contain between 1 and 255 bytes, duplicate names are rejected, and the complete list must fit in the TLS ALPN
-extension. Present `verify`, `x25519mlkem768`, and `verbose` values must be JSON booleans, and a present `ech-sni-trick`
-must be a non-empty JSON string. A wrong type is a startup error rather than a request to use the default.
+extension. Present `verify`, `x25519mlkem768`, and `verbose` values must be JSON booleans. A wrong type is a startup error
+rather than a request to use the default.
 
 `x25519mlkem768` should usually stay enabled. Disabling it makes the ClientHello smaller, but also makes it less close to
 current Chrome behavior.
@@ -207,21 +202,6 @@ The `h2` ALPS value is the raw Chrome payload, not a serialized HTTP/2 `SETTINGS
 wire representation after the per-protocol values are registered. Custom ALPN values are offered without a
 TlsClient-defined ALPS payload.
 
-## ECH SNI Trick
-
-When `ech-sni-trick` is set, `TlsClient` creates a second, fake ClientHello using that hostname. The fake ClientHello is
-embedded as the GREASE `encrypted_client_hello` payload of the real outer ClientHello.
-
-Important details:
-
-- the outer SNI remains `settings.sni`
-- the embedded fake ClientHello uses the same configured `alpns` list and order
-- the embedded fake ClientHello disables `x25519mlkem768` to keep the payload smaller
-- this is meant to coordinate with packet-side tricks such as `IpManipulator`
-
-The purpose is byte consistency: the ClientHello bytes BoringSSL hashes should match the bytes that packet-level logic
-places on the wire.
-
 ## Runtime Behavior
 
 On upstream `Init`, `TlsClient`:
@@ -274,8 +254,7 @@ Certificate verification failures are logged with the BoringSSL verify result an
 generateTlsHello:<sni>
 ```
 
-The generated ClientHello uses this tunnel instance's configured behavior, including `alpns`, `x25519mlkem768`, and any
-configured `ech-sni-trick`.
+The generated ClientHello uses this tunnel instance's configured behavior, including `alpns` and `x25519mlkem768`.
 
 ## Handshake Takeover API
 
@@ -368,3 +347,26 @@ Use separate WaterWall nodes for those layers.
   node for it. `TlsClient` does not communicate the server's ALPN choice back to that node.
 - Do not disable `verify` for public connections unless you intentionally want to skip certificate validation.
 - Do not disable `x25519mlkem768` if your goal is the closest current Chrome-like handshake.
+
+## Advanced: ECH SNI Trick
+
+:::caution Advanced, specialized behavior
+This feature is not part of ordinary TLS configuration or the normal responsibility of `TlsClient`. Use it only when a
+deployment deliberately coordinates TLS ClientHello construction with compatible packet-level manipulation.
+:::
+
+The optional `ech-sni-trick` setting accepts a non-empty hostname string:
+
+```json
+"ech-sni-trick": "example.net"
+```
+
+When configured, `TlsClient` creates a second, fake ClientHello using that hostname and embeds its bytes as the GREASE
+`encrypted_client_hello` payload of the real outer ClientHello. The outer cleartext SNI remains `settings.sni`.
+
+The embedded fake ClientHello uses the configured `alpns` list in the same order, but disables `x25519mlkem768` to keep
+the payload smaller. This behavior is intended to coordinate with packet-side mechanisms such as `IpManipulator`'s
+packet-splitting trick, keeping the ClientHello bytes hashed by BoringSSL consistent with the bytes placed on the wire.
+
+The value must be a non-empty JSON string; an empty value or another JSON type is a startup error. The
+`generateTlsHello:<sni>` tunnel API also applies this setting when it is configured.
