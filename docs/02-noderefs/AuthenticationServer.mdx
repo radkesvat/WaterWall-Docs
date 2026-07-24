@@ -6,7 +6,7 @@ description: "Reference documentation for the AuthenticationServer node."
 ---
 
 <!--
-Documentation version: 107
+Documentation version: 108
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/AuthenticationServer/description.md, and both files must keep the same documentation version.
 -->
 
@@ -325,9 +325,19 @@ counters:
 
 Revisions start at `1`.
 
+The in-memory users table is authoritative: it is the table loaded from disk,
+periodically saved, and used as the merge target for client updates. Request
+messages run under the server state rwlock. Independent point reads share the
+read side, while authentication, baseline replacement, database saves, stats
+merges, and user mutations take the write side.
+
 Every authenticated request message refreshes the session activity timestamp.
-Worker `0` sweeps idle sessions every `60000` ms. Sessions are runtime state and
-are not persisted across process restarts.
+Request dispatch holds either the state read or write lock while using the
+session pointer. Worker `0` takes the state write lock while sweeping idle
+sessions every `60000` ms, so expiry cannot destroy a session that a request is
+using. The last-activity timestamp is atomic, allowing concurrent point-read
+requests to refresh it while sharing the read lock. Sessions are runtime state
+and are not persisted across process restarts.
 
 ## Synchronization Model
 
@@ -547,3 +557,23 @@ toward the previous tunnel.
 - This node is not a packet tunnel and does not use packet-line semantics.
 - The module name `UpdateUserTraficStatsDiff` intentionally follows the current
   source spelling.
+
+## User Database Performance
+
+- SHA-256 is the canonical plaintext-password lookup key. A password lookup
+  derives SHA-256 once and resolves through the SHA-256 hash index; there is no
+  fallback scan over the user table, so both hits and misses are average O(1).
+  The exact plaintext comparison after an index hit is the authoritative,
+  collision-safe check.
+- All keyed lookups (SHA-224, SHA-256, UUID, WireGuard public key, durable id,
+  and non-empty name) are average O(1). WireGuard Allowed-IP address lookup and
+  range-overlap detection are O(log M) through an ordered interval index.
+- Session baseline snapshots for `GetAllUsers` and `Authenticate` use the native
+  `usersCopy()` deep copy instead of a JSON round trip. `GetAllUsers` serializes
+  the store exactly once for the network response and uses a native copy of the
+  same table for the session baseline.
+- Pure point-read request messages (`Ping`, `GetUserBySHA-224/256`, and
+  `GetUserByPassword`) share the server state read lock and may execute
+  concurrently. Any message containing authentication, `GetAllUsers`, a user
+  mutation, a stats mutation, or an unknown or mixed non-point-read request
+  takes the state write lock for the full dispatch.
