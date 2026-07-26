@@ -6,37 +6,34 @@ description: "Reference documentation for the PingServer node."
 ---
 
 <!--
-Documentation version: 108
+Documentation version: 110
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/PingServer/description.md, and both files must keep the same documentation version.
 -->
 
 # PingServer
 
-`PingServer` is the paired server-side packet tunnel for `PingClient`. It is
-directionally opposite on the client-to-server ingress path: wrapped peer
-traffic is expected to arrive through PingServer's downstream callback, where it
-is restored and forwarded toward the previous node. Plain server-side response
-packets can still be wrapped on the upstream path before they are forwarded
-toward the next node.
+`PingServer` is the paired server-side packet tunnel for `PingClient`. Wrapped
+requests arrive through PingServer's upstream callback, are restored, and
+continue toward the next node. Plain responses arrive through the downstream
+callback, are wrapped, and continue toward the previous node.
 
 It is a pure packet tunnel created with WaterWall's packet-tunnel API. It runs
 on worker packet lines and does not allocate per-connection line state.
 
 ## Direction Model
 
-`PingServer` does not use PingClient's request-side mental model:
+Transform role and callback direction are separate:
 
 | Direction | Behavior |
 | --- | --- |
-| downstream `Payload` | Server inbound path. Decapsulates or restores matching wrapped peer traffic, then forwards with `tunnelPrevDownStreamPayload()`. |
-| upstream `Payload` | Server outbound response path. Encapsulates or rewrites plain response packets, then forwards with `tunnelNextUpStreamPayload()`. |
+| upstream `Payload` | Restores matching wrapped requests, then forwards with `tunnelNextUpStreamPayload()`. |
+| downstream `Payload` | Encapsulates or rewrites plain responses, then forwards with `tunnelPrevDownStreamPayload()`. |
 
-This matters for packet-topology design. Wrapped traffic from the peer must
-reach `PingServer` through the downstream path.
+Direct `PingClient -> PingServer` adjacency is the canonical pair.
 
 ```text
-plain packet side -> PingServer -> packet transport / Bridge
-plain packet side <- PingServer <- packet transport / Bridge
+plain request -> PingClient -> PingServer -> plain request
+plain response <- PingClient <- PingServer <- plain response
 ```
 
 ## Typical Placement
@@ -44,23 +41,34 @@ plain packet side <- PingServer <- packet transport / Bridge
 Opposite a `PingClient`:
 
 ```text
-TunDevice -> PingServer -> RawSocket
 TunDevice -> PingClient -> RawSocket
+RawSocket -> PingServer -> TunDevice
 ```
 
-For local tests, a `Bridge` can connect the two packet branches while preserving
-the intended upstream/downstream callback directions.
+For local tests, use one direct packet chain:
 
 ```text
-TesterClient(packet-mode=true) -> PingClient -> Bridge
-TesterServer(packet-mode=true) -> PingServer -> Bridge
+TesterClient(packet-mode=true) -> PingClient -> PingServer -> TesterServer(packet-mode=true)
 ```
+
+## Compatibility And Migration
+
+This direction change is intentionally breaking. Change an existing
+`TunDevice -> PingServer -> RawSocket` server chain to
+`RawSocket -> PingServer -> TunDevice`, replace paired-Bridge Ping layouts with
+direct `PingClient -> PingServer` adjacency, and deploy that topology together
+with the new PingServer binary. An old PingServer must keep the old server
+topology. PingClient's implementation, settings, and wire format are unchanged,
+so an older PingClient remains wire-compatible with the new PingServer when
+their settings match. A coordinated peer upgrade may be operationally simpler,
+but it is not a protocol requirement. MTU requirements remain
+strategy-dependent.
 
 ## Configuration Example
 
 ```json
 {
-  "name": "icmp-server",
+  "name": "ping-server",
   "type": "PingServer",
   "settings": {
     "strategy": "wrap-in-new-ip-and-icmp-header",
@@ -75,7 +83,7 @@ TesterServer(packet-mode=true) -> PingServer -> Bridge
     "ttl": 64,
     "tos": 0
   },
-  "next": "raw-out"
+  "next": "tun-in"
 }
 ```
 
@@ -101,10 +109,10 @@ Details:
 - outer IPv4 `ttl`, `tos`, and IPv4 ID come from settings/counters
 - `source` and `dest` are optional
 - when omitted, outer source/destination are copied from the inner packet
-- downstream decapsulation accepts ICMP echo request and echo reply packets
-- downstream decapsulation checks `identifier` only when `check-identifier` is
+- upstream decapsulation accepts ICMP echo request and echo reply packets
+- upstream decapsulation checks `identifier` only when `check-identifier` is
   enabled
-- downstream decapsulation does not verify configured source/destination
+- upstream decapsulation does not verify configured source/destination
   addresses
 - recovered ICMP payload is forwarded even if it is not a valid IPv4 packet
 
@@ -151,8 +159,8 @@ packet. Use it only when surrounding nodes expect that shape.
 Only swaps the IPv4 protocol number in place:
 
 - requires `swap-protocol`
-- downstream changes inbound ICMP packets back to `swap-protocol`
-- upstream changes outbound packets whose IPv4 protocol equals `swap-protocol`
+- upstream changes matching request ICMP packets back to `swap-protocol`
+- downstream changes response packets whose IPv4 protocol equals `swap-protocol`
   to ICMP
 - recalculates only the IPv4 header checksum
 - leaves transport bytes unchanged
@@ -167,7 +175,7 @@ number from `0` to `255`.
 | --- | --- | --- | --- |
 | `strategy` | string | `wrap-in-icmp-header-and-reuse-ipv4-addresses` | Packet disguise mode. |
 | `identifier` | integer | `44975` (`0xAFAF`) | ICMP echo identifier for ICMP envelope modes. Range: `0..65535`. |
-| `check-identifier` | boolean | `true` | When enabled, downstream ICMP envelopes must match `identifier`; mismatches are forwarded unchanged. |
+| `check-identifier` | boolean | `true` | When enabled, upstream ICMP envelopes must match `identifier`; mismatches are forwarded unchanged. |
 | `sequence-start` | integer | `0` | Initial ICMP echo sequence counter for ICMP envelope modes. Range: `0..65535`. |
 | `ipv4-id-start` | integer | `0` | Initial outer IPv4 identification counter for `wrap-in-new-ip-and-icmp-header`. Range: `0..65535`. |
 | `ttl` | integer | `64` | Outer IPv4 TTL for `wrap-in-new-ip-and-icmp-header`. Range: `0..255`. |
@@ -177,7 +185,7 @@ number from `0` to `255`.
 | `roundup` | boolean | `false` | Legacy alias for `roundup-size`. |
 | `source` | IPv4 string | copied from inner packet | Optional outer source for `wrap-in-new-ip-and-icmp-header`. |
 | `dest` | IPv4 string | copied from inner packet | Optional outer destination for `wrap-in-new-ip-and-icmp-header`. |
-| `swap-protocol` | string or integer | required for protocol-swap strategy | Protocol restored from ICMP on downstream path. |
+| `swap-protocol` | string or integer | required for protocol-swap strategy | Protocol restored from ICMP on the upstream request path. |
 | `swap-identifier` | string or integer | unset | Legacy alias for `swap-protocol`. |
 
 ## Roundup And XOR
@@ -232,18 +240,21 @@ fragmenting or wrapping it. This is not a safe substitute for MTU planning: the
 packet is no longer disguised as the configured ICMP envelope and may be
 filtered or routed differently.
 
-For a common `TunDevice -> PingServer -> RawSocket` path whose real packet MTU
-is 1500, configure `TunDevice.settings.device-mtu` no higher than the applicable
-table value. Setting both `misc.mtu` and `device-mtu` to `1400` is a simple
-conservative choice when the Ping strategy may change, but it is not required
-when the exact overhead is known.
+For a common `RawSocket -> PingServer -> TunDevice` server path whose real packet
+MTU is 1500, wrapped requests arrive from `RawSocket` on PingServer's previous
+side and are decoded upstream. Plain responses arrive from `TunDevice` on
+PingServer's next side and are encoded downstream toward `RawSocket`. Configure
+`TunDevice.settings.device-mtu` no higher than the applicable table value.
+Setting both `misc.mtu` and `device-mtu` to `1400` is a simple conservative
+choice when the Ping strategy may change, but it is not required when the exact
+overhead is known.
 
 `roundup-size` can pad an accepted packet all the way to the 1500-byte Ping
 limit. Consequently, a 1400-byte input is safe for a direct 1500-byte output
 path, but roundup may consume the remaining space; it does not necessarily
 leave 100 bytes for another encapsulation layer after `PingServer`. Account for
-every later header as well, and use the smaller of the real path MTU and every
-downstream node's packet limit.
+every additional header as well, and use the smaller of the real path MTU and
+every adjacent node's packet limit.
 
 ## Packet Handling Notes
 
@@ -252,9 +263,9 @@ downstream node's packet limit.
 - IPv6/non-IPv4 packets that cannot be rewritten are generally forwarded
   unchanged.
 - Fragmented IPv4 packets are forwarded unchanged in reuse-header mode.
-- Matching downstream ICMP envelopes with malformed roundup metadata or
+- Matching upstream ICMP envelopes with malformed roundup metadata or
   malformed reuse trailers are dropped and logged.
-- Matching downstream ICMP can be echo request or echo reply.
+- Matching upstream ICMP can be echo request or echo reply.
 - If `check-identifier` is enabled and the ICMP identifier does not match, the
   packet is forwarded unchanged rather than decapsulated.
 - `source`/`dest` are not checked during decapsulation.
