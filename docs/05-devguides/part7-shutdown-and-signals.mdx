@@ -162,6 +162,58 @@ is honored too. There are no cross-thread writes to `wloop_t::flags`.
 6. the worker destroys its own resources and returns from its thread routine;
 7. worker 0 joins it.
 
+The canonical shape is:
+
+```c
+if (! requestProgramShutdown(1))
+{
+    abortProgramNow(1);
+}
+return;
+```
+
+`abortProgramNow()` is the **handoff-failure fallback only**. Reaching for it
+first turns an ordinary resource failure into a teardown that skips every
+registered cleanup callback.
+
+### Cleanup before the request, and nothing after it
+
+Steps 1 and 2 are not advice, they are the precondition. Never call
+`requestProgramShutdown()` while holding a tunnel mutex, a read/write lock, a
+line lock, or any transient resource this callback must release itself — worker 0
+runs the real teardown and cannot take a lock the failing worker still owns.
+
+Recycle only what the current callback still owns. A buffer already pushed into a
+line-state queue or stream stays reachable and is released by normal line/tunnel
+teardown; recycling it again is a double free.
+
+After an accepted request the callback is done. Do not create a line, send a
+packet, arm another timer, mutate completion state, or call a later startup step.
+When a helper reports "shutdown requested" to its caller, that caller must return
+too — a timer failure that a caller reads as success leaves the callback running
+as though a timer were armed. `packetsenderWaitUntilDeadline()` shows the shape:
+it returns a three-valued result so `ready`, `waiting` and `shutdown-requested`
+cannot collapse into one boolean.
+
+### `onStart` schedules work; it does not run it
+
+Do not infer execution context from a filename. `instance/start.c` contains both
+kinds of code:
+
+- what `onStart` itself runs is a **main-thread startup** context (Category E);
+- what `onStart` *enqueues* with a worker-message API is a **runtime worker
+  callback** (Category B), even though it is defined in the same file.
+
+By the time such a task runs, the workers are up and the shutdown handoff exists,
+so a failure inside it must request an orderly shutdown, not `terminateProgram()`.
+`authenticationclientStartPingTimer()`, `keepaliveclientStartWorkerTimer()` and
+`packetstostreamStartWorkerTimer()` are all in `instance/start.c` and all
+Category B.
+
+A worker that fails this way must not clean up on behalf of anyone else. Timers
+other workers already published stay in their slots; each worker deletes its own
+slot in `onWorkerStop` during the orderly shutdown.
+
 ## 7. Classifying a termination call site
 
 Do **not** classify by log level or by whether the exit code is non-zero. For
@@ -213,6 +265,45 @@ failing call. Buffer recycling and the loggers both run before the classificatio
 and either can overwrite it, which silently reclassifies a device loss as a
 transient.
 
+### A failed test verdict is not an impossible internal state
+
+`TesterClient` and `TesterServer` reach termination for two unrelated reasons, and
+the distinction decides the category:
+
+- **A valid runtime failure verdict** — the peer sent an early, extra, duplicate,
+  malformed-size, mismatching, trailing or overflowing payload, finished before
+  verification completed, or the watchdog expired. The test driver reached a real
+  result, so this is Category B: recycle the buffer the callback still owns, then
+  go through the one verdict helper (`testerclientFail()` /
+  `testerserverFail()`) and return.
+- **An impossible internal state** — a payload generator asked for a payload its
+  own validated configuration can never produce, a buffer pool reporting zero
+  writable capacity, a close scheduled before verification, a response counter
+  disagreeing with its own mask. Nothing a peer sends can produce these, so they
+  are Category D: log and `abortProgramNow(1)` directly, never through the verdict
+  helper.
+
+Keeping those helpers to a single meaning is what makes both readable, so a
+generator whose every failure is an invariant becomes non-nullable: its callers
+use the returned buffer without a NULL check.
+
+### Packet-line death stays a hard abort
+
+A worker packet line is process-lifetime state: it is allocated in
+`tunnelchainFinalize()` and destroyed only in `tunnelchainDestroy()`. If one dies
+at runtime, that contract has already been violated, and orderly teardown can no
+longer assume line state is structurally valid. Those sites hard-abort even
+though they run on a worker — `initializeLineOnTargetWorker()`,
+`wireguarddeviceQueueWorkerPacketInit()`, `packetsenderStartWorker()`,
+`packetsenderSendReadyPackets()`, `testerserverResponseSendTask()`, and any
+`Finish` received on a packet line.
+
+The opposite case is an *ordinary* line being rejected. A neighbouring connector
+refusing one transport line is operational, not process-wide:
+`wireguarddeviceQueueWorkerTransportLineInit()` logs a warning and returns, leaves
+the slot `NULL`, and lets `wireguarddeviceEnsureTransportLine()` retry on a later
+output. It calls none of the three process APIs.
+
 ## 8. Shutdown callback registry
 
 - registration and removal are rejected once the list is frozen for the
@@ -257,3 +348,40 @@ ctest --preset linux --output-on-failure -R 'shutdown|signal_manager|wloop_stop|
 
 Every successful shutdown path exits the process, so these tests fork a child per
 scenario and report back over an inherited pipe.
+
+### Call-site policy tests
+
+```bash
+python3 tests/tunnels_abort_policy_test.py --mutation-test
+python3 tests/tunnels_orderly_shutdown_policy_test.py --mutation-test
+ctest --preset linux --output-on-failure -R 'orderly_shutdown|abort_runtime'
+```
+
+- `tunnels_abort_policy_test.py` — every audited Category-D site still hard-aborts
+  with exit code 1, and the Category-C/E exclusions never drift into one.
+- `tunnels_orderly_shutdown_policy_test.py` — every Category-B site keeps its
+  request, its fallback, its pre-request cleanup anchors and its caller's
+  immediate return; tester invariants keep hard-aborting; the retryable WireGuard
+  path calls none of the three APIs; main-thread startup sites stay Category E.
+
+Both scan function bodies with a lexical C scanner, so a commented-out or quoted
+lookalike cannot satisfy a candidate, and both run a mutation mode that removes
+each load-bearing element in turn and requires the checker to catch it.
+
+The runtime counterparts inject the real failure. `*_orderly_shutdown_test`
+linker-wraps `wtimerAdd` and the three process APIs, then asserts the whole
+contract: exactly one request with exit code 1, no abort, no terminate, every
+transient buffer recycled exactly once, nothing forwarded, no state published,
+and the callback returning.
+
+The failure paths that leave the process run in a forked child, and the child's
+exit code says *which* contract the abort satisfied, so reaching the right
+function through the wrong path still fails:
+
+- a Category-B fallback must follow exactly one refused `requestProgramShutdown(1)`;
+- a Category-D invariant must abort with no request at all.
+
+Tasks that `onStart` only enqueues are driven the way the runtime drives them —
+through the public `onStart` entry point and a real worker message queue — so
+per-worker ownership and `onWorkerStop` cleanup are exercised rather than
+assumed.
