@@ -125,7 +125,7 @@ Never route shutdown control through it.
 ```c
 bool workerRequestStop(worker_t *worker);        // thread-safe, never waits
 void workerDestroyOwnResources(worker_t *worker); // owner thread only, once
-void workerJoin(worker_t *worker);
+bool workerJoin(worker_t *worker);
 ```
 
 Rules:
@@ -139,6 +139,9 @@ Rules:
   clears its loop during teardown;
 - every spawned worker is asked to stop before the first join, so shutdown does
   not serialize on one slow worker.
+- a failed join leaves `thread_valid` set and prevents worker-resource/global
+  destruction. Terminal shutdown hard-aborts at that point because a
+  possibly-live worker can still access those resources.
 
 `worker_t::lifecycle` is an atomic, monotonically advancing
 `worker_lifecycle_e` (`Initialized → Running → StopRequested → Exited → Joined`).
@@ -152,7 +155,83 @@ It enqueues nothing and allocates nothing. The loop checks the flag with acquire
 ordering before each iteration, so a request issued *before* `wloopRun()` started
 is honored too. There are no cross-thread writes to `wloop_t::flags`.
 
-## 6. Worker-originated shutdown, step by step
+## 6. Device stop, join, and destruction
+
+Device `Stop` and `Destroy` have different ownership jobs:
+
+- `Stop` unpublishes new work, wakes blocked I/O, verifies every owned thread
+  join, and only then drains thread-owned queues;
+- `Destroy` runs later, after external producers are quiescent, and frees
+  retained process-visible resources.
+
+The global order is deliberately:
+
+```text
+nodemanagerStop()
+  -> request/stop/join workers
+  -> destroy worker resources
+  -> nodemanagerDestroy()
+```
+
+`tundeviceWrite()` and `rawdeviceWrite()` can run on event-loop workers and the
+lwIP pseudo-worker path. Device destruction therefore cannot reclaim a writer
+queue merely because its own writer thread joined; it waits until the global
+order above has stopped every producer context.
+
+### Reader delivery ownership
+
+A `device_reader_session_t` owns one packed lifetime gate. `CLOSED` and the
+successful-entry count share one atomic modification order: an Enter CAS before
+Close contributes to the count and Close waits for Leave; a Close first makes
+the Enter reject. Open-release publishes installed session fields to
+Enter-acquire, and Leave-release publishes completed callback work to Close's
+acquire observation of zero.
+
+Close-and-quiesce is a lifecycle-owner operation. Calling it from inside the
+same guarded callback is a programming error, because the owner would wait for
+itself. There is no release-build "skip the wait" path.
+
+Each queued reader message retains a session reference until delivery or queue
+cleanup. Delivery enters the gate, compares a relaxed generation tag, calls the
+device only for the current generation, leaves the gate, recycles the message,
+and finally releases its reference. Generation zero is invalid and generation
+wrap is refused, so a pre-restart message cannot become current again. The old
+reader producer thread must be joined before a new generation opens: gate
+quiescence covers callbacks, not a producer still able to post.
+
+### Writer generations
+
+Writer submission intentionally has no gate or per-send refcount. A producer
+performs one acquire load of an immutable published generation and calls
+`chanTrySend()` on that generation's channel. Stop exchanges publication to
+null, closes the selected channel, joins the writer, drains leftovers, and
+retires the closed generation.
+
+A producer that loaded the old pointer before Stop may finish its send attempt
+against the allocated, now-closed channel; it can never cross into a replacement
+queue. A call paused before the pointer load may select a later generation.
+Retired generations remain allocated until device destruction, after all
+workers and pseudo-workers have stopped. This trades one queue allocation per
+restart (up to 128K pointer slots for Linux TUN/Raw) for a writer hot path with
+no lifetime RMW, TLS scan, hazard pointer, or quiescence wait. Repeated runtime
+restart is therefore safe but intentionally not memory-neutral.
+
+Every device join follows the same failure rule: a failed join retains the
+thread handle/joinable flag and all resources the thread may access. It blocks
+drain, retirement, restart, and destruction until a later join succeeds.
+
+Linux Capture classifies reader exit under `reader_state_mutex`. Stop sets
+`reader_stop_requested` while holding that mutex before clearing the relaxed
+loop flag or waking the reader. The exiting wrapper takes the same mutex:
+whichever side acquires it first decides expected versus unexpected exit.
+Neither an acquire load nor any other atomic load is a "fresh value" primitive.
+
+TUN keeps one relaxed lifecycle atomic for `STARTING`, `UP`, `STOPPING`, and
+`FAILED` arbitration. It orders only that value. Thread creation/join, the
+reader gate, and writer-generation publication provide the ordering for
+companion fields.
+
+## 7. Worker-originated shutdown, step by step
 
 1. release every buffer the callback owns;
 2. unlock every lock it holds;
@@ -214,7 +293,7 @@ A worker that fails this way must not clean up on behalf of anyone else. Timers
 other workers already published stay in their slots; each worker deletes its own
 slot in `onWorkerStop` during the orderly shutdown.
 
-## 7. Classifying a termination call site
+## 8. Classifying a termination call site
 
 Do **not** classify by log level or by whether the exit code is non-zero. For
 each site, record which threads can reach it, what it owns, and whether the
@@ -304,7 +383,7 @@ refusing one transport line is operational, not process-wide:
 the slot `NULL`, and lets `wireguarddeviceEnsureTransportLine()` retry on a later
 output. It calls none of the three process APIs.
 
-## 8. Shutdown callback registry
+## 9. Shutdown callback registry
 
 - registration and removal are rejected once the list is frozen for the
   traversal;
@@ -318,7 +397,7 @@ output. It calls none of the three process APIs.
 The global-state callback is registered first, so LIFO runs it last — after every
 other subsystem callback has had the workers available.
 
-## 9. Signal-mask policy
+## 10. Signal-mask policy
 
 Only the main thread has the handled stop signals unblocked. Every
 application-owned thread keeps them blocked. This is enforced in `threadCreate()`,
@@ -329,7 +408,7 @@ lwIP, TUN/raw/capture threads).
 Fatal crash signals (SIGSEGV, SIGILL, SIGABRT, …) restore the default
 disposition and re-raise. They never run ordinary cleanup.
 
-## 10. Tests
+## 11. Tests
 
 ```bash
 ctest --preset linux --output-on-failure -R 'shutdown|signal_manager|wloop_stop|node_manager_stop'
