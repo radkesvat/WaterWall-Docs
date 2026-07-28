@@ -182,6 +182,37 @@ device lifetime gates whose comments assume the callback cannot resume;
 callbacks that may destroy a line re-entrantly; non-void return values; and
 worker/device routines that must publish an exited/failed state.
 
+### Reaching Category B from a device I/O routine
+
+A device thread only reaches Category B by **returning**. Its wrapper
+(`tundeviceNoteUnexpectedThreadExit()`) is what publishes `FAILED` and requests
+the shutdown, so an error the routine swallows with `continue` never gets there:
+the device stays advertised as usable while every packet is discarded. A process
+that exits can be restarted by a supervisor; one that spins cannot be noticed.
+
+So POSIX device I/O errors are classified against a whitelist
+(`ww/devices/tun/tun_io_error.h`), never by guessing:
+
+| Class | Errors | Action |
+| --- | --- | --- |
+| Transient | `EINTR`, `EAGAIN`/`EWOULDBLOCK`, `ENOBUFS`, `ENOMEM` | retry / go back to the poll loop |
+| Packet-local (**writes only**) | `EINVAL` | drop that packet, keep the device |
+| Terminal | everything else, including `EIO`, `EBADF`, `ENODEV`, `ENXIO`, `EMSGSIZE` | return from the routine |
+
+Two rules that are easy to get backwards:
+
+- **`EINVAL` on write must stay packet-local.** The kernel rejects a malformed
+  frame that way, and frames reaching a TUN writer come from remote peers.
+  Making it terminal hands any peer a one-packet process kill.
+- **`EMSGSIZE` on write is terminal.** Oversized packets are already dropped
+  before the syscall, so `EMSGSIZE` means the configured MTU exceeds the device's
+  real MTU — an operator misconfiguration that never recovers.
+
+Capture `errno` (or `GetLastError()`) into a local **immediately** after the
+failing call. Buffer recycling and the loggers both run before the classification
+and either can overwrite it, which silently reclassifies a device loss as a
+transient.
+
 ## 8. Shutdown callback registry
 
 - registration and removal are rejected once the list is frozen for the
