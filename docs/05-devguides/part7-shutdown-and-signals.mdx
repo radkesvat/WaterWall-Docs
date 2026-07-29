@@ -168,15 +168,27 @@ The global order is deliberately:
 
 ```text
 nodemanagerStop()
+  -> drain queued lwIP work
+  -> release protocol state and stop/join tcpip_thread
   -> request/stop/join workers
   -> destroy worker resources
   -> nodemanagerDestroy()
 ```
 
 `tundeviceWrite()` and `rawdeviceWrite()` can run on event-loop workers and the
-lwIP pseudo-worker path. Device destruction therefore cannot reclaim a writer
-queue merely because its own writer thread joined; it waits until the global
-order above has stopped every producer context.
+lwIP path. Device destruction therefore cannot reclaim a writer queue merely
+because its own writer thread joined; it waits until the global order above has
+stopped every producer context.
+
+The lwIP pseudo-worker owns WaterWall pools, but `tcpip_init()` also creates a
+real OS thread. Node `Stop` first detaches PacketsToConnection netifs and
+listeners. Global shutdown then posts a cooperative callback behind already
+queued lwIP work. That callback releases active/bound/listening TCP and UDP
+state, including retained out-of-order pbufs, and stops `tcpip_thread`; the
+shutdown owner joins it before destroying any worker or pseudo-worker pool. A
+custom pbuf records its originating worker and pool; if lwIP releases it on
+another thread, the buffer is destroyed rather than being inserted into a
+foreign thread's pool.
 
 ### Reader delivery ownership
 
@@ -219,6 +231,10 @@ restart is therefore safe but intentionally not memory-neutral.
 Every device join follows the same failure rule: a failed join retains the
 thread handle/joinable flag and all resources the thread may access. It blocks
 drain, retirement, restart, and destruction until a later join succeeds.
+After a successful join, a restartable device explicitly releases the debug
+thread ownership of its reader/writer buffer pool. The next thread generation
+then claims the pool on first access; resetting ownership while the old thread
+can still run is forbidden.
 
 Linux Capture classifies reader exit under `reader_state_mutex`. Stop sets
 `reader_stop_requested` while holding that mutex before clearing the relaxed
@@ -411,7 +427,7 @@ disposition and re-raise. They never run ordinary cleanup.
 ## 11. Tests
 
 ```bash
-ctest --preset linux --output-on-failure -R 'shutdown|signal_manager|wloop_stop|node_manager_stop'
+ctest --preset linux --output-on-failure -R 'shutdown|signal_manager|wloop_stop|node_manager_stop|thread_transfer'
 ```
 
 - `shutdown_manager_test` — off-main orderly requests, once-only cleanup on the
@@ -424,6 +440,10 @@ ctest --preset linux --output-on-failure -R 'shutdown|signal_manager|wloop_stop|
   before the loop runs, is idempotent, and is safe racing the loop's own exit.
 - `node_manager_stop_once_test` — `nodemanagerStop()` idempotence and `onStop`
   running exactly once.
+- `lwip_shutdown_test` — retained TCP out-of-order pbuf release plus cooperative
+  `tcpip_thread` join.
+- `buffer_pool_thread_transfer_test` — post-join pool ownership transfer between
+  two simultaneously allocated, distinct thread identities.
 
 Every successful shutdown path exits the process, so these tests fork a child per
 scenario and report back over an inherited pipe.
