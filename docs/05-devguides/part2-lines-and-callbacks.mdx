@@ -79,14 +79,42 @@ The crucial distinction:
 > still logically alive. After a re-entrant callback, a locked line may be
 > `alive == false`. Always re-check `lineIsAlive()` before continuing.
 
+**Logical death is immediate; physical reclamation is not.** `lineDestroy()`
+clears `alive` and drops one reference. If anyone else still holds a `lineLock()`
+the allocation stays readable until they unlock — which is exactly what makes the
+owner postcondition below both checkable and cheap:
+
+```c
+lineLock(l);                 /* keep the allocation present for the assertion */
+owner->fnFinD(owner, l);
+assert(! lineIsAlive(l));    /* logical death is immediate */
+lineUnlock(l);               /* physical free may occur right here */
+```
+
+A logically dead line must never receive another flow callback, and by the time
+it is reclaimed every tunnel's line state must already be zeroed.
+
 ### Who May Destroy a Line
 
-Only the tunnel that **created** a line may call `lineDestroy()` on it. Common
-creators:
+Only the tunnel that **created** a line may call `lineDestroy()` on it —
+`lineCreate()` or `lineCreateForWorker()` for that **exact `line_t` instance**.
 
-- adapters such as `TcpListener`, `UdpListener`, `TcpConnector`
-- a few middle tunnels that legitimately create their own lines, such as
-  `MuxServer`, `ReverseClient`, `PacketsToStream`, and `PacketsToConnection`
+Ownership belongs to the line, not to the node type. Do not infer it from a name
+such as "Client", "Server", "Listener", or "Connector":
+
+- `TcpListener` calls `lineCreate()` for every accepted connection and is that
+  line's owner.
+- `TcpConnector` owns a **socket**, not a line. It calls neither `lineCreate()`
+  nor `lineDestroy()`; it consumes a line created further up the chain. Owning an
+  OS resource is not owning a `line_t`.
+- A tunnel routinely **mixes roles**: `MuxClient` owns its parent/carrier line
+  while borrowing every child line; `HttpClient` owns the upload/download
+  transport lines it splits a borrowed main line into; `Socks5Server`,
+  `TrojanServer`, and `VlessServer` own UDP remote lines while borrowing the
+  client line. Decide per line, in the same handler, before cleaning anything up.
+
+`tests/line_ownership_policy_test.py` records the classification of every
+production creation site and fails when a new one appears unclassified.
 
 Every other tunnel must **propagate `Finish`** and let the owner destroy the
 line. Calling `lineDestroy()` on a line you did not create is a serious bug.
@@ -271,18 +299,120 @@ return;                          // 4. do not touch l or ls again
 Adapters are simpler: sitting at one end of the chain, they only ever send
 `Finish` once, toward the opposite direction.
 
-Lines you **own** are different again. A creator such as `MuxClient` destroys its
-state, forwards `Finish`, and then — because it is the owner — destroys the line
-if it is still alive:
+Lines you **own** are different again, and they carry a stronger, checkable
+obligation — the next section.
+
+### The Owner Finish Postcondition
+
+> When a tunnel receives `Finish` for a **normal line it created**, that handler
+> must not return while the line is still logically alive:
+>
+> ```c
+> /* on return from the owner's Finish handler for a normal line */
+> assert(! lineIsAlive(line));
+> ```
+
+The postcondition is about **logical** death only. Outstanding `lineLock()`
+references may keep the allocation present until suspended or re-entrant frames
+unwind; the memory does not have to be freed before the handler returns.
+
+Before returning, an owner must:
+
+1. **Detach every producer** that can still target the line — io callbacks,
+   timers, idle-table items, lookup maps, queues, scheduled tasks.
+2. Complete whatever cleanup is legal for the direction that sent `Finish`.
+3. Destroy its own line state exactly once.
+4. Propagate `Finish` only where the topology requires, and only **away from the
+   sender** — the no-reflection rule is unchanged by ownership.
+5. Call `lineDestroy(line)` unless a nested path already did.
+6. Return immediately, touching no destroyed state.
+
+A creator such as `MuxClient` does exactly that. The excerpt below is
+`muxclientTunnelDownStreamFinish()` — the `fnFinD` slot, so **next** is the
+sender. The parent's children hang off the prev side, and prev is therefore the
+only direction anything may travel:
 
 ```c
-muxclientLinestateDestroy(parent_ls);
-tunnelNextUpStreamFinish(t, parent_l);
-if (lineIsAlive(parent_l))
+/* fnFinD on the parent line MuxClient created; next finished us. */
+while (child_ls)
 {
-    lineDestroy(parent_l);   // only the owner may do this
+    /* ... */
+    muxclientLinestateDestroy(child_ls);
+    tunnelPrevDownStreamFinish(t, child_l);   // away from the sender
+    /* ... */
+}
+
+muxclientLinestateDestroy(parent_ls);
+lineDestroy(parent_l);                        // only the owner may do this
+```
+
+The general shape, with the copy-to-stack step that keeps the code safe after
+`LinestateDestroy()`. Read the direction off the callback slot the handler is
+installed in — this one is `fnFinU`, so **prev** sent it and `next` is the only
+side that may be told:
+
+```c
+void ownerUpStreamFinish(tunnel_t *t, line_t *l)
+{
+    owner_lstate_t *ls = lineGetState(l, t);
+
+    ownerDetachResources(t, l, ls);                  /* 1 */
+
+    bool propagate_away = ls->next_init_sent;        /* copy before destroying */
+    ownerLinestateDestroy(ls);                       /* 3 */
+
+    if (propagate_away)
+    {
+        tunnelNextUpStreamFinish(t, l);              /* 4 */
+    }
+    if (lineIsAlive(l))
+    {
+        lineDestroy(l);                              /* 5 */
+    }
+    return;                                          /* 6 */
 }
 ```
+
+The `fnFinD` mirror is the same function with `tunnelPrevDownStreamFinish()` in
+step 4. An **endpoint** owner — a chain head such as `TcpListener` or
+`UdpStatelessSocket` — has no prev at all, so its `fnFinD` propagates nothing and
+step 4 disappears. The postcondition is unchanged either way.
+
+**Why it matters.** Without it, this sequence corrupts memory: a middle tunnel
+forwards a re-entrant callback; a nested `Finish` destroys that middle tunnel's
+per-line state; the line owner receives the propagated `Finish` but leaves the
+line alive; the outer callback then reads `lineIsAlive(line) == true` and resumes
+against state that no longer exists. The postcondition makes `lineIsAlive()` an
+honest post-callback signal.
+
+**Borrowed lines are the mirror image.** Destroy only your own per-line state,
+propagate the same directional `Finish` away from the sender when the topology
+requires it, and **never** call `lineDestroy()` — the real owner's destroy must
+stay valid. Never reflect `Finish`, payload, `Est`, `Pause`, or `Resume` back
+toward the side that finished you.
+
+**A middle tunnel that also owns the line** still follows the both-directions
+ordering above for its *local* close, and then the owner postcondition applies on
+top: the line must be dead before that close frame returns.
+
+**`requestProgramShutdown()` does not satisfy the postcondition.** It schedules
+global teardown on worker 0; the current worker callback returns and unwinds
+through every suspended frame first. An owner whose `Finish` reaches a terminal
+failure must still detach, destroy its state, and mark the line dead — and *then*
+request the shutdown.
+
+**Deferred OS cleanup is not an excuse to stay alive.** If a resource needs
+asynchronous teardown, detach it from the line first and give the deferred
+cleanup object its own copy of whatever it needs. A live line is not a cleanup
+token.
+
+**Packet lines are excluded.** They are never subject to the owned-normal-line
+postcondition and must never be destroyed at runtime. A `Finish` on one is not
+automatically a contract violation: a packet-lifecycle anchor may reject it, a
+transparent middle transform forwards it in the same direction, and an
+intentional terminal absorber may absorb it when there is nothing onward to
+notify or release. The exact handler role and direction decide which category
+applies — see [Part 4](part4-packet-tunnels.mdx).
 
 ### Most Tunnels Need No Directional-Finish State
 
@@ -427,6 +557,16 @@ Before you call a flow change done:
 - If you send final protocol bytes during `Finish`, do you mark the sender side
   finished before the send and block reflected `Pause`/`Resume`?
 - Does only the line **owner** ever call `lineDestroy()`?
+- Did you classify each line as **owned normal**, **borrowed normal**, or
+  **packet** before editing its `Finish` path?
+- Does every owner `Finish` path for a normal line return with
+  `! lineIsAlive(line)` — including the error, timeout, and terminal-verdict
+  branches?
+- Are io callbacks, timers, idle items, and map entries detached before the
+  owner's state and line are destroyed?
+- Does a borrowed-line path avoid `lineDestroy()` entirely?
+- Is `requestProgramShutdown()` used *in addition to* closing an owned line, never
+  instead of it?
 - Did you avoid adding an `initialized` flag the source does not require?
 
 ---

@@ -65,6 +65,148 @@ packet line is still alive after forwarding a packet. If your change can let a
 packet line die at runtime, that is almost certainly a bug.
 :::
 
+## Runtime `Finish` on a Packet Line
+
+[Part 2](part2-lines-and-callbacks.mdx) requires an owner's `Finish` handler for a
+**normal** line to return with `! lineIsAlive(line)`. **Packet lines are excluded
+from that postcondition, without exception.** A packet line is owned by the chain,
+not by any tunnel, and `tunnelchainDestroy()` is the only place that may ever
+destroy it. That part is absolute: whatever else your handler does, it must never
+call `lineDestroy()` on a packet line.
+
+What a `Finish` on a packet line *means*, though, depends entirely on the hop that
+receives it, the direction it arrived from, and the role that handler plays.
+There are three categories. Chain position is useful context, but it is not
+enough by itself to select one.
+
+### Category 1 — packet-lifecycle anchor: reject impossible close
+
+A packet adapter or bridge may anchor the worker's packet-pipeline state on the
+packet line and have no notion of that role closing. Here “adapter” means a
+packet-pipeline boundary or lifecycle endpoint, **not** a tunnel that owns the
+`line_t`. Nothing in a correct chain finishes that exact role, so a `Finish`
+arriving in that handler and direction means a neighbour broke the contract:
+
+- **never** call `lineDestroy()`;
+- **fail loudly** — `LOGF(...)` then `abortProgramNow(1)`, the project's
+  packet-line contract-violation policy;
+- never convert it into normal connection teardown;
+- leave the real destruction to `tunnelchainDestroy()`.
+
+That is exactly what the anchoring adapters do:
+
+```c
+void tundeviceTunnelDownStreamFinish(tunnel_t *t, line_t *l)
+{
+    discard t;
+    LOGF("TunDevice: unexpected downstream Finish on worker packet line %u", (unsigned int) lineGetWID(l));
+    abortProgramNow(1);
+}
+```
+
+Examples include `TunDevice` and `RawSocket`; the upstream packet sides of
+`PacketsToConnection` and `PacketsToStream`; the downstream packet side of
+`StreamToPackets`; `PacketSplitStream`; the packet modes of `TesterClient` and
+`TesterServer`; and the packet-line role of `WireGuardDevice`. These are
+per-handler classifications, not labels for the whole tunnel: the same bridge
+may own normal lines on its other side and close those normally.
+
+`tests/unittests/packet_adapter_finish_test.c` proves the covered anchoring calls
+do not return.
+
+### Category 2 — transparent middle transform: forward lifecycle
+
+A middle tunnel that transforms packet payloads does not thereby own or terminate
+the line lifecycle. It must forward `Init`, `Est`, `Pause`, `Resume`, `Finish`,
+and any other callback unrelated to its transform in the same direction:
+
+- upstream callbacks continue with `tunnelNextUpStream*`;
+- downstream callbacks continue with `tunnelPrevDownStream*`;
+- a received callback is never reflected toward its sender.
+
+`PingClient` inherits these lifecycle pass-throughs from `packettunnelCreate()`;
+`PingServer` installs equivalent explicit `Finish` forwarding. Keeping the
+transform separate from the lifecycle allows flexible chains such as:
+
+```text
+UdpListener <-> PingServer <-> UdpConnector
+```
+
+Here `PingServer` can decapsulate the ICMP-wrapped packet on the relevant payload
+path while the ordinary UDP line lifecycle continues through it unchanged.
+`packettunnelCreate()` therefore keeps the standard lifecycle pass-throughs and
+only makes unimplemented packet **payload** callbacks fatal.
+
+### Category 3 — intentional terminal absorber: document the no-op
+
+A packet line is still a `line_t`, and a chain may legally terminate one at an
+ordinary stream adapter. That adapter borrows the packet line exactly as it would
+borrow a connection line, and it closes its own side for its own reasons.
+
+The shipped example is `PacketSender -> UdpConnector`, which
+`tests/cases/udp_connector_listener_packet_loss_multiworker` exercises:
+
+```text
+PacketSender ──(worker packet line)──> UdpConnector ──> network
+```
+
+`UdpConnector` opens a UDP socket per line and expires it when the flow goes idle.
+Expiry sends `tunnelPrevDownStreamFinish()` **down the worker packet line**, and it
+lands on `packetsenderTunnelDownStreamFinish()`. That is not a violation and must
+not abort. `PacketSender` owns no per-line state, has no prev, and does not use
+`Finish` as a completion signal, so absorbing the close is the whole job.
+
+This classification is directional. `PacketSender` downstream is an absorber,
+while its upstream handler remains fatal because the chain head has no `prev`
+that could legally send it a callback. `PacketReceiver` is another intentional
+absorber: it owns no per-line state, may terminate either end of a chain, and
+reports completion through its timer and report path rather than `Finish`.
+
+Propagate the close, release what you own, report a violation — or state in the
+handler that you own no per-line state and have no onward direction, so absorbing
+the close really is the whole job. A body that is nothing but `discard` statements
+does not distinguish the last case from a bug.
+
+The legitimate absorbers today are `BlackHole` (a chain-end sink that borrows
+every line), `PacketReceiver` (a chain end that reports by timer and file) and
+`PacketSender` downstream (Category 3 above).
+
+`tests/line_ownership_policy_test.py` walks every
+`tunnels/*/{upstream,downstream}/fin.c` and rejects a handler whose whole body is
+`discard` statements unless it appears in `SILENT_FINISH_ALLOWED` with a written
+rationale, so a lost propagation or a lost owner close cannot arrive looking like
+a deliberate no-op.
+
+So the question to ask is never only “is this a packet line?” or “is this tunnel
+at a chain end?” It is **“what role does this exact handler and direction play,
+what does the tunnel keep on this line, and who is still waiting on it?”**
+
+### Dual-role handlers must check the exact role first
+
+Some nodes see **both** a persistent packet line and normal lines they own. The
+handler must decide which one it was given before doing anything:
+
+- `WireGuardDevice` is a `packettunnelCreate()` tunnel on its packet side, but it
+  also creates one **normal transport line per worker** for its encrypted side.
+  A `Finish` on a transport line is an ordinary owned-line close (destroy the
+  slot, `lineDestroy()`); a `Finish` on the packet line is a violation and aborts.
+- `PacketsToStream` and `PacketsToConnection` anchor bridge state on the packet
+  line while owning the normal lines they create behind it.
+
+Use the chain to identify the role — never a name or a guess:
+
+```c
+if (tunnelchainIsWorkerPacketLine(tunnelGetChain(t), l))
+{
+    LOGF("MyNode: unexpected Finish on worker packet line %u", (unsigned int) lineGetWID(l));
+    abortProgramNow(1);
+}
+/* from here on this is a normal line: apply the Part 2 owner postcondition */
+```
+
+Any intentional classification that differs by line role or direction must be
+documented at the handler and covered by a regression test.
+
 ## Packet Lines Are Shared Worker State
 
 Because one packet line serves many unrelated packets on a worker, anything stored
@@ -111,19 +253,22 @@ Key facts:
 - `packettunnelCreate()` **asserts `lstate_size == 0`**. Pure packet tunnels have
   no per-line state.
 - They are expected to **override the packet payload callbacks**.
-- Several default stream-style callbacks are intentionally invalid. For example,
-  the default upstream/downstream payload handlers call `LOGF(...)` and
-  `terminateProgram(1)` — they exist to crash loudly if you forget to override
-  them:
+- The default payload callbacks are intentionally invalid: they call `LOGF(...)`
+  and `abortProgramNow(1)`, so they crash loudly if you forget to override them:
 
 ```c
-void packettunnelDefaultUpStreamPayload(tunnel_t *self, line_t *line, sbuf_t *payload)
+static void packettunnelDefaultUpStreamPayload(tunnel_t *self, line_t *line, sbuf_t *payload)
 {
     LOGF("Unexpected call to default up stream payload for a packet tunnel, "
          "this function must be overridden");
-    terminateProgram(1);
+    abortProgramNow(1);
 }
 ```
+
+- `Init`, `Est`, `Pause`, `Resume`, and `Finish` inherit the standard
+  same-direction lifecycle pass-throughs. An individual tunnel overrides one
+  only when its exact handler role requires an anchoring rejection, explicit
+  forwarding, or an intentional terminal absorption as classified above.
 
 Examples: `IpOverrider`, `IpManipulator`, `PingClient`, `PingServer`,
 `WireGuardDevice`.
@@ -131,8 +276,8 @@ Examples: `IpOverrider`, `IpManipulator`, `PingClient`, `PingServer`,
 For pure packet tunnels:
 
 - Do not add connection-style line lifecycle logic casually.
-- Do not assume `Init` / `Finish` behave like normal stream tunnels — check the
-  actual callback implementations first.
+- `lstate_size == 0` does **not** mean "packet lines only". A
+  `kNodeLayerAnything` packet tunnel also carries normal connection lines.
 - Some default callbacks deliberately abort; know which ones you must override.
 
 ### 2. Packet-Line Anchored Bridges (`tunnelCreate`)
@@ -238,9 +383,36 @@ downstream response must be restored before TesterClient sees it. Add at least
 one test that would **fail** if PingServer upstream encapsulated instead of
 decapsulating.
 
+The packet-line `Finish` contract has its own coverage, and a new packet-side
+handler belongs in it:
+
+- `tests/unittests/packet_adapter_finish_test.c` calls the anchoring adapters'
+  `Finish` handlers for real in a forked child and requires the child to die
+  rather than return.
+- `tests/cases/udp_connector_listener_packet_loss_multiworker` is the other half:
+  it runs a real chain where a borrowing adapter finishes the worker packet line
+  on idle expiry, so it fails if that legitimate close is ever made fatal.
+- `tests/line_ownership_policy_test.py` fails if a `fin.c` becomes an
+  unexplained bare return, or if a contract test loses its ctest registration.
+
 ## Rules for Packet-Oriented Changes (Summary)
 
-- Do not close packet lines during runtime.
+- Do not close packet lines during runtime, and never `lineDestroy()` one.
+- The owner Finish postcondition from Part 2 does **not** apply to packet lines.
+- Classify each packet-line `Finish` handler and direction as one of three roles:
+  an anchor rejects an impossible close with `LOGF` + `abortProgramNow(1)`; a
+  transparent middle transform forwards it in the same direction; an intentional
+  terminal absorber documents why there is nothing to forward or release.
+- `PacketSender` is direction-specific: downstream absorbs the legitimate close
+  from `UdpConnector`, while upstream remains fatal. `PacketReceiver` is also an
+  intentional terminal absorber.
+- A handler that can receive both a packet line and a normal line must branch on
+  the exact role (`tunnelchainIsWorkerPacketLine()`) before any cleanup.
+- `packettunnelCreate()` only means `lstate_size == 0`; several such nodes are
+  `kNodeLayerAnything` and carry ordinary connection lines too, which is why its
+  lifecycle callbacks stay plain pass-throughs.
+- A `Finish` handler that does nothing must say why: propagate, release, report,
+  or document that you own no per-line state and have no onward direction.
 - Do not run normal per-connection `Finish` logic on packet lines unless the
   source clearly expects it.
 - Treat packet-line state as worker-local shared state.

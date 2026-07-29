@@ -292,6 +292,38 @@ as though a timer were armed. `packetsenderWaitUntilDeadline()` shows the shape:
 it returns a three-valued result so `ready`, `waiting` and `shutdown-requested`
 cannot collapse into one boolean.
 
+### Requesting a shutdown is not closing a line
+
+`requestProgramShutdown()` **schedules** global teardown on worker 0. It does not
+make any current line logically dead, and it does not run before this callback
+returns: the worker callback unwinds normally, through every suspended and
+re-entrant frame between it and the event loop. Those frames keep observing
+`lineIsAlive(line)`.
+
+So a shutdown request never substitutes for the owner Finish postcondition in
+[Part 2](part2-lines-and-callbacks.mdx). When a `Finish` handler for a **normal
+line the tunnel created** reaches a terminal failure, the order is:
+
+1. record the diagnostic and the failure verdict;
+2. detach the line's producers (io callbacks, timers, idle items, maps);
+3. destroy this tunnel's line state;
+4. `lineDestroy()` the line, so it is dead before the handler returns;
+5. `requestProgramShutdown(code)`, with the `abortProgramNow(code)` fallback if
+   the worker-0 handoff is refused;
+6. return.
+
+Steps 2–4 come *before* step 5 for the same reason as every other cleanup here:
+this callback is the last frame that still owns that state. `TesterClient`'s
+incomplete-response branch
+(`testerclientFailOwnedLine()` in `tunnels/TesterClient/common/helpers.c`) is the
+worked example, and
+`tests/unittests/testerclient_orderly_shutdown_test.c` holds an outer reference
+across the callback to prove the line is dead when it returns.
+
+The exception is the same one as everywhere else: a persistent worker **packet
+line** is never destroyed at runtime, so a terminal failure on one hard-aborts
+instead (Category D).
+
 ### `onStart` schedules work; it does not run it
 
 Do not infer execution context from a filename. `instance/start.c` contains both
@@ -373,6 +405,13 @@ the distinction decides the category:
   result, so this is Category B: recycle the buffer the callback still owns, then
   go through the one verdict helper (`testerclientFail()` /
   `testerserverFail()`) and return.
+
+  One extra step when the verdict is reached **inside a `Finish` handler for a
+  normal line the tester owns**: the verdict helper only reports, it does not
+  close anything, so that branch must go through `testerclientFailOwnedLine()`
+  instead. It detaches the worker slot, destroys the line state, marks the line
+  dead, and only then reports the verdict — the owner postcondition and the
+  Category-B shape at once.
 - **An impossible internal state** — a payload generator asked for a payload its
   own validated configuration can never produce, a buffer pool reporting zero
   writable capacity, a close scheduled before verification, a response counter
@@ -400,6 +439,12 @@ refusing one transport line is operational, not process-wide:
 `wireguarddeviceQueueWorkerTransportLineInit()` logs a warning and returns, leaves
 the slot `NULL`, and lets `wireguarddeviceEnsureTransportLine()` retry on a later
 output. It calls none of the three process APIs.
+
+`WireGuardDevice` shows both halves in one handler, which is why it has to check
+the exact role first: `wireguarddeviceHandleTransportLineFinish()` treats a
+`Finish` on one of its own per-worker transport lines as an ordinary owned-line
+close (clear the slot, `lineDestroy()`), and a `Finish` on the chain's worker
+packet line as the Category-D violation above.
 
 ## 9. Shutdown callback registry
 
@@ -455,7 +500,8 @@ scenario and report back over an inherited pipe.
 ```bash
 python3 tests/tunnels_abort_policy_test.py --mutation-test
 python3 tests/tunnels_orderly_shutdown_policy_test.py --mutation-test
-ctest --preset linux --output-on-failure -R 'orderly_shutdown|abort_runtime'
+python3 tests/line_ownership_policy_test.py --mutation-test
+ctest --preset linux --output-on-failure -R 'orderly_shutdown|abort_runtime|owned_line|line_ownership'
 ```
 
 - `tunnels_abort_policy_test.py` — every audited Category-D site still hard-aborts
@@ -464,6 +510,18 @@ ctest --preset linux --output-on-failure -R 'orderly_shutdown|abort_runtime'
   request, its fallback, its pre-request cleanup anchors and its caller's
   immediate return; tester invariants keep hard-aborting; the retryable WireGuard
   path calls none of the three APIs; main-thread startup sites stay Category E.
+- `line_ownership_policy_test.py` — every production `lineCreate()` site stays
+  classified, no borrowing tunnel starts calling `lineDestroy()`, every registered
+  owner close path still destroys its line, and every registered packet-lifecycle
+  anchor still hard-aborts instead of destroying the packet line. It also sweeps
+  every `tunnels/*/{upstream,downstream}/fin.c` and rejects any handler whose whole
+  body is `discard` statements unless it is registered in
+  `SILENT_FINISH_ALLOWED` with a rationale, so an intentional terminal absorber is
+  distinguishable from a lost propagation or owner close. Transparent middle
+  handlers remain ordinary same-direction forwarding code. This is where the "a
+  shutdown request is not line destruction" rule is pinned in source: it requires
+  the runtime tests below to keep both their content **and** their `add_test`
+  registration, because a test file nothing builds proves nothing.
 
 Both scan function bodies with a lexical C scanner, so a commented-out or quoted
 lookalike cannot satisfy a candidate, and both run a mutation mode that removes
