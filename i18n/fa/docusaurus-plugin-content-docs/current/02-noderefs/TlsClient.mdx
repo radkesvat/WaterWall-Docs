@@ -5,7 +5,7 @@ sidebar_label: "TlsClient"
 description: "راهنمای نود TlsClient در WaterWall."
 ---
 
-<!-- Written from version 115 of the English doc. -->
+<!-- Written from version 120 of the English doc. -->
 
 # TlsClient
 
@@ -78,7 +78,7 @@ VlessClient -> TlsClient -> TcpConnector
 
 | Field | Type | توضیح |
 | --- | --- | --- |
-| `sni` | string | مقدار Server Name Indication در TLS؛ نبودن این فیلد یا خالی بودن آن خطاست. |
+| `sni` | string | مقدار Server Name Indication در TLS با طول ۱ تا ۲۵۵ byte. |
 
 وقتی `verify` فعال باشد، همین `sni` برای certificate verification هم استفاده می‌شود.
 
@@ -89,18 +89,75 @@ VlessClient -> TlsClient -> TcpConnector
 | `alpns` | `["h2", "http/1.1"]` | فهرست ترتیبی protocolهای پیشنهادی ALPN؛ ترتیب JSON عیناً در ClientHello حفظ می‌شود. |
 | `verify` | `true` | بررسی certificate متعلق به peer را در BoringSSL فعال می‌کند. |
 | `x25519mlkem768` | `true` | برای نزدیک‌تر شدن رفتار به Chrome، گروه hybrid با نام `X25519MLKEM768` را اعلام می‌کند. |
+| `tls13-record-shaping` | تنظیم نشده | تنظیم آزمایشی padding و delay سمت فرستنده برای TLS 1.3. |
 | `verbose` | `false` | جزئیات بیشتری از state مربوط به TLS را log می‌کند. |
 
 با `verify: true`، فایل CA داخلی `utils/cacert.h` در context مربوط به BoringSSL بارگذاری می‌شود. اگر `verify` را `false`
 بگذارید، handshake همچنان واقعی است اما زنجیره certificate برای این instance از tunnel بررسی نمی‌شود.
 
 مقادیر پیش‌فرض اختیاری فقط وقتی اعمال می‌شوند که key مربوطه وجود نداشته باشد. اگر `alpns` وجود داشته باشد، باید arrayای
-از stringها باشد. طول هر نام باید بین ۱ تا ۲۵۵ byte باشد، نام تکراری پذیرفته نمی‌شود و کل فهرست باید در extension مربوط
-به ALPN جا شود. اگر `verify`، `x25519mlkem768` یا `verbose` وجود داشته باشد، مقدار آن باید boolean واقعی JSON باشد. نوع
-اشتباه باعث خطای startup می‌شود و به‌معنای انتخاب مقدار پیش‌فرض نیست.
+از stringها باشد. طول هر نام باید بین ۱ تا ۲۵۵ byte باشد، نام تکراری پذیرفته نمی‌شود و طول فهرست encodeشده نباید از
+۶۵٬۵۳۳ byte بیشتر شود. اگر `verify`، `x25519mlkem768` یا `verbose` وجود داشته باشد، مقدار آن باید boolean واقعی JSON
+باشد. نوع اشتباه باعث خطای startup می‌شود و به‌معنای انتخاب مقدار پیش‌فرض نیست.
 
 بهتر است `x25519mlkem768` را فعال نگه دارید. غیرفعال کردن آن ClientHello را کوچک‌تر می‌کند، اما شباهت handshake به نسخه‌های
 فعلی Chrome را هم کاهش می‌دهد.
+
+## شکل‌دهی آزمایشی TLS 1.3 Record
+
+تنظیم `tls13-record-shaping` به‌صورت اختیاری نخستین application recordهای TLS 1.3 را که همین نود می‌فرستد pad می‌کند و
+به تأخیر می‌اندازد. اگر این تنظیم وجود نداشته باشد، قابلیت غیرفعال است. این قابلیت هرگز ciphertext دریافتی، handshake
+recordها، alertها، application recordهای خالی، byteهای fallback یا recordهای TLS 1.2 را تغییر نمی‌دهد. اگر باید هر دو
+جهت ارسال شکل داده شوند، `TlsClient` محلی و `TlsServer` راه دور را جداگانه تنظیم کنید.
+
+فرم سفارشی:
+
+```json
+"tls13-record-shaping": {
+  "scope": {"first-application-records": 8},
+  "outcomes": [
+    {
+      "probability": 50,
+      "padding-bytes": [100, 200],
+      "delay": {"probability": 75, "ms": [10, 20]}
+    },
+    {"probability": 10, "padding-bytes": [400, 600]}
+  ]
+}
+```
+
+`padding-bytes` و `delay.ms` یک integer یا بازه integer شامل دو سر `[minimum, maximum]` می‌پذیرند. تعداد outcomeها باید
+بین ۱ تا ۱۶ باشد؛ `first-application-records` بین ۱ تا ۱۰۲۴، padding بین ۱ تا ۴۰۹۶ byte و delay بین ۰ تا ۱۰۰۰
+millisecond است. probabilityهای outcome به‌صورت تجمعی و mutually exclusive تفسیر می‌شوند و مجموع آن‌ها نباید از ۱۰۰
+بیشتر باشد. هر بار حداکثر یک outcome انتخاب می‌شود و درصد استفاده‌نشده record را بدون تغییر می‌گذارد. probability مربوط
+به delay فقط پس از انتخاب همان outcome بررسی می‌شود. key ناشناخته و مقدار غیرinteger یا خارج از محدوده باعث خطای
+startup می‌شود. هر record واجد شرایط یک جایگاه از scope مصرف می‌کند، حتی اگر هیچ outcomeای انتخاب نشود.
+
+در حال حاضر فقط فرم سفارشی شامل `scope` و `outcomes` پذیرفته می‌شود. تا زمانی که اندازه‌گیری‌های representative برای
+capture، overhead، موفقیت connection و classifier انتشار یک preset versionشده را توجیه نکنند، key به نام `profile`
+رد می‌شود.
+
+Padding از byteهای صفر استاندارد TLS 1.3 در `TLSInnerPlaintext` استفاده می‌کند و به‌اندازه انتخاب‌شده به ciphertext
+می‌افزاید، البته تا ظرفیت قانونی باقی‌مانده در TLS record. Delay پس از رمزنگاری اعمال می‌شود و latency انتخاب‌شده را
+اضافه می‌کند. ترتیب recordها روی wire با رابطه
+`release_at = max(now + delay, previous_release_at)` حفظ می‌شود. ciphertext صف‌شده برای هر line حداکثر ۱ MiB است؛ در
+۷۶۸ KiB به producer backpressure داده می‌شود و در ۳۸۴ KiB دوباره آزاد می‌شود. انتقال Pause و Resume از state فعلی wire
+پیروی می‌کند: اگر تخلیه هنگام Resume به‌صورت re-entrant یک Pause دیگر از wire دریافت کند، Resume قدیمی تا رسیدن Resume
+واقعی بعدی ارسال نمی‌شود. اگر سمت cleartext پایان یابد، timer لغو می‌شود و تا زمانی که wire قابل نوشتن باشد ciphertext
+صف‌شده client به‌صورت synchronous و با ترتیب FIFO آزاد می‌شود. اگر wire در حالت pause باشد، باقی صف دور ریخته می‌شود؛
+state محلی و upstream `Finish` پیش از بازگشت callback تکمیل می‌شوند.
+در طول این تخلیه نهایی همگام، downstream Payload و Est دور ریخته می‌شوند و Pause و Resume فقط state محلی wire-paused را
+به‌روزرسانی می‌کنند؛ هیچ‌یک از این callbackها به سمت owner پایان‌یافته cleartext فرستاده نمی‌شود. پایان سمت wire خروجی
+صف‌شده را لغو و دور می‌ریزد و فقط به سمت cleartext منتقل می‌شود. اگر ساخت timer شکست بخورد، recordها فوراً و به‌ترتیب
+تخلیه می‌شوند.
+
+شکل‌دهی همراه با delay برای مصرف‌کنندگان داخلی handshake takeover مانند `RealityClient` رد می‌شود، زیرا takeover خام
+نمی‌تواند TLS record تأخیردار و معلق را به ارث ببرد. شکل‌دهی فقط با padding، وقتی boundary مربوط به takeover خالی است،
+همچنان سازگار می‌ماند.
+
+Record shaping می‌تواند اندازه و زمان‌بندی recordهای ابتدایی را کمتر قابل پیش‌بینی کند، اما نمی‌تواند یک round trip
+داخلی handshake را حذف کند، burst را کوچک‌تر کند یا همه ویژگی‌های جهت و زمان‌بندی را پنهان کند. وقتی multiplexing برای
+deployment مناسب است، آن را همراه `MuxClient`/`MuxServer` استفاده کنید.
 
 ## ترتیب ALPN و مسئولیت هماهنگی protocol برنامه
 
@@ -248,6 +305,7 @@ generateTlsHello:<sni>
 ```
 
 ClientHello تولیدشده از تنظیمات همین tunnel instance استفاده می‌کند، از جمله `alpns` و `x25519mlkem768`.
+طول SNI ورودی API باید بین ۱ تا ۲۵۵ byte باشد.
 
 ## API Handshake Takeover
 
@@ -347,7 +405,7 @@ required_padding_left = 0
 عمدی ساخت TLS ClientHello را با دستکاری سازگار در سطح packet هماهنگ می‌کند.
 :::
 
-تنظیم اختیاری `ech-sni-trick` یک string غیرخالی برای hostname می‌پذیرد:
+تنظیم اختیاری `ech-sni-trick` یک string مربوط به hostname با طول ۱ تا ۲۵۵ byte می‌پذیرد:
 
 ```json
 "ech-sni-trick": "example.net"
@@ -362,5 +420,5 @@ ClientHello جعلی از همان فهرست و ترتیب تنظیم‌شده 
 `IpManipulator` طراحی شده است تا byteهایی که BoringSSL از ClientHello hash می‌کند با byteهای قرارگرفته روی wire یکسان
 بمانند.
 
-مقدار این گزینه باید یک string غیرخالی JSON باشد؛ مقدار خالی یا هر نوع دیگر JSON باعث خطای startup می‌شود. API تونل
-`generateTlsHello:<sni>` نیز در صورت تنظیم بودن، این گزینه را اعمال می‌کند.
+مقدار این گزینه باید یک string در JSON با طول ۱ تا ۲۵۵ byte باشد؛ مقدار خارج از این محدوده یا هر نوع دیگر JSON باعث
+خطای startup می‌شود. API تونل `generateTlsHello:<sni>` نیز در صورت تنظیم بودن، این گزینه را اعمال می‌کند.

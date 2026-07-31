@@ -5,7 +5,7 @@ sidebar_label: "TlsServer"
 description: "راهنمای نود TlsServer در WaterWall."
 ---
 
-<!-- Written from version 106 of the English doc. -->
+<!-- Written from version 110 of the English doc. -->
 
 # TlsServer
 
@@ -127,10 +127,61 @@ Fallback فقط تا پیش از قطعی شدن مسیر TLS قابل انتخ�
 | `fallback-node-name` | تنظیم نشده | branch جایگزین برای ورودی‌ای که پیش از قطعی شدن مسیر TLS، آشکارا غیر TLS است. نام‌های `fallback-node` و `fallback` هم پذیرفته می‌شوند. |
 | `fallback-intentional-delay-ms` | `7` | تأخیر عمدی برای payloadهای upstream در fallback؛ مقدار `0` آن را غیرفعال می‌کند. |
 | `fallback-intentional-delay-jitter-ms` | `1` | jitter تصادفی برای زمان‌بندی payloadهای fallback؛ اگر delay صفر باشد نادیده گرفته می‌شود. |
+| `tls13-record-shaping` | تنظیم نشده | تنظیم آزمایشی padding و delay سمت فرستنده برای TLS 1.3. |
 | `verbose` | `false` | جزئیات بیشتری از lifecycle مربوط به TLS را log می‌کند. |
 
 نمی‌توانید `sni` و fallback را هم‌زمان تنظیم کنید؛ وگرنه ممکن بود یک ClientHello معتبر با SNI متفاوت به‌عنوان plaintext
 به fallback برسد و رفتار سرور را قابل fingerprint کند.
+
+## شکل‌دهی آزمایشی TLS 1.3 Record
+
+تنظیم `tls13-record-shaping` به‌صورت اختیاری نخستین application recordهای TLS 1.3 را که همین نود می‌فرستد pad می‌کند و
+به تأخیر می‌اندازد. اگر این تنظیم وجود نداشته باشد، قابلیت غیرفعال است. این قابلیت هرگز ciphertext دریافتی، handshake
+recordها، alertها، application recordهای خالی، byteهای fallback یا recordهای TLS 1.2 را تغییر نمی‌دهد. اگر باید هر دو
+جهت ارسال شکل داده شوند، `TlsServer` محلی و `TlsClient` راه دور را جداگانه تنظیم کنید.
+
+فرم سفارشی:
+
+```json
+"tls13-record-shaping": {
+  "scope": {"first-application-records": 8},
+  "outcomes": [
+    {
+      "probability": 50,
+      "padding-bytes": [100, 200],
+      "delay": {"probability": 75, "ms": [10, 20]}
+    },
+    {"probability": 10, "padding-bytes": [400, 600]}
+  ]
+}
+```
+
+`padding-bytes` و `delay.ms` یک integer یا بازه integer شامل دو سر `[minimum, maximum]` می‌پذیرند. تعداد outcomeها باید
+بین ۱ تا ۱۶ باشد؛ `first-application-records` بین ۱ تا ۱۰۲۴، padding بین ۱ تا ۴۰۹۶ byte و delay بین ۰ تا ۱۰۰۰
+millisecond است. probabilityهای outcome به‌صورت تجمعی و mutually exclusive تفسیر می‌شوند و مجموع آن‌ها نباید از ۱۰۰
+بیشتر باشد. هر بار حداکثر یک outcome انتخاب می‌شود و درصد استفاده‌نشده record را بدون تغییر می‌گذارد. probability مربوط
+به delay فقط پس از انتخاب همان outcome بررسی می‌شود. key ناشناخته و مقدار غیرinteger یا خارج از محدوده باعث خطای
+startup می‌شود. هر record واجد شرایط یک جایگاه از scope مصرف می‌کند، حتی اگر هیچ outcomeای انتخاب نشود.
+
+در حال حاضر فقط فرم سفارشی شامل `scope` و `outcomes` پذیرفته می‌شود. تا زمانی که اندازه‌گیری‌های representative برای
+capture، overhead، موفقیت connection و classifier انتشار یک preset versionشده را توجیه نکنند، key به نام `profile`
+رد می‌شود.
+
+Padding از byteهای صفر استاندارد TLS 1.3 در `TLSInnerPlaintext` استفاده می‌کند و به‌اندازه انتخاب‌شده به ciphertext
+می‌افزاید، البته تا ظرفیت قانونی باقی‌مانده در TLS record. Delay پس از رمزنگاری اعمال می‌شود و latency انتخاب‌شده را
+اضافه می‌کند. ترتیب recordها روی wire با رابطه
+`release_at = max(now + delay, previous_release_at)` حفظ می‌شود. ciphertext صف‌شده برای هر line حداکثر ۱ MiB است؛ در
+۷۶۸ KiB به producer backpressure داده می‌شود و در ۳۸۴ KiB دوباره آزاد می‌شود. انتقال Pause و Resume از state فعلی wire
+پیروی می‌کند: اگر تخلیه هنگام Resume به‌صورت re-entrant یک Pause دیگر از wire دریافت کند، Resume قدیمی تا رسیدن Resume
+واقعی بعدی ارسال نمی‌شود. پس از آنکه `close_notify` همتا سمت cleartext را پایان داد، `TlsServer` هیچ Payload، Pause یا
+Resumeای به آن سمت نمی‌فرستد؛ application byteهایی که بعداً دریافت شوند یا پیش‌تر توسط یک callback بیرونی رمزگشایی شده
+باشند دور ریخته می‌شوند. اگر سمت cleartext پایان یابد، ciphertext پذیرفته‌شده server و یک `close_notify` بدون padding پیش
+از downstream `Finish` تخلیه می‌شوند. پایان سمت wire خروجی صف‌شده را لغو و دور می‌ریزد و فقط به سمت cleartext منتقل می‌شود.
+اگر ساخت timer شکست بخورد، recordها فوراً و به‌ترتیب تخلیه می‌شوند.
+
+Record shaping می‌تواند اندازه و زمان‌بندی recordهای ابتدایی را کمتر قابل پیش‌بینی کند، اما نمی‌تواند یک round trip
+داخلی handshake را حذف کند، burst را کوچک‌تر کند یا همه ویژگی‌های جهت و زمان‌بندی را پنهان کند. وقتی multiplexing برای
+deployment مناسب است، آن را همراه `MuxClient`/`MuxServer` استفاده کنید.
 
 ## TLS Versionها
 
