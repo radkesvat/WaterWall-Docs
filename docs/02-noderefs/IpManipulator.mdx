@@ -6,7 +6,7 @@ description: "Reference documentation for the IpManipulator node."
 ---
 
 <!--
-Documentation version: 113
+Documentation version: 115
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/IpManipulator/description.md, and both files must keep the same documentation version.
 -->
 
@@ -420,15 +420,19 @@ normal path. If the ClientHello has TLS 1.3 PSK binders and changing the SNI
 would require recomputing binders, the trick skips the crafted copy and leaves
 the original path alone.
 
+Multi-segment capture begins only when a packet contains a recognizable
+ClientHello first segment. Unrelated and non-TLS TCP payloads fail open
+immediately without entering a speculative prestart queue. Recognized,
+in-order ClientHellos can still span multiple TCP segments.
+
 ## smuggle-sni
 
-`smuggle-sni` sends the real ClientHello through a helper upstream branch and a
-delayed crafted ClientHello through the normal `next` path.
+`smuggle-sni` captures and reassembles a TLS ClientHello record across single or multi-segment TCP payloads (up to 16 segments / 16 KB) on the 4-tuple, sends the real ClientHello through a helper upstream branch immediately in order, and sends a generated multi-segment fake ClientHello batch through the normal `next` path after `smuggle-sni-delay-ms`. The fake batch strictly preserves original TCP segment boundaries, original TCP payload lengths, original TCP sequence numbers, and any trailing payload bytes beyond the ClientHello record. If length mismatch, fragment timeout/discontinuity, or generation failure occurs, `smuggle-sni` fails open immediately to the normal path.
 
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
 | `smuggle-sni` | non-empty string | required to enable | SNI value written into the crafted ClientHello copy. |
-| `smuggle-sni-delay-ms` | integer ms, `>= 0` | `0` | Delay before sending the crafted copy on the normal path. |
+| `smuggle-sni-delay-ms` | integer ms, `>= 0` | `0` | Delay before sending the crafted copy batch on the normal path. |
 | `real-sni-upstream-node` | string | required | Node name that receives the real captured ClientHello immediately. |
 
 This trick requires a normal top-level `next`. The helper node must exist and
@@ -500,8 +504,10 @@ preserve the captured packet TTL.
 ## smuggle-fin
 
 `smuggle-fin` injects a mirrored FIN/ACK through a helper branch and temporarily
-queues traffic on the worker until the expected downstream echo is seen and the
-optional delay expires.
+queues traffic on the flow-owner worker until the expected downstream echo is
+seen and the optional delay expires. Matching reverse packets that arrive on
+another worker are copied to the owner worker before they enter the same ordered
+queue. Each queued packet retains its own checksum-recalculation intent.
 
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -557,6 +563,12 @@ Downstream payload order:
 7. SNI Blender downstream hook
 8. `smuggle-sni` downstream logging hook
 9. final downstream send
+
+For internal `smuggle-fin` replay, upstream packets restart at the upstream
+entry because `smuggle-fin` is the first stage. Downstream packets resume
+immediately after `smuggle-fin`; their protocol and port-ghost restoration
+already ran before queuing and are not repeated. This does not change the normal
+downstream order above.
 
 ## Lifecycle and Packet-Line Semantics
 
