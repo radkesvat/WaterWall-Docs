@@ -5,7 +5,7 @@ sidebar_label: "IpManipulator"
 description: "راهنمای نود IpManipulator در WaterWall."
 ---
 
-<!-- Written from version 110 of the English doc. -->
+<!-- Written from version 113 of the English doc. -->
 
 # IpManipulator
 
@@ -170,13 +170,23 @@ IpManipulator: no tricks are enabled, nothing to do
 اگر شماره پروتکل packet برگشتی با یکی از مقادیر جایگزین منطبق باشد، نود آن را به TCP یا UDP
 عادی برمی‌گرداند. برای تونل دوطرفه، سمت مقابل هم باید تنظیمات سازگار داشته باشد.
 
-بهتر است مقدار TCP و UDP یکسان نباشد. Parser فعلی این حالت را رد نمی‌کند، اما
-بازیابی مبهم و عیب‌یابی دشوار می‌شود.
+مقدار جایگزین نباید برابر شماره پروتکل واقعی TCP یعنی `6` یا UDP یعنی `17`
+باشد؛ حتی اگر فقط یکی از این دو خانواده تنظیم شده باشد. در غیر این صورت،
+ترافیک واقعی با آن شماره از ترافیک mapشده قابل تشخیص نیست. اگر swap برای هر دو
+خانواده TCP و UDP فعال باشد، مقدارهای جایگزین آن‌ها نیز باید متفاوت باشند.
 
-هر بار که نود فیلد `Protocol` را تغییر می‌دهد، فقط checksumِ headerِ IPv4 را با
-`calcIpv4HeaderChecksum()` دوباره محاسبه می‌کند. بایت‌ها و checksumهای transport
-بدون تغییر می‌مانند و protocol swap نه درخواست محاسبه کامل checksum ایجاد
-می‌کند و نه درخواست موجود را پاک می‌کند.
+trickهای upstream زمانی اجرا می‌شوند که packet هنوز شماره پروتکل واقعی خود را
+دارد. درست پیش از خروج عادی، `IpManipulator` ابتدا port ghost را اعمال می‌کند،
+checksumهای IPv4 و transport را با پروتکل واقعی کامل می‌کند، شماره پروتکل را
+swap می‌کند و سپس checksumِ headerِ IPv4 را اصلاح می‌کند. در downstream، شماره
+پروتکل پیش از بازیابی port ghost یا parse شدن packet توسط هر trick مربوط به
+TCP/TLS بازیابی می‌شود.
+
+اگر یک packet در upstream از قبل مقدار جایگزین تنظیم‌شده این نود را داشته باشد،
+`IpManipulator` این نود را بخش صریح unwrap در یک جفت transport زنجیره‌ای در نظر
+می‌گیرد: پروتکل واقعی را بازیابی می‌کند، checksum را با همان پروتکل کامل می‌کند
+و packet را بدون mapping به جلو می‌فرستد. اگر باید packet پس از یک نود بعدی
+همچنان wrapped بماند، همان protocol swap را روی آن نود فعال نکنید.
 
 ## TCP Flag Rewrite
 
@@ -377,6 +387,15 @@ Port ghost در مرحله نهایی ارسال upstream اعمال و در ا�
 در packetهای downstream که tail مربوط را دارند، portهای اصلی بازیابی می‌شوند
 و packet به طول اولیه برمی‌گردد. Packetهای fragmentشده نادیده گرفته می‌شوند.
 
+packetهای TCP ساخته‌شده که از MTU بزرگ‌تر هستند، پیش از اعمال port ghost به
+segmentهای کوچک‌تر تقسیم می‌شوند. هر segment خروجی دقیقاً یک trailer می‌گیرد و
+بودجه payload در segmentation فضای همان trailer را کنار می‌گذارد تا اندازه
+نهایی از `GLOBAL_MTU_SIZE` بیشتر نشود.
+
+branchهای کمکی اختصاصی real-SNI، ‏mirrored-FIN و server-hello مربوط به
+overlap-SNI، tuple اصلی خود را حفظ می‌کنند و trailer مربوط به port ghost
+نمی‌گیرند.
+
 ## first-sni
 
 `first-sni` یک یا چند نسخه ساخته‌شده از ClientHello را پیش از نسخه اصلی می‌فرستد.
@@ -507,23 +526,23 @@ Parser فعلی این ترکیب‌ها را نمی‌پذیرد:
 ترتیب upstream payload:
 
 1. `smuggle-fin`
-2. protocol swap
-3. TCP flag rewrite
-4. `synfin-sni`
-5. `ech-sni-trick`
-6. `overlap-sni`
-7. `smuggle-sni`
-8. `first-sni`
-9. SNI Blender
-10. مسیر نهایی ارسال، شامل port ghost و ساخت کپی packet
+2. TCP flag rewrite
+3. `synfin-sni`
+4. `ech-sni-trick`
+5. `overlap-sni`
+6. `smuggle-sni`
+7. `first-sni`
+8. SNI Blender
+9. خروجی نهایی: port ghost، محاسبه checksum با پروتکل واقعی، protocol swap و
+   سپس forward یا duplicate کردن packet
 
 ترتیب downstream payload:
 
-1. بازیابی port ghost
-2. `smuggle-fin`
-3. `ech-sni-trick`
-4. `overlap-sni`
-5. protocol swap
+1. بازیابی protocol
+2. بازیابی port ghost
+3. `smuggle-fin`
+4. `ech-sni-trick`
+5. `overlap-sni`
 6. TCP flag rewrite
 7. hook downstream مربوط به SNI Blender
 8. logging hook مربوط به `smuggle-sni`
@@ -539,7 +558,9 @@ Parser فعلی این ترکیب‌ها را نمی‌پذیرد:
 - نباید packet line را در runtime آزاد کند.
 
 با `Init` مربوط به packet line در upstream، مسیر عادی `next` مقداردهی اولیه می‌شود.
-اگر branchهای کمکی برای real-SNI یا real-FIN تنظیم شده باشند، آن‌ها نیز مقداردهی می‌شوند.
+اگر branchهای کمکی برای real-SNI، ‏real-FIN یا server hello ساخته‌شده توسط
+overlap-SNI تنظیم شده باشند، آن‌ها نیز مقداردهی می‌شوند. اگر چند نقش کمکی به یک
+branch اشاره کنند، آن branch فقط یک بار `Init` دریافت می‌کند.
 
 ## محدودیت‌ها و Padding
 
