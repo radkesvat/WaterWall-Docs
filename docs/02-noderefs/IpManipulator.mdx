@@ -6,7 +6,7 @@ description: "Reference documentation for the IpManipulator node."
 ---
 
 <!--
-Documentation version: 110
+Documentation version: 113
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/IpManipulator/description.md, and both files must keep the same documentation version.
 -->
 
@@ -171,14 +171,22 @@ When a packet comes back with a configured replacement number, `IpManipulator`
 restores it to normal TCP or UDP. For a symmetric tunnel, enable compatible
 protocol-swap settings on the peer-side packet chain too.
 
-Avoid using the same replacement number for TCP and UDP. The parser does not
-reject it, but restoration becomes ambiguous and the path is much harder to
-reason about.
+Replacement values must not be the literal TCP (`6`) or UDP (`17`) protocol
+numbers, even when only one family is configured, because genuine traffic using
+the reused number could not be distinguished from mapped traffic. When both
+families are enabled, their configured replacement values must also be distinct.
 
-Whenever the tunnel changes the protocol field, it recalculates only the IPv4
-header checksum with `calcIpv4HeaderChecksum()`. Transport bytes and transport
-checksums remain untouched, and protocol swap does not create or clear a
-full-recalculation request.
+Upstream tricks run while the packet still carries its real protocol number.
+Immediately before normal egress, `IpManipulator` applies port ghost, completes
+the IPv4 and transport checksums using that real protocol, swaps the protocol
+number, and repairs the IPv4 header checksum. Downstream restores the protocol
+before port-ghost restoration or any TCP/TLS trick parses the packet.
+
+If an upstream packet already carries this node's configured replacement,
+`IpManipulator` treats the node as the explicit unwrapping half of a chained
+transport pair: it restores the real protocol, completes checksum work under
+that protocol, and forwards the packet unmapped. To keep a packet wrapped past
+a later node, do not enable the same protocol swap on that node.
 
 ## TCP Flag Rewrite
 
@@ -385,6 +393,14 @@ Downstream packets that still carry those tail bytes restore the original live
 ports and shrink the packet back to its original length. Fragmented IPv4
 packets are skipped.
 
+Oversized crafted TCP packets are segmented before port ghost is applied. Each
+emitted segment receives exactly one trailer, and the segmentation payload
+budget reserves space for that trailer so the result stays within
+`GLOBAL_MTU_SIZE`.
+
+Dedicated real-SNI, mirrored-FIN, and overlap-SNI server-hello helper branches
+preserve their original tuples and do not receive a port-ghost trailer.
+
 ## first-sni
 
 `first-sni` sends one or more crafted ClientHello copies before the original
@@ -520,23 +536,23 @@ pipeline returns as soon as a later SNI trick fully handles a packet.
 Upstream payload order:
 
 1. `smuggle-fin`
-2. protocol swap
-3. TCP flag rewrite
-4. `synfin-sni`
-5. `ech-sni-trick`
-6. `overlap-sni`
-7. `smuggle-sni`
-8. `first-sni`
-9. SNI Blender
-10. final send path, including port ghost and packet duplicate
+2. TCP flag rewrite
+3. `synfin-sni`
+4. `ech-sni-trick`
+5. `overlap-sni`
+6. `smuggle-sni`
+7. `first-sni`
+8. SNI Blender
+9. final egress: port ghost, checksum under the real protocol, protocol swap,
+   then packet forwarding/duplication
 
 Downstream payload order:
 
-1. port-ghost restore
-2. `smuggle-fin`
-3. `ech-sni-trick`
-4. `overlap-sni`
-5. protocol swap
+1. protocol restore
+2. port-ghost restore
+3. `smuggle-fin`
+4. `ech-sni-trick`
+5. `overlap-sni`
 6. TCP flag rewrite
 7. SNI Blender downstream hook
 8. `smuggle-sni` downstream logging hook
@@ -552,7 +568,9 @@ Downstream payload order:
 - it must not destroy packet lines during runtime
 
 On upstream packet-line `Init`, the normal `next` path is initialized. Helper
-branches for real-SNI and real-FIN tricks are initialized too when configured.
+branches for real-SNI, real-FIN, and overlap-SNI crafted server hellos are
+initialized too when configured. Aliased helper branches receive `Init` only
+once.
 
 ## Limits and Padding
 
