@@ -6,7 +6,7 @@ description: "Reference documentation for the IpManipulator node."
 ---
 
 <!--
-Documentation version: 115
+Documentation version: 116
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/IpManipulator/description.md, and both files must keep the same documentation version.
 -->
 
@@ -336,6 +336,32 @@ added by any other size-growing node or by another `IpManipulator` rewrite.
 In particular, enabling this option by itself does not append or remove bytes;
 at least one direction must have a TCP-bit rewrite action configured.
 
+### Rejected TCP-bit compositions
+
+Configuration fails at creation for these combinations:
+
+- any `up-tcp-bit-*` action together with `first-sni`, `smuggle-sni`,
+  `overlap-sni`, `synfin-sni`, or `ech-sni-trick`, with or without
+  `preserve-tcp-bitflags`. Upstream TCP-bit actions run before stateful SNI
+  inspection, while packets generated and replayed by those state machines do
+  not consistently re-enter TCP-bit processing.
+- `preserve-tcp-bitflags` together with at least one `up-tcp-bit-*` action and
+  `sni-blender`. The backup byte is appended before SNI Blender creates IPv4
+  fragments, but the peer restoration path skips fragments and cannot remove
+  that byte.
+
+These combinations remain accepted:
+
+- `preserve-tcp-bitflags` with no TCP-bit actions, which is a no-op encoder
+- downstream-only `dw-tcp-bit-*` actions with a stateful SNI trick or with
+  `sni-blender`, because they do not touch the upstream flow-opening SYN or
+  ClientHello
+- simple upstream TCP-bit actions with `sni-blender` when
+  `preserve-tcp-bitflags` is disabled
+
+`preserve-tcp-bitflags` remains unsupported with any future upstream stage that
+fragments or reshapes a metadata-bearing TCP packet.
+
 ## SNI Blender
 
 SNI Blender does not rewrite the SNI string. It changes the IP packet shape of
@@ -468,14 +494,66 @@ unchanged.
 
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
-| `ech-sni-trick` | non-empty string | required to enable | Must match the related `TlsClient.settings.ech-sni-trick` value for the same flow. |
+| `ech-sni-trick` | string, 1 through 255 bytes | required to enable | Must match the related `TlsClient.settings.ech-sni-trick` value for the same flow. |
 | `data-shard-1-delay` | integer ms, `>= 0` | `0` | Delay before releasing the first original held packet after sending the fake inner ClientHello segment. |
-| `data-shard-2-delay` | integer ms, `>= 0` | `0` | Delay before releasing the following original packet. |
+| `data-shard-2-delay` | integer ms, `>= 0` | `0` | Additional delay before releasing original packets 2 through N consecutively in their original sequence order. A one-packet capture ignores this setting. |
 
 The combined shard delay must fit in the supported unsigned 32-bit delay range.
 The out-of-order fake-inner packet is sent with `PSH` set. If the crafted
 out-of-order packet would exceed `GLOBAL_MTU_SIZE`, the flow is rejected instead
 of reshaped.
+
+Capture is sequence-aware and does not depend on packet ordinals. A payload-free
+TCP `SYN`, with or without ECN `ECE`/`CWR`, opens a flow. TCP Fast Open SYN data
+is unsupported and passes through. Capture starts only when upstream payload
+contains a validated complete or partial TLS ClientHello prefix; unrelated and
+non-TLS payloads are never placed in a speculative prestart queue. Contiguous
+bytes continue validation through the five-byte TLS record header and four-byte
+handshake header until the exact record length is complete. Payload-free
+packets, including ACK-only packets before or during capture, pass unchanged and
+do not advance or disable capture.
+
+Capture is bounded to 16 packets, a 16384-byte TLS record, and a 1500 ms timeout.
+A sequence gap, malformed or unsupported record, packet or size limit, timeout,
+or overlap that cannot be proven to be an exact retransmission fails open: held
+originals are released unchanged in TCP sequence order and that flow generation
+becomes passthrough. During incomplete capture, an exact retransmission matching
+an already-held segment's sequence, length, and bytes is consumed without
+disabling capture; partial and ambiguous overlaps fail open.
+
+After capture, `IpManipulator` requires a valid outer SNI, a valid
+`encrypted_client_hello` extension, and exactly one embedded inner TLS
+ClientHello whose SNI parses completely and matches `ech-sni-trick` byte for
+byte. Missing, malformed, truncated, mismatched, or ambiguous candidates fail
+open without emitting a fake inner packet. This mechanism remains GREASE
+camouflage rather than real encrypted ECH.
+
+On success, the original ClientHello bytes, packet boundaries, and TCP sequence
+numbers remain unchanged. `IpManipulator` first sends one out-of-order TCP
+packet containing only the matching embedded ClientHello bytes. It then:
+
+1. releases original packet 1 after `data-shard-1-delay`;
+2. waits the additional `data-shard-2-delay`; and
+3. releases original packets 2 through N consecutively in their original order.
+
+A one-packet capture uses only the first delay. A two-packet capture preserves
+the original two-shard timing, while a larger capture does not create multiple
+equal-deadline timer messages that could reorder packets.
+
+During delayed release, only an exact retransmission of an original segment that
+is still pending is swallowed. ACK-only traffic, non-overlapping later payload,
+and partial or ambiguous overlaps pass unchanged. TCP `FIN` and `RST` remain
+connection-lifecycle traffic and are never swallowed. A matching close in either
+direction cancels every original packet still awaiting release; an upstream
+close during incomplete capture first releases held originals, while a
+downstream close disposes of the incomplete capture without later injection.
+
+Each delayed original is bound to the nonzero generation of the ECH flow that
+captured it as well as its 4-tuple. Reusing the same 4-tuple starts a new
+generation and first invalidates the old generation's incomplete capture and
+pending originals, so stale capture or release timers cannot inject old
+ClientHello data. While originals are pending, the flow remains protected from
+ordinary idle expiry; normal idle expiry resumes after the final release.
 
 ## synfin-sni
 
@@ -520,6 +598,34 @@ must not point back to `IpManipulator`.
 
 Packets without TCP payload, packets that are already `SYN`, `FIN`, or `RST`,
 non-TCP packets, and fragmented IPv4 packets are left alone.
+
+## Stateful Flow Tables
+
+| Setting | Type | Default | Description |
+| --- | --- | --- | --- |
+| `stateful-flow-limit` | integer, `32` through `1048576` | `65536` | Hard upper bound on the active flows that each enabled stateful trick may track. |
+
+`first-sni`, `smuggle-sni`, `overlap-sni`, `synfin-sni`, `ech-sni-trick`, and
+`smuggle-fin` each receive their own bounded table with this limit. The tables
+never grow beyond it. When a shard is full, `IpManipulator` reclaims a small,
+fixed budget of entries whose idle deadlines have passed. If that does not free
+a slot, admission fails open, the packet continues unchanged, and a
+rate-limited warning is logged. A live flow is never evicted to admit another
+flow, which protects ECH and Smuggle-FIN records that own held packet buffers.
+
+Every table uses one normalized four-tuple as its canonical key, so forward and
+reverse packets resolve to the same record, hash, shard, and lock, including
+across workers. A valid replacement SYN explicitly cancels the previous
+generation's timers, captures, and queues as applicable before reinitializing
+that sole record in the new orientation. Duplicate canonical entries are not
+admitted.
+
+The shard count follows the worker count, capped at 64, and the configured limit
+is partitioned so shard limits sum to the requested total. Lookup uses hash
+buckets and idle expiry uses a per-shard deadline heap, avoiding whole-table
+scans in packet callbacks. Flow-entry pointers remain valid only while their
+shard mutex is held; timers and cross-worker messages therefore identify flows
+by normalized tuple and generation.
 
 ## Mutual Exclusion
 
@@ -591,6 +697,9 @@ once.
 | `required_padding_left` | `0 bytes` |
 | SNI Blender fragment count | `1` through `16` |
 | protocol replacement number | `0` through `255` |
+| `stateful-flow-limit` | `32` through `1048576` |
+| ECH hostname length | `1` through `255 bytes` |
+| ECH capture | up to `16 packets` and a `16384-byte` TLS record |
 
 `IpManipulator` does not require chain left padding. Some tricks allocate or
 clone packet buffers internally when crafting replacement packets.
