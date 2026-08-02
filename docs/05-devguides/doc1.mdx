@@ -316,6 +316,75 @@ Worker thread identity in WaterWall is explicit and invalid by default:
 - **lwIP pseudo-worker** is registered (`workerWIDIsRegistered()` returns true), but is not an event worker (`workerWIDIsEventWorker()` returns false) as it owns no WaterWall event loop.
 - Native/library threads use `getTID()` for logging/diagnostics and remain WID-invalid unless explicitly bound via `workerBindCurrentThread()`.
 
+### Choosing a Worker-Context Helper
+
+Never write `getWID()` into an affinity check, an array index, or a resource
+lookup. Pick the narrowest helper for the context you are already in — the
+helper encodes the domain, so an unregistered thread or the lwIP pseudo-worker
+cannot slip through an equality comparison that happens to match.
+
+| Context | Use |
+| --- | --- |
+| Callback has a `line_t *` | `lineIsOnCurrentEventWorker(line)`, `lineGetWID(line)`, `lineGetBufferPool(line)`, `lineReuseBuffer(line, buf)` |
+| Worker-message callback has `worker_t *worker` | `worker->wid`, `worker->buffer_pool`, `worker->loop` — do not re-read TLS |
+| Event/timer/io callback has a loop or event | `getLoopEventWorkerWID(weventGetLoop(ev))` once, then reuse the local |
+| Genuine event-loop callback with no line or worker | `getCurrentEventWorker()`, `getCurrentEventWorkerWID()`, `getCurrentEventWorkerBufferPool()`, `getCurrentEventWorkerLoop()` |
+| Lifecycle callback given an explicit `wid` | `currentThreadIsEventWorkerWID(wid)` |
+| Code that needs worker 0 by design | explicit WID `0` plus `currentThreadIsEventWorkerWID(0)`; never infer it from default TLS |
+| Externally reachable or otherwise fallible API | `tryGetCurrentEventWorker()` / `currentThreadIsEventWorker()`, then return an error, `NULL`, or queue |
+| Code that may run on lwIP | `workerWIDIsRegistered()` or an explicit target WID; never an event-worker array |
+| Auxiliary device thread | device-owned pools/channels only; post to an explicit event worker |
+| Logging only | raw `getWID()` is fine, preferably through `workerWIDLabel()` (prints `unregistered`) alongside `getTID()` |
+
+The pointer-returning `getCurrentEventWorker*()` accessors are for internal
+callbacks whose contract already guarantees an event worker. They abort rather
+than fall back to worker 0, so anything reachable from a device thread, a
+library callback, or a public API must use the predicate form and fail cleanly.
+
+```c
+// Line callback: affinity and pool ownership both come from the line.
+if (! lineIsOnCurrentEventWorker(l))
+{
+    sendWorkerMessageForceQueueWithCleanup(lineGetWID(l), doWork, cleanup, t, l, buf);
+    return;
+}
+lineReuseBuffer(l, buf);
+
+// Worker-message callback: the message was delivered to exactly one worker.
+static void onWorkerMessage(worker_t *worker, void *arg1, void *arg2, void *arg3)
+{
+    line_t *packet_line = tunnelchainGetWorkerPacketLine(tunnelGetChain(t), worker->wid);
+    ...
+}
+
+// Timer callback: derive the owner from the loop, validate once, reuse it.
+const wid_t wid = getLoopEventWorkerWID(weventGetLoop(timer));
+ts->worker_timers[wid] = NULL;
+
+// lwIP callback: only the target packet worker may act inline.
+if (currentThreadIsEventWorkerWID(route_ctx->packet_wid)) { emitInline(); }
+else                                                     { queueToPacketWorker(); }
+
+// Device thread: device-owned resources only, delivery by explicit WID.
+sbuf_t *buf = bufferpoolGetLargeBuffer(dev->reader_buffer_pool);
+sendWorkerMessageForceQueueWithCleanup(target_wid, deliver, cleanup, dev, buf, NULL);
+```
+
+Cross-thread buffer cleanup is not the same as recycling. `reuseBuffer(buf)`
+means "reuse on the current event worker" and rejects a caller that owns no
+worker-local pool. When you are *not* on the buffer's owner, `sbufDestroy(buf)`
+is the correct release — do not convert those paths to `reuseBuffer()`.
+
+Ordinary tunnel APIs (`<node>TunnelApi()`) run on an event worker and take
+ownership of their message. Consume it through `tunnelapiRecycleMessage()` or
+`tunnelapiUnsupportedMessage()` in `ww/objects/node.h`; both destroy the buffer
+and report `kApiResultError` when the caller is not an event worker, instead of
+borrowing worker 0's pool.
+
+`tests/worker_identity_source_policy_test.py` enforces these rules: it rejects
+new `getWorkerXxx(getWID())` nesting, raw `getWID() == 0` ownership decisions,
+raw current-WID affinity comparisons, and tunnel-API recycle boilerplate.
+
 ## Glossary
 
 | Term | Meaning |
