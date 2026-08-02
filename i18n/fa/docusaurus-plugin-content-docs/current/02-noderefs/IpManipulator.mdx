@@ -5,7 +5,7 @@ sidebar_label: "IpManipulator"
 description: "راهنمای نود IpManipulator در WaterWall."
 ---
 
-<!-- Written from version 113 of the English doc. -->
+<!-- Written from version 117 of the English doc. -->
 
 # IpManipulator
 
@@ -105,18 +105,12 @@ SNI Blender:
   "type": "IpManipulator",
   "settings": {
     "protoswap-tcp": 253,
-    "protoswap-tcp-2": 254,
-    "first-sni": "cover.example.net",
-    "first-sni-count": 2,
-    "first-sni-replay-delay": 20,
-    "first-sni-final-delay": 50,
-    "first-sni-ttl": 1,
+    "protoswap-udp": 252,
+    "sni-blender": true,
+    "sni-blender-packets": 4,
     "packet-duplicate": 1,
-    "preserve-tcp-bitflags": true,
-    "up-tcp-bit-ack": "packet->fin",
-    "up-tcp-bit-fin": "packet->ack",
-    "dw-tcp-bit-ack": "packet->fin",
-    "dw-tcp-bit-fin": "packet->ack"
+    "source-port-ghost": true,
+    "dest-port-ghost": true
   },
   "next": "next-packet-node"
 }
@@ -141,7 +135,7 @@ IpManipulator: no tricks are enabled, nothing to do
 
 | خانواده | تنظیمات اصلی | جهت | کاربرد |
 | --- | --- | --- | --- |
-| Protocol swap | `protoswap-tcp`, `protoswap-tcp-2`, `protoswap-udp` | دو طرف | تغییر شماره پروتکل IPv4 و بازیابی آن در سمت مقابل. |
+| Protocol swap | `protoswap-tcp`, `protoswap-udp` | دو طرف | تغییر شماره پروتکل IPv4 و بازیابی آن در سمت مقابل. |
 | SNI Blender | `sni-blender`, `sni-blender-packets` | upstream | قطعه‌قطعه کردن IPv4/TCP TLS ClientHello و فرستادن قطعه‌ها با ترتیب درهم. |
 | Packet duplicate | `packet-duplicate` | مسیر نهایی ارسال | ارسال چند کپی اضافه از packet نهایی و سپس نسخه اصلی. |
 | first-sni | `first-sni` | upstream | فرستادن یک ClientHello جعلی پیش از نسخه اصلی. |
@@ -162,7 +156,6 @@ IpManipulator: no tricks are enabled, nothing to do
 | --- | --- | --- |
 | `protoswap` | integer | نام مستعار قدیمی `protoswap-tcp`. |
 | `protoswap-tcp` | integer | protocol number جایگزین برای packetهای TCP. |
-| `protoswap-tcp-2` | integer | عدد دوم اختیاری؛ packetهای TCP در هر جهت به‌تناوب یکی از دو عدد را می‌گیرند. |
 | `protoswap-udp` | integer | protocol number جایگزین برای packetهای UDP. |
 
 بازه معتبر شماره پروتکل جایگزین از `0` تا `255` است.
@@ -174,6 +167,11 @@ IpManipulator: no tricks are enabled, nothing to do
 باشد؛ حتی اگر فقط یکی از این دو خانواده تنظیم شده باشد. در غیر این صورت،
 ترافیک واقعی با آن شماره از ترافیک mapشده قابل تشخیص نیست. اگر swap برای هر دو
 خانواده TCP و UDP فعال باشد، مقدارهای جایگزین آن‌ها نیز باید متفاوت باشند.
+
+گزینه `protoswap-tcp-2` حذف شده است و configuration قدیمی شامل آن رد می‌شود.
+برای مهاجرت، تنها از mapping برگشت‌پذیر `protoswap-tcp` استفاده کنید. این تغییر
+همچنین تضمین می‌کند همه fragmentهای یک datagram از IPv4 شماره پروتکل یکسانی
+دریافت کنند.
 
 trickهای upstream زمانی اجرا می‌شوند که packet هنوز شماره پروتکل واقعی خود را
 دارد. درست پیش از خروج عادی، `IpManipulator` ابتدا port ghost را اعمال می‌کند،
@@ -299,39 +297,73 @@ upstream یا downstream نمی‌دهد:
 
 :::warning هشدار MTU و اندازه packet
 
-هر عملیات بازنویسی همراه با `preserve-tcp-bitflags` دقیقاً یک بایت به packet
-اضافه می‌کند. `IpManipulator` اندازه packet بزرگ‌شده را با `misc.mtu`،
-`GLOBAL_MTU_SIZE`، `kMaxAllowedPacketLength` یا path MTU مقایسه نمی‌کند و packet
-را fragment نمی‌کند یا TCP MSS را کاهش نمی‌دهد. این نود فقط بررسی می‌کند که
-buffer فعلی برای یک بایت دیگر فضا داشته باشد. اگر buffer فضا نداشته باشد، packet
-با ثبت warning کنار گذاشته می‌شود. اگر فضا موجود باشد، packet بزرگ‌شده فرستاده
-می‌شود؛ برای نمونه، ورودی 1500 بایتی به 1501 بایت تبدیل می‌شود و ممکن است سپس
-توسط `RawSocket`، ‏`TunDevice`، یک packet node دیگر یا شبکه فیزیکی کنار گذاشته
-شود.
+هر عملیات بازنویسی همراه با `preserve-tcp-bitflags` یک بایت به packet اضافه
+می‌کند. پیش از خروج نهایی، اگر این بایت، بایت‌های port ghost یا هر دو باعث شوند
+یک packet کامل IPv4/TCP از `GLOBAL_MTU_SIZE` بزرگ‌تر شود، `IpManipulator`
+packetهای داده واجد شرایط را در سطح transport به segmentهای کوچک‌تر تقسیم
+می‌کند. flagهای زنده و ذخیره‌شده هر segment مستقل تعیین می‌شوند، هر segment یک
+مجموعه کامل trailer می‌گیرد و sequence space با درنظرگرفتن مصرف یک شماره sequence
+توسط SYN پیوسته می‌ماند. بنابراین یک ورودی TCP با اندازه 1500 بایت می‌تواند پشت
+MTU برابر 1500 در WaterWall باقی بماند و صرفاً برای این trailerها به headroom
+اضافی از طرف operator نیاز ندارد. اگر packet نهایی از نظر اندازه معتبر باشد اما
+buffer دقیقاً پر باشد، buffer بزرگ‌تر می‌شود.
 
-برای هر جهتی که action بازنویسی TCP-bit دارد، از بودجه زیر استفاده کنید:
-
-```text
-maximum input packet size
-  <= min(output adapter limit, real path MTU, every later packet limit) - 1
-```
-
-برای نمونه، اگر actionها فقط در upstream باشند و مسیر مستقیم
-`TunDevice -> IpManipulator -> RawSocket` به 1500 بایت محدود باشد، MTU ورودی TUN
-را حداکثر روی `1499` تنظیم کنید. تنظیم `misc.mtu` روی `1499` فقط زمانی این نتیجه
-را دارد که `TunDevice.settings.device-mtu` حذف شده باشد؛ اگر `device-mtu` صریحاً
-تنظیم شده است، آن را نیز روی `1499` یا کمتر قرار دهید.
-
-اگر actionهای TCP-bit در downstream یا هر دو جهت تنظیم شده‌اند، بودجه ورودی هر
-یک از این جهت‌های بازنویسی را جداگانه محاسبه کنید. کاهش MTU مربوط به TUN محلی،
-اندازه packetهایی را که از `RawSocket` می‌رسند محدود نمی‌کند. overhead هر نود
-دیگری که اندازه packet را افزایش می‌دهد و هر بازنویسی دیگر `IpManipulator` را
-نیز از بودجه کم کنید.
+`IpManipulator` برای این منظور IPv4 fragmentation یا reassembly انجام نمی‌دهد.
+UDP بزرگ‌تر از MTU، ‏RST، ‏URG پشتیبانی‌نشده و packetهای دیگری که segmentation
+امن آن‌ها ممکن نیست، با logging دارای rate limit کنار گذاشته می‌شوند. در
+deploymentهای UDP همچنان باید operator برای بایت‌های port ghost در MTU headroom
+در نظر بگیرد.
 
 :::
 
 در نتیجه، فعال‌کردن این گزینه به‌تنهایی بایتی اضافه یا حذف نمی‌کند؛ حداقل در یکی
 از جهت‌ها باید یک action بازنویسی TCP-bit تنظیم شده باشد.
+
+### قواعد ترکیب Stateful SNI
+
+در یک `IpManipulator` فقط یکی از `first-sni`، ‏`smuggle-sni`، ‏`overlap-sni`،
+`synfin-sni` و `ech-sni-trick` می‌تواند فعال باشد. هر یک از این trickهای stateful
+همراه با `sni-blender` یا `packet-duplicate` در همان instance نیز رد می‌شود، چون
+state machine مربوط transcript خود را مستقیماً ارسال می‌کند.
+
+اگر هر دو عملیات لازم هستند، از دو نود استفاده کنید:
+
+```text
+... -> IpManipulator(stateful SNI only)
+    -> IpManipulator(sni-blender and/or packet-duplicate)
+    -> ...
+```
+
+در traversal مربوط به upstream، نود stateful باید ابتدا قرار گیرد. duplication
+پیش از نود stateful، ورودی‌های آن را duplicate می‌کند و معادل duplicate کردن
+خروجی نهایی آن نیست. ترکیب `sni-blender` و `packet-duplicate` وقتی هیچ trick
+stateful مربوط به SNI فعال نباشد همچنان پشتیبانی می‌شود.
+
+### ترکیب‌های ردشده TCP-bit
+
+در ترکیب‌های زیر ساخت configuration شکست می‌خورد:
+
+- هر action از نوع `up-tcp-bit-*` همراه با `first-sni`، ‏`smuggle-sni`،
+  `overlap-sni`، ‏`synfin-sni` یا `ech-sni-trick`، چه
+  `preserve-tcp-bitflags` فعال باشد چه نباشد. actionهای upstream مربوط به TCP-bit
+  پیش از بررسی stateful SNI اجرا می‌شوند، اما packetهای ساخته‌شده یا replayشده
+  توسط این state machineها به‌طور یکسان دوباره وارد پردازش TCP-bit نمی‌شوند.
+- `preserve-tcp-bitflags` همراه با حداقل یک action از نوع `up-tcp-bit-*` و
+  `sni-blender`. بایت پشتیبان پیش از ساخت fragmentهای IPv4 توسط SNI Blender
+  اضافه می‌شود، اما مسیر بازیابی peer از fragmentها عبور می‌کند و نمی‌تواند آن
+  بایت را حذف کند.
+
+ترکیب‌های زیر همچنان پذیرفته می‌شوند:
+
+- `preserve-tcp-bitflags` بدون هیچ action مربوط به TCP-bit که encoder بدون اثر است؛
+- actionهای فقط downstream از نوع `dw-tcp-bit-*` همراه با یک trick stateful مربوط
+  به SNI یا `sni-blender`، چون SYN آغازکننده flow یا ClientHello در upstream را
+  تغییر نمی‌دهند؛
+- actionهای ساده TCP-bit در upstream همراه با `sni-blender` وقتی
+  `preserve-tcp-bitflags` غیرفعال است.
+
+`preserve-tcp-bitflags` با هر stage آینده در upstream که یک packet TCP دارای
+metadata را fragment یا reshape کند پشتیبانی نمی‌شود.
 
 ## SNI Blender
 
@@ -341,7 +373,7 @@ ClientHello را تغییر می‌دهد.
 | گزینه | نوع | اجباری | توضیح |
 | --- | --- | --- | --- |
 | `sni-blender` | boolean | بله | قطعه‌قطعه کردن TLS ClientHello و فرستادن قطعه‌ها با ترتیب درهم را فعال می‌کند. |
-| `sni-blender-packets` | integer | وقتی فعال است بله | تعداد fragmentها. مقدار معتبر `1` تا `16`. |
+| `sni-blender-packets` | integer | وقتی فعال است بله | تعداد fragmentها. مقدار معتبر `2` تا `16`. |
 
 رفتار:
 
@@ -387,10 +419,18 @@ Port ghost در مرحله نهایی ارسال upstream اعمال و در ا�
 در packetهای downstream که tail مربوط را دارند، portهای اصلی بازیابی می‌شوند
 و packet به طول اولیه برمی‌گردد. Packetهای fragmentشده نادیده گرفته می‌شوند.
 
-packetهای TCP ساخته‌شده که از MTU بزرگ‌تر هستند، پیش از اعمال port ghost به
-segmentهای کوچک‌تر تقسیم می‌شوند. هر segment خروجی دقیقاً یک trailer می‌گیرد و
-بودجه payload در segmentation فضای همان trailer را کنار می‌گذارد تا اندازه
-نهایی از `GLOBAL_MTU_SIZE` بیشتر نشود.
+packetهای داده کامل TCP، چه عادی و چه ساخته‌شده، از یک segmenter نهایی مشترک
+استفاده می‌کنند. هر segment خروجی دقیقاً یک trailer مربوط به port ghost و، در
+صورت تنظیم، یک بایت flag ذخیره‌شده با قابلیت بازیابی مستقل دریافت می‌کند.
+`SYN`/`CWR` فقط روی segment نخست، ‏`FIN`/`PSH` فقط روی segment پایانی و
+`ACK`/`ECE` قابل‌اعمال روی همه segmentها قرار می‌گیرد. هر segment کامل‌شده در
+`GLOBAL_MTU_SIZE` جا می‌شود و سپس duplication نهایی packet روی همان segment
+اعمال می‌شود.
+
+UDP بزرگ‌تر از MTU نمی‌تواند از TCP segmentation استفاده کند و با logging دارای
+rate limit کنار گذاشته می‌شود. `IpManipulator`، ‏IPv4 fragmentation/reassembly
+ایجاد نمی‌کند؛ بنابراین port ghost برای UDP همچنان به MTU headroom فراهم‌شده
+توسط operator نیاز دارد.
 
 branchهای کمکی اختصاصی real-SNI، ‏mirrored-FIN و server-hello مربوط به
 overlap-SNI، tuple اصلی خود را حفظ می‌کنند و trailer مربوط به port ghost
@@ -413,15 +453,33 @@ overlap-SNI، tuple اصلی خود را حفظ می‌کنند و trailer مر�
 شامل TLS 1.3 PSK binder باشد و تغییر SNI نیاز به recompute binder داشته باشد،
 trick برای احتیاط اجرا نمی‌شود.
 
+capture چندsegmentی فقط وقتی آغاز می‌شود که یک packet شامل segment نخست قابل‌تشخیص
+ClientHello باشد. payloadهای TCP نامرتبط و غیر TLS بدون ورود به صف prestart
+حدسی بلافاصله fail-open می‌شوند. ClientHelloهای شناخته‌شده و in-order همچنان
+می‌توانند در چند segment از TCP قرار داشته باشند.
+
+fragmentهای IPv4، شامل fragment نخست با `MF=1` و fragmentهای بعدی با offset
+غیرصفر، هرگز وارد capture مربوط به First-SNI نمی‌شوند و در مسیر عادی fail-open
+ادامه می‌دهند. وقتی replay یا خروجی نهایی تأخیر دارد، tail مربوط به transcript
+پیش از packetهای بعدی در یک FIFO محدود قرار می‌گیرد و همه در یک deadline مطلق
+آزاد می‌شوند.
+
 ## smuggle-sni
 
-`smuggle-sni`، ClientHello واقعی را به branch کمکی می‌فرستد و یک ClientHello
-ساخته‌شده را با تأخیر روی مسیر عادی `next` ارسال می‌کند.
+`smuggle-sni` یک TLS ClientHello record را در یک four-tuple و در یک یا چند TCP
+segment، تا سقف 16 segment و 16 کیلوبایت، capture و reassemble می‌کند. ClientHello
+واقعی را فوراً و با ترتیب درست از branch کمکی upstream می‌فرستد و پس از
+`smuggle-sni-delay-ms` یک batch چندsegmentی از ClientHello جعلی ساخته‌شده را روی
+مسیر عادی `next` ارسال می‌کند. batch جعلی مرزهای اصلی TCP segment، طول اصلی
+payload هر segment، شماره‌های اصلی TCP sequence و هر payload پس از انتهای
+ClientHello record را دقیقاً حفظ می‌کند. در صورت تفاوت طول، timeout یا ناپیوستگی
+fragmentها، یا شکست generation، ‏`smuggle-sni` فوراً به مسیر عادی fail-open
+می‌شود.
 
 | گزینه | نوع | پیش‌فرض | توضیح |
 | --- | --- | --- | --- |
 | `smuggle-sni` | string غیرخالی | اجباری برای فعال‌سازی | SNI داخل نسخه ساخته‌شده. |
-| `smuggle-sni-delay-ms` | ms، `>= 0` | `0` | تأخیر ارسال نسخه جعلی روی مسیر معمولی. |
+| `smuggle-sni-delay-ms` | ms، `>= 0` | `0` | تأخیر ارسال batch جعلی روی مسیر معمولی. |
 | `real-sni-upstream-node` | string | اجباری | branchی که ClientHello واقعی را بی‌درنگ می‌گیرد. |
 
 این trick به `next` معمول در سطح اصلی نیاز دارد. نود کمکی باید وجود داشته باشد
@@ -430,6 +488,10 @@ trick برای احتیاط اجرا نمی‌شود.
 
 `IpManipulator` برای ساخت ClientHello دست‌کاری‌شده یک `TlsClient` داخلی no-chain
 می‌سازد.
+
+packetهای بعدی در پنجره تأخیر وارد همان FIFO محدود می‌شوند و deadline مطلق flow
+را به کار می‌برند. transcript جعلی پیش از این FIFO schedule می‌شود؛ `FIN` و
+`RST` پشت داده‌هایی که از قبل در صف هستند باقی می‌مانند.
 
 ## overlap-sni
 
@@ -447,6 +509,10 @@ trick برای احتیاط اجرا نمی‌شود.
 این trick به `next` معمول در سطح اصلی نیاز دارد. Branch کمکی باید وجود داشته
 باشد و نباید به خود `IpManipulator` اشاره کند.
 
+packetهای بعدی upstream از deadline مطلق overlap window و یک FIFO محدود استفاده
+می‌کنند و برای هر packet یک نسخه تازه از `overlap-sni-delay-ms` دریافت نمی‌کنند.
+tail ساخته‌شده overlap پیش از آنکه FIFO بتواند آزاد شود schedule می‌شود.
+
 ## ech-sni-trick
 
 `ech-sni-trick` برای هماهنگی با `TlsClient.settings.ech-sni-trick` طراحی شده
@@ -457,13 +523,66 @@ trick برای احتیاط اجرا نمی‌شود.
 
 | گزینه | نوع | پیش‌فرض | توضیح |
 | --- | --- | --- | --- |
-| `ech-sni-trick` | string غیرخالی | اجباری برای فعال‌سازی | باید با مقدار مرتبط در `TlsClient.settings.ech-sni-trick` هماهنگ باشد. |
+| `ech-sni-trick` | string با طول 1 تا 255 بایت | اجباری برای فعال‌سازی | باید با مقدار مرتبط در `TlsClient.settings.ech-sni-trick` هماهنگ باشد. |
 | `data-shard-1-delay` | ms، `>= 0` | `0` | تاخیر آزاد کردن اولین original packet بعد از ارسال fake inner ClientHello segment. |
-| `data-shard-2-delay` | ms، `>= 0` | `0` | تاخیر آزاد کردن packet اصلی بعدی. |
+| `data-shard-2-delay` | ms، `>= 0` | `0` | تأخیر اضافه پیش از آزاد کردن original packetهای 2 تا N به‌صورت متوالی و با ترتیب اصلی sequence. در capture تک‌packetی نادیده گرفته می‌شود. |
 
 مجموع تأخیرها باید در بازه unsigned 32-bit پشتیبانی‌شده جا شود. Packet خارج از ترتیب
 با flagِ `PSH` فرستاده می‌شود. اگر packet ساخته‌شده از `GLOBAL_MTU_SIZE` بزرگ‌تر باشد،
 flow به‌جای تغییر شکل رد می‌شود.
+
+capture براساس sequence است و به شماره ترتیبی packetها وابسته نیست. یک TCP `SYN`
+بدون payload، چه با flagهای ECN یعنی `ECE`/`CWR` و چه بدون آن‌ها، flow را باز
+می‌کند. SYN دارای داده TCP Fast Open پشتیبانی نمی‌شود و بدون تغییر عبور می‌کند.
+capture فقط وقتی آغاز می‌شود که payload مربوط به upstream شامل prefix معتبر،
+کامل یا ناقص، از TLS ClientHello باشد؛ payloadهای نامرتبط و غیر TLS هرگز در صف
+prestart حدسی قرار نمی‌گیرند. byteهای پیوسته از header پنج‌بایتی TLS record و
+header چهاربایتی handshake اعتبارسنجی می‌شوند تا طول دقیق record کامل شود.
+packetهای بدون payload، از جمله ACK-only پیش از capture یا هنگام آن، بدون تغییر
+عبور می‌کنند و capture را جلو نمی‌برند یا غیرفعال نمی‌کنند.
+
+capture به 16 packet، یک TLS record با اندازه 16384 بایت و timeout برابر 1500 ms
+محدود است. gap در sequence، record malformed یا پشتیبانی‌نشده، عبور از محدودیت
+packet یا اندازه، timeout، یا overlapی که نتوان دقیقاً retransmission بودن آن را
+اثبات کرد باعث fail-open می‌شود: originalهای نگه‌داشته‌شده بدون تغییر و با ترتیب
+TCP sequence آزاد می‌شوند و generation همان flow وارد حالت passthrough می‌شود.
+هنگام capture ناقص، retransmission دقیقی که sequence، طول و byteهایش با یک
+segment نگه‌داشته‌شده برابر باشد consume می‌شود و capture را غیرفعال نمی‌کند؛
+overlap جزئی یا مبهم fail-open می‌شود.
+
+پس از capture، ‏`IpManipulator` به یک outer SNI معتبر، یک extension معتبر
+`encrypted_client_hello` و دقیقاً یک TLS ClientHello داخلی جاسازی‌شده نیاز دارد
+که SNI آن کامل parse شود و byteبه‌byte با `ech-sni-trick` برابر باشد. candidate
+گمشده، malformed، ناقص، ناسازگار یا مبهم بدون ارسال packet جعلی داخلی fail-open
+می‌شود. این مکانیزم camouflage از نوع GREASE است، نه ECH رمزنگاری‌شده واقعی.
+
+در حالت موفق، byteهای ClientHello اصلی، مرزهای packet و شماره‌های TCP sequence
+بدون تغییر می‌مانند. `IpManipulator` ابتدا یک packet خارج از ترتیب TCP را که فقط
+شامل byteهای ClientHello داخلی منطبق است ارسال می‌کند. سپس:
+
+1. original packet شماره 1 را پس از `data-shard-1-delay` آزاد می‌کند؛
+2. به‌اندازه `data-shard-2-delay` اضافه منتظر می‌ماند؛ و
+3. original packetهای 2 تا N را به‌صورت متوالی و با ترتیب اصلی آزاد می‌کند.
+
+capture تک‌packetی فقط از تأخیر نخست استفاده می‌کند. capture دوpacketی timing
+دو shard اصلی را حفظ می‌کند، اما capture بزرگ‌تر چند timer message با deadline
+برابر ایجاد نمی‌کند که بتوانند packetها را reorder کنند.
+
+هنگام آزادسازی با تأخیر، فقط retransmission دقیق یک original segment که هنوز
+pending است swallow می‌شود. ترافیک ACK-only، ‏payload بعدی بدون overlap و
+overlapهای جزئی یا مبهم بدون تغییر عبور می‌کنند. TCP `FIN` و `RST` همچنان ترافیک
+lifecycle اتصال هستند و هرگز swallow نمی‌شوند. close منطبق در هر جهت همه original
+packetهایی را که هنوز منتظر آزادسازی هستند cancel می‌کند؛ close در upstream
+هنگام capture ناقص ابتدا originalهای نگه‌داشته‌شده را آزاد می‌کند، اما close در
+downstream همان capture ناقص را بدون injection بعدی دور می‌اندازد.
+
+هر original با تأخیر هم به generation غیرصفر flow مربوط به ECH که آن را capture
+کرده و هم به four-tuple آن متصل است. استفاده دوباره از همان four-tuple یک
+generation جدید آغاز می‌کند و ابتدا capture ناقص و originalهای pending مربوط به
+generation قدیمی را invalid می‌کند؛ بنابراین timer قدیمی capture یا release
+نمی‌تواند داده ClientHello قدیمی را inject کند. تا زمانی که originalها pending
+هستند، flow از idle expiry عادی محافظت می‌شود و پس از آخرین release، idle expiry
+عادی از سر گرفته می‌شود.
 
 ## synfin-sni
 
@@ -488,10 +607,16 @@ flow به‌جای تغییر شکل رد می‌شود.
 TTL برابر `0` واقعاً مقدار آن را صفر می‌کند. اگر می‌خواهید TTL اصلی حفظ شود، کلید
 TTL را اصلاً قرار ندهید.
 
+sequence ساخته‌شده به‌صورت synchronous و با ترتیب مستندشده ارسال می‌شود و هیچ
+sleep مصنوعی 20 ms برای هر packet یا تأخیر pacing قابل تنظیم ندارد.
+
 ## smuggle-fin
 
-`smuggle-fin` یک `FIN|ACK` آینه‌شده روی branch کمکی تزریق می‌کند و ترافیک همان
-worker را تا دریافت echo در downstream و پایان تأخیر اختیاری در صف نگه می‌دارد.
+`smuggle-fin` یک `FIN|ACK` آینه‌شده روی branch کمکی تزریق می‌کند و ترافیک را روی
+worker مالک flow تا دریافت echo مورد انتظار در downstream و پایان تأخیر اختیاری
+در صف نگه می‌دارد. packetهای reverse منطبق که روی worker دیگری می‌رسند پیش از
+ورود به همان صف مرتب به worker مالک کپی می‌شوند. هر packet صف‌شده intent مستقل
+خود را برای محاسبه دوباره checksum حفظ می‌کند.
 
 | گزینه | نوع | پیش‌فرض | توضیح |
 | --- | --- | --- | --- |
@@ -505,21 +630,49 @@ worker را تا دریافت echo در downstream و پایان تأخیر اخ
 packetهای بدون TCP payload، packetهایی که از قبل `SYN`، `FIN` یا `RST` هستند،
 packetهای غیر TCP و packetهای fragmentشده IPv4 بدون تغییر عبور می‌کنند.
 
+## جدول‌های Stateful Flow
+
+| گزینه | نوع | پیش‌فرض | توضیح |
+| --- | --- | --- | --- |
+| `stateful-flow-limit` | integer از `32` تا `1048576` | `65536` | سقف سخت flowهای فعالی که هر trick فعال stateful می‌تواند دنبال کند. |
+
+هر یک از `first-sni`، ‏`smuggle-sni`، ‏`overlap-sni`، ‏`synfin-sni`،
+`ech-sni-trick` و `smuggle-fin` جدول محدود مستقل خود را با این limit دریافت
+می‌کند. جدول‌ها هرگز بیش از آن رشد نمی‌کنند. وقتی یک shard پر باشد،
+`IpManipulator` با بودجه ثابت و کوچک entryهایی را که idle deadline آن‌ها گذشته
+است reclaim می‌کند. اگر slot آزاد نشود، admission به‌صورت fail-open شکست
+می‌خورد، packet بدون تغییر ادامه می‌یابد و warning با rate limit ثبت می‌شود.
+برای پذیرفتن flow دیگر هیچ flow زنده‌ای evict نمی‌شود؛ در نتیجه recordهای ECH و
+Smuggle-FIN که مالک bufferهای packet نگه‌داشته‌شده هستند محافظت می‌شوند.
+
+هر جدول یک four-tuple نرمال‌شده را به‌عنوان key canonical استفاده می‌کند؛ بنابراین
+packetهای forward و reverse، حتی میان workerها، به همان record، ‏hash، ‏shard و
+lock می‌رسند. یک SYN جایگزین معتبر، پیش از initialize دوباره همان record در جهت
+جدید، timerها، captureها و queueهای generation قبلی را صریحاً cancel می‌کند.
+entry canonical تکراری پذیرفته نمی‌شود.
+
+تعداد shardها از تعداد workerها پیروی می‌کند و حداکثر 64 است. limit تنظیم‌شده
+طوری تقسیم می‌شود که مجموع limitهای shardها برابر مقدار درخواستی بماند. lookup
+از hash bucket و idle expiry از deadline heap مخصوص هر shard استفاده می‌کند تا
+در callbackهای packet نیازی به scan کل جدول نباشد. pointer مربوط به flow entry
+فقط تا زمانی معتبر است که mutex همان shard نگه داشته شده باشد؛ بنابراین timerها
+و messageهای میان workerها flow را با tuple نرمال‌شده و generation شناسایی
+می‌کنند.
+
+delay barrierهای First-SNI، ‏Smuggle-SNI و Overlap-SNI در هر flow حداکثر 16
+packet و 256 KiB نگه می‌دارند. یک generation در سطح tunnel، action مربوط به
+release را به instance دقیق tuple متصل می‌کند تا timer قدیمی نتواند tuple
+استفاده‌شده مجدد را آزاد کند. batchها زیر shard lock جدا می‌شوند و بیرون آن
+forward می‌شوند. تمام‌شدن ظرفیت count یا byte با ترتیب FIFO fail-open می‌شود و
+reset، ‏timeout یا destruction جدول همه packetهای نگه‌داشته‌شده را recycle
+می‌کند.
+
 ## ناسازگاری‌ها
 
-Parser فعلی این ترکیب‌ها را نمی‌پذیرد:
-
-| هم‌زمان فعال نشوند |
-| --- |
-| `smuggle-sni` و `overlap-sni` |
-| `smuggle-sni` و `synfin-sni` |
-| `overlap-sni` و `synfin-sni` |
-| `ech-sni-trick` و `smuggle-sni` |
-| `ech-sni-trick` و `overlap-sni` |
-| `ech-sni-trick` و `synfin-sni` |
-
-`first-sni` جداگانه خوانده و تجزیه می‌شود، اما اگر در runtime یکی از trickهای بعدی packet را
-به‌طور کامل پردازش کند، pipeline همان‌جا متوقف می‌شود.
+parser هر جفت از مجموعه پنج‌عضوی stateful SNI یعنی `first-sni`، ‏`smuggle-sni`،
+`overlap-sni`، ‏`synfin-sni` و `ech-sni-trick` را رد می‌کند. همچنین هر یک از آن‌ها
+با `sni-blender` یا `packet-duplicate` در همان instance رد می‌شود. برای chain
+دو‌نودی پشتیبانی‌شده، بخش «قواعد ترکیب Stateful SNI» در بالا را ببینید.
 
 ## ترتیب اجرای Runtime
 
@@ -548,10 +701,18 @@ Parser فعلی این ترکیب‌ها را نمی‌پذیرد:
 8. logging hook مربوط به `smuggle-sni`
 9. ارسال نهایی downstream
 
+برای replay داخلی `smuggle-fin`، packetهای upstream از ابتدای pipeline مربوط به
+upstream دوباره شروع می‌شوند، چون `smuggle-fin` نخستین stage است. packetهای
+downstream بلافاصله پس از `smuggle-fin` ادامه می‌دهند؛ بازیابی protocol و port
+ghost پیش از قرارگرفتن آن‌ها در صف انجام شده است و تکرار نمی‌شود. این رفتار ترتیب
+عادی downstream بالا را تغییر نمی‌دهد.
+
 ## Lifecycle و Packet Line
 
 `IpManipulator` یک packet tunnel خالص است:
 
+- metadata نود، `kNodeLayer3` را advertise می‌کند، در حالی که constraint هر دو
+  همسایه `kNodeLayerAnything` باقی می‌ماند.
 - برای هر packet چرخه عمر اتصال جداگانه ندارد.
 - callbackهای payload مسیر اصلی runtime هستند.
 - `Finish`، `Pause`، `Resume` و `Est` برای استفاده عادی معتبر نیستند
@@ -567,8 +728,11 @@ branch اشاره کنند، آن branch فقط یک بار `Init` دریافت 
 | مقدار | اندازه |
 | --- | --- |
 | `required_padding_left` | `0 bytes` |
-| تعداد fragmentهای SNI Blender | `1` تا `16` |
+| تعداد fragmentهای SNI Blender | `2` تا `16` |
 | protocol replacement number | `0` تا `255` |
+| `stateful-flow-limit` | `32` تا `1048576` |
+| طول hostname مربوط به ECH | `1` تا `255 bytes` |
+| capture مربوط به ECH | حداکثر `16 packet` و یک TLS record با اندازه `16384-byte` |
 
 این نود از chain فضای left padding نمی‌خواهد. بعضی trickها برای ساخت packetهای
 دست‌کاری‌شده، بافر را کپی یا بافر تازه‌ای تخصیص می‌دهند.
@@ -583,6 +747,7 @@ branch اشاره کنند، آن branch فقط یک بار `Init` دریافت 
 - این نود به این وابسته است که output packet بعدی
   `line->recalculate_checksum` را رعایت کند.
 - بهتر است branchهای کمکی از `next` معمول جدا باشند.
-- وقتی `sni-blender` فعال است، `sni-blender-packets` اجباری است.
+- وقتی `sni-blender` فعال است، `sni-blender-packets` اجباری است و باید بین `2`
+  و `16` باشد.
 - فیلد `trick_sni_blender_packets_delay_max` در struct زبان C وجود دارد، اما parser
   فعلی JSON آن را در دسترس قرار نمی‌دهد و از آن استفاده نمی‌کند.

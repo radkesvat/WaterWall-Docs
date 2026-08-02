@@ -6,7 +6,7 @@ description: "Reference documentation for the IpManipulator node."
 ---
 
 <!--
-Documentation version: 116
+Documentation version: 117
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/IpManipulator/description.md, and both files must keep the same documentation version.
 -->
 
@@ -103,18 +103,12 @@ Mixed advanced example:
   "type": "IpManipulator",
   "settings": {
     "protoswap-tcp": 253,
-    "protoswap-tcp-2": 254,
-    "first-sni": "cover.example.net",
-    "first-sni-count": 2,
-    "first-sni-replay-delay": 20,
-    "first-sni-final-delay": 50,
-    "first-sni-ttl": 1,
+    "protoswap-udp": 252,
+    "sni-blender": true,
+    "sni-blender-packets": 4,
     "packet-duplicate": 1,
-    "preserve-tcp-bitflags": true,
-    "up-tcp-bit-ack": "packet->fin",
-    "up-tcp-bit-fin": "packet->ack",
-    "dw-tcp-bit-ack": "packet->fin",
-    "dw-tcp-bit-fin": "packet->ack"
+    "source-port-ghost": true,
+    "dest-port-ghost": true
   },
   "next": "next-packet-node"
 }
@@ -141,7 +135,7 @@ IpManipulator: no tricks are enabled, nothing to do
 
 | Trick family | Main settings | Direction | Purpose |
 | --- | --- | --- | --- |
-| Protocol swap | `protoswap-tcp`, `protoswap-tcp-2`, `protoswap-udp` | both | Rewrite IPv4 protocol numbers and restore them on the opposite side. |
+| Protocol swap | `protoswap-tcp`, `protoswap-udp` | both | Rewrite IPv4 protocol numbers and restore them on the opposite side. |
 | SNI Blender | `sni-blender`, `sni-blender-packets` | upstream | Fragment and shuffle IPv4/TCP TLS ClientHello packets. |
 | Packet duplicate | `packet-duplicate` | final send path | Send extra copies of the final packet before the original. |
 | first-sni | `first-sni` | upstream | Send a crafted ClientHello copy before the original. |
@@ -162,7 +156,6 @@ protocol number `6` and UDP is normally `17`.
 | --- | --- | --- |
 | `protoswap` | integer | Legacy alias for `protoswap-tcp`. |
 | `protoswap-tcp` | integer | Replacement protocol number for TCP packets. |
-| `protoswap-tcp-2` | integer | Optional second TCP replacement number; upstream and downstream TCP packets alternate between the two configured values independently per direction. |
 | `protoswap-udp` | integer | Replacement protocol number for UDP packets. |
 
 Valid protocol replacement values are `0` through `255`.
@@ -175,6 +168,11 @@ Replacement values must not be the literal TCP (`6`) or UDP (`17`) protocol
 numbers, even when only one family is configured, because genuine traffic using
 the reused number could not be distinguished from mapped traffic. When both
 families are enabled, their configured replacement values must also be distinct.
+
+`protoswap-tcp-2` has been removed and a stale configuration containing it is
+rejected. Migrate to the single reversible `protoswap-tcp` mapping. This also
+ensures every fragment of one IPv4 datagram receives the same mapped protocol
+number.
 
 Upstream tricks run while the packet still carries its real protocol number.
 Immediately before normal egress, `IpManipulator` applies port ghost, completes
@@ -303,38 +301,45 @@ payload bytes, restoration can fail or restore the wrong flags.
 
 :::warning MTU and packet-size warning
 
-Every rewrite operation with `preserve-tcp-bitflags` appends exactly one byte.
-`IpManipulator` does not compare the enlarged packet with `misc.mtu`,
-`GLOBAL_MTU_SIZE`, `kMaxAllowedPacketLength`, or the path MTU, and it does not
-fragment the packet or reduce TCP MSS. It only checks whether the current
-buffer has room for one more byte. If the buffer has no room, the packet is
-dropped and a warning is logged. If the buffer does have room, the enlarged
-packet is forwarded; for example, a 1500-byte input becomes 1501 bytes and can
-then be discarded by `RawSocket`, `TunDevice`, another packet node, or the
-physical network.
+Every rewrite operation with `preserve-tcp-bitflags` appends one byte. Before
+final egress, `IpManipulator` transport-segments eligible whole IPv4 TCP data
+packets when that byte, port-ghost bytes, or both would exceed
+`GLOBAL_MTU_SIZE`. Every segment gets independently derived live and saved
+flags, one complete set of trailers, and continuous sequence space that
+accounts for SYN consuming one sequence number. A 1500-byte TCP input can
+therefore remain behind a 1500-byte WaterWall MTU without reserving operator
+headroom merely for these trailers. An exact-fit buffer is grown when the final
+packet is otherwise valid.
 
-For each direction that has TCP-bit rewrite actions, use this budget:
-
-```text
-maximum input packet size
-  <= min(output adapter limit, real path MTU, every later packet limit) - 1
-```
-
-For example, with upstream-only actions in a direct
-`TunDevice -> IpManipulator -> RawSocket` path limited to 1500 bytes, configure
-the TUN input MTU to at most `1499`. Setting `misc.mtu` to `1499` achieves that
-only when `TunDevice.settings.device-mtu` is omitted; if `device-mtu` is set
-explicitly, set it to `1499` or lower as well.
-
-If downstream or both-direction TCP-bit actions are configured, budget the
-input to those rewrite directions separately. Lowering the local TUN MTU does
-not constrain packets that arrive from `RawSocket`. Also subtract overhead
-added by any other size-growing node or by another `IpManipulator` rewrite.
+`IpManipulator` does not implement IPv4 fragmentation or reassembly for this
+purpose. Oversized UDP, RST, unsupported URG, and other packets that cannot be
+safely transport-segmented are logged with rate limiting and dropped. UDP
+deployments still need operator-provided MTU headroom for port-ghost bytes.
 
 :::
 
 In particular, enabling this option by itself does not append or remove bytes;
 at least one direction must have a TCP-bit rewrite action configured.
+
+### Stateful SNI composition rules
+
+Only one of `first-sni`, `smuggle-sni`, `overlap-sni`, `synfin-sni`, and
+`ech-sni-trick` may be enabled in one `IpManipulator`. Any one of those
+stateful tricks is also rejected with same-instance `sni-blender` or
+`packet-duplicate` because the state machine emits its transcript directly.
+
+Use two nodes when both operations are needed:
+
+```text
+... -> IpManipulator(stateful SNI only)
+    -> IpManipulator(sni-blender and/or packet-duplicate)
+    -> ...
+```
+
+The stateful node must come first in upstream traversal. Duplication before the
+stateful node duplicates its inputs and is not equivalent to duplicating its
+final output. `sni-blender` plus `packet-duplicate` remains supported when no
+stateful SNI trick is enabled.
 
 ### Rejected TCP-bit compositions
 
@@ -370,7 +375,7 @@ an upstream TLS ClientHello.
 | Setting | Type | Required | Description |
 | --- | --- | --- | --- |
 | `sni-blender` | boolean | yes | Enables TLS ClientHello fragmentation and shuffle. |
-| `sni-blender-packets` | integer | yes when enabled | Number of fragments. Valid range: `1` through `16`. |
+| `sni-blender-packets` | integer | yes when enabled | Number of fragments. Valid range: `2` through `16`. |
 
 Behavior:
 
@@ -419,10 +424,16 @@ Downstream packets that still carry those tail bytes restore the original live
 ports and shrink the packet back to its original length. Fragmented IPv4
 packets are skipped.
 
-Oversized crafted TCP packets are segmented before port ghost is applied. Each
-emitted segment receives exactly one trailer, and the segmentation payload
-budget reserves space for that trailer so the result stays within
-`GLOBAL_MTU_SIZE`.
+Ordinary and crafted whole TCP data packets share one final egress segmenter.
+Each emitted segment receives exactly one port-ghost trailer and, when
+configured, one independently restorable saved-flags byte. `SYN`/`CWR` appear
+only on the first segment, `FIN`/`PSH` only on the final segment, and
+`ACK`/applicable `ECE` on every segment. Every completed segment stays within
+`GLOBAL_MTU_SIZE`, then final packet duplication is applied to that segment.
+
+Oversized UDP cannot use TCP segmentation and is rate-limited-log-and-drop.
+IpManipulator does not introduce IPv4 fragmentation/reassembly, so UDP port
+ghost still requires operator-provided MTU headroom.
 
 Dedicated real-SNI, mirrored-FIN, and overlap-SNI server-hello helper branches
 preserve their original tuples and do not receive a port-ghost trailer.
@@ -451,6 +462,11 @@ ClientHello first segment. Unrelated and non-TLS TCP payloads fail open
 immediately without entering a speculative prestart queue. Recognized,
 in-order ClientHellos can still span multiple TCP segments.
 
+IPv4 fragments, including an `MF=1` first fragment and any nonzero-offset later
+fragment, never enter First-SNI capture and continue on the normal fail-open
+path. When replay/final output is delayed, the transcript tail is inserted into
+a bounded FIFO before later packets and released at one absolute deadline.
+
 ## smuggle-sni
 
 `smuggle-sni` captures and reassembles a TLS ClientHello record across single or multi-segment TCP payloads (up to 16 segments / 16 KB) on the 4-tuple, sends the real ClientHello through a helper upstream branch immediately in order, and sends a generated multi-segment fake ClientHello batch through the normal `next` path after `smuggle-sni-delay-ms`. The fake batch strictly preserves original TCP segment boundaries, original TCP payload lengths, original TCP sequence numbers, and any trailing payload bytes beyond the ClientHello record. If length mismatch, fragment timeout/discontinuity, or generation failure occurs, `smuggle-sni` fails open immediately to the normal path.
@@ -468,6 +484,10 @@ separate branch head rather than the same node as the normal `next`.
 `IpManipulator` creates an internal no-chain `TlsClient` helper to generate the
 crafted ClientHello shape for this trick.
 
+Later packets inside its delay window enter the same bounded FIFO and use the
+flow's absolute deadline. The fake transcript is scheduled before that FIFO;
+`FIN` and `RST` stay behind already queued data.
+
 ## overlap-sni
 
 `overlap-sni` captures early TLS packets, builds a generated Chrome-like
@@ -483,6 +503,10 @@ overlaps generated and real bytes on the TCP sequence range.
 
 This trick requires a normal top-level `next`. The helper branch must exist and
 must not point back to `IpManipulator`.
+
+Later upstream packets use the flow's absolute overlap-window deadline and a
+bounded FIFO instead of receiving a fresh copy of `overlap-sni-delay-ms`. The
+crafted overlap tail is scheduled before that FIFO can release.
 
 ## ech-sni-trick
 
@@ -579,6 +603,9 @@ ClientHello bytes.
 TTL value `0` is a real TTL override. Omit the TTL field entirely if you want to
 preserve the captured packet TTL.
 
+The crafted sequence is emitted synchronously in the documented order with no
+artificial per-packet 20 ms sleep or configurable pacing delay.
+
 ## smuggle-fin
 
 `smuggle-fin` injects a mirrored FIN/ACK through a helper branch and temporarily
@@ -627,21 +654,20 @@ scans in packet callbacks. Flow-entry pointers remain valid only while their
 shard mutex is held; timers and cross-worker messages therefore identify flows
 by normalized tuple and generation.
 
+First-SNI, Smuggle-SNI, and Overlap-SNI delay barriers retain at most 16 packets
+and 256 KiB per flow. One tunnel-wide generation binds the release action to
+the exact tuple instance, so a stale timer cannot release a reused tuple.
+Batches are detached under the shard lock and forwarded outside it. Count/byte
+exhaustion fails open in FIFO order, and reset, timeout, or table destruction
+recycles every retained packet.
+
 ## Mutual Exclusion
 
-The current parser rejects these combinations:
-
-| Cannot be enabled together |
-| --- |
-| `smuggle-sni` and `overlap-sni` |
-| `smuggle-sni` and `synfin-sni` |
-| `overlap-sni` and `synfin-sni` |
-| `ech-sni-trick` and `smuggle-sni` |
-| `ech-sni-trick` and `overlap-sni` |
-| `ech-sni-trick` and `synfin-sni` |
-
-`first-sni` is parsed independently, but remember that the runtime packet
-pipeline returns as soon as a later SNI trick fully handles a packet.
+The parser rejects every pair within the five-member stateful SNI set:
+`first-sni`, `smuggle-sni`, `overlap-sni`, `synfin-sni`, and
+`ech-sni-trick`. It also rejects any of them with same-instance `sni-blender`
+or `packet-duplicate`. See the supported two-node chain under "Stateful SNI
+composition rules" above.
 
 ## Runtime Pipeline
 
@@ -680,6 +706,8 @@ downstream order above.
 
 `IpManipulator` is a pure packet tunnel:
 
+- its node metadata advertises `kNodeLayer3`, while both neighbor constraints
+  remain `kNodeLayerAnything`
 - it has no per-packet connection lifecycle
 - packet payload callbacks are the intended runtime path
 - `Finish`, `Pause`, `Resume`, and `Est` callbacks are invalid for normal use
@@ -695,7 +723,7 @@ once.
 | Value | Size |
 | --- | --- |
 | `required_padding_left` | `0 bytes` |
-| SNI Blender fragment count | `1` through `16` |
+| SNI Blender fragment count | `2` through `16` |
 | protocol replacement number | `0` through `255` |
 | `stateful-flow-limit` | `32` through `1048576` |
 | ECH hostname length | `1` through `255 bytes` |
@@ -716,6 +744,7 @@ clone packet buffers internally when crafting replacement packets.
   `line->recalculate_checksum`.
 - Helper branch nodes should be separate branches, not the same node as the
   normal `next`.
-- `sni-blender-packets` is required when `sni-blender` is enabled.
+- `sni-blender-packets` is required when `sni-blender` is enabled and must be
+  between `2` and `16`.
 - `trick_sni_blender_packets_delay_max` exists in the C state struct, but the
   current JSON parser does not expose or use it.
