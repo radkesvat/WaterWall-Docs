@@ -6,7 +6,7 @@ description: "Reference documentation for the IpManipulator node."
 ---
 
 <!--
-Documentation version: 118
+Documentation version: 120
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/IpManipulator/description.md, and both files must keep the same documentation version.
 -->
 
@@ -494,10 +494,17 @@ flow's absolute deadline. The fake transcript is scheduled before that FIFO;
 ClientHello, sends a crafted server-side TLS packet through a helper branch, and
 overlaps generated and real bytes on the TCP sequence range.
 
+After the two warmup packets, it holds a payload only when that segment begins
+an incomplete TLS ClientHello record. Complete ClientHellos and non-TLS payloads
+pass immediately. If the contiguous completing segment does not arrive before
+the hold timeout, the segment is released unchanged and the flow fails open to
+passthrough.
+
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
 | `overlap-sni` | non-empty string | required to enable | SNI value for the generated ClientHello. |
 | `overlap-sni-delay-ms` | integer ms, `>= 0` | `0` | Delay for packets after the fake TCP `SYN` and later upstream packets while the overlap window is active. |
+| `overlap-sni-hold-timeout-ms` | integer ms, `> 0` | `50` | Maximum wait for the contiguous segment that completes an incomplete ClientHello; expiry releases the held segment unchanged. |
 | `overlap-sni-syn-ttl` | integer `0` through `255` | preserve original | IPv4 TTL for the fake TCP `SYN`. |
 | `crafted-server-hello-upstream-node` | string | required | Helper branch that receives the crafted server-side TLS packet. |
 
@@ -586,9 +593,16 @@ first TLS data chunk, then a close packet, a fake SYN, a crafted fake
 ClientHello, generated TLS-looking filler bytes, and finally the remaining real
 ClientHello bytes.
 
+After the two warmup packets, it holds a payload only when that segment begins
+an incomplete TLS ClientHello record. Complete ClientHellos and non-TLS payloads
+pass immediately. If the contiguous completing segment does not arrive before
+the hold timeout, the segment is released unchanged and the flow fails open to
+passthrough.
+
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
 | `synfin-sni` | non-empty string | required to enable | SNI value for the generated ClientHello. |
+| `synfin-sni-hold-timeout-ms` | integer ms, `> 0` | `50` | Maximum wait for the contiguous segment that completes an incomplete ClientHello; expiry releases the held segment unchanged. |
 | `synfin-sni-additional-range-min` | integer `0` through `65535` | `0` | Minimum extra real ClientHello bytes added to the first real chunk. |
 | `synfin-sni-additional-range-max` | integer `0` through `65535` | same as min when min is set alone, otherwise `0` | Maximum extra real bytes; one random value is chosen per flow and clamped before the real SNI bytes. |
 | `synfin-sni-syn-ttl` | integer `0` through `255` | preserve original | TTL for the fake SYN. |
@@ -664,6 +678,14 @@ the exact tuple instance, so a stale timer cannot release a reused tuple.
 Batches are detached under the shard lock and forwarded outside it. Count/byte
 exhaustion fails open in FIFO order, and reset, timeout, or table destruction
 recycles every retained packet.
+
+Overlap-SNI and SynFIN-SNI holds use separate per-flow fail-open timers keyed by
+the normalized tuple plus a nonzero hold generation. Timeout releases the held
+segment unchanged outside the shard lock. An upstream close releases either
+trick's live hold, and Overlap-SNI also releases it on a downstream close.
+If idle expiry or table teardown removes the record before its timer callback,
+the record destructor deliberately disposes of the held packet instead of
+forwarding from under the shard lock or during shutdown.
 
 ## Mutual Exclusion
 
