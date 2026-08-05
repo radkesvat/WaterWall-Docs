@@ -5,7 +5,7 @@ sidebar_label: "StreamToPackets"
 description: "راهنمای نود StreamToPackets در WaterWall."
 ---
 
-<!-- Written from version 106 of the English doc. -->
+<!-- Written from version 107 of the English doc. -->
 
 # StreamToPackets
 
@@ -22,13 +22,14 @@ IPv4 packet bytes + IPv4 packet bytes + IPv4 packet bytes + ...
 ## کار این نود
 
 - یک stream line واتروال را از سمت قبلی می‌پذیرد.
-- برای هر worker یک active stream line نگه می‌دارد تا packetهای برگشتی را روی آن بنویسد.
+- برای کل نود یک source IP فعال نگه می‌دارد؛ چند stream line اعتبارسنجی‌شده از همان IP می‌توانند هم‌زمان ترافیک حمل کنند.
 - بایت‌های stream در مسیر upstream را تا کامل شدن یک packet IPv4 در buffer نگه می‌دارد.
 - packetها را با استفاده از فیلد `total-length` استخراج می‌کند.
 - در صورت تنظیم، packetهای decodeشده را پیش از فرستادن به سمت packet اعتبارسنجی می‌کند.
+- پیش از تحویل packet decodeشده به packet chain، affinity مربوط به inner flow را بازیابی می‌کند.
 - packetهای decodeشده را در جهت upstream به نود packet-oriented بعدی می‌فرستد.
-- payloadهای برگشتی از سمت packet را به شکل packet خام IPv4 روی active stream line می‌نویسد.
-- IPv6، payloadهای غیر IPv4، packetهای نامعتبر IPv4 و خروجی سمت packet در نبود active stream line را کنار می‌گذارد.
+- payloadهای برگشتی از سمت packet را روی یک stream line فعال که برای هر inner flow انتخاب می‌شود، به شکل packet خام IPv4 می‌نویسد.
+- IPv6، payloadهای غیر IPv4، packetهای نامعتبر IPv4 و خروجی سمت packet را وقتی هیچ stream line فعال و unpaused وجود ندارد کنار می‌گذارد.
 
 این نود فقط مرز packetها را از stream بازیابی می‌کند و TCP/UDP flow را بازسازی نمی‌کند؛ برای آن کار از `PacketsToConnection` استفاده کنید.
 
@@ -95,7 +96,7 @@ packet C: K bytes, where IPv4 total-length = K
 
 `StreamToPackets` هیچ length prefixی نمی‌خواند. ابتدا header مربوط به IPv4 را می‌خواند، از فیلد `total-length` فقط برای تعیین اندازه packet استفاده می‌کند و تا جمع شدن کل packet در buffer منتظر می‌ماند.
 
-packetهای برگشتی از packet side با همان فرمت packet IPv4 خام به active stream line نوشته می‌شوند.
+packetهای برگشتی از packet side با همان فرمت packet IPv4 خام روی یکی از stream lineهای source فعال نوشته می‌شوند.
 
 ## مدل جریان
 
@@ -104,7 +105,7 @@ flowchart LR
     S[نود stream-side قبلی] -->|stream bytes| STP[StreamToPackets]
     STP -->|packet IPv4 decode شده| P[نود packet-side بعدی]
     P -->|packet Payload| STP
-    STP -->|bytes IPv4 خام روی active stream line| S
+    STP -->|bytes IPv4 خام روی stream line فعالِ انتخاب‌شده برای flow| S
 ```
 
 خلاصه جهت:
@@ -112,22 +113,80 @@ flowchart LR
 | جهت | رفتار |
 | --- | --- |
 | stream side به packet side | بایت‌ها را در buffer جمع می‌کند، packetهای IPv4 را استخراج و در صورت تنظیم اعتبارسنجی می‌کند، سپس آن‌ها را به نود بعدی می‌فرستد. |
-| packet side به stream side | payload packet IPv4 معتبر را به‌عنوان byte خام به active stream line می‌فرستد. |
+| packet side به stream side | برای هر inner flow یک stream line فعال و unpaused انتخاب می‌کند و payload معتبر IPv4 را به‌صورت byte خام روی آن می‌فرستد. |
 
-## Active Stream Line و bootstrap packet-line
+## Source فعال، pool مربوط به lineها و bootstrap packet-line
 
 `StreamToPackets` میان stream lineهای معمول و worker packet lineهای مشترک پل می‌زند.
 
 هنگام startup، برای هر worker یک upstream packet-line `Init` در صف می‌گذارد تا tunnel بعدی در سمت packet، پس از startup مربوط به node manager، worker packet line را دریافت کند.
 
+### هویت source
+
+مالکیت در سطح کل نود است، نه برای هر worker: در هر لحظه حداکثر یک source IP
+مشخص فعال است. هویت فقط از source IP تشکیل می‌شود و port عمداً در آن دخالت
+ندارد؛ زیرا `TcpListener` در آن قسمت port مربوط به listener را نگه می‌دارد و
+reconnectها از ephemeral port تازه استفاده می‌کنند. lineهایی که source IP مشخصی
+ندارند ــ برای مثال ترکیب مستقیم و in-process از
+`PacketsToStream -> StreamToPackets` ــ یک هویت anonymous مشترک دارند. در نتیجه
+این ترکیب‌ها کار می‌کنند، اما دو peer از نوع anonymous از هم قابل تشخیص نیستند.
+
+### Candidateها و فعال‌سازی
+
 هنگام مقداردهی اولیه یک stream line در جهت upstream:
 
-- `StreamToPackets` آن line را به‌عنوان active stream line برای آن worker ذخیره می‌کند
 - state مربوط به parser را برای آن stream line مقداردهی اولیه می‌کند
-- packet-line paused flag را پاک می‌کند
+- line را به‌عنوان یک **candidate** ثبت می‌کند
 - downstream `Est` را به stream side قبلی برمی‌گرداند
 
-اگر stream line تازه‌ای روی همان worker جای active line قبلی را بگیرد، payloadهای برگشتی به جدیدترین active line فرستاده می‌شوند.
+candidate دنبال می‌شود، اما هرگز برای ترافیک برگشتی قابل انتخاب نیست. اولین
+packet معتبر IPv4 که از آن decode شود، یا یک heartbeat معتبر در sensitive mode،
+آن را فعال می‌کند. بایت‌های malformed، overflow و اعتبارسنجی ناموفق هرگز اثبات
+protocol نیستند؛ بنابراین نه candidate را فعال می‌کنند و نه source فعال را
+تغییر می‌دهند.
+
+### جابه‌جایی مالکیت
+
+| وضعیت | نتیجه |
+| --- | --- |
+| source فعالی وجود ندارد | candidate اعتبارسنجی‌شده به source فعال تبدیل می‌شود و generation تازه‌ای برای source باز می‌کند. |
+| source با source فعال یکسان است | line به generation موجود می‌پیوندد و همه lineهای اعتبارسنجی‌شده آن IP هم‌زمان قابل استفاده می‌مانند. |
+| source متفاوت است | **جدیدترین source اعتبارسنجی‌شده برنده است.** generation تازه‌ای publish می‌شود و همه lineهای source قبلی، از جمله candidateهای idle، روی worker خودشان و از سمت قبلی بسته می‌شوند. |
+| آخرین line فعال finish می‌شود | source فعال پاک می‌شود و تا اعتبارسنجی یک line تازه، ترافیک برگشتی کنار گذاشته می‌شود. |
+
+lineای که در takeover کنار گذاشته شده است، حتی اگر یکی از callbackهای payload
+آن از قبل در حال اجرا باشد، دیگر نمی‌تواند مالکیت را پس بگیرد. یک connection
+واقعاً تازه از IP قدیمی می‌تواند پس از تولید ترافیک معتبر دوباره takeover کند؛
+بنابراین روی listenerهای غیرقابل اعتماد پیش از این نود authentication یا
+allowlisting قرار دهید.
+
+پس از آغاز stop این instance توسط node manager، line تازه‌ای ثبت نمی‌شود و هیچ
+candidateای promote نمی‌شود. lineهایی که از قبل فعال هستند همچنان drain می‌شوند؛
+در نتیجه shutdown نه ownership epoch تازه‌ای باز می‌کند و نه کار eviction را
+روی workerهایی که در حال خاموش شدن هستند queue می‌کند.
+
+هر line کنارگذاشته‌شده با taskای روی worker خودش بسته می‌شود. اگر post کردن آن
+task به دلیلی غیر از shutdown ــ مانند تمام شدن message pool یا نپذیرفتن wakeup
+توسط loop ــ ممکن نباشد و takeover روی worker همان line اجرا شود، line همان‌جا
+بسته می‌شود. در غیر این صورت کانال دومی برای دسترسی به آن worker وجود ندارد؛ پس
+نود به‌صورت fail-closed عمل می‌کند: orderly shutdown برنامه را درخواست می‌کند و
+اگر worker صفر handoff را نپذیرد، به abort فوری برمی‌گردد. connection مربوط به
+source قدیمی هرگز در حال اجرا رها نمی‌شود.
+
+## Affinity مربوط به Inner Flow
+
+worker مالک outer connection را socket manager انتخاب می‌کند و این worker چیزی
+درباره مالک inner IP flow مشخص نمی‌کند. بنابراین `StreamToPackets` affinity را
+از خود packet decodeشده دوباره به دست می‌آورد:
+
+1. symmetric flow hash مشترک inner packet را محاسبه می‌کند
+2. `packet_line[hash % workers]` را انتخاب می‌کند
+3. اگر مقصد worker فعلی باشد packet را مستقیم forward می‌کند؛ در غیر این صورت آن را روی worker مقصد queue می‌کند
+
+هر دو جهت یک flow hash یکسانی تولید می‌کنند؛ بنابراین ترافیک forward و reverse
+روی یک packet worker باقی می‌ماند. اگر hash کردن inner flow یک packet decodeشده
+ممکن نباشد، آن packet با ثبت log کنار گذاشته می‌شود و round-robin نمی‌شود، زیرا
+مالکیت worker برای state آن قابل تعیین نیست.
 
 ## استخراج packet
 
@@ -172,13 +231,24 @@ payload برگشتی از سمت packet تحت این اعتبارسنجی قا�
 
 وقتی payload packet از سمت بعدی می‌رسد:
 
-- tunnel active stream line را برای worker packet line پیدا می‌کند
-- اگر active stream line وجود نداشته باشد، packet کنار گذاشته می‌شود
-- اگر active stream line pause یا dead باشد، packet کنار گذاشته می‌شود
 - اگر payload از `kMaxAllowedPacketLength` بزرگ‌تر باشد، کنار گذاشته می‌شود
 - اگر checksum recalculation روی packet line درخواست شده باشد، checksum کامل packet IPv4 دوباره محاسبه می‌شود
 - اگر payload یک packet سازگار IPv4 نباشد، کنار گذاشته می‌شود
-- در غیر این صورت bytes IPv4 خام downstream به stream line قبلی ارسال می‌شوند
+- symmetric flow hash مربوط به packet با **rendezvous hashing** یک carrier را از میان lineهای فعال و unpaused در generation فعلی source انتخاب می‌کند
+- اگر چنین lineای وجود نداشته باشد، packet کنار گذاشته می‌شود؛ candidateها، lineهای paused و lineهای generation منقضی‌شده هرگز به‌عنوان fallback استفاده نمی‌شوند
+- در غیر این صورت bytes خام IPv4 روی همان line و worker خودش در جهت downstream ارسال می‌شوند
+
+تا وقتی pool واجد شرایط تغییری نکند، یک flow همیشه همان line را انتخاب می‌کند و
+tuple معکوس نیز همان line را برمی‌گزیند. flowهای متفاوت در pool پخش می‌شوند، حتی
+اگر packet worker مشترکی داشته باشند.
+
+اضافه شدن، pause، resume یا حذف یک line، pool واجد شرایط را تغییر می‌دهد و ممکن
+است بعضی flowها را به carrier دیگری منتقل کند. بنابراین در اطراف این تغییرها
+مقداری reordering ممکن است رخ دهد: packet فرستاده‌شده روی carrier جدید می‌تواند
+از packetی که هنوز روی carrier قبلی در حال انتقال است جلو بزند. این مسیر packet
+است و inner protocol درست مانند هر شبکه دیگری مسئول ordering است. peerای که به
+تحویل کاملاً مرتب packetهای برگشتی نیاز دارد نباید هنگام اضافه یا حذف شدن stream
+lineها به این نود متکی باشد. round-robin برای هر packet هرگز استفاده نمی‌شود.
 
 این همان فرمت stream بدون header استفاده شده توسط `PacketsToStream` را حفظ می‌کند.
 
@@ -202,23 +272,30 @@ payload برگشتی از سمت packet تحت این اعتبارسنجی قا�
 
 | callback دریافت‌شده توسط `StreamToPackets` | رفتار |
 | --- | --- |
-| upstream `Init` | stream line ورودی را به‌عنوان active line برای آن worker ذخیره می‌کند و downstream `Est` را به سمت قبلی می‌فرستد. |
+| upstream `Init` | stream line ورودی را به‌عنوان candidate ثبت می‌کند و downstream `Est` را به سمت قبلی می‌فرستد. |
 | upstream `Payload` | بایت‌های stream را در buffer جمع می‌کند، packetهای IPv4 را استخراج می‌کند، heartbeat ping را مدیریت و packetها را اعتبارسنجی می‌کند و سپس آن‌ها را به نود بعدی می‌فرستد. |
-| upstream `Pause` | active stream line را برای نوشتن برگشت packet-side paused علامت می‌زند. |
-| upstream `Resume` | paused flag را برای active stream line پاک می‌کند. |
-| upstream `Finish` | اگر active stream line همان line باشد آن را پاک می‌کند و state مربوط به parser را از بین می‌برد. |
+| upstream `Pause` | همان stream line را paused می‌کند و از انتخاب‌های تازه flow کنار می‌گذارد؛ lineهای فعال دیگر تغییری نمی‌کنند. |
+| upstream `Resume` | paused flag همان line را پاک می‌کند و دوباره آن را قابل انتخاب می‌سازد. |
+| upstream `Finish` | line را از registry حذف و state مربوط به parser آن را destroy می‌کند، بدون اینکه چیزی به سمت فرستنده برگرداند. اگر آن line آخرین line فعال باشد، source فعال را پاک می‌کند. |
 | upstream `Est` | warning log؛ انتظار نمی‌رود. |
-| downstream `Payload` | payload packet IPv4 معتبر را به active stream line می‌فرستد. |
+| downstream `Payload` | برای هر inner flow یک stream line فعال انتخاب می‌کند و payload معتبر IPv4 را روی آن می‌فرستد. |
 | downstream `Est` | No-op. tunnelهای packet معمولاً `Est` نمی‌فرستند. |
 | downstream `Init` | fatal guard؛ جهت نامعتبر. |
 | downstream `Finish` | fatal guard؛ جهت نامعتبر. |
 | downstream `Pause` / `Resume` | warning log؛ از packet side انتظار نمی‌رود. |
 
-وقتی active stream line در حالت pause باشد، packet برگشتی به‌جای قرار گرفتن در صف کنار گذاشته می‌شود.
+line paused در انتخاب شرکت نمی‌کند و flowهای آن به بقیه pool منتقل می‌شوند. اگر
+همه lineهای فعال paused باشند، خروجی packet برگشتی به‌جای قرار گرفتن در یک صف
+سراسری نامحدود کنار گذاشته می‌شود.
+
+stream lineهای ورودی borrowed هستند: `StreamToPackets` هیچ‌کدام را destroy
+نمی‌کند و هرگز worker packet line را finish یا destroy نمی‌کند. takeover یک line
+مربوط به source قدیمی را با اجرای task روی worker خود آن line و فرستادن Finish
+به سمت قبلی می‌بندد؛ owner در همان سمت destruction را انجام می‌دهد.
 
 ## محاسبه مجدد Checksum
 
-اگر `line->recalculate_checksum` روی packet line تنظیم باشد و payload یک IPv4 باشد، `StreamToPackets` checksum کامل packet IPv4 را قبل از نوشتن به active stream line دوباره محاسبه می‌کند، سپس flag را پاک می‌کند.
+اگر `line->recalculate_checksum` روی packet line تنظیم باشد و payload یک IPv4 باشد، `StreamToPackets` checksum کامل packet IPv4 را قبل از نوشتن به stream line انتخاب‌شده دوباره محاسبه می‌کند، سپس flag را پاک می‌کند.
 
 ## متادیتای نود
 
@@ -239,5 +316,7 @@ tunnel هیچ بایتی به ابتدای payload اضافه نمی‌کند؛ 
 - آن را با `PacketsToStream` در سمت مقابل جفت کنید.
 - آن را با stream packet قدیمی 2-byte-prefix تغذیه نکنید؛ parsing فعلی از فیلد IPv4 total-length استفاده می‌کند.
 - از `packet-validation-level: "hard"` وقتی می‌خواهید اعتبارسنجی قوی‌تری از packetهای decode شده از stream داشته باشید استفاده کنید.
-- اگر active stream line وجود نداشته باشد یا در حالت pause باشد، packetهای برگشتی ممکن است از دست بروند.
+- اگر همه lineهای فعال paused باشند یا اصلاً source فعالی وجود نداشته باشد، packetهای برگشتی ممکن است از دست بروند.
+- ترافیک برگشتی می‌تواند روی هر line از pool مربوط به source فعال برسد؛ بنابراین peer باید packet decodeشده را روی هر یک از lineهای خود بپذیرد. `PacketsToStream` این کار را انجام می‌دهد.
+- مالکیت برای کل نود متعلق به یک source IP است. روی listenerهای غیرقابل اعتماد، پیش از این نود authentication یا allowlisting قرار دهید.
 - از `PacketsToConnection` به‌جای این نود استفاده کنید وقتی هدف بازسازی TCP/UDP flow است نه بازسازی packet boundary.

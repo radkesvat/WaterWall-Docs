@@ -6,7 +6,7 @@ description: "Reference documentation for the StreamToPackets node."
 ---
 
 <!--
-Documentation version: 106
+Documentation version: 107
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/StreamToPackets/description.md, and both files must keep the same documentation version.
 -->
 
@@ -29,15 +29,18 @@ There is no 2-byte length prefix. Old documentation may call this node
 ## What It Does
 
 - Accepts a stream-oriented WaterWall line from the previous side.
-- Stores one active stream line per worker for packet-side return writes.
+- Tracks one active source IP for the whole node; several validated stream lines
+  from that IP carry traffic together.
 - Buffers upstream stream bytes until a full IPv4 packet is available.
 - Extracts packets using each IPv4 packet's total-length field.
 - Optionally validates decoded packets before forwarding them to the packet side.
+- Restores inner-flow worker affinity before handing a decoded packet to the
+  packet chain.
 - Sends decoded packets upstream to the next packet-oriented node.
-- Sends return packet payloads from the packet side back to the active stream
-  line as raw IPv4 packets.
+- Sends return packet payloads from the packet side back to one active stream
+  line chosen per inner flow, as raw IPv4 packets.
 - Drops IPv6, non-IPv4 payloads, malformed IPv4 packets, and packet-side output
-  when there is no active stream line.
+  when no active, unpaused stream line exists.
 
 This node rebuilds packet boundaries from a stream. It is not a TCP/UDP flow
 reconstruction node; use `PacketsToConnection` for that.
@@ -109,8 +112,8 @@ packet C: K bytes, where IPv4 total-length = K
 trusts the total-length field only enough to know how many bytes make one
 packet, and waits until the full packet is buffered.
 
-Return packets from the packet side are written back to the active stream line
-using the same raw IPv4 packet format.
+Return packets from the packet side are written back to one of the active source's
+stream lines using the same raw IPv4 packet format.
 
 ## Flow Model
 
@@ -119,7 +122,7 @@ flowchart LR
     S[Previous stream-side node] -->|stream bytes| STP[StreamToPackets]
     STP -->|decoded IPv4 packet| P[Next packet-side node]
     P -->|packet Payload| STP
-    STP -->|raw IPv4 bytes on active stream line| S
+    STP -->|raw IPv4 bytes on a per-flow active stream line| S
 ```
 
 Direction summary:
@@ -127,9 +130,9 @@ Direction summary:
 | Direction | Behavior |
 | --- | --- |
 | stream side to packet side | Buffers bytes, extracts IPv4 packets, optionally validates them, then sends packets to the next node. |
-| packet side back to stream side | Sends valid IPv4 packet payload back to the active stream line as raw bytes. |
+| packet side back to stream side | Selects one active, unpaused stream line per inner flow and sends the valid IPv4 packet payload back on it as raw bytes. |
 
-## Active Stream Line And Packet-Line Bootstrap
+## Active Source, Line Pool, And Packet-Line Bootstrap
 
 `StreamToPackets` bridges between normal stream lines and persistent worker
 packet lines.
@@ -137,15 +140,71 @@ packet lines.
 At startup, it queues packet-line upstream `Init` on every worker so the next
 packet-side tunnel sees the worker packet line after node-manager startup.
 
+### Source identity
+
+Ownership is global to the node, not per worker: at most one concrete source IP
+is active at a time. The identity is the source IP alone. The port is excluded
+deliberately, because `TcpListener` stores the local listener port there and
+reconnects use fresh ephemeral ports. Lines without a concrete source IP - a
+directly composed in-process `PacketsToStream -> StreamToPackets` pair, for
+example - share one explicit anonymous identity, so those compositions keep
+working; two anonymous peers cannot be told apart.
+
+### Candidates and activation
+
 When an upstream stream line is initialized:
 
-- `StreamToPackets` stores that line as the active stream line for the worker
-- it initializes parser state for that stream line
-- it clears the packet-line paused flag
+- `StreamToPackets` initializes parser state for that line
+- it registers the line as a **candidate**
 - it sends downstream `Est` back to the previous stream side
 
-If a later stream line replaces the active one on the same worker, return
-packet payloads go to the newest active line.
+A candidate is tracked but never selectable. It is activated by its first valid
+decoded IPv4 packet, or by a valid sensitive-mode heartbeat. Malformed bytes,
+overflow, and failed validation are never protocol proof, so they can neither
+activate a candidate nor change the active source.
+
+### Ownership transitions
+
+| Situation | Result |
+| --- | --- |
+| No active source | The validated candidate becomes the active source and opens a new source generation. |
+| Same source as the active one | The line joins the existing generation. All validated lines from that IP stay usable together. |
+| A different source | **Validated newest source wins.** A new generation is published, and every line of the previous source, including idle candidates, is closed on its own worker through the previous side. |
+| The last active line finishes | The active source is cleared and return traffic is dropped until a new line is validated. |
+
+A line evicted by a takeover can never reclaim ownership, even if one of its
+payload callbacks was already running. A genuinely new connection from the old IP
+can take over again after producing valid traffic, so put authentication or
+allowlisting in front of this node on untrusted listeners.
+
+Once the node manager begins stopping this instance, no line may be registered
+and no candidate may be promoted. Lines that are already active keep draining, so
+a shutdown never starts a new ownership epoch or queues eviction work onto
+workers that are already going away.
+
+An evicted line is closed by a task on its own worker. If that task cannot be
+posted for a reason other than shutdown - an exhausted message pool, a loop that
+refuses a wakeup - and the takeover is running on that line's own worker, it is
+closed there instead. If it is not, there is no second channel to that worker and
+no way to close the line, so the node fails closed: it requests an orderly
+program shutdown, falling back to an immediate abort if worker 0 will not take
+the handoff. An old-source connection is never left running.
+
+## Inner-Flow Worker Affinity
+
+The worker that owns an outer connection is chosen by the socket manager and says
+nothing about which worker owns an inner IP flow, so `StreamToPackets` re-derives
+affinity from the decoded packet itself:
+
+1. compute the shared symmetric flow hash of the inner packet
+2. take `packet_line[hash % workers]`
+3. forward directly when that is the current worker, otherwise queue the packet to
+   the target worker
+
+Both directions of one flow produce the same hash, so forward and reverse traffic
+stay on the same packet worker. A decoded packet whose flow cannot be hashed is
+logged and dropped rather than round-robined, because its stateful worker
+ownership cannot be established.
 
 ## Packet Extraction
 
@@ -198,14 +257,28 @@ to the stream line.
 
 When packet payload arrives from the next side:
 
-- the tunnel finds the active stream line for the worker packet line
-- if no active stream line exists, the packet is dropped
-- if the active stream line is paused or dead, the packet is dropped
 - if the payload is larger than `kMaxAllowedPacketLength`, it is dropped
 - if checksum recalculation is requested on the packet line, the full IPv4
   packet checksum is recalculated
 - if the payload is not a self-consistent IPv4 packet, it is dropped
-- otherwise the raw IPv4 bytes are sent downstream to the previous stream line
+- the symmetric flow hash of the packet selects one carrier by **rendezvous
+  hashing** over the active, unpaused lines of the current source generation
+- if no such line exists, the packet is dropped; candidates, paused lines, and
+  lines from a superseded generation are never used as a fallback
+- otherwise the raw IPv4 bytes are sent downstream on that line, on that line's
+  own worker
+
+While the eligible pool is unchanged, one flow always selects the same line, and
+the reverse tuple selects the same line as the forward one. Different flows spread
+across the pool, including flows that share a packet worker.
+
+Adding, pausing, resuming or removing a line changes the eligible pool and can
+move some flows to a different carrier, so a small amount of reordering is
+possible around those transitions: a packet sent on the new carrier can overtake
+one still in flight on the old one. This is a packet path, and the inner protocol
+owns ordering exactly as it does over any network. A peer that needs strictly
+ordered delivery of the packets it receives back must not depend on this node
+while stream lines are joining or leaving. Per-packet round-robin is never used.
 
 This preserves the same headerless stream format used by `PacketsToStream`.
 
@@ -232,26 +305,32 @@ Callback behavior:
 
 | Callback received by `StreamToPackets` | Behavior |
 | --- | --- |
-| upstream `Init` | Stores the incoming stream line as the active line for that worker and sends downstream `Est` back to the previous side. |
+| upstream `Init` | Registers the incoming stream line as a candidate and sends downstream `Est` back to the previous side. |
 | upstream `Payload` | Buffers stream bytes, extracts IPv4 packets, handles heartbeat ping, validates, and forwards packets to the next node. |
-| upstream `Pause` | Marks the active stream line paused for packet-side return writes. |
-| upstream `Resume` | Clears the paused flag for the active stream line. |
-| upstream `Finish` | Clears the active stream line if it matches and destroys parser state for that stream line. |
+| upstream `Pause` | Marks that one stream line paused, excluding it from new flow selection. Other active lines are unaffected. |
+| upstream `Resume` | Clears that line's paused flag, making it selectable again. |
+| upstream `Finish` | Removes that line from the registry and destroys its parser state, sending nothing back toward the sender. Clears the active source when it was the last active line. |
 | upstream `Est` | Warning log; not expected. |
-| downstream `Payload` | Sends valid IPv4 packet payload back to the active stream line. |
+| downstream `Payload` | Selects one active stream line per inner flow and sends the valid IPv4 packet payload back on it. |
 | downstream `Est` | No-op. Packet tunnels usually do not send `Est`. |
 | downstream `Init` | Fatal guard; invalid direction. |
 | downstream `Finish` | Fatal guard; invalid direction. |
 | downstream `Pause` / `Resume` | Warning log; not expected from packet side. |
 
-When the active stream line is paused, return packet output toward the stream is
-dropped rather than queued.
+A paused line is skipped and its flows move to the rest of the pool. When every
+active line is paused, return packet output is dropped rather than queued into an
+unbounded global buffer.
+
+Incoming stream lines are borrowed: `StreamToPackets` never destroys one, and it
+never finishes or destroys a worker packet line. A takeover closes an old-source
+line by running a task on that line's own worker and finishing it toward the
+previous side, which is the owner that performs the destruction.
 
 ## Checksum Recalculation
 
 If `line->recalculate_checksum` is set on the packet line and the payload is
 IPv4, `StreamToPackets` recalculates the full IPv4 packet checksum before
-writing it back to the active stream line, then clears the flag.
+writing it back to the selected stream line, then clears the flag.
 
 ## Node Metadata
 
@@ -276,6 +355,11 @@ The tunnel does not prepend bytes, so it has no extra left-padding requirement.
   IPv4 total-length field.
 - Use `packet-validation-level: "hard"` when you want stronger validation of
   packets decoded from the stream.
-- Return packet output is lossy while the active stream line is paused or absent.
+- Return packet output is lossy while every active line is paused, or while there
+  is no active source at all.
+- Return traffic may arrive on any line of the active source's pool, so the peer
+  must accept a decoded packet on any of its lines. `PacketsToStream` does.
+- Ownership is one source IP for the whole node. Put authentication or
+  allowlisting in front of it on untrusted listeners.
 - Use `PacketsToConnection` instead when the goal is TCP/UDP flow
   reconstruction rather than packet boundary restoration.

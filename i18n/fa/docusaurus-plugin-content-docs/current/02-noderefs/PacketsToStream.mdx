@@ -5,7 +5,7 @@ sidebar_label: "PacketsToStream"
 description: "راهنمای نود PacketsToStream در WaterWall."
 ---
 
-<!-- Written from version 106 of the English doc. -->
+<!-- Written from version 107 of the English doc. -->
 
 # PacketsToStream
 
@@ -28,7 +28,8 @@ IPv4 packet bytes + IPv4 packet bytes + IPv4 packet bytes + ...
 - packetهای IPv4 ناسازگار یا نامعتبر را کنار می‌گذارد.
 - packetهای معتبر IPv4 را بدون افزودن framing header روی stream می‌نویسد.
 - بایت‌های برگشتی stream را در buffer نگه می‌دارد و با استفاده از فیلد `total-length` مرز packetهای IPv4 را بازیابی می‌کند.
-- packetهای بازیابی‌شده را به سمت قبلی packet برمی‌گرداند.
+- packetهای بازیابی‌شده را روی worker مالک inner flow هر packet به سمت قبلی packet برمی‌گرداند.
+- ترافیک برگشتی هر inner flow را روی هر یک از stream lineهای خود می‌پذیرد.
 - اگر line رو به stream بسته شود یا heartbeat در sensitive mode timeout شود، line تازه‌ای می‌سازد.
 
 این یک adapter میان packet و stream بر پایه parsing مربوط به IPv4 است، نه یک protocol عمومی برای framing بایت‌ها.
@@ -124,7 +125,7 @@ flowchart LR
 | جهت | رفتار |
 | --- | --- |
 | packet side به stream side | packet IPv4 معتبر به‌صورت خام روی stream line worker-local ارسال می‌شود. |
-| stream side به packet side | بایت‌های stream در buffer جمع و به packetهای IPv4 decode می‌شوند؛ سپس پس از اعتبارسنجی اختیاری، در جهت downstream به سمت packet می‌روند. |
+| stream side به packet side | بایت‌های stream در buffer جمع و به packetهای IPv4 decode می‌شوند؛ سپس پس از اعتبارسنجی اختیاری، بر اساس inner tuple دوباره flow-affine می‌شوند و در جهت downstream روی packet line مربوط به worker همان flow می‌روند. |
 
 ## Stream Line Worker-Local
 
@@ -149,7 +150,21 @@ flowchart LR
 4. منتظر می‌ماند تا همان تعداد بایت در buffer جمع شود
 5. دقیقاً آن تعداد byte را به‌عنوان یک packet استخراج می‌کند
 6. اختیاراً packet decode شده را اعتبارسنجی می‌کند
-7. آن را به نود packet-side قبلی می‌فرستد
+7. symmetric hash مشترک inner flow را محاسبه می‌کند
+8. packet را روی `packet_line[hash % workers]` به نود packet-side قبلی می‌فرستد؛ اگر worker مقصد همین worker باشد مستقیم و در غیر این صورت با queue کردن روی worker مقصد
+
+worker مربوط به outer stream line عمداً برای انتخاب packet line استفاده نمی‌شود.
+peerای مانند `StreamToPackets` برای هر inner flow یک return carrier را از کل pool
+lineهای فعال خود انتخاب می‌کند؛ بنابراین هر flow می‌تواند روی هر یک از این lineها
+برسد. محاسبه دوباره affinity از inner tuple این حالت را امن می‌کند و هر دو جهت
+یک flow را روی یک packet worker نگه می‌دارد. اگر hash کردن flow یک packet
+decodeشده ممکن نباشد، آن packet با ثبت log کنار گذاشته می‌شود و به‌صورت
+round-robin پخش نمی‌شود، زیرا مالکیت worker برای state آن قابل تعیین نیست.
+
+فقط packetهای decodeشده دوباره flow-affine می‌شوند. parser، state مربوط به
+heartbeat در sensitive mode و ساخت دوباره output line همچنان در اختیار worker
+خود stream line باقی می‌مانند. در مسیر ارسال نیز این نود همچنان برای هر packet
+worker یک stream output line نگه می‌دارد.
 
 parser در برابر داده نامعتبر مقاوم است. اگر ابتدای stream شروع معتبر یک packet IPv4 نباشد، decoder در یک پنجره محدود به دنبال نقطه resync می‌گردد و بایت‌ها را تا header معتبر بعدی کنار می‌گذارد. parser همواره جلو می‌رود و از محدوده buffer خارج نمی‌شود.
 

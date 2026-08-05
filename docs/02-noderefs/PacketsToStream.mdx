@@ -6,7 +6,7 @@ description: "Reference documentation for the PacketsToStream node."
 ---
 
 <!--
-Documentation version: 106
+Documentation version: 107
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/PacketsToStream/description.md, and both files must keep the same documentation version.
 -->
 
@@ -37,7 +37,9 @@ packet's IPv4 total-length field. Old documentation may call this node
 - Writes valid IPv4 packets to the stream side without adding a framing header.
 - Buffers return stream bytes and reconstructs IPv4 packets from the total
   length field.
-- Sends reconstructed return packets back to the previous packet side.
+- Sends reconstructed return packets back to the previous packet side on the
+  worker that owns each packet's inner flow.
+- Accepts return traffic for any inner flow on any of its stream lines.
 - Recreates the stream-facing line if it finishes or sensitive-mode heartbeat
   fails.
 
@@ -139,7 +141,7 @@ Direction summary:
 | Direction | Behavior |
 | --- | --- |
 | packet side to stream side | Valid IPv4 packet is sent raw on the worker-local stream line. |
-| stream side back to packet side | Stream bytes are buffered, decoded into IPv4 packets, optionally validated, then emitted downstream to the packet side. |
+| stream side back to packet side | Stream bytes are buffered, decoded into IPv4 packets, optionally validated, re-affinitized from the inner tuple, then emitted downstream on that flow's own worker packet line. |
 
 ## Worker-Local Stream Line
 
@@ -167,7 +169,23 @@ Return traffic from the stream side is buffered in a read stream. The decoder:
 4. waits until that many bytes are buffered
 5. extracts exactly that many bytes as one packet
 6. optionally validates the decoded packet
-7. sends it back to the previous packet-side node
+7. computes the shared symmetric inner-flow hash
+8. sends it back to the previous packet-side node on `packet_line[hash % workers]`,
+   directly when that is the current worker and queued to the target worker
+   otherwise
+
+The outer stream line's worker is deliberately not used to pick the packet line.
+A peer such as `StreamToPackets` selects a return carrier per inner flow out of
+its whole active line pool, so any flow can arrive on any of these lines;
+re-deriving affinity from the inner tuple is what makes that safe, and what keeps
+both directions of a flow on one packet worker. A decoded packet whose flow cannot
+be hashed is logged and dropped rather than round-robined, because its stateful
+worker ownership cannot be established.
+
+Only the decoded packets are re-affinitized. The parser, the sensitive-mode
+heartbeat state, and output-line recreation all stay owned by the stream line's
+own worker, and this node keeps one stream output line per packet worker on its
+send side.
 
 The parser is resilient to garbage. If the stream head cannot be a valid IPv4
 start, the decoder scans a bounded resync window and discards bytes until the
