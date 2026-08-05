@@ -6,7 +6,7 @@ description: "Reference documentation for the TunDevice node."
 ---
 
 <!--
-Documentation version: 106
+Documentation version: 111
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/TunDevice/description.md, and both files must keep the same documentation version.
 -->
 
@@ -170,6 +170,35 @@ An explicit adapter `interface` setting overrides the automatic pin. A `source-i
 
 The c-ares DNS resolver sockets are not pinned by this feature. If the host's physical default route changes after startup, restart Waterwall or configure explicit interfaces/routes.
 
+## Reverse Path Filtering (Linux)
+
+Linux reverse-path filtering drops incoming packets whose source address does not route back out of the interface they arrived on. Traffic injected into a TUN regularly trips that check, so on Linux `TunDevice` writes `0` to both:
+
+```text
+/proc/sys/net/ipv4/conf/all/rp_filter
+/proc/sys/net/ipv4/conf/<device-name>/rp_filter
+```
+
+Both are required. The kernel filters on `max(all, <interface>)`, so leaving either one non-zero keeps the filter active for the TUN.
+
+This happens for every Linux TUN, not only when native system routes are enabled. A TUN whose routes are installed externally — by `post-up-script`, by another tool, or by the peer's configuration — hits the same check.
+
+Other interface-specific `rp_filter` files are left untouched, so any interface carrying its own non-zero value keeps filtering. Be aware of one side effect: an interface sitting at `0` while only `all` was non-zero becomes unfiltered, because lowering `all` lowers the floor for every interface.
+
+These sysctl changes are not restored on stop or destroy. If the sysctl files are read-only, startup logs a warning and continues.
+
+### Why The Value Is Re-Applied
+
+On systemd distributions the interface-specific write does not survive a single attempt. udev answers the new interface's `add` event by running:
+
+```text
+systemd-sysctl --prefix=/net/ipv4/conf/<device-name> ...
+```
+
+which re-applies patterns such as the `net.ipv4.conf.*.rp_filter` line in `/usr/lib/sysctl.d/50-default.conf`. That pass lands a few milliseconds after the interface appears, so it would otherwise overwrite the value immediately after it is written.
+
+`TunDevice` therefore holds the value down, re-applying it until it has stayed `0` for 300 ms. This adds roughly that much to TUN bring-up. If the value keeps being reset, Waterwall gives up after 2 seconds and logs an error, and reverse-path filtering stays enabled for the device.
+
 ## DNS Configuration
 
 `dns` accepts one or two IPv4 addresses:
@@ -196,9 +225,10 @@ On startup, `TunDevice`:
 2. creates the TUN interface
 3. assigns `device-ip`
 4. brings the interface up
-5. installs routes if enabled
-6. configures DNS if requested
-7. runs `post-up-script` if configured
+5. on Linux, disables IPv4 reverse-path filtering for the device
+6. installs routes if enabled
+7. configures DNS if requested
+8. runs `post-up-script` if configured
 
 When the OS device produces a packet:
 
