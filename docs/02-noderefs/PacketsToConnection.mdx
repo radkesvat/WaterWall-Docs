@@ -5,9 +5,10 @@ sidebar_label: "PacketsToConnection"
 description: "Reference documentation for the PacketsToConnection node."
 ---
 <!--
-Documentation version: 110
+Documentation version: 113
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/PacketsToConnection/description.md, and both files must keep the same documentation version.
 -->
+
 # PacketsToConnection
 
 `PacketsToConnection` is a packet-to-transport bridge built on lwIP.
@@ -114,6 +115,14 @@ Important internal rules:
 - packets emitted back to the packet side use the worker packet line for that packet worker
 - the worker-local netifs inherit the core `misc.mtu`, so a response larger than it leaves as IPv4 fragments
   rather than as one oversized raw packet the packet topology could not carry
+- packet emission is protected by an admission gate held through the previous-neighbour callback. Global shutdown
+  runs a pre-stop pass for every tunnel before any ordinary `onStop()`: PTC closes and quiesces this gate there, so an
+  already-admitted callback finishes before its neighbour can stop and a queued callback that runs later is cancelled
+  without allocating a worker buffer. Netif output is always queued, even to the same worker, so no neighbouring
+  callback runs while lwIP's non-recursive core lock is held
+- Stop explicitly detaches every owned per-flow UDP PCB, wildcard UDP PCB, and TCP listener before removing its netif.
+  WaterWall's lwIP patch treats that as a raw-owner precondition and rejects `netif_remove()` if either raw owner is
+  still present; it never silently frees a pointer the tunnel could still retain
 
 This keeps line destruction and tunnel state teardown on the normal Waterwall line side instead of relying on ad-hoc cross-worker message ownership.
 
@@ -235,10 +244,19 @@ The key idea is that the previous side is packet-oriented, while the next side i
   header and reading one out of a later fragment's payload bytes would be guessing - so the whole address is
   reserved for fragmented UDP, not only for fragmented DNS. Fragmented TCP to that address is unaffected and
   is routed normally
-- the zero-copy receive path wraps each incoming packet in a pooled descriptor sized from the shared
-  reassembly budget in `ww/lwip/lwipopts.h`; exhausting it drops one packet with a rate-limited warning. Packet
-  transforms may leave the buffer cursor unaligned, so that valid exceptional case is copied into an aligned
-  lwIP-owned pbuf while the common aligned path remains zero-copy
+- the zero-copy receive path wraps each incoming packet in a pooled descriptor whose size is derived in
+  `ww/lwip/lwipopts.h` from the shared reassembly budget *and* the TCP flow target. Both matter: one fragment
+  held for reassembly pins one descriptor, and so does one TCP segment held out of order - the larger consumer
+  of the two, and unlike `PBUF_POOL` exhaustion it does not trigger lwIP's out-of-order reclamation. The
+  resulting figure is headroom rather than a hard bound - one wrapper per advertised flow, plus the reassembly
+  budget and a fixed reserve. What makes it a bound is the per-PCB `TCP_OOSEQ_MAX_PBUFS`/`TCP_OOSEQ_MAX_BYTES`
+  ceiling beside it, which stops one reordering peer from spending the whole pool; exhaustion past that drops
+  one packet with a rate-limited warning
+- packet transforms may leave the buffer cursor at any byte alignment, and lwIP reads typed IP/TCP headers
+  straight out of it, so that exceptional case is copied into an aligned buffer and travels through the same
+  custom-pbuf wrapper as everything else. It is deliberately *not* copied into an lwIP `PBUF_RAM`: with pooled
+  heap allocation the largest class is 16 KiB including overhead, which silently dropped every valid misaligned
+  IPv4 packet above roughly that size while the aligned path beside it had no such ceiling
 - ICMP is not implemented
 - UDP pause is lossy, not queued
 - IPv4 route/netif contexts are created on demand per packet worker, not per destination IP, and are not currently exposed as a tuning surface

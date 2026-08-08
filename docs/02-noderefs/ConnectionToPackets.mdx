@@ -5,9 +5,10 @@ sidebar_label: "ConnectionToPackets"
 description: "Reference documentation for the ConnectionToPackets node."
 ---
 <!--
-Documentation version: 136
+Documentation version: 139
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/ConnectionToPackets/description.md, and both files must keep the same documentation version.
 -->
+
 # ConnectionToPackets Node
 
 `ConnectionToPackets` is the active-open inverse of `PacketsToConnection`. It takes an ordinary WaterWall connection
@@ -230,12 +231,29 @@ queued without bound.
   therefore never registers or retires anything - cannot keep answering for a tuple whose grace period has passed.
 - A registration that lands on a tombstone replaces it. lwIP has already chosen that exact local port, so refusing would
   trade an accepted late-packet ambiguity for a visible connection failure.
-- A local `Finish` or clean remote half-close first flushes accepted TCP bytes. Any remainder moves with the PCB to a
-  node-owned drain, including while the active open is still in `SYN_SENT`; it writes until the peer has every byte and
-  only then closes. Its tuple stays registered as *draining* - neither active nor a tombstone - so it cannot be evicted
-  while this node still owns the PCB. Drains are best-effort within a shared `16 MiB` budget and a `30` second deadline.
-  Resource refusal, deadline expiry, connect failure, or terminal write/close failure resets the TCP flow instead of
-  reporting a clean but truncated EOF.
+- A local `Finish` or clean remote half-close first flushes accepted TCP bytes. The PCB then moves to a node-owned
+  closer, which a *connected* flow takes even with nothing left queued: bytes already inside lwIP may still be
+  unacknowledged, the peer may still be sending with nobody left to credit it, and its acknowledgements have to keep
+  routing to this worker. During that handoff, every byte already copied out of lwIP but not yet passed to
+  `tcp_recved()` is returned before the line's PCB pointer is cleared. This includes still-queued owner tasks and the
+  paused subset, so the closer inherits a fully reopened receive window and each accepted byte is credited once.
+- The closer writes until the peer has every accepted byte and then requests a TX-only shutdown. Its tuple stays
+  registered as *draining* - neither active nor a tombstone - so it cannot be evicted while this node still owns the
+  PCB. A `30` second deadline covers both queued-byte delivery and a FIN that lwIP has accepted but cannot yet allocate.
+  In that latter state `tcp_shutdown()` returns success with `TF_CLOSEPEND`; the closer keeps its callbacks, registry
+  ownership, and deadline, and records peer EOF without retiring. Only an actual transition to `FIN_WAIT_1` or
+  `LAST_ACK` with `TF_CLOSEPEND` clear means the FIN was queued. At that point a separate `60` second peer-close
+  deadline is armed. Closers are also bounded by a shared `16 MiB` byte budget and a `4096` object count; past any
+  bound, the PCB is aborted exactly once rather than reporting a clean but truncated EOF or leaving an untracked PCB.
+- The FIN is sent with a TX-only shutdown, never `tcp_close()`. lwIP resets and frees a PCB whenever `tcp_close()` runs
+  in `ESTABLISHED` or `CLOSE_WAIT` with receive credit outstanding - and this node returns credit from an owner-worker
+  task, and withholds it entirely while the previous tunnel is paused, so that is the ordinary state rather than an
+  exceptional one. The reset would have taken every unacknowledged outbound byte with it, which is precisely what the
+  closer exists to prevent. Only a flow that never reached a connected state still closes, where the rule cannot apply.
+- A write lwIP refuses with `ERR_MEM` is retried from a `tcp_poll` callback installed for exactly as long as the write
+  stays blocked. `tcp_sent` alone was not enough: a first write that fails on an otherwise idle PCB leaves nothing
+  unacknowledged, so no acknowledgement was ever coming and the line stayed paused after the pressure cleared. Any other
+  write error is terminal and closes the flow once instead of being retried forever.
 - The active-open deadline is a cancellable per-line timer owned by that line's event worker, holding exactly one line
   reference. A successful connection cancels it immediately: a fire-and-forget delayed task would have kept its message
   and the line allocation behind it alive for the whole configured timeout, up to the ~49.7 days a `uint32_t`
@@ -245,8 +263,11 @@ queued without bound.
   identify a packet that arrives from the network after a tuple was retired and reused, because an IP packet carries no
   generation. Tombstones reduce that late-network-packet window but cannot eliminate it.
 - `onStop()` publishes a stopping gate, then detaches every PCB, flow, netif and staged fragment under the lwIP core
-  lock, and clears each live line's copy of its PCB pointer so a worker that has not drained yet cannot dereference a
-  released PCB. Every queued task rechecks the gate, so a task that observes it suppresses its data and lifecycle events
+  lock. TCP PCBs are **aborted** there rather than closed: Stop is terminal, the gate already refuses this node's netif
+  output, and a successful close would have left an established PCB sitting in `FIN_WAIT` on lwIP's process-global
+  active list - outliving the netif removed moments later, and able to observe whichever future interface inherits that
+  one-byte netif index. It also clears each live line's copy of its PCB pointer so a worker that has not drained yet
+  cannot dereference a released PCB. Every queued task rechecks the gate, so a task that observes it suppresses its data and lifecycle events
   toward either neighbour, while close paths stay live so borrowed lines can still be released by their owners.
 - The gate is not a strict quiescence boundary: a task that passed its check immediately before `onStop()` published the
   gate can still reach a neighbour afterwards. It is rechecked after every blocking section - waiting for the lwIP core
@@ -286,14 +307,18 @@ The reassembly budget is deliberately independent of the flow targets: reassembl
 reassembly backlog cannot starve the receive path. Return packets are injected as reference pbufs rather than copied
 into pool buffers, so one wire packet costs exactly one unit of that budget - which is the unit lwIP charges.
 
-`PacketsToConnection`'s zero-copy receive path takes its wrapper-pool size from the same budget, since each fragment
-lwIP retains pins one wrapper.
+`PacketsToConnection`'s zero-copy receive path derives its wrapper-pool size from that budget plus the advertised TCP
+flow count plus a fixed reserve. Reassembly is not its only consumer: every segment TCP retains out of order also pins a
+wrapper, and unlike `PBUF_POOL` exhaustion, wrapper exhaustion does not trigger lwIP's out-of-order reclamation - so a
+pool sized for reassembly alone could be emptied by ordinary reordering across the flow target and then drop the very
+retransmissions that would have freed it. A per-PCB `TCP_OOSEQ_MAX_PBUFS` ceiling keeps one peer from spending the
+shared reserve.
 
 The previous development-sized values let five concurrent TCP flows exhaust the whole process, and could not reassemble
 a single fragmented 8 KiB datagram.
 
-These pools are static. With the documented defaults a Linux release build has roughly **9.5 MB total BSS**, about an
-**8.5 MB increase** over the earlier development-sized pools' roughly 1.0 MB. Lower the cache variables to trade
+These pools are static. With the documented defaults a Linux release build has roughly **9.6 MB total BSS**, about an
+**8.6 MB increase** over the earlier development-sized pools' roughly 1.0 MB. Lower the cache variables to trade
 concurrency back for memory on a constrained target; a value large enough to overflow lwIP's `u16_t` pool counters
 fails the build instead of silently truncating.
 
