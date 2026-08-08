@@ -5,7 +5,7 @@ sidebar_label: "PacketsToConnection"
 description: "Reference documentation for the PacketsToConnection node."
 ---
 <!--
-Documentation version: 114
+Documentation version: 115
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/PacketsToConnection/description.md, and both files must keep the same documentation version.
 -->
 
@@ -111,7 +111,8 @@ Important internal rules:
 - packet-line `Init` is a startup/bootstrap event, not a per-flow open
 - generated TCP/UDP Waterwall lines are owned by the packet worker that accepted the flow
 - lwIP callbacks hand work back to the owning line worker through `lineScheduleTask()` and `lineScheduleTaskWithBuf()`
-- delayed UDP idle close runs on the line owner with `lineScheduleDelayedTask()`
+- UDP idle close uses one cancellable owner-worker timer. The timer owns exactly one line reference while armed,
+  activity resets the same timer, and close cancels it and drops the reference before line state is zeroed
 - packets emitted back to the packet side use the worker packet line for that packet worker
 - the worker-local netifs inherit the core `misc.mtu`, so a response larger than it leaves as IPv4 fragments
   rather than as one oversized raw packet the packet topology could not carry
@@ -119,14 +120,15 @@ Important internal rules:
   `Init`/`Payload`/`Resume`/`Finish` work uses a second gate held through the next-neighbour callback. Global shutdown
   runs a pre-stop pass for every tunnel before any ordinary `onStop()`: PTC closes and quiesces both gates there, so an
   already-admitted callback finishes before its neighbour can stop and queued work that runs later is cancelled. A
-  refused next-side task recycles its owned buffer and closes the PTC-owned normal line locally; it never calls a
-  stopped neighbour
+  refused next-side ordinary work recycles anything it owns and leaves teardown to the owner path; an initialized line
+  still receives its one explicit teardown `Finish` while PTC's Stop hook is ordered before the next tunnel's Stop hook
 - netif output is always queued, even to the same worker, so no neighbouring callback runs while lwIP's non-recursive
   core lock is held. Fake-DNS lookup and response construction remain under that lock, but the completed response is
   returned to the outer packet handler and published only after it unlocks
 - every generated TCP/UDP line is registered in a per-worker owner list until its one close path unlinks it. Stop first
   detaches PCB, route-map, callback, and UDP-idle producers under the core lock, then drains each owner-worker list,
-  destroys the line state, and calls `lineDestroy()`. Configuration Stop waits for all worker drains; terminal worker
+  preserves whether next-side `Init` completed, destroys PTC line state, sends exactly one next-side teardown `Finish`
+  when required, and calls `lineDestroy()`. Configuration Stop waits for all worker drains; terminal worker
   shutdown performs the same drain locally without relying on new message admission
 - Stop explicitly detaches every owned per-flow UDP PCB, wildcard UDP PCB, and TCP listener before removing its netif.
   WaterWall's lwIP patch treats that as a raw-owner precondition and rejects `netif_remove()` if either raw owner is
@@ -140,18 +142,24 @@ The internally created TCP/UDP lines are normal connection lines. They are separ
 
 When the network side closes a flow:
 
-- lwIP state is detached first
+- a connected TCP PCB moves to an instance-owned closer, even when the application queue is empty
+- the closer copies only the suffix `tcp_write()` has not accepted; bytes already copied into lwIP are never duplicated
+- receive credit is returned, peer data is consumed, and a TX-only `tcp_shutdown()` sends FIN after every accepted byte
 - this tunnel destroys its own line state
 - if upstream `Init` was already sent, upstream `Finish` is propagated
 - the internally created line is then destroyed by `PacketsToConnection`
 
 When the next tunnel sends downstream `Finish`:
 
-- `PacketsToConnection` closes the lwIP side
+- `PacketsToConnection` transfers a connected TCP PCB to the same graceful closer
 - destroys its own line state
 - destroys the internally created line
 
 It does not reflect that downstream `Finish` back toward upstream.
+
+The closer has monotonic delivering, FIN-pending, and closing phases. Delivery and peer-close deadlines are bounded at
+30 and 60 seconds, and one instance may retain at most 4096 closers and 16 MiB of copied suffixes. Allocation, capacity,
+terminal write, or deadline failure resets that flow; Stop aborts all active closers before route/netif removal.
 
 That matches Waterwall's direction rules for internally created lines.
 
@@ -165,7 +173,7 @@ TCP backpressure is integrated with Waterwall:
 
 - if lwIP cannot accept all downstream bytes, remaining data is queued
 - upstream is paused with `tunnelNextUpStreamPause()`
-- lwIP sent callbacks flush the queue
+- lwIP sent callbacks flush the queue, and `tcp_poll` supplies bounded progress when the first write accepted nothing
 - upstream is resumed with `tunnelNextUpStreamResume()` when writable again
 
 For receive-side backpressure:
@@ -258,7 +266,8 @@ The key idea is that the previous side is packet-oriented, while the next side i
   of the two, and unlike `PBUF_POOL` exhaustion it does not trigger lwIP's out-of-order reclamation. The
   resulting figure is headroom rather than a hard bound - one wrapper per advertised flow, plus the reassembly
   budget and a fixed reserve. What makes it a bound is the per-PCB `TCP_OOSEQ_MAX_PBUFS`/`TCP_OOSEQ_MAX_BYTES`
-  ceiling beside it, which stops one reordering peer from spending the whole pool; exhaustion past that drops
+  ceiling beside it. The 32-pbuf ceiling is the effective bound; the byte ceiling is an intentionally unreachable
+  future-defense guard at the current receive window. Exhaustion past the active bound drops
   one packet with a rate-limited warning
 - packet transforms may leave the buffer cursor at any byte alignment, and lwIP reads typed IP/TCP headers
   straight out of it, so that exceptional case is copied into an aligned buffer and travels through the same

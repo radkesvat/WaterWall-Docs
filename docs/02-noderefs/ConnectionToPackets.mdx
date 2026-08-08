@@ -5,7 +5,7 @@ sidebar_label: "ConnectionToPackets"
 description: "Reference documentation for the ConnectionToPackets node."
 ---
 <!--
-Documentation version: 140
+Documentation version: 141
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/ConnectionToPackets/description.md, and both files must keep the same documentation version.
 -->
 
@@ -267,19 +267,20 @@ queued without bound.
   between lookup and delivery, and it is revalidated under the lwIP core lock immediately before injection. It cannot
   identify a packet that arrives from the network after a tuple was retired and reused, because an IP packet carries no
   generation. Tombstones reduce that late-network-packet window but cannot eliminate it.
-- `onStop()` publishes a stopping gate, then detaches every PCB, flow, netif and staged fragment under the lwIP core
+- `onPreStop()` publishes stopping and closes two reference-counted admission gates. The previous-side gate spans every
+  ordinary normal-line callback, while the next-side gate spans packet-line `Init`/`Payload`. Closing waits for an
+  already admitted callback to return and rejects every later callback before any neighbor can complete `onStop()`.
+  `onStop()` then detaches every PCB, flow, netif and staged fragment under the lwIP core
   lock. TCP PCBs are **aborted** there rather than closed: Stop is terminal, the gate already refuses this node's netif
   output, and a successful close would have left an established PCB sitting in `FIN_WAIT` on lwIP's process-global
   active list - outliving the netif removed moments later, and able to observe whichever future interface inherits that
   one-byte netif index. It also clears each live line's copy of its PCB pointer so a worker that has not drained yet
-  cannot dereference a released PCB. Every queued task rechecks the gate, so a task that observes it suppresses its data and lifecycle events
+  cannot dereference a released PCB. Every queued task enters the relevant gate, so a rejected task suppresses its data and lifecycle events
   toward either neighbour, while close paths stay live so borrowed lines can still be released by their owners.
-- The gate is not a strict quiescence boundary: a task that passed its check immediately before `onStop()` published the
-  gate can still reach a neighbour afterwards. It is rechecked after every blocking section - waiting for the lwIP core
-  lock is unbounded, since lwIP's timer thread holds it for whole sweeps - and again immediately before any callback
-  toward a neighbour, which is as narrow as the window gets from inside this node. What the gate plus the core-locked
-  cleanup does guarantee is that no PCB is touched after stop. Full callback quiescence would need a lifecycle counter
-  in the framework rather than more one-time checks here.
+- If lwIP replays refused receive data from its real timer thread, the callback leaves the original pbuf retained,
+  latches one retry, and queues `tcp_process_refused_data()` to the flow's owner worker. Owner-pool access and delivery
+  therefore remain worker-correct, including a data-plus-FIN replay. A required control enqueue refusal requests orderly
+  process shutdown so Stop can discover and release the registered flow instead of silently losing a state transition.
 - Borrowed lines are finished and destroyed later by their real owners.
 
 ## Capacity
