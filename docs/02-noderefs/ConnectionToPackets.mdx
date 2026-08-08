@@ -5,7 +5,7 @@ sidebar_label: "ConnectionToPackets"
 description: "Reference documentation for the ConnectionToPackets node."
 ---
 <!--
-Documentation version: 139
+Documentation version: 140
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/ConnectionToPackets/description.md, and both files must keep the same documentation version.
 -->
 
@@ -221,9 +221,11 @@ queued without bound.
 - Because the chain may start with a layer-4 adapter, the packet side is initialized from `onStart()` with one queued
   task per worker rather than by the node manager's layer-3 head initialization.
 - A gracefully closed TCP flow leaves a tombstone in the flow registry so late FIN/ACK traffic still reaches the right
-  worker and netif. It is a routing grace period of `2 * TCP_MSL`, not a model of the PCB's lifetime: `tcp_close()`
-  moves the PCB through FIN_WAIT or LAST_ACK before TIME_WAIT even begins, so no fixed interval measured from the close
-  can track it. A tombstone may therefore outlive its PCB or expire before it; neither loses a live flow.
+  worker and netif. It is a routing grace period of `2 * TCP_MSL`, not a model of the PCB's lifetime. The node-owned
+  closer uses TX-only `tcp_shutdown(pcb, 0, 1)` and tracks the PCB through `FIN_WAIT_1`, `FIN_WAIT_2`, `CLOSING`, or
+  `LAST_ACK`; it does not use `tcp_close()` for a connected flow. When lwIP moves the PCB to `TIME_WAIT`, the closer
+  detaches its application callbacks and retires its live registry entry immediately, leaving only lwIP to own the
+  `TIME_WAIT` PCB. The separate tombstone may therefore outlive that PCB or expire before it; neither loses a live flow.
 - Tombstones are held in a fixed `4096`-entry retirement ring rather than each holding its own worker timer - a timer
   per close made both the timer queue and shutdown cost grow with connection churn. The ring is what makes the bound
   hard: more flows can close inside one grace period than an age-based sweep would be allowed to remove, so past the cap
@@ -241,10 +243,13 @@ queued without bound.
   registered as *draining* - neither active nor a tombstone - so it cannot be evicted while this node still owns the
   PCB. A `30` second deadline covers both queued-byte delivery and a FIN that lwIP has accepted but cannot yet allocate.
   In that latter state `tcp_shutdown()` returns success with `TF_CLOSEPEND`; the closer keeps its callbacks, registry
-  ownership, and deadline, and records peer EOF without retiring. Only an actual transition to `FIN_WAIT_1` or
-  `LAST_ACK` with `TF_CLOSEPEND` clear means the FIN was queued. At that point a separate `60` second peer-close
-  deadline is armed. Closers are also bounded by a shared `16 MiB` byte budget and a `4096` object count; past any
-  bound, the PCB is aborted exactly once rather than reporting a clean but truncated EOF or leaving an untracked PCB.
+  ownership, and deadline, and records peer EOF without retiring. An actual transition to `FIN_WAIT_1`, `FIN_WAIT_2`,
+  `CLOSING`, or `LAST_ACK` with `TF_CLOSEPEND` clear means the FIN was queued; this real state is reconciled before the
+  pending-FIN deadline, so a transition made by the same timer tick wins at deadline equality. `TIME_WAIT` is graceful
+  terminal reconciliation and retires the closer without aborting the PCB. A separate `60` second peer-close deadline
+  covers active closing states. Closers are also bounded by a shared `16 MiB` byte budget and a `4096` object count;
+  past any bound, the PCB is aborted exactly once rather than reporting a clean but truncated EOF or leaving an
+  untracked PCB.
 - The FIN is sent with a TX-only shutdown, never `tcp_close()`. lwIP resets and frees a PCB whenever `tcp_close()` runs
   in `ESTABLISHED` or `CLOSE_WAIT` with receive credit outstanding - and this node returns credit from an owner-worker
   task, and withholds it entirely while the previous tunnel is paused, so that is the ordinary state rather than an
