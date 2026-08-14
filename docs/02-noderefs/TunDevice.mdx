@@ -6,54 +6,61 @@ description: "Reference documentation for the TunDevice node."
 ---
 
 <!--
-Documentation version: 111
+Documentation version: 115
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/TunDevice/description.md, and both files must keep the same documentation version.
 -->
 
-# TunDevice
+# TunDevice Node
 
-`TunDevice` attaches a Waterwall packet chain to an operating-system TUN interface. It reads layer-3 IP packets from the virtual device and injects them into the chain, and it writes IP packets that reach it from the chain back into the device.
+`TunDevice` attaches WaterWall to a TUN interface. It reads IP packets from the virtual network device and forwards them into the chain, and it can also write IP packets from the chain back into the TUN device.
 
-This is a layer-3 adapter, not a connection-oriented stream tunnel. It does not create one line per connection. Runtime packets use the worker packet lines that the chain provides for packet-layer nodes.
+This node is a layer-3 adapter rather than a connection-oriented tunnel.
+
+## What It Does
+
+- Creates and configures a TUN interface.
+- Assigns an IP address and subnet mask to that device.
+- Brings the device up.
+- Reads packets from the device and forwards them to the adjacent chain side.
+- Writes packets received from the chain back into the device.
+- Recalculates checksums before writing when the line requests it.
+
+Because it is a packet adapter, this node does not create per-connection lines. It uses worker packet lines provided by the chain.
 
 ## Typical Placement
 
-`TunDevice` can be used at either edge of a packet chain:
+`TunDevice` can be placed at either edge of a chain:
 
-```text
-TunDevice -> IpManipulator -> RawSocket
-TunDevice -> WireGuardDevice -> UdpStatelessSocket
-TunDevice -> PacketsToStream -> TcpConnector
-TcpListener -> StreamToPackets -> TunDevice
-```
+- if it is last in the chain, packets read from the TUN device are forwarded to the previous node
+- otherwise, packets read from the TUN device are forwarded to the next node
 
-When `TunDevice` is not the last node, packets read from the OS device are forwarded to the next node with the upstream packet path. When it is the last node, packets read from the OS device are forwarded to the previous node with the downstream packet path.
+Payload coming from either side and reaching `TunDevice` is written into the TUN interface.
 
-Payload that reaches `TunDevice` from either direction is treated as an IP packet and written to the TUN interface.
-
-## Basic Example
+## Configuration Example
 
 ```json
 {
   "name": "tun0-adapter",
   "type": "TunDevice",
   "settings": {
-    "device-name": "wtun0",
+    "device-name": "tun0",
     "device-ip": "10.10.0.1/24",
-    "device-mtu": 1500
+    "device-mtu": 1500,
+    "dns": ["1.1.1.1", "8.8.8.8"],
+    "route-table": "off"
   },
-  "next": "next-node"
+  "next": "next-node-name"
 }
 ```
 
-Full-route example with local networks excluded:
+Full-route example with local ranges excluded:
 
 ```json
 {
   "name": "tun0-adapter",
   "type": "TunDevice",
   "settings": {
-    "device-name": "wtun0",
+    "device-name": "tun0",
     "device-ip": "10.10.0.1/24",
     "device-mtu": 1500,
     "route-table": "main",
@@ -61,239 +68,222 @@ Full-route example with local networks excluded:
       "10.0.0.0/8",
       "172.16.0.0/12",
       "192.168.0.0/16"
-    ],
-    "dns": ["1.1.1.1", "8.8.8.8"]
+    ]
   },
-  "next": "next-node"
+  "next": "next-node-name"
 }
 ```
 
-## Required Settings
+## Required JSON Fields
 
-| Field | Type | Description |
-|---|---|---|
-| `device-name` | string | Name of the TUN interface to create or open. Use a unique name that does not collide with another OS interface or another Waterwall node. |
-| `device-ip` | string | Device address in CIDR form, such as `10.10.0.1/24`. Waterwall splits this into the interface IP and subnet mask. |
+### Top-level fields
 
-The top-level `settings` object must exist and must not be empty.
+- `name` `(string)`
+  A user-chosen name for this node.
 
-## Optional Settings
+- `type` `(string)`
+  Must be exactly `"TunDevice"`.
 
-| Field | Default | Description |
-|---|---|---|
-| `device-mtu` | global Waterwall MTU | MTU configured on the TUN device. Must be between `1` and `65535`. |
-| `route-table` | `off` | Controls native route installation. Use `off`, `main`, `auto`, or a Linux routing table name/number. |
-| `system-route` | `false` | Shortcut for full-device routing. If true and `route-table` is not set, behaves like `route-table: "main"`. |
-| `route-cidrs` | full route for the device address family | CIDRs to route through the TUN when system routing is enabled. |
-| `route-exclude-cidrs` | none | CIDRs subtracted from `route-cidrs`, useful for LAN, management, and upstream endpoint ranges. |
-| `dns` | unset | One or two IPv4 DNS servers to associate with the TUN interface. |
-| `loop-protection` | enabled when system routing is enabled | Keeps Waterwall's own outbound sockets from being routed back into the TUN. |
-| `post-up-script` | unset | Shell command run after the interface is up, routes are installed, and DNS is configured. |
-| `pre-down-script` | unset | Shell command run before DNS/routes are cleaned up and the interface is brought down. |
+### `settings`
 
-## How The TUN Address Works
+- `device-name` `(string)`
+  Name of the TUN interface to create or open.
 
-If you configure:
+- `device-ip` `(string)`
+  IPv4 interface address and subnet in CIDR form. IPv6 is rejected because the
+  packet datapath is IPv4-only.
+  Example: `"10.10.0.1/24"`
 
-```text
-10.10.0.1/24
-```
+  The current implementation splits this into:
+  - device IP address
+  - subnet mask length
 
-then `10.10.0.1` is the local address assigned to the operating-system TUN interface. Traffic sent to that exact address is local to the host, similar in spirit to sending traffic to `127.0.0.1`; it is not the interesting packet path for Waterwall.
+## Optional `settings` Fields
 
-Traffic sent to another address in the routed range, for example:
+- `device-mtu` `(integer)`
+  MTU to configure on the TUN device, in the inclusive range `68..65535`.
+  Fractional numbers, strings, booleans, and `null` are rejected.
 
-```text
-10.10.0.2
-```
+  Default: global MTU size used by WaterWall.
 
-is what normally enters the TUN device. In that case the packet seen by Waterwall can have source `10.10.0.1` and destination `10.10.0.2`. Packet nodes after `TunDevice`, such as `IpOverrider` or `IpManipulator`, can then rewrite or transform that packet before it reaches the next adapter.
+- `route-table` `(string)`
+  Controls native system route installation.
 
-## Route Configuration
+  Default: `"off"`
 
-Native route installation is disabled by default. Enable it with either:
+  Supported values:
+  - `"off"`: do not install routes
+  - `"main"` or `"auto"`: install routes into the normal platform routing table
+  - Linux only: a numeric or named routing table accepted by `ip route`
 
-```json
-"route-table": "main"
-```
+- `system-route` `(boolean)`
+  Convenience switch for full-device routing. If this is `true` and `route-table` is not set, it behaves like `"route-table": "main"`.
 
-or:
+  Default: `false`
 
-```json
-"system-route": true
-```
+- `route-cidrs` `(array of strings)`
+  CIDRs to route toward the TUN interface when routing is enabled.
 
-Supported `route-table` values:
+  Default: the IPv4 full route, `"0.0.0.0/0"`.
+  Default routes are installed as split `/1` routes so the existing system default route does not need to be replaced.
 
-| Value | Behavior |
-|---|---|
-| `off` | Do not install native routes. |
-| `main` | Install routes into the platform's main routing table. |
-| `auto` | Treated as main-table routing on platforms that support it. |
-| Linux table name or number | Install routes into that Linux routing table. |
+- `route-exclude-cidrs` `(array of strings)`
+  CIDRs to leave out of the routes installed by `route-cidrs`.
 
-Windows and macOS reject route tables other than `main` or `auto`.
+  This is useful when `route-cidrs` is global and some local, management, or upstream endpoint ranges must keep using the existing system route.
 
-When routing is enabled and `route-cidrs` is omitted, Waterwall installs a full route for the address family of `device-ip`. A default route such as `0.0.0.0/0` is expanded into split `/1` routes so the existing system default route does not need to be directly replaced.
+- `dns` `(array of IPv4 strings)`
+  DNS servers to associate with the TUN interface.
 
-`route-exclude-cidrs` subtracts networks from the route set:
+  The array must contain one or two valid IPv4 addresses. Hostnames, IPv6
+  addresses, empty strings, and more than two entries are rejected during node
+  creation.
 
-```json
-{
-  "route-table": "main",
-  "route-cidrs": ["0.0.0.0/0"],
-  "route-exclude-cidrs": [
-    "10.0.0.0/8",
-    "172.16.0.0/12",
-    "192.168.0.0/16"
-  ]
-}
-```
+  `null` is treated the same as leaving the field unset.
 
-Use exclusions for local networks, management addresses, and any upstream server endpoint that must keep using the physical network path.
+  On Linux this requires `systemd-resolved` / `resolvectl`; it sets DNS servers
+  with `resolvectl dns` and installs the `~.` routing domain so the configured
+  servers are used as the default resolver path while the device is active. On
+  Windows this configures static IPv4 DNS servers on the Wintun adapter with
+  `netsh`; DNS precedence still follows Windows interface metrics. macOS TUN DNS
+  configuration is rejected during node creation; use `post-up-script` /
+  `pre-down-script` for platform-specific resolver setup there.
 
-## Loop Protection
+- `loop-protection` `(boolean)`
+  Keeps WaterWall's own outbound traffic from being routed back into the TUN
+  (a routing loop) when the TUN is a system/full route.
 
-When the TUN device becomes a system or full route, the host may route Waterwall's own outbound connector sockets back into the TUN. That creates a self-loop: Waterwall sends traffic, the OS sends it into the TUN, and Waterwall reads it again.
+  Default: enabled whenever system routing is enabled (i.e. tracks
+  `system-route` / `route-table`), disabled otherwise. Set to `false` to opt out.
 
-`loop-protection` is enabled by default whenever system routing is enabled. Before the TUN routes are installed, `TunDevice` snapshots the current physical default interface and publishes it as a process-wide egress pin. Outbound adapters such as `TcpConnector`, `UdpConnector`, and `UdpStatelessSocket` can apply that pin unless their own `interface` setting is configured.
+  When active, `TunDevice` snapshots the current physical default interface
+  before installing TUN routes and publishes it as a process-wide egress pin.
+  Outbound adapter sockets such as `TcpConnector`, `UdpConnector`, and
+  `UdpStatelessSocket` apply that pin unless their own `interface` setting is
+  explicitly configured.
 
-Platform notes:
+- `post-up-script` `(string)`
+  Optional shell command to run after the interface is up and native routes are installed.
 
-| Platform | Loop-protection behavior |
-|---|---|
-| Linux | Uses the detected default interface with socket interface binding. |
-| Windows | Uses the detected interface index for outbound socket routing. |
-| macOS | No automatic egress pin currently; use explicit connector `interface` settings or route exclusions. |
+- `pre-down-script` `(string)`
+  Optional shell command to run before native routes are removed and the interface is brought down.
 
-An explicit adapter `interface` setting overrides the automatic pin. A `source-ip` setting alone does not override it. If the chosen source IP belongs to a different physical interface than the detected default route, set the connector `interface` explicitly.
+## Detailed Behavior
 
-The c-ares DNS resolver sockets are not pinned by this feature. If the host's physical default route changes after startup, restart Waterwall or configure explicit interfaces/routes.
+### Device setup
 
-## Reverse Path Filtering (Linux)
+During tunnel creation, `TunDevice`:
 
-Linux reverse-path filtering drops incoming packets whose source address does not route back out of the interface they arrived on. Traffic injected into a TUN regularly trips that check, so on Linux `TunDevice` writes `0` to both:
+- parses route/DNS settings
+- if loop protection is enabled, snapshots the current physical default
+  interface and publishes it for outbound adapter sockets
 
-```text
-/proc/sys/net/ipv4/conf/all/rp_filter
-/proc/sys/net/ipv4/conf/<device-name>/rp_filter
-```
+During `onStart`, `TunDevice`:
 
-Both are required. The kernel filters on `max(all, <interface>)`, so leaving either one non-zero keeps the filter active for the TUN.
-
-This happens for every Linux TUN, not only when native system routes are enabled. A TUN whose routes are installed externally — by `post-up-script`, by another tool, or by the peer's configuration — hits the same check.
-
-Other interface-specific `rp_filter` files are left untouched, so any interface carrying its own non-zero value keeps filtering. Be aware of one side effect: an interface sitting at `0` while only `all` was non-zero becomes unfiltered, because lowering `all` lowers the floor for every interface.
-
-These sysctl changes are not restored on stop or destroy. If the sysctl files are read-only, startup logs a warning and continues.
-
-### Why The Value Is Re-Applied
-
-On systemd distributions the interface-specific write does not survive a single attempt. udev answers the new interface's `add` event by running:
-
-```text
-systemd-sysctl --prefix=/net/ipv4/conf/<device-name> ...
-```
-
-which re-applies patterns such as the `net.ipv4.conf.*.rp_filter` line in `/usr/lib/sysctl.d/50-default.conf`. That pass lands a few milliseconds after the interface appears, so it would otherwise overwrite the value immediately after it is written.
-
-`TunDevice` therefore holds the value down, re-applying it until it has stayed `0` for 300 ms. This adds roughly that much to TUN bring-up. If the value keeps being reset, Waterwall gives up after 2 seconds and logs an error, and reverse-path filtering stays enabled for the device.
-
-## DNS Configuration
-
-`dns` accepts one or two IPv4 addresses:
-
-```json
-"dns": ["1.1.1.1", "8.8.8.8"]
-```
-
-Invalid IPv4 strings, hostnames, IPv6 addresses, empty entries, and more than two servers are rejected during node creation. `null` is treated like leaving the field unset.
-
-Platform behavior:
-
-| Platform | Behavior |
-|---|---|
-| Linux | Uses `resolvectl dns` and sets the `~.` routing domain. Requires `systemd-resolved` and `resolvectl`. |
-| Windows | Uses `netsh` to configure static IPv4 DNS servers on the Wintun adapter. DNS precedence still follows Windows interface metrics. |
-| macOS | The `dns` setting is rejected during node creation. Use `post-up-script` and `pre-down-script` for resolver setup. |
-
-## Packet Flow
-
-On startup, `TunDevice`:
-
-1. decides whether packets read from the device should go to the next or previous node
-2. creates the TUN interface
-3. assigns `device-ip`
-4. brings the interface up
-5. on Linux, disables IPv4 reverse-path filtering for the device
-6. installs routes if enabled
-7. configures DNS if requested
-8. runs `post-up-script` if configured
-
-When the OS device produces a packet:
-
-1. the packet is received on a worker
-2. the packet is dropped if the device is down or the application is terminating
-3. the packet version is checked
-4. IPv4 packets are forwarded using that worker's packet line
-5. non-IPv4 packets are currently dropped by this receive path
-
-When payload reaches `TunDevice` from the chain:
-
-1. the payload is treated as an IP packet
-2. checksum recalculation is performed if the packet line requests it
-3. the packet is written to the TUN device
-4. if the device is down or the write fails, the buffer is reused and a warning is logged
-
-## Packet-Line Semantics
-
-`TunDevice` is a packet adapter. It uses the worker packet line created by the chain, not a normal per-connection line. Packet lines are persistent worker-local runtime lines and must not be destroyed during normal packet flow.
-
-In debug builds, after `TunDevice` forwards a received packet, it checks that the packet line is still alive. If a downstream packet tunnel destroys that packet line during runtime, Waterwall treats it as a packet-tunnel contract violation.
-
-Connection-style callbacks such as `Init`, `Est`, `Finish`, `Pause`, and `Resume` are ignored by this adapter. Payload callbacks are the meaningful runtime path.
-
-## Checksum Behavior
-
-Some packet tunnels can mark the line so checksums must be recalculated. When `TunDevice` writes a packet to the OS device and `recalculate_checksum` is set, it recalculates the packet checksum and clears the flag.
-
-For fragmented IPv4 packets, Waterwall's checksum helper avoids recalculating transport checksums that cannot be safely recalculated from a single fragment and only fixes what can be fixed from the available packet data.
-
-## MTU Notes
-
-If `device-mtu` is not set, the node uses Waterwall's global MTU value.
-
-Lowering the MTU can be useful when later packet nodes add overhead. Be careful when combining `TunDevice` with adapters that work directly with a physical interface, such as `RawSocket`: the OS may reject packets that no longer match the real path MTU expectations. In that kind of topology, keep the global MTU and TUN MTU aligned with the physical path.
-
-## Shutdown Behavior
-
-On stop or destroy, `TunDevice` cleans up in the reverse direction:
-
-1. runs `pre-down-script` before bringing the device down
-2. clears the loop-protection egress pin if this instance published it
-3. clears DNS settings
-4. removes installed routes in reverse install order
-5. brings down and destroys the TUN device
-
-If route or DNS cleanup fails, Waterwall logs a warning.
-
-## Node Metadata
-
-| Property | Value |
-|---|---|
-| Layer | Layer 3 |
-| Chain position | Can be chain head or chain end |
-| `next` | Optional, but normally present unless used at the end of a chain |
-| `prev` | Allowed |
-| Required left padding | `0` |
-| Line state | Minimal placeholder state; packet runtime uses worker packet lines |
-
-## Common Mistakes
-
-- Pinging the TUN interface address itself and expecting packets to enter Waterwall. Use another address in the routed range.
-- Enabling full routing without excluding the upstream server endpoint or relying on loop protection for a platform/topology it cannot cover.
-- Using `dns` on macOS. Configure resolver state with scripts instead.
-- Expecting non-IPv4 packets from the TUN receive path to be forwarded.
-- Treating `TunDevice` as a TCP/UDP connection adapter. It carries raw IP packets through packet lines.
-- Forgetting that Windows TUN management requires administrative privileges.
-
+- decides which adjacent tunnel should receive packets read from the device
+- creates the TUN device
+- assigns the configured IP/subnet
+- brings the device up
+- on Linux, disables IPv4 reverse-path filtering for `all` and the TUN interface, always, and holds the interface value down until it sticks
+- optionally installs native system routes
+- optionally runs `post-up-script`
+
+The actual device creation is deferred until start time because the tunnel needs chain context to know which side should receive packets.
+
+### Packet input path
+
+When the TUN device produces a packet:
+
+- the packet is received on a worker
+- the kernel TUN contract supplies packet bytes without checksum-offload provenance. Unfragmented kernel-produced
+  packets are trusted at this adapter boundary and are validated by their downstream consumer; fragmented IPv4
+  packets pass the common fragment parser, which validates their structure and header checksum before association
+- only IPv4 packets are currently accepted by this path
+- the packet is forwarded through the chosen adjacent tunnel using the worker's packet line
+
+If the device is down, the packet is dropped.
+
+Fragment affinity follows the packet buffer through ordinary forwarding, delay, one-to-one copies, duplication, worker
+handoff, and cleanup rather than ending at queue admission or callback return. Copies share one counted settlement
+claim, and the reader session remains alive until the last copy is consumed. If an identity expires or its reader
+generation ends while a claim is outstanding, late copies are refused before lwIP and the identity remains poisoned;
+the final factual stack result or conservative cleanup settlement decides when its reassembly-timeout hold can end. If
+publication is only partially admitted, producer admission closes immediately, the reader loop exits, and orderly
+shutdown is requested. This fail-closed path prevents later same-ID packets from completing a hybrid datagram with
+fragments already queued to lwIP.
+
+### Packet output path
+
+When payload reaches `TunDevice` from upstream or downstream:
+
+- the payload is treated as an IP packet
+- the complete packet is structurally validated as exact IPv4, even when no
+  checksum recalculation was requested; trailing bytes and malformed or
+  truncated packets are dropped
+- checksum recalculation is performed if the line requests it
+- the packet is written to the TUN device only if requested checksum recalculation succeeds; malformed or truncated
+  packets that cannot be recalculated are dropped with a rate-limited warning
+
+Both upstream and downstream payload handlers write to the same TUN device.
+
+### Checksum behavior
+
+Before writing a packet, `TunDevice` checks line flags:
+
+- if `recalculate_checksum` is set, the packet checksum is recomputed
+- full packet checksum recalculation is attempted
+- for fragmented IPv4 packets, transport checksum recalculation is skipped automatically and only the IP header checksum is recomputed
+- if the requested calculation cannot validate the available packet structure, the request flag is cleared and the
+  buffer is recycled without calling the OS TUN writer
+
+### Self-traffic loop protection
+
+When the TUN installs itself as the system default route, every outbound packet
+of the machine is steered into the TUN -- including WaterWall's own upstream
+sockets. Without protection those packets are read back from the TUN and re-sent,
+forming a routing loop.
+
+With `loop-protection` enabled (the default in system-route mode), `TunDevice`:
+
+- snapshots the original default interface per family *before* installing the
+  TUN routes,
+- publishes that interface as a process-wide egress pin,
+- lets outbound adapter sockets apply the pin before `connect()`, `bind()`, or
+  `sendto()` traffic can follow the new TUN default route,
+- releases the pin when the owning `TunDevice` stops or is destroyed.
+
+On Linux the pin is applied with `SO_BINDTODEVICE`. On Windows it is applied with
+`IP_UNICAST_IF` / `IPV6_UNICAST_IF`. macOS currently has no automatic egress pin,
+so use an explicit connector `interface` or `route-exclude-cidrs` there.
+
+An explicit adapter `interface` setting overrides the automatic pin. A
+`source-ip` setting alone does not override it; if the source IP belongs to a
+different NIC than the detected default interface, especially on Windows
+strong-host configurations, set `interface` explicitly instead.
+
+c-ares DNS resolver sockets are not pinned by this feature. The default
+interface is detected once at startup; if the physical default route changes,
+restart WaterWall or configure explicit interfaces/routes.
+
+### Callback behavior
+
+Payload is the meaningful callback path. Ordinary connection lifecycle
+callbacks (`Init`, `Est`, `Pause`, and `Resume`) are terminal absorbers at this
+packet adapter. An unexpected `Finish` in either direction is a fatal packet-line
+lifecycle violation and aborts the program; it is not a no-op.
+
+The chain owns one persistent packet line per worker. `TunDevice` never destroys
+those lines and has zero bytes of line state.
+
+## Notes And Caveats
+
+- The current receive path only forwards IPv4 packets.
+- `device-ip` must be a valid CIDR string.
+- On Windows, the implementation requires administrative privileges to load and manage the tunnel driver.
+- On macOS, the requested name should be an `utunN` name; if no concrete `utun` unit is requested, macOS assigns the actual interface name.
+- Native system route setup is disabled by default. If enabled, routes are removed during destroy in reverse install order.
+- On Linux, startup always writes `0` to `/proc/sys/net/ipv4/conf/all/rp_filter` and to the TUN interface's own `rp_filter` so reverse-path filtering does not drop packets routed through the TUN. This happens for every Linux TUN, not only when native system routes are enabled, because the kernel filters on `max(all, <interface>)` and both must be `0` for the TUN to be exempt. Other interface-specific `rp_filter` files are left untouched, so any interface carrying its own non-zero value keeps filtering; an interface left at `0` while only `all` was non-zero does become unfiltered as a side effect. These sysctl changes are not restored on stop or destroy. If the sysctl files are read-only, startup logs a warning and continues.
+- The interface-specific write is re-applied until it sticks. On systemd distributions, udev answers the new interface's `add` event by running `systemd-sysctl --prefix=/net/ipv4/conf/<interface>`, which re-applies patterns such as the `net.ipv4.conf.*.rp_filter` line in `/usr/lib/sysctl.d/50-default.conf` and would otherwise overwrite the value a few milliseconds after it is written. Startup therefore holds the value down until it has stayed `0` for 300 ms, which adds roughly that much to TUN bring-up, and gives up with an error log after 2 s.
+- DNS setup is optional. If configured, invalid IPv4 values are rejected during node creation and failed platform DNS application stops startup.
+- On Windows and macOS, `route-table` values other than `"main"` or `"auto"` are rejected.
+- Platform support depends on build and operating system support for TUN devices.

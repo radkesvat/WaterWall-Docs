@@ -6,75 +6,40 @@ description: "Reference documentation for the MuxClient node."
 ---
 
 <!--
-Documentation version: 106
+Documentation version: 107
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/MuxClient/description.md, and both files must keep the same documentation version.
 -->
 
-# MuxClient
+# MuxClient Node
 
-`MuxClient` multiplexes many logical WaterWall lines onto a smaller number of
-shared parent transport lines.
+`MuxClient` multiplexes many logical WaterWall lines onto a smaller number of shared transport lines. Instead of opening one full transport connection for every child line, it opens a parent connection and packs multiple child streams into framed messages on that parent.
 
-Instead of opening one full transport connection for every incoming child line,
-`MuxClient` creates or reuses a parent line toward `next`, attaches child lines
-to that parent, and sends each child's events as internal MUX frames. The remote
-side must use `MuxServer` to recreate independent child lines.
-
-```mermaid
-flowchart LR
-    in1[Conn 1] --> M[MuxClient]
-    in2[Conn 2] --> M
-    in3[Conn 3] --> M
-    in4[Conn 4] --> M
-    M --> out((Parent transport line))
-
-    style M stroke:#ff6b35,stroke-width:2px
-    style in1 fill:transparent,stroke:transparent
-    style in2 fill:transparent,stroke:transparent
-    style in3 fill:transparent,stroke:transparent
-    style in4 fill:transparent,stroke:transparent
-```
-
-`MuxClient` is not a listener or connector. The previous node creates the child
-lines, and the next node carries the shared parent transport.
-
-## Typical Placement
-
-Simple TCP transport:
-
-```text
-client side: TcpListener -> MuxClient -> TcpConnector
-server side: TcpListener -> MuxServer -> TcpConnector
-```
-
-With an outer protocol stack:
-
-```text
-client side: TcpListener -> MuxClient -> HttpClient -> TlsClient -> TcpConnector
-server side: TcpListener -> TlsServer -> HttpServer -> MuxServer -> TcpConnector
-```
-
-Use MUX when many short or medium-lived logical connections should share fewer
-outer transport connections.
+In practice, this node is used together with `MuxServer` on the remote side.
 
 ## What It Does
 
-- Accepts normal child lines from the previous node.
-- Creates parent transport lines toward `next`.
-- Reuses parent lines according to the selected concurrency mode.
-- Assigns each child a 32-bit connection id, or `cid`.
-- Encodes child payload, pause, resume, and finish events into MUX frames.
-- Decodes reply frames from `MuxServer` and routes them back to the matching
-  child.
-- Queues parent-delivered data when the local child write side is paused.
-- Reflects per-child backpressure with `FlowPause` and `FlowResume` frames.
-- Closes exhausted idle parent lines when their last child finishes.
+- Accepts many child lines from the previous node.
+- Reuses a shared parent transport line toward the next node.
+- Wraps child traffic into an internal MUX frame format.
+- Creates a new parent transport line when the current one is exhausted.
+- Demultiplexes reply frames from the remote `MuxServer` back to the correct child line.
+- Forwards `pause`, `resume`, and `finish` per child stream.
 
-`MuxClient` creates parent `line_t` objects internally and is responsible for
-destroying those parent lines. It does not destroy child lines created by the
-previous node.
+This node is not a listener by itself. It relies on the previous node to create child lines and on the next node to provide the real shared transport.
 
-## Configuration Examples
+## Typical Placement
+
+A common layout is:
+
+- some line-producing node before `MuxClient`
+- `MuxClient`
+- one transport chain after it
+- `MuxServer` on the remote side of that transport
+- service-facing nodes after `MuxServer`
+
+Typical pairings are useful when you want many short or medium-lived logical connections to share fewer outer transport connections.
+
+## Configuration Example
 
 Timer mode:
 
@@ -104,7 +69,7 @@ Counter mode:
 }
 ```
 
-Fixed parent pool mode:
+Fixed connection count mode:
 
 ```json
 {
@@ -118,178 +83,185 @@ Fixed parent pool mode:
 }
 ```
 
-## Required Fields
+## Required JSON Fields
 
-Top-level fields:
+### Top-level fields
 
-| Field | Type | Description |
-| --- | --- | --- |
-| `name` | string | User-chosen node name. Must be unique inside the config file. |
-| `type` | string | Must be exactly `"MuxClient"`. |
-| `settings` | object | Required. Must contain `mode` and the mode-specific required setting. |
-| `next` | string | Required. The next node carries parent transport lines. |
+- `name` `(string)`
+  A user-chosen name for this node.
 
-Required `settings` fields:
+- `type` `(string)`
+  Must be exactly `"MuxClient"`.
 
-| Setting | Required When | Description |
-| --- | --- | --- |
-| `mode` | always | One of `timer`, `counter`, or `fixed-connections-count`. |
-| `connection-duration-ms` | `mode: "timer"` | Milliseconds during which a parent line may accept new child lines. Must be greater than `60`. |
-| `connection-capacity` | `mode: "counter"` | Maximum child cids opened on one parent line. Must be greater than `0`. |
-| `per-worker-connections-count` | `mode: "fixed-connections-count"` | Number of parent lines maintained per worker. Must be greater than `0`. |
+- `next` `(string)`
+  The next node that carries the shared parent transport connection.
 
-## Optional Settings
+### `settings`
 
-| Setting | Type | Default | Description |
-| --- | --- | --- | --- |
-| `child-buffer-limit` | integer | `8388608` | Maximum queued bytes for one paused child. Must be greater than `0`. If reached, the child is closed with a MUX `Close` frame. |
-| `child-buffer-pause-tolerance` | integer | `524288` | Queue threshold where the child sends `FlowPause` and may pause parent reads. Must be `0` or greater. Values above `child-buffer-limit` are capped to the limit. |
-| `log-main-line-stats` | boolean | `false` | When enabled, parent lines log stats every `5000` ms. |
+- `mode` `(string)`
+  Controls when `MuxClient` stops attaching new child lines to the current parent transport line.
 
-Stats include worker id, parent read/write pause state, child count, child
-read-pause count, and child write-pause count.
+  Supported values:
+  - `"timer"`
+  - `"counter"`
+  - `"fixed-connections-count"`
 
-## Parent And Child Model
+- `connection-duration-ms` `(integer, milliseconds)`
+  Required when `mode` is `"timer"`.
 
-`MuxClient` has two line roles:
+  A parent transport line may accept new child lines only until this many milliseconds have passed since that parent was created.
 
-| Role | Meaning |
-| --- | --- |
-| child line | A logical WaterWall connection received from the previous node. |
-| parent line | A shared transport connection created by `MuxClient` toward `next`. |
+  The implementation requires this value to be greater than `60`.
 
-Each child receives a `cid`. The `cid` is local to one parent line and is used
-inside MUX frames so `MuxServer` can map payloads and control events back to the
-correct logical stream.
+- `connection-capacity` `(integer)`
+  Required when `mode` is `"counter"`.
 
-In timer and counter modes, each worker has one current reusable parent, called
-the unsatisfied line in the implementation. New children join it until it is
-exhausted.
+  Maximum number of child streams that may be opened on one parent transport line before `MuxClient` rotates to a new
+  parent.
 
-In fixed parent pool mode, the first child on a worker causes `MuxClient` to
-create `per-worker-connections-count` parent lines for that worker. New children
-are assigned to the least-loaded parent in that worker's pool, with a
-round-robin tie break. No extra parent lines are created while the pool slots
-are alive.
+  This value must be greater than `0`.
 
-## Mode Behavior
+- `per-worker-connections-count` `(integer)`
+  Required when `mode` is `"fixed-connections-count"`.
 
-| Mode | Parent Stops Accepting New Children When | Useful When |
-| --- | --- | --- |
-| `timer` | parent age is greater than `connection-duration-ms` | You want parent transport lines to rotate over time. |
-| `counter` | parent `cid` reaches `connection-capacity` | You want a simple cap on logical streams per parent. |
-| `fixed-connections-count` | not exhausted by age or child count | You want a stable per-worker outer connection count. |
+  Number of parent transport lines `MuxClient` keeps available per worker.
 
-An exhausted parent is not closed immediately. It stops accepting new children,
-but existing children continue until they finish. If an exhausted parent has no
-children, `MuxClient` closes and destroys it.
+  This value must be greater than `0`.
 
-There is also an absolute cid hard limit: when a parent reaches `4294967295`,
-it is exhausted.
+## Optional `settings` Fields
 
-## Stream Opening Behavior
+- `child-buffer-limit` `(integer, bytes, optional)`
+  Maximum queued data per paused child line before `MuxClient` closes that child stream.
 
-Current code attaches a child during upstream `Init`:
+  Default: `8388608` (`8 MB`).
 
-1. Select or create a parent line on the same worker.
-2. Initialize the child MUX line state.
-3. Link the child to the parent.
-4. Assign the next `cid`.
-5. Report downstream `Est` to the previous node for the child.
+- `child-buffer-pause-tolerance` `(integer, bytes, optional)`
+  Queued-data threshold where a paused child also pauses reads on the shared parent transport.
 
-The `Open` frame is not sent during `Init`. It is emitted with the first
-upstream payload as an `Open` frame followed by a `Data` frame in the same
-buffer. If the child finishes before sending any payload, `MuxClient` sends
-`Open` followed by `Close` so the peer observes a complete open/close sequence.
+  Default: `524288` (`512 KB`). Set to `0` to pause parent reads as soon as data must be queued for a paused child.
+  Values above `child-buffer-limit` are capped to `child-buffer-limit`.
 
-## Frame Format
+- `log-main-line-stats` `(boolean, optional)`
+  When `true`, each active parent transport line logs mux diagnostics every `5` seconds.
 
-`MuxClient` and `MuxServer` share an 8-byte packed frame header:
+  The log includes `wid`, parent-line write/read pause state, child count, child read-pause count, and child
+  write-pause count. Default: `false`.
 
-| Field | Size | Description |
-| --- | ---: | --- |
-| `length` | `uint16` | Payload length after the header, stored big-endian. |
-| `flags` | `uint8` | Frame kind. |
-| `_pad1` | `uint8` | Internal padding byte. |
-| `cid` | `uint32` | Child stream id, stored big-endian. |
+## Detailed Behavior
+
+### Parent and child model
+
+`MuxClient` keeps two kinds of lines:
+
+- child lines: the logical streams coming from the previous node
+- parent lines: the shared transport connections opened toward the next node
+
+Each child line gets a 32-bit connection id (`cid`). That id is used inside MUX frames so the remote `MuxServer` can map traffic back to the correct child stream.
+
+In timer and counter modes, `MuxClient` keeps one current reusable parent line per worker. The code calls this the unsatisfied line. As long as that parent is still allowed to accept more children, new child lines will join it.
+
+In fixed connection count mode, `MuxClient` keeps a fixed-size parent pool per worker. When a worker first needs a mux parent, it opens `per-worker-connections-count` parent transport lines for that worker. New child lines are assigned to the least-loaded parent in that worker's pool, with a round-robin tie break, and no additional parent lines are opened while the pool slots are alive.
+
+### When a new parent connection is opened
+
+When a child line arrives:
+
+- if there is no reusable parent line for that worker, a new parent line is created
+- if the current parent line is exhausted, a new parent line is created
+- the new parent line is initialized through the next node
+- the child line is then attached to that parent and an internal `Open` frame is sent
+
+Once the `Open` frame is sent successfully, `MuxClient` immediately reports downstream establishment to the child line.
+
+In fixed connection count mode, the first child on a worker creates that worker's fixed parent pool. Later child lines reuse those parents instead of creating more. If a parent slot is closed by the transport side, a later child can recreate that slot, but the active pool size for the worker is still capped by `per-worker-connections-count`.
+
+### Exhaustion rules
+
+The current parent line becomes exhausted in one of these ways:
+
+- timer mode: its age becomes greater than `connection-duration-ms`
+- counter mode: its opened child stream count reaches `connection-capacity`
+- fixed connection count mode: parent lines are not exhausted by age or child count
+- absolute hard limit: the parent connection id reaches `4294967295`
+
+An exhausted parent line is not closed immediately. It simply stops accepting new child lines. Existing child streams continue using it until they finish.
+
+When the parent is exhausted and its last child closes, `MuxClient` closes the parent transport line too. If a reusable
+parent becomes exhausted while it has no active children, `MuxClient` closes it before replacing it with a new parent.
+
+### Internal frame format
+
+`MuxClient` and `MuxServer` share the same fixed header format:
+
+- `length` `(uint16)`
+- `flags` `(uint8)`
+- `_pad1` `(uint8)`
+- `cid` `(uint32)`
+
+Header size: `8 bytes`
 
 Frame flags:
 
-| Flag | Meaning |
-| ---: | --- |
-| `0` | `Open` |
-| `1` | `Close` |
-| `2` | `FlowPause` |
-| `3` | `FlowResume` |
-| `4` | `Data` |
+- `0`: `Open`
+- `1`: `Close`
+- `2`: `FlowPause`
+- `3`: `FlowResume`
+- `4`: `Data`
 
-The implementation rejects payloads larger than `0xFFFF - 8`, so one MUX data
-frame can carry at most `65527` payload bytes. `MuxClient` does not split a
-large child payload into multiple MUX frames; payloads reaching this node should
-already fit that limit.
+Payload length is the framed data length after the header.
 
-## Direction Behavior
+`65,527` bytes is the maximum payload of one `Data` frame, not a limit on one
+child `Payload` callback. The encoder splits a larger callback payload into
+consecutive `Data` frames of at most `65,527` bytes and preserves the exact byte
+order. The checked aggregate encoded size (payload plus every 8-byte frame
+header and an optional `Open` frame) must fit in `uint32_t`. If it does not, the
+input buffer is recycled and only that child is closed; no partial frame is
+published. Allocation of the checked aggregate buffer follows the shift-buffer
+fail-fast allocation contract, so an actual allocator refusal terminates rather
+than forwarding a truncated encoding.
 
-| Incoming callback | Behavior |
-| --- | --- |
-| child upstream `Init` | Selects/creates a parent, links the child, assigns a `cid`, and reports `Est` to the previous node. |
-| child upstream `Payload` | Prepends `Open + Data` for the first payload, otherwise prepends `Data`, then sends to the parent toward `next`. |
-| child upstream `Pause` / `Resume` | Sends `FlowPause` / flushes queued data and possibly sends `FlowResume`. |
-| child upstream `Finish` | Sends `Close`, or `Open + Close` if no payload opened the stream yet; closes idle exhausted parent if needed. |
-| parent downstream `Payload` | Parses MUX frames from `MuxServer`, routes `Data`, `Close`, `FlowPause`, and `FlowResume` to the matching child. |
-| parent downstream `Pause` / `Resume` | Reflects parent write pressure to the most recent writer child, or to all children if no recent writer is known. |
-| parent downstream `Finish` | Marks the parent finishing, flushes/finishes all children toward the previous node, destroys parent state, and destroys the owned parent line. |
-| upstream `Est` | Disabled; reaching this callback is fatal. |
-| downstream `Init` | Disabled; reaching this callback is fatal. |
+### Data flow direction
 
-Unknown frames, frames for missing cids, and unexpected `Open` frames arriving
-from the server side are dropped.
+- Child to parent transport: previous node -> `MuxClient` -> next node
+- Parent transport back to child: next node -> `MuxClient` -> previous node
 
-## Backpressure And Queues
+For payload, `MuxClient` adds the 8-byte header before sending data on the parent line.
 
-MUX keeps backpressure per child:
+For replies, it reads complete frames from the parent line, looks up the child by `cid`, strips the header, and forwards the payload to that child.
 
-- If a local child pauses, `MuxClient` sends `FlowPause` for that `cid`.
-- If peer `FlowPause` arrives, reads from the local child are paused.
-- If parent-delivered data arrives for a paused child, data is queued on that
-  child.
-- Once one child's queue reaches `child-buffer-pause-tolerance`, the child sends
-  `FlowPause` and parent input may be paused.
-- The same tolerance is also applied to aggregate queued child data on the
-  parent line.
-- Once queued data drops below `min(512 KiB, child-buffer-limit)`, `FlowResume`
-  and parent read resume can be sent.
-- If one child's queue reaches `child-buffer-limit`, the child is closed.
+### Pause and resume behavior
 
-This lets one slow child stop its own stream without forcing every other child
-on the same parent to stop immediately.
+When a child line is paused or resumed by the previous node, `MuxClient` uses `FlowPause` and `FlowResume` frames for
+that child's `cid`. `FlowPause` is sent as soon as the local child write side pauses.
 
-## Buffer And Padding Notes
+If writing parent-delivered data to a child causes that child to pause, `MuxClient` queues later data for that child.
+If the queued data reaches `child-buffer-pause-tolerance`, `MuxClient` also pauses parent transport reads locally so the
+shared parent cannot keep draining into that child's queue. Queued child data is flushed when the child resumes. A
+`FlowResume` is sent once the child's pending data drops below `512 KB`, so the peer can begin sending before the queue
+is fully empty; parent reads resume when no child queue still requires the parent pause.
 
-`MuxClient` prepends MUX headers to outgoing parent payloads. Node metadata
-advertises:
+The same pause threshold is also applied to the aggregate queued child data on the parent line. This prevents a fixed
+parent from continuing to read while many paused children each have a smaller-than-threshold queue.
 
-```text
-required_padding_left = 16
-layer_group = kNodeLayerAnything
-```
+If one paused child's queue still reaches `child-buffer-limit`, `MuxClient` sends a `Close` for that child and finishes the local child line.
 
-The 16 bytes are needed because the first child payload can prepend two headers:
-one `Open` header and one `Data` header. Later data and control frames use one
-8-byte header.
+When the remote side pauses the shared parent line, `MuxClient` tries to pause the child that most recently wrote to that parent. If no recent writer is known, it pauses all attached children. Resume only clears parent-write pressure; a child that is still under peer `FlowPause` remains paused.
 
-Parent incoming bytes are accumulated in a read stream until a full MUX frame is
-available. If the parent read stream grows above `1 MiB`, the parent and all
-attached children are closed.
+### Buffering and overflow handling
 
-## Practical Notes
+Replies from the parent transport are accumulated in a read stream until complete MUX frames are available.
 
-- `MuxClient` must be paired with `MuxServer`.
+Current overflow limit:
+
+- `1 MB` buffered on the parent read stream
+
+If that limit is exceeded, `MuxClient` closes the parent line and finishes all child lines attached to it.
+
+## Notes And Caveats
+
+- `MuxClient` is intended to be paired with `MuxServer`.
 - `mode` is mandatory in the current implementation.
-- `connection-duration-ms` only applies to timer mode.
-- `connection-capacity` only applies to counter mode.
-- `per-worker-connections-count` only applies to fixed parent pool mode.
-- With multiple workers, fixed parent pool mode scales by worker count. For
-  example, `per-worker-connections-count: 2` with 4 workers can create up to 8
-  parent transport lines.
-- `MuxClient` is a middle tunnel, not a generic endpoint.
+- `connection-duration-ms` is only valid in timer mode.
+- `connection-capacity` is only valid in counter mode.
+- `per-worker-connections-count` is only valid in fixed connection count mode.
+- `UpStreamEst` and `DownStreamInit` are disabled in the current implementation, so this node is not meant to be used as a generic chain endpoint.

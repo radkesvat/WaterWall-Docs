@@ -6,57 +6,45 @@ description: "Reference documentation for the RawSocket node."
 ---
 
 <!--
-Documentation version: 114
+Documentation version: 118
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/RawSocket/description.md, and both files must keep the same documentation version.
 -->
 
-# RawSocket
+# RawSocket Node
 
-`RawSocket` connects WaterWall to raw IPv4 packet capture and raw IPv4 packet
-injection. It can capture packets from the host networking stack, forward those
-packets into a layer-3 chain, and inject raw IP packets that come back from the
-chain.
+`RawSocket` connects WaterWall to raw IPv4 packet capture and raw packet injection. It captures matching IP packets from the host networking stack and forwards them into the chain, and it can also inject raw IP packets coming from the chain back into the system.
 
-Older documentation may call this node `RawDevice`. The current node type is
-`RawSocket`.
+This node is a layer-3 adapter rather than a connection-oriented tunnel.
 
-`RawSocket` is a layer-3 adapter, not a connection-oriented tunnel. Captured
-packets are forwarded on worker packet lines, while payload arriving from either
-chain direction is treated as a complete raw IP packet and written to the raw
-output device.
+## What It Does
+
+- Creates a capture device for matching IPv4 packets.
+- Creates a raw output device for sending raw IPv4 packets.
+- Captures packets that match a configured IP filter.
+- Forwards captured packets to the adjacent chain side.
+- Writes raw IP packets from the chain out through the raw device.
+- Applies checksum recalculation before writing when the line requests it.
+- Optionally sets a firewall mark on the raw output device where supported.
 
 ## Typical Placement
 
-At the edge of a packet chain:
+`RawSocket` can be placed at either edge of a chain:
 
-```text
-RawSocket -> PacketReceiver
-PacketSender -> RawSocket
-TunDevice -> IpManipulator -> RawSocket
-```
+- if it is last in the chain, captured packets are forwarded to the previous node
+- otherwise, captured packets are forwarded to the next node
 
-With packet disguise nodes:
+Payload reaching `RawSocket` from upstream or downstream is treated as an IP packet and injected through the raw device.
+
+With PingClient/PingServer packet disguise, use these edge orders:
 
 ```text
 TunDevice -> PingClient -> RawSocket
 RawSocket -> PingServer -> TunDevice
 ```
 
-In first position, `RawSocket` forwards captured wrapped packets upstream into
-`PingServer`. PingServer restores them toward `TunDevice`; plain packets captured
-by TunDevice return downstream through PingServer for wrapping and raw
-injection.
-
-`RawSocket` can have a previous node, a next node, or both. The captured-packet
-direction is selected at startup:
-
-| Chain position | Captured IPv4 packets are forwarded to |
-| --- | --- |
-| `RawSocket` is the last node in the chain | previous node, through downstream payload |
-| `RawSocket` is not the last node | next node, through upstream payload |
-
-Payload that reaches `RawSocket` from either upstream or downstream is injected
-through the same raw output device.
+In first position, RawSocket forwards captured wrapped packets upstream into
+PingServer. PingServer restores them toward TunDevice; plain packets captured by
+TunDevice return downstream through PingServer for wrapping and raw injection.
 
 ## Configuration Example
 
@@ -78,113 +66,104 @@ through the same raw output device.
 }
 ```
 
-## Required Fields
+## Required JSON Fields
 
-Top-level fields:
+### Top-level fields
 
-| Field | Type | Description |
-| --- | --- | --- |
-| `name` | string | User-chosen node name. Must be unique inside the config file. |
-| `type` | string | Must be exactly `"RawSocket"`. |
-| `settings` | object | Required because capture mode and capture ranges must be configured. |
+- `name` `(string)`
+  A user-chosen name for this node.
 
-Required `settings` fields:
+- `type` `(string)`
+  Must be exactly `"RawSocket"`.
 
-| Setting | Type | Description |
-| --- | --- | --- |
-| `capture-filter-mode` | string | Capture filter mode. The parser recognizes `"source-ip"` and `"dest-ip"`, but the current implementation only accepts `"source-ip"`. |
-| `capture-ips` | array of strings | Non-empty array of IPv4 addresses or IPv4 CIDR ranges to capture. |
+### `settings`
 
-Each `capture-ips` item may be a single IPv4 address:
+- `capture-filter-mode` `(string)`
+  Filter mode for captured traffic.
 
-```json
-"192.0.2.10"
-```
+  Parsed values are:
+  - `"source-ip"`
+  - `"dest-ip"`
 
-or an IPv4 CIDR range:
+  Important note: the current implementation only accepts `"source-ip"`. If `"dest-ip"` is selected, tunnel creation fails with a message telling you to use `TunDevice` for outgoing capture instead.
 
-```json
-"198.51.100.0/24"
-```
+- `capture-ips` `(array of strings)`
+  IPv4 addresses or IPv4 CIDR ranges used by the capture device filter.
 
-IPv6 values are rejected.
+  Each item may be a single IPv4 address such as `"192.0.2.10"` or a CIDR range such as `"198.51.100.0/24"`.
+  IPv6 entries are rejected. The legacy `capture-ip` string is still accepted as a single-entry `/32` filter.
 
-## Optional Settings
+## Optional `settings` Fields
 
-| Setting | Type | Default | Description |
-| --- | --- | --- | --- |
-| `capture-device-name` | string | `unnamed-capture-device` | Name passed to the capture-device backend. |
-| `raw-device-name` | string | `unnamed-raw-device` | Name passed to the raw-output backend. |
-| `mark` | integer | `0` | Firewall mark for the raw output device where the platform/backend supports it. |
+- `capture-device-name` `(string)`
+  User-visible or internal name for the capture device.
 
-Compatibility aliases:
+  Default: `"unnamed-capture-device"`
 
-| Alias | Meaning |
-| --- | --- |
-| `listen-ips` | Accepted as an alias for `capture-ips`. |
-| `capture-ip` | Legacy single-string capture range. It is accepted as one `/32`-style entry; use `capture-ips` for new configs. |
+- `raw-device-name` `(string)`
+  User-visible or internal name for the raw output device.
 
-## Capture Path
+  Default: `"unnamed-raw-device"`
 
-During startup, `RawSocket` creates:
+- `mark` `(integer)`
+  Firewall mark used for the raw output device where the platform supports it.
 
-- a capture device using the configured IPv4 ranges
-- a raw output device for packet injection
+  Default: `0`
 
-When the capture backend receives a packet:
+## Detailed Behavior
 
-1. `RawSocket` checks whether the packet is IPv4.
-2. WinDivert checksum/direction metadata or Linux NFQUEUE `NFQA_SKB_INFO` classifies the IPv4 header as
-   metadata-proven valid, explicitly not-ready/offloaded, or untrusted.
-3. Only explicitly not-ready/offloaded headers are normalized. Corrupt untrusted headers are dropped, while
-   metadata-proven valid headers skip redundant recomputation.
-4. Non-IPv4 packets are recycled and not forwarded.
-5. The worker packet line for that worker is fetched from the chain.
-6. The captured IPv4 packet is forwarded to the selected adjacent side.
+### Capture path
 
-The capture backend is expected to apply the configured IP filter. `RawSocket`
-does not create a normal per-connection line for each packet.
+During `onPrepare`, `RawSocket`:
 
-## Output Path
+- decides which adjacent tunnel should receive captured packets
+- creates the capture device using `capture-ips`
+- creates the raw output device
+- brings both devices up
 
-When upstream or downstream payload reaches `RawSocket`:
+When a packet is captured:
 
-1. The payload buffer is treated as a raw IP packet.
-2. If the line has `recalculate_checksum` set and the packet is IPv4, WaterWall
-   recalculates packet checksums before writing.
-3. The packet is written through the raw output device.
-4. If the raw device is down or the write fails, the buffer is recycled.
+- the packet is checked for IP version
+- checksum provenance is consumed at the backend boundary. WinDivert's checksum/direction flags and Linux NFQUEUE's
+  `NFQA_SKB_INFO` independently classify IPv4, TCP, and UDP checksums as metadata-proven valid, explicitly
+  not-ready/offloaded, or untrusted. Trusted unfragmented offload is materialized on the captured copy, including the
+  TCP/UDP pseudoheader checksum; untrusted corrupt bytes are dropped rather than repaired
+- fragmented packets are never given a transport checksum calculated over one fragment. A fragmented L4-offload packet
+  is dropped; an IP-header-only offload may repair that header while preserving a demonstrably valid transport checksum
+- only IPv4 packets are currently forwarded by this path
+- the packet is forwarded through the chosen adjacent side using the worker packet line
 
-Both upstream and downstream payload callbacks use this same write path.
+Fragment affinity follows the captured packet buffer through forwarding, delay, one-to-one copies, duplication, worker
+handoff, and cleanup rather than ending at queue admission or callback return. Copies share one counted settlement
+claim, and the reader session remains alive until the last copy is consumed. If an identity expires or its reader
+generation ends with a claim outstanding, late copies are refused before lwIP and the key remains poisoned until its
+factual or conservative final settlement. If publication is only partially admitted, producer admission closes
+immediately, the capture reader exits (allowing Linux NFQUEUE's `--queue-bypass` lifecycle to take over), and orderly
+shutdown is requested. This prevents later same-ID packets from completing a hybrid datagram with fragments already
+queued to lwIP.
 
-## Checksum Behavior
+### Output path
 
-`RawSocket` respects packet-line checksum metadata from earlier packet nodes.
+When payload reaches `RawSocket` from upstream or downstream:
 
-If `line->recalculate_checksum` is set and the payload is IPv4:
+- the payload is treated as a raw IP packet
+- the complete packet is structurally validated as exact IPv4, even when no
+  checksum recalculation was requested; trailing bytes and malformed or
+  truncated packets are dropped
+- checksum recalculation is performed if requested by the line
+- the packet is written through the raw device
 
-- full packet checksum recalculation is attempted
-- the flag is cleared after recalculation
-- fragmented IPv4 transport checksum details are handled by the shared checksum
-  helper
+Both upstream and downstream payload handlers write to the same raw output device.
 
-This is useful after nodes such as `IpManipulator` or `IpOverrider` modify IPv4,
-TCP, UDP, or ICMP fields and request checksum repair before final output.
+### Capture filter behavior
 
-## Capture Filter Limits
+The capture device is configured using `capture-ips`.
 
-The settings parser recognizes:
+Current implementation behavior:
 
-```text
-source-ip
-dest-ip
-```
-
-Current behavior is stricter:
-
-- `source-ip` is accepted
-- `dest-ip` fails tunnel creation with a message recommending `TunDevice` for
-  outgoing capture-style use
+- on Windows, the capture filter is built from equivalent `ip.SrcAddr` equality or inclusive range checks
+- on Linux, one netfilter queue rule is created for each configured IPv4 address or CIDR range
+- `capture-filter-mode` is parsed, but only the `source-ip` path is currently implemented
 
 On Linux, the NFQUEUE rules use `--queue-bypass`. If WaterWall is not listening
 on the queue, matching packets continue through the host firewall instead of
@@ -205,44 +184,33 @@ open. While a reader thread is joinable, it owns the queue descriptor;
 terminal cleanup requests closure, and the reader wrapper closes the queue only
 after the routine has stopped using that descriptor.
 
-Use `TunDevice` when you need virtual-interface behavior or routed outgoing
-packet handling. Use `RawSocket` when you specifically need host-stack capture
-plus raw IPv4 injection.
+### Checksum behavior
 
-## Direction And Lifecycle Behavior
+Before writing a packet, `RawSocket` checks line flags:
 
-| Callback | Behavior |
-| --- | --- |
-| upstream `Payload` | Injects the payload through the raw output device. |
-| downstream `Payload` | Injects the payload through the raw output device. |
-| captured packet callback | Forwards captured IPv4 on the worker packet line to the selected adjacent side. |
-| `Init`, `Est`, `Pause`, `Resume`, `Finish` | No-op. `RawSocket` is not connection-lifecycle driven. |
+- if `recalculate_checksum` is set, checksums are recomputed
+- full packet checksum recalculation is attempted
+- for fragmented IPv4 packets, transport checksum recalculation is skipped automatically and only the IPv4 header checksum is recomputed
 
-`RawSocket` is an adapter and does not destroy packet lines during normal
-runtime. Worker packet lines are owned by the chain.
+### Why `TunDevice` may be a better fit for some cases
 
-## Node Metadata
+The current `RawSocket` implementation is focused on capturing inbound IPv4 traffic that matches a source-IP filter and injecting raw IPv4 packets.
 
-Source-backed metadata:
+If you need a virtual interface model or packet handling that is closer to routed interface traffic, `TunDevice` is usually the better match.
 
-| Property | Value |
-| --- | --- |
-| node flags | `kNodeFlagChainHead | kNodeFlagChainEnd` |
-| adapter | `true` |
-| `can_have_prev` | `true` |
-| `can_have_next` | `true` |
-| `layer_group` | `kNodeLayer3` |
-| `layer_group_prev_node` | `kNodeLayerAnything` |
-| `layer_group_next_node` | `kNodeLayerAnything` |
-| `required_padding_left` | `0` bytes |
+### Callback and line lifecycle
 
-The node does not prepend protocol headers and does not need left padding.
+Payload is the meaningful callback path. Ordinary connection lifecycle
+callbacks (`Init`, `Est`, `Pause`, and `Resume`) are terminal absorbers at this
+packet adapter. An unexpected `Finish` in either direction is a fatal packet-line
+lifecycle violation and aborts the program; it is not a no-op.
 
-## Practical Notes
+The chain owns one persistent packet line per worker. `RawSocket` never destroys
+those lines and has zero bytes of line state.
 
-- Run with the privileges required by the platform raw/capture backend.
-- Configure `capture-ips` explicitly; an empty array is rejected.
-- Prefer `capture-ips` over legacy `capture-ip`.
-- The current receive path forwards only IPv4 packets.
-- Platform behavior depends on the available raw socket, capture, and firewall
-  mark backend.
+## Notes And Caveats
+
+- The current receive path only forwards IPv4 packets.
+- `capture-filter-mode` is effectively limited to `"source-ip"` right now.
+- `capture-ips` should be provided explicitly.
+- Platform support depends on the raw/capture backend available on the operating system.

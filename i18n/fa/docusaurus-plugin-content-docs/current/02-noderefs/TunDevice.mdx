@@ -5,13 +5,20 @@ sidebar_label: "TunDevice"
 description: "راهنمای نود TunDevice در WaterWall."
 ---
 
-<!-- Written from version 111 of the English doc. -->
+<!-- Written from version 115 of the English doc. -->
 
 # TunDevice
 
 `TunDevice` یک packet chain در WaterWall را به TUN interface سیستم‌عامل وصل می‌کند. packetهای لایه ۳ را از device مجازی می‌خواند و وارد chain می‌کند؛ packetهایی را هم که از chain برمی‌گردند در همان TUN device می‌نویسد.
 
 این نود adapter لایه ۳ است، نه یک tunnel اتصال‌محور. برای هر connection line جداگانه‌ای نمی‌سازد؛ packetهای زمان اجرا از packet lineهایی استفاده می‌کنند که chain برای هر worker ساخته است.
+
+در receive path فعلی فقط IPv4 پذیرفته می‌شود. قرارداد kernel TUN منشأ offload
+checksum ارائه نمی‌کند؛ packet unfragmented تولیدشده توسط kernel در این مرز trusted
+است و consumer بعدی آن را validation می‌کند، ولی fragment IPv4 از parser مشترک
+fragment می‌گذرد و ساختار و header checksum آن پیش از association بررسی می‌شود.
+Claim مربوط به fragment در forwarding، copy، duplication، delay، worker handoff و
+cleanup همراه buffer می‌ماند و publication ناقص fail-closed است.
 
 ## جایگاه رایج
 
@@ -78,7 +85,7 @@ object مربوط به `settings` الزامی است و نباید خالی ب�
 
 | گزینه | پیش‌فرض | توضیح |
 |---|---|---|
-| `device-mtu` | MTU سراسری واتروال | مقدار MTU برای TUN device. باید بین `1` و `65535` باشد. |
+| `device-mtu` | MTU سراسری واتروال | مقدار MTU برای TUN device در بازهٔ inclusive ‏`68..65535`. عدد کسری، string، boolean و `null` رد می‌شوند. |
 | `route-table` | `off` | نصب routeهای native سیستم‌عامل را کنترل می‌کند. مقدارهای `off`، `main`، `auto` یا table name/number لینوکس. |
 | `system-route` | `false` | میان‌بری برای full-device routing. اگر `true` باشد و `route-table` را ننویسید، مانند `route-table: "main"` عمل می‌کند. |
 | `route-cidrs` | full route بر اساس family آدرس device | CIDRهایی که وقتی routing فعال است باید از TUN عبور کنند. |
@@ -234,9 +241,10 @@ systemd-sysctl --prefix=/net/ipv4/conf/<device-name> ...
 وقتی payload از chain به `TunDevice` برسد:
 
 1. payload به‌عنوان IP packet در نظر گرفته می‌شود
-2. اگر packet line درخواست کرده باشد، checksum دوباره محاسبه می‌شود
-3. packet داخل TUN device نوشته می‌شود
-4. اگر device پایین باشد یا write ناموفق شود، buffer بازیافت و warning در log ثبت می‌شود
+2. payload به‌عنوان دقیقاً یک packet کامل IPv4 validation می‌شود؛ trailing bytes، header ناقص و طول ناسازگار drop می‌شوند
+3. اگر packet line درخواست کرده باشد، checksum دوباره محاسبه می‌شود؛ failure flag را پاک و buffer را recycle می‌کند و writer صدا زده نمی‌شود
+4. packet معتبر داخل TUN device نوشته می‌شود
+5. اگر device پایین باشد یا write ناموفق شود، buffer بازیافت و warning در log ثبت می‌شود
 
 ## Packet Line
 
@@ -244,13 +252,20 @@ systemd-sysctl --prefix=/net/ipv4/conf/<device-name> ...
 
 در buildهای debug، نود پس از فرستادن packet ورودی بررسی می‌کند که packet line هنوز زنده باشد. اگر tunnel دیگری آن را در زمان اجرا از بین برده باشد، WaterWall این اتفاق را نقض قرارداد packet tunnel می‌داند.
 
-callbackهای اتصال‌محور مثل `Init`، `Est`، `Finish`، `Pause` و `Resume` برای این adapter نادیده گرفته می‌شوند. مسیر مهم runtime همان payload است.
+callbackهای `Init`، ‏`Est`، ‏`Pause` و `Resume` terminal absorberهای بدون state هستند.
+اما `Finish` غیرمنتظره در هر جهت نقض fatal lifecycle مربوط به packet line است و
+program را abort می‌کند؛ no-op نیست. این node packet lineها را هرگز destroy نمی‌کند
+و line state آن صفر بایت است.
 
 ## Checksum
 
 بعضی packet tunnelها می‌توانند روی line علامت بگذارند که checksum باید دوباره محاسبه شود. وقتی `TunDevice` می‌خواهد packet را به سیستم‌عامل بنویسد و `recalculate_checksum` فعال باشد، checksum packet را محاسبه می‌کند و flag را پاک می‌کند.
 
 برای IPv4 fragmentها، helper مربوطه transport checksum را که از یک fragment کامل قابل محاسبه نیست با احتیاط مدیریت می‌کند و فقط بخش‌هایی را اصلاح می‌کند که از داده موجود قابل اصلاح باشند.
+
+درخواست checksum حتی روی drop path نیز در همین مرز مصرف می‌شود تا به packet نامرتبط
+بعدی leak نکند. اگر ساختار موجود برای calculation کافی نباشد، packet با warning
+rate-limited drop و هرگز به TUN نوشته نمی‌شود.
 
 ## نکته‌های MTU
 
@@ -279,7 +294,7 @@ callbackهای اتصال‌محور مثل `Init`، `Est`، `Finish`، `Pause` 
 | `next` | اختیاری، ولی در استفاده معمول وقتی انتهای chain نیست وجود دارد |
 | `prev` | مجاز |
 | Required left padding | `0` |
-| Line state | state حداقلی؛ packet runtime از worker packet line استفاده می‌کند |
+| Line state | `0` بایت؛ packet runtime از worker packet line استفاده می‌کند |
 
 ## خطاهای رایج
 

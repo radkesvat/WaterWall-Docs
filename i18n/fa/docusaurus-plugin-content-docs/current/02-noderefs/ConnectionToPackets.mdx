@@ -1,0 +1,228 @@
+---
+sidebar_position: 85
+title: "ConnectionToPackets"
+sidebar_label: "ConnectionToPackets"
+description: "راهنمای نود ConnectionToPackets در WaterWall."
+---
+
+<!-- Written from version 150 of the English doc. -->
+
+# ConnectionToPackets
+
+`ConnectionToPackets` معکوس active-open نود `PacketsToConnection` است. یک
+connection line معمولی WaterWall را می‌گیرد، flow متناظر TCP یا UDP را در stack
+درون‌پردازه‌ای lwIP باز می‌کند و packetهای خام IPv4 حاصل را روی packet side زنجیره
+می‌فرستد. Packet برگشتی دوباره به همان flow تزریق می‌شود و داده به شکل downstream
+payload روی connection line اصلی خارج می‌شود.
+
+```text
+normal connection -> ConnectionToPackets -> raw IPv4 TCP/UDP packets
+return IPv4 packets -> ConnectionToPackets -> original connection downstream
+```
+
+این نود یک userspace transport bridge است، نه TUN شفاف سیستم‌عامل. به kernel TUN،
+raw socket یا دسترسی root نیاز ندارد. Application باید از adapterی مثل
+`TcpListener`، ‏`UdpListener`، ‏`TcpUdpListener` یا `Socks5Server` وارد WaterWall
+شود؛ capture کردن socketهای نامرتبط kernel بیرون از scope آن است.
+
+## توپولوژی‌های معمول
+
+```text
+TcpListener -> Socks5Server -> ConnectionToPackets
+            -> PacketsToConnection -> TcpUdpConnector -> destination
+```
+
+یا روی WireGuard:
+
+```text
+listener/SOCKS -> ConnectionToPackets -> WireGuardDevice -> UdpStatelessSocket
+remote UdpStatelessSocket -> WireGuardDevice -> PacketsToConnection
+                         -> TcpUdpConnector -> destination
+```
+
+`source-ipv4` مجازی باید از packet topology مسیر برگشت داشته باشد. در WireGuard
+سمت local معمولاً peer را با route مقصد `0.0.0.0/0` انتخاب می‌کند و peer remote
+باید source مجازی را، معمولاً به صورت `/32`، اجازه دهد.
+
+## Scope
+
+پشتیبانی می‌شود:
+
+- TCP روی IPv4؛
+- UDP روی IPv4، از جمله datagram بزرگ‌تر از یک MTU؛
+- مقصد IP و مقصد domain از طریق `DomainResolver` داخلی؛
+- چند event worker.
+
+رد یا drop می‌شود:
+
+- IPv6، به‌صورت دائمی و عامدانه؛
+- ICMP و protocolهای غیر TCP/UDP؛
+- UDP payload بالاتر از `65507` بایت؛
+- packet برگشتی بدون flow ثبت‌شده.
+
+تحویل ICMP error و حفظ source port اصلی application فعلاً پیاده‌سازی نشده‌اند.
+این نود فقط IPv4 تولید می‌کند. `domain-strategy` فقط `only-ipv4` را می‌پذیرد؛ domain
+فقط-AAAA با نام روشن fail می‌شود و هر مقصد IPv6 با بستن همان line رد می‌شود. این
+تصمیم، IPv6 سراسری lwIP را برای nodeهای دیگر غیرفعال نمی‌کند.
+
+## مرز نهایی‌سازی Checksum
+
+در ingress برگشتی، این نود مصرف‌کنندهٔ نهایی درخواست یک-packet مربوط به checksum
+روی packet line است. درخواست را پیش از هر validation/drop می‌گیرد و پاک می‌کند،
+packet را در storage mutable و aligned قرار می‌دهد و checksumهای قابل پشتیبانی را
+پیش از lwIP اصلاح می‌کند. Packet malformed، IPv6، stopping یا refused نمی‌تواند
+flag را به packet بعدی leak کند. برای TCP/UDP بدون fragmentation، header IPv4 و
+transport checksum اصلاح می‌شوند؛ برای fragment فقط checksum header IPv4 قابل
+محاسبه است و transport checksum ساختگی تولید نمی‌شود.
+
+## Fragmentation
+
+UDP datagram بزرگ‌تر از MTU به `ip4_frag()` کامل تحویل می‌شود تا identification،
+offset و flag ‏`MF` را lwIP بسازد. Fragmentهای برگشتی با association table به
+worker flow route می‌شوند؛ فقط fragment صفر portها را دارد، پس fragmentهای زودتر
+با سقف count و byte staging می‌شوند و در صورت ناقص‌ماندن آزاد خواهند شد.
+
+Association فقط تا پایان datagram و settlement همهٔ کارهای queueشده زنده است.
+پس از آخرین injection یک FIFO barrier روی owner worker کلید دقیق reassembly را
+purge و سپس identification را reusable می‌کند. Coverage دقیقاً مانند lwIP است:
+duplicate و overlap رد می‌شوند و فقط rangeهای adjacent merge می‌شوند. داده بعد از
+final end، final fragment دوم با end متفاوت یا truncation range ثبت‌شده هم رد است.
+
+کلید reassembly شامل netif ingress، source، destination، protocol و identification
+است. تا پایان publication یا بعد از هر failure، ID reserved و traffic matching
+drop می‌شود. Fragment صفر دوم، حتی برای همان flow، ambiguous است و association را
+poison/purge می‌کند. Deadline هنگام وجود injection admitted در queue منقضی نمی‌شود؛
+accept واقعی lwIP timeout کامل تازه‌ای می‌دهد، ولی admission صرف آن را refresh
+نمی‌کند.
+
+Boundهای fail-closed عبارت‌اند از:
+
+- حداکثر `128` datagram در حال association؛
+- حداکثر `16` fragment و مجموع `1 MiB` staging پیش از fragment صفر؛
+- حداکثر `16` range جدا برای هر datagram؛
+- timeout برابر `15` ثانیه.
+
+Reserved flag، ‏`DF` همراه fragmentation، payload خالی، non-final payload غیر
+مضرب ۸، IP options، checksum بد header و endpoint بزرگ‌تر از `65535 - 20` پیش از
+مصرف capacity رد می‌شوند. همهٔ packetهای یک flow روی یک packet worker می‌مانند.
+
+TCP outbound با MSS مشتق از MTU fragment نمی‌شود، ولی TCP fragment برگشتی معتبر
+است. Fragment صفر فقط به source/destination port نیاز دارد. پس از reassembly، lwIP
+header اعلام‌شدهٔ TCP با طول ۲۰ تا ۶۰ بایت را validation و prefix لازم ۴۰ تا ۸۰
+بایتی IPv4+TCP را به head کوچک contiguous pull-up می‌کند؛ options یا datagram لازم
+نیست در یک pbuf جا شوند.
+
+Fragment device-originated یک settlement claim ref-counted را در copy، staging،
+handoff و input lwIP همراه می‌برد و هر refusal/expiry/Stop دقیقاً یک بار آن را resolve
+می‌کند. Query/purge از کلید دقیق netif انجام می‌شود و نتیجه یکی از `NoResidue`،
+`ResiduePresent` یا در صورت نبود اثبات، `Unknown` است.
+
+## تنظیمات
+
+| تنظیم | اجباری | پیش‌فرض | معنی |
+| --- | --- | --- | --- |
+| `source-ipv4` | بله | ندارد | source IPv4 مجازی netif/PCBها؛ نباید wildcard، loopback، multicast یا broadcast باشد. |
+| `mtu` | خیر | `misc.mtu` سراسری | بازهٔ `576..9000`؛ MSS از آن مشتق و UDP بالاتر از آن fragment می‌شود. |
+| `domain-strategy` | خیر | `only-ipv4` | تنها مقدار پذیرفته‌شده `only-ipv4` است. |
+| `tcp-connect-timeout-ms` | خیر | `30000` | deadline اتصال TCP active-open. |
+| `max-pending-bytes` | خیر | `262144` | سقف دادهٔ application پیش از connect یا هنگام پُربودن send window؛ بازهٔ `1024..67108864`. |
+
+فقط نبود یک field پیش‌فرض را انتخاب می‌کند. Type غلط، عدد کسری یا خارج از بازه
+configuration را با نام field رد می‌کند. Core MTU پیش از narrow شدن در بازهٔ
+`68..65535` validation می‌شود؛ اگر مقدار inherited بیرون بازهٔ خود node باشد نیز
+configuration fail می‌شود.
+
+```json
+{
+  "name": "connection-to-packets",
+  "type": "ConnectionToPackets",
+  "settings": {
+    "source-ipv4": "10.90.0.1",
+    "mtu": 1420,
+    "domain-strategy": "only-ipv4",
+    "tcp-connect-timeout-ms": 30000,
+    "max-pending-bytes": 262144
+  },
+  "next": "wireguard-device"
+}
+```
+
+## انتخاب مقصد و Protocol
+
+قاعده دقیقاً با `TcpUdpConnector` یکسان است: protocol دقیق destination context
+اولویت دارد، سپس protocol دقیق source context؛ مقدار absent/ambiguous همان line را
+رد می‌کند. Address/port از destination context می‌آید. `DomainResolver` داخلی پیش
+از این node قرار می‌گیرد تا packet با IP resolved ساخته شود. Fake DNS وجود ندارد؛
+حفظ domain اصلی در سمت remote به metadata protocol جدا نیاز دارد.
+
+## Flow Control
+
+TCP در هر دو جهت backpressure واقعی دارد. داده‌ای که lwIP هنوز نمی‌گیرد تا سقف
+`max-pending-bytes` queue و previous side pause می‌شود؛ data دریافتی ابتدا downstream
+تحویل می‌شود و pause re-entrant باعث withheld شدن receive credit و بسته‌شدن window
+می‌گردد. هر flow علاوه بر byte limit حداکثر `1024` entry queue نگه می‌دارد؛ عبور
+از آن فقط همان flow را reset/close می‌کند. UDP queue stream ندارد و هنگام pause
+datagram را lossy drop می‌کند.
+
+## Lifecycle
+
+- Connection line borrowed است؛ node فقط state خودش را destroy می‌کند و هرگز
+  `lineDestroy()` نمی‌زند. Packet lineهای هر worker متعلق به chain و runtime-persistent
+  هستند؛ دریافت `Finish` روی آن‌ها contract violation و abort است.
+- Construction staged و transactional است: netif array، flow/fragment registry،
+  tombstone ring و async session باید کامل ساخته شوند؛ failure از یک unwind واحد
+  برمی‌گردد و هیچ bridge نیمه‌usable منتشر نمی‌شود.
+- چون chain ممکن است با L4 آغاز شود، packet side در `onStart()` با task جدا برای هر
+  worker initialize می‌شود.
+- Close graceful TCP یک tombstone routing به مدت `2 * TCP_MSL` در ring ثابت `4096`
+  entry می‌گذارد. Registration تازه همان tuple tombstone را replace می‌کند.
+- Flow متصل حتی با queue خالی به closer node-owned منتقل می‌شود؛ byteهای پذیرفته‌شده
+  و receive credit دقیقاً یک بار reconcile می‌شوند. Closer ابتدا همهٔ byteها را
+  می‌نویسد و با `tcp_shutdown(pcb, 0, 1)` فقط TX را می‌بندد، نه `tcp_close()` که در
+  state معمول دارای receive credit ممکن است RST و data loss ایجاد کند.
+- Deadline delivery/FIN برابر `30` ثانیه و peer-close برابر `60` ثانیه است. Closerها
+  سقف `4096` object و `16 MiB` suffix copied دارند؛ عبور از bound PCB را یک بار abort
+  می‌کند. `TIME_WAIT` پایان graceful است و ownership PCB به lwIP می‌ماند.
+- `ERR_MEM` write فقط تا زمان blocked بودن با `tcp_poll` retry می‌شود؛ خطای دیگر
+  terminal است. Connect deadline یک timer cancellable owner-worker با دقیقاً یک
+  line reference است.
+- Generation از تزریق packet queueشدهٔ flow قدیمی به tuple reused جلوگیری می‌کند،
+  ولی packet دیررس شبکه generation ندارد؛ tombstone فقط window ambiguity را کم می‌کند.
+- `onPreStop()` gateهای prev/next، classification/publication و async callback را
+  می‌بندد و منتظر callback admitted می‌ماند. Messageها async session نگه می‌دارند،
+  نه pointer خام tunnel. `onStop()` زیر core lock همهٔ PCB، flow، netif و fragment
+  staged را detach می‌کند و PCBها را abort می‌کند تا بعد از حذف netif روی list
+  global lwIP زنده نمانند.
+- Refused-data replay از timer واقعی lwIP به owner worker queue می‌شود. Refusal کار
+  کنترلی لازم ابتدا PCB callback/route را detach و borrowed line را در terminal
+  registry preallocated منتشر می‌کند؛ orderly shutdown فقط escalation بعد از این
+  handoff است. Owner واقعی borrowed line در پایان آن را destroy می‌کند.
+
+## Capacity
+
+همهٔ nodeهای lwIP poolهای static سراسری را share می‌کنند:
+
+| CMake variable | پیش‌فرض | مصرف |
+| --- | ---: | --- |
+| `WW_LWIP_MAX_TCP_FLOWS` | `2048` | TCP PCB و segment pool |
+| `WW_LWIP_MAX_UDP_FLOWS` | `2048` | UDP PCB |
+| `WW_LWIP_MAX_REASS_DATAGRAMS` | `32` | datagram fragmentشده هم‌زمان |
+| `WW_LWIP_MAX_TCP_LISTENERS` | `320` | listener PCB |
+
+Derived poolها در configure و preprocessor از overflow `u16_t` محافظت می‌شوند.
+Heap classها از مجموع targetهای TCP و UDP ساخته می‌شوند. Reassembly مستقل از flow
+count است: هر datagram حداکثر ۱۶ pbuf، pool سراسری ۳۲×۱۶ و `PBUF_POOL_SIZE` سه برابر
+آن است. Wrapper zero-copy در PTC reassembly و TCP out-of-order را پوشش می‌دهد و
+`TCP_OOSEQ_MAX_PBUFS` مصرف یک peer را محدود می‌کند.
+
+با defaultها Linux Release حدود **9.6 MB BSS** دارد، تقریباً **8.6 MB** بیشتر از
+poolهای development قدیمی. Namespace netif سراسری ۲۵۵ index دارد؛ loopback و همهٔ
+nodeهای lwIP در آن شریک‌اند و pair CTP/PTC تقریباً `1 + 2 * workers` مصرف می‌کند.
+Exhaustion flow affected را با diagnostic rate-limited می‌بندد و process را abort
+نمی‌کند.
+
+## Composition
+
+- Node قبلی باید layer 4 و node بعدی layer 3 باشد.
+- `next` اجباری و مقصد packetهاست.
+- حضور این node chain را packet chain می‌کند و packet line هر worker را می‌سازد.

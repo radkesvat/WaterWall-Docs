@@ -5,7 +5,7 @@ sidebar_label: "PacketsToConnection"
 description: "راهنمای نود PacketsToConnection در WaterWall."
 ---
 
-<!-- Written from version 106 of the English doc. -->
+<!-- Written from version 127 of the English doc. -->
 
 # PacketsToConnection
 
@@ -117,6 +117,47 @@ bridge حداقلی:
 
 packetهایی که این شرایط را نداشته باشند به pool برگردانده می‌شوند و به نود بعدی نمی‌روند.
 
+## مرز نهایی‌سازی Checksum
+
+`PacketsToConnection` مصرف‌کنندهٔ نهایی درخواست یک-packet مربوط به checksum روی
+packet line است. درخواست پیش از validation/drop گرفته و پاک می‌شود، input shifted
+در storage mutable و aligned قرار می‌گیرد و checksumهای پشتیبانی‌شده پیش از parse
+typed یا ingress به lwIP اصلاح می‌شوند. بنابراین packet malformed، IPv6، stopping
+یا refused نمی‌تواند flag را به packet بعدی leak کند. در IPv4 TCP/UDP بدون fragment
+هر دو checksum header و transport اصلاح می‌شوند؛ در fragment فقط header IPv4 قابل
+اصلاح است.
+
+Input misaligned به aligned sbuf copy و از همان custom-pbuf wrapper عبور می‌کند؛
+برخلاف `PBUF_RAM` سقف heap class شانزده KiB ندارد. Wrapperهای zero-copy به تعداد
+reassembly budget، target flowهای TCP و reserve ثابت size می‌شوند. هر datagram
+ناقص حداکثر ۱۶ pbuf دارد و per-PCB ceiling مربوط به `TCP_OOSEQ_MAX_PBUFS` مانع
+مصرف کل reserve به‌دست یک peer می‌شود.
+
+## Publication، Fragment و Shutdown فعلی
+
+Netif هر worker از `misc.mtu` سراسری استفاده می‌کند و response بزرگ‌تر را با
+`ip4_frag()` fragment می‌کند. Fake-DNS reply نیز از `ip4_output_if()` همان netif
+می‌گذرد. UDP fragment خطاب به آدرس fake-DNS با warning محدودشده drop می‌شود؛ port
+روی fragmentهای بعدی قابل استنتاج نیست و fragmented TCP به آن آدرس عادی route
+می‌شود.
+
+Claim ref-counted مربوط به fragment device-originated در copy، duplication، delay،
+handoff و cleanup همراه buffer می‌ماند. پس از lwIP input کلید دقیق reassembly شامل
+netif/source/destination/protocol/ID query می‌شود؛ refusal همان کلید را purge می‌کند
+و نبود اثبات، identity را تا timeout زمانی و `IP_REASS_MAXAGE + 1` tick واقعی lwIP
+reserved نگه می‌دارد تا hybrid datagram ساخته نشود.
+
+دو gate جدا publication packet و callback normal-line را پوشش می‌دهند. `onPreStop`
+هر دو را پیش از Stop همسایه‌ها می‌بندد. Output lwIP همیشه queue می‌شود، حتی روی همان
+worker، تا callback همسایه زیر core lock اجرا نشود. Messageهای دیررس async session
+detached نگه می‌دارند، نه pointer خام tunnel.
+
+هر TCP/UDP line ساخته‌شده تا close در owner list همان worker است. Stop ابتدا PCB،
+route، callback و timer را detach، سپس state را destroy، در صورت تکمیل Init دقیقاً
+یک `Finish` به next می‌فرستد و line owned را `lineDestroy()` می‌کند. UDP idle timer
+cancellable است و هنگام armed بودن دقیقاً یک line reference دارد. Netif تنها بعد
+از detach شدن همهٔ PCBها و raw ownerها حذف می‌شود.
+
 ## مدل جریان
 
 ```mermaid
@@ -189,6 +230,10 @@ backpressure سمت دریافت نیز مدیریت می‌شود:
 
 به این ترتیب flow control مربوط به TCP بدون بستن packet line حفظ می‌شود.
 
+هر flow علاوه بر `max-pending-bytes` حداکثر `1024` record ACK/pause نگه می‌دارد.
+Accounting مجموع و remaining در ۳۲ بیت انجام می‌شود، پس buffer stream می‌تواند از
+۶۵۵۳۵ بایت بزرگ‌تر باشد. Empty TCP buffer بدون ورود به queue مصرف می‌شود.
+
 ## رفتار UDP
 
 UDP نیز به شکل lineهای معمول واتروال ارائه می‌شود، اما مدل آن datagram-based است و state کمتری از TCP دارد.
@@ -225,6 +270,9 @@ UDP سازوکار واقعی backpressure مانند stream ندارد.
 - downstream payload از طریق UDP PCB متصل ارسال می‌شود و WaterWall buffer فوراً reuse می‌شود
 
 این محدودیت در مسیر UDP عمدی است. اگر backpressure بدون از دست رفتن داده اهمیت دارد، از stream transport یا لایه‌ای استفاده کنید که retransmission و flow control خودش را فراهم می‌کند.
+
+Payload downstream UDP حداکثر `65507` بایت است؛ مقدار بزرگ‌تر بدون narrow شدن در
+APIهای ۱۶ بیتی lwIP drop می‌شود و payload صفر بایت یک datagram معتبر باقی می‌ماند.
 
 ## Fake DNS
 
@@ -271,6 +319,7 @@ UDP سازوکار واقعی backpressure مانند stream ندارد.
 | گزینه | نوع | پیش‌فرض | توضیح |
 | --- | --- | --- | --- |
 | `udp-idle-timeout-ms` | integer | `300000` | طول عمر idle برای UDP lineهای ساخته‌شده. حداقل `1`. |
+| `max-pending-bytes` | integer | `262144` | سقف byteهای TCP منتظر یا پذیرفته‌شده ولی ACKنشده؛ بازهٔ `1024..67108864`. عبور از آن همان flow را reset می‌کند. |
 | `fake-dns` | boolean یا object | `false` | فعال‌سازی و تنظیم fake DNS responder داخل tunnel. |
 | `fake_dns` | boolean یا object | تنظیم نشده | alias برای `fake-dns`. |
 | `mapdns` | boolean یا object | تنظیم نشده | alias قدیمی برای `fake-dns`. |
@@ -283,11 +332,18 @@ UDP سازوکار واقعی backpressure مانند stream ندارد.
 | `address` | IPv4 string | `198.18.0.2` | آدرس IPv4 که fake DNS responder روی آن listen می‌کند. |
 | `port` | integer | `53` | UDP destination port برای DNS queryهای fake. باید `1..65535` باشد. |
 | `network` | IPv4 string | `100.64.0.0` | شبکه پایه fake-IP. قبل از استفاده توسط `netmask` mask می‌شود. |
-| `netmask` | IPv4 string | `255.192.0.0` | fake-IP network mask. |
-| `cache-size` | integer | `10000` | تعداد record domain-to-fake-IP. حداقل `1` و باید داخل fake network جا بگیرد. |
+| `netmask` | IPv4 string | `255.192.0.0` | mask پیوستهٔ prefix از `/1` تا `/31`. |
+| `cache-size` | integer | `10000` | تعداد record domain-to-fake-IP؛ حداکثر product برابر `262144` و باید داخل prefix جا بگیرد. |
 | `ttl` | integer | `1` | DNS answer TTL بر حسب ثانیه. باید `0` یا بیشتر باشد. |
 
-اگر بیش از یکی از کلیدهای fake DNS وجود داشته باشد، source آن‌ها به‌ترتیب `fake-dns`، سپس `fake_dns` و در پایان `mapdns` بررسی می‌شود.
+دقیقاً یکی از `fake-dns`، ‏`fake_dns` و `mapdns` مجاز است؛ aliasهای تکراری حتی با
+value برابر رد می‌شوند. Object غیرفعال نیز fieldبهfield validation می‌شود ولی table
+اختصاص نمی‌دهد. `address` باید unicast IPv4 غیر wildcard/loopback/multicast/broadcast
+باشد. همهٔ questionهای A/IN پیش از نخستین mapping parse و unique nameهای یک query
+در یک transaction commit می‌شوند؛ failure هیچ record یا LRU order نیمه‌تغییر‌یافته
+باقی نمی‌گذارد. Prefix باید پیوسته و حداقل یک host bit داشته باشد؛ `/31` دقیقاً دو
+record دارد. هندسهٔ table پیش از allocation از overflow محافظت می‌شود و سقف
+۲۶۲۱۴۴ record تقریباً ۱۶ MiB storage روی build ۶۴ بیتی است.
 
 ## معناشناسی Callback و Lifecycle
 
@@ -309,7 +365,7 @@ callbackهای connection line ساخته‌شده از tunnel بعدی:
 | downstream `Payload` | bytes/datagramها را به lwIP می‌نویسد. |
 | downstream `Pause` | خواندن از TCP/UDP line ساخته‌شده را متوقف می‌کند. |
 | downstream `Resume` | خواندن را از سر می‌گیرد و در TCP، receive credit معوق را آزاد می‌کند. |
-| downstream `Finish` | سمت lwIP را می‌بندد و per-line state و line ساخته‌شده توسط این tunnel را از بین می‌برد. |
+| downstream `Finish` | PCB متصل را به closer graceful منتقل، state را destroy و line owned را می‌بندد؛ Finish را به packet side بازتاب نمی‌دهد. |
 | downstream `Init` | fatal guard؛ callback معتبری برای lineهای ساخته‌شده نیست. |
 | downstream `Est` | No-op. |
 
@@ -321,6 +377,14 @@ callbackهای connection line ساخته‌شده از tunnel بعدی:
 - سپس `PacketsToConnection`، lineای را که خودش ساخته بود از بین می‌برد
 
 بسته شدن flowهای جداگانه هرگز packet line مشترک را از بین نمی‌برد؛ این line تا زمان از بین رفتن tunnel chain زنده می‌ماند.
+
+Closer byteهای پذیرفته‌شده را زیر backpressure drain و سپس با
+`tcp_shutdown(pcb, 0, 1)` TX را half-close می‌کند. فازهای delivering، FIN-pending و
+closing فقط رو به جلو هستند؛ deadline delivery/FIN ‏۳۰ ثانیه و peer-close ‏۶۰ ثانیه
+است. سقف instance برابر ۴۰۹۶ closer و ۱۶ MiB suffix copied است. Allocation/cap/error
+یا deadline flow را reset می‌کند و Stop همهٔ closerها را abort می‌کند. `tcp_close()`
+برای flow متصل استفاده نمی‌شود، چون با receive credit outstanding می‌تواند RST
+فرستاده و byteهای ACKنشده را از بین ببرد.
 
 ## نگاشت Address Context
 
@@ -362,6 +426,8 @@ tunnel برای هر payload، framing header اضافه نمی‌کند و به
 - map مربوط به fake DNS فقط در همین tunnel instance وجود دارد و با از بین رفتن tunnel پاک می‌شود.
 - packet-line `Finish` در طول runtime نقض قرارداد به حساب می‌آید.
 - IPv6 و ICMP فعلاً کنار گذاشته می‌شوند.
+- Netifهای process فقط ۲۵۵ index دارند و loopback و همهٔ nodeهای lwIP در آن شریک‌اند؛ exhaustion creation را سریع fail می‌کند.
+- poolهای سراسری default برای ۲۰۴۸ flow TCP، ‏۲۰۴۸ flow UDP، ‏۳۲ datagram reassembly و ۳۲۰ listener ساخته می‌شوند و Linux Release تقریباً `9.6 MB` BSS دارد.
 - packetهایی که پس از IPv4 total length بایت اضافه دارند کنار گذاشته می‌شوند؛ زیرا پیاده‌سازی به برابری دقیق طول `sbuf` و IP total length نیاز دارد.
 
 ## تفاوت با PacketsToStream
