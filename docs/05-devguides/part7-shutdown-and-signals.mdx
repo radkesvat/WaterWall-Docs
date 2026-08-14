@@ -87,6 +87,47 @@ from it:
 Only worker 0 performs `REQUESTED -> STOPPING`, and only the pass that wins that
 transition runs cleanup.
 
+### Global node pre-stop before node stop
+
+At the start of `STOPPING`, `nodemanagerStop()` performs two process-wide passes:
+
+1. it calls every tunnel's `onPreStop` in every configuration, closing producer
+   admission and quiescing sources of new callbacks;
+2. only after the complete prepass does it call any `onStop`, where tunnels may
+   join threads, detach callbacks, and release shared resources.
+
+The order is global, not `preStop(config A) -> stop(config A) -> preStop(config
+B)`. This prevents a still-running producer in one configuration from targeting
+resources already stopped in another. `onStop` must nevertheless tolerate a
+partial-start/failure path that invokes it without the global prepass. Per-worker
+`onWorkerStop` cleanup remains separate and runs on the owning worker.
+
+### Worker-local normal-line drain order
+
+After a worker loop returns, `workerDestroyOwnResources()` closes ordinary
+message/producer admission but keeps the loop, chain, tunnels, adapters, and
+line/buffer pools alive while normal lines are drained. The order is:
+
+1. drain authoritative external source-owner inventories, currently including
+   SocketManager's per-worker `UdpListener` idle tables;
+2. walk each chain from source to tail through `onWorkerStop`, so autonomous
+   source owners close their remaining lines before middle tunnels validate
+   that borrowed child sets are empty, and tail adapters remain available to
+   detach their resources and return one downstream `Finish`;
+3. close listener I/O, clean async DNS and admitted pending messages, and destroy
+   the event loop; then
+4. destroy worker-local pools only after every normal line is logically dead and
+   every physical reference has returned.
+
+Every autonomous normal-line creator publishes a line in exactly one
+owner-worker inventory before re-entrant `Init`, removes the entry before any
+close callback, and makes repeated drain harmless. Tail adapters inventory only
+lines whose `Init` reached them; a line still in an upstream resolver or other
+pre-tail interval remains the creator's responsibility. Middle tunnels do not
+duplicate inventories for borrowed lines, although they must drain internal
+normal lines they created. Packet lines and documented resource-free terminal
+absorbers are separate lifecycle categories.
+
 ## 3. Exit-code arbitration
 
 Deterministic, independent of thread scheduling:
@@ -485,8 +526,9 @@ ctest --preset linux --output-on-failure -R 'shutdown|signal_manager|wloop_stop|
   and proof that callbacks do not run in the async handler's context.
 - `wloop_stop_request_test` — stop wakes a blocked loop, survives being requested
   before the loop runs, is idempotent, and is safe racing the loop's own exit.
-- `node_manager_stop_once_test` — `nodemanagerStop()` idempotence and `onStop`
-  running exactly once.
+- `node_manager_stop_once_test` — `nodemanagerStop()` idempotence, the global
+  all-configuration `onPreStop` prepass, partial-stop safety, and worker-stop
+  separation.
 - `lwip_shutdown_test` — retained TCP out-of-order pbuf release plus cooperative
   `tcpip_thread` join.
 - `buffer_pool_thread_transfer_test` — post-join pool ownership transfer between
@@ -526,6 +568,12 @@ ctest --preset linux --output-on-failure -R 'orderly_shutdown|abort_runtime|owne
 Both scan function bodies with a lexical C scanner, so a commented-out or quoted
 lookalike cannot satisfy a candidate, and both run a mutation mode that removes
 each load-bearing element in turn and requires the checker to catch it.
+
+`udplistener_mux_shutdown_order_test` drives the real UdpListener expiry callback
+through SocketManager's per-socket drain before MuxClient worker cleanup. It
+covers counter, timer, and fixed Mux selection, repeated drain/stop, and a
+non-Mux control; the borrowed child is always destroyed by UdpListener and Mux
+closes only its now-zero-child internal parent.
 
 The runtime counterparts inject the real failure. `*_orderly_shutdown_test`
 linker-wraps `wtimerAdd` and the three process APIs, then asserts the whole

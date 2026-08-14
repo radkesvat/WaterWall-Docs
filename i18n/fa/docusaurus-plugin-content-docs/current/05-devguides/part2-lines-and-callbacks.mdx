@@ -84,6 +84,47 @@ Line آغاز می‌شود.
 > منطقی هنوز زنده است. پس از یک Callback از نوع Re-entrant، ممکن است Line قفل‌شده
 > `alive == false` باشد. پیش از ادامه همیشه دوباره `lineIsAlive()` را بررسی کنید.
 
+Threadای که آخرین reference را آزاد می‌کند الزاماً event worker همان line نیست.
+ممکن است یک device thread، pseudo-worker مربوط به lwIP یا scheduler ثبت‌نشده، در
+حالی reference معتبر نگه داشته باشد که owner خط را نابود و admission پیام‌ها را
+بسته است. بنابراین آخرین `lineUnlock()` وقتی روی event worker ثبت‌شده نیست از مسیر
+thread-safe در shared pool استفاده می‌کند؛ فقط event worker ثبت‌شده مجاز است fast
+path مربوط به local pool را به کار ببرد. هنگام teardown، باقی‌ماندن itemهای
+checked-out در line pool یک خطای سخت در ترتیب lifecycle است، پس master pool مشترک
+تا بازگشت همهٔ referenceها زنده می‌ماند.
+
+Reference count مرز publication برای reclamation نهایی نیز هست. هر decrement از
+نوع acquire-release، writeهای teardown پیش از خود را منتشر می‌کند و RMWای که گذار
+`1 -> 0` را می‌بیند پیش از خواندن `alive`، stateهای zeroشده، routing/domain یا
+credentials آن release sequence را acquire می‌کند. هر کدی که مستقیماً reference
+count را کم می‌کند باید همین قرارداد را حفظ کند؛ lock صف پیام یا readiness flag
+نامرتبط جای این publication را نمی‌گیرد.
+
+### زمان‌بندی بررسی‌شده روی Worker
+
+توابع `lineScheduleTask()`، ‏`lineScheduleTaskWithBuf()` و هر دو گونهٔ delayed
+اعلام می‌کنند که کار الزامی پذیرفته شده است یا نه. نتیجهٔ `false` یعنی reference
+متعلق به scheduler و، در گونهٔ دارای buffer، خود buffer آزاد شده‌اند و callback
+هرگز اجرا نمی‌شود. پیش از انتخاب reconciliation هم‌زمان یا مسیر terminal owner،
+latchهایی مانند `*_scheduled` را بازنشانی کنید.
+
+Delayed taskهای line باید روی worker مالک همان line ساخته شوند. شکست تخصیص timer
+یا درج در timed queue یک refusal است، نه اجازهٔ اجرای زودهنگام callback؛ callback
+با حداقل delay ممکن است خودش را دوباره schedule کند و fallback هم‌زمان به recursion
+بی‌کران برسد. کار lifecycle الزامی و cross-worker، اگر setup timer در سمت مقصد
+پس از admission پیام ممکن است شکست بخورد، به owner صریح یا registry قابل drain در
+Stop نیاز دارد. فقط payload عمداً lossy یا statistics مشاهده‌ای می‌توانند نتیجهٔ
+schedule را نادیده بگیرند و این استثناها در policy منبع ثبت می‌شوند.
+
+`pipe_tunnel` مشترک نیز همین قاعده را برای streamهای مرتب cross-worker رعایت
+می‌کند. یک pair owner صریح نقش‌های borrowed/owned و referenceها را نگه می‌دارد؛
+از دست‌رفتن هر Init، data، control یا Finish کل pair را به حالت terminal می‌برد.
+هر سمت روی worker مالک خود detach می‌شود، فقط companion line ساخته‌شده نابود
+می‌شود و drain کردن registry در pre-stop/stop fallback بدون پیام است. Pair تا
+detach شدن هر دو سمت و همهٔ پیام‌های صف‌شده، reference فیزیکی هر دو line را نگه
+می‌دارد؛ آزادکردن reference مقصد با detach سمت اول می‌تواند sender هم‌زمان را با
+استفادهٔ دوباره از حافظه وارد race کند.
+
 ### چه کسی اجازه دارد Line را نابود کند؟
 
 فقط تونلی که Line را **ساخته است** اجازه دارد `lineDestroy()` را روی آن فراخوانی
@@ -96,6 +137,32 @@ Line آغاز می‌شود.
 همه‌ی تونل‌های دیگر باید `Finish` را **Propagate** کنند و نابودکردن Line را به
 مالک بسپارند. فراخوانی `lineDestroy()` روی Lineای که خودتان نساخته‌اید یک Bug
 جدی است.
+
+### Ownerها و adapterهای کامل در Shutdown
+
+مالکیت فوری `Finish` تنها نیمی از قرارداد normal line است. هر سازندهٔ autonomous
+باید بتواند هنگام shutdown همهٔ lineهای زندهٔ خود را enumerate کند. Line تازه را
+پیش از هر `Init` یا publication از نوع re-entrant دقیقاً در یک inventory متعلق به
+owner-worker منتشر کنید و در همهٔ مسیرهای close دقیقاً یک بار حذف کنید. Slot یا
+entry مربوط به idle table را **پیش از** فراخوانی `Finish` پاک کنید؛ callback ممکن
+است re-enter شود و اجرای دوبارهٔ Stop باید slot خالی ببیند و کاری نکند.
+
+یک connection-admitting/source owner ابتدا admission را می‌بندد، lineهای باقی‌مانده
+را enumerate می‌کند، state خود را نابود می‌کند، در صورت نیاز `Finish` را دور از
+sender می‌فرستد و با همهٔ lineهای owned که از نظر منطقی مرده‌اند برمی‌گردد. تعهد
+tail adapter نگه‌دارندهٔ connection متفاوت است: باید همهٔ lineهایی را که `Init`
+آن‌ها به adapter رسیده enumerate کند، OS resource را detach و close کند، state
+adapter را نابود کند و دقیقاً یک downstream `Finish` بفرستد تا سازندهٔ واقعی line
+آن را ببندد. Tail پیش از رسیدن `Init` مسئولیتی ندارد؛ autonomous/internal creator
+باید آن بازه را پوشش دهد.
+
+Drain کردن source owner روی event worker مالک انجام می‌شود، در حالی که loop، chain،
+tunnel stateها، tail adapterها و line/buffer poolها هنوز زنده‌اند و پیش از آنکه
+hookهای middle/end خالی‌بودن مجموعهٔ childهای borrowed را الزام کنند. Tunnel میانی
+نباید برای جبران ترتیب shutdown یک inventory تکراری از lineهای borrowed بسازد؛
+اما normal lineهایی را که خودش در داخل می‌سازد inventory و drain می‌کند. Packet
+lineهای پایدار و terminal absorberهای مستند که per-line resource ندارند استثناهای
+صریح‌اند، نه inventoryهای فراموش‌شده.
 
 Invariant مهمی نیز در حالت Debug وجود دارد: وقتی Line سرانجام آزاد می‌شود،
 `lineUnRefInternal()` با `debugAssertZeroBuf` بررسی می‌کند که Line State همه‌ی

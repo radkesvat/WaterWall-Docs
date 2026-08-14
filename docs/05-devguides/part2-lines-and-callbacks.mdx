@@ -94,6 +94,49 @@ lineUnlock(l);               /* physical free may occur right here */
 A logically dead line must never receive another flow callback, and by the time
 it is reclaimed every tunnel's line state must already be zeroed.
 
+The thread which drops the final reference is not necessarily the line's event
+worker. A device thread, lwIP pseudo-worker, or unregistered scheduler can hold
+a legitimate reference while the owner destroys the line and closes message
+admission. The final `lineUnlock()` therefore returns the allocation through a
+thread-safe shared-pool path when no registered event worker is current; only a
+registered event worker may use the local-pool fast path. Chain teardown treats
+checked-out line-pool items as a hard ordering violation, so the shared master
+pool remains alive until every outstanding reference is gone.
+
+The reference count is also the publication edge for final reclamation. Every
+acquire-release decrement publishes the releasing thread's preceding teardown
+writes; the RMW which observes `1 -> 0` acquires that release sequence before reading `alive`, zeroed
+tunnel state, routing/domain storage, or credentials. Code that adds another
+direct reference-count decrement must preserve this release/acquire protocol.
+Do not rely on worker-message locks or an unrelated readiness flag to publish
+line state to a foreign final releaser.
+
+### Checked Worker Scheduling
+
+`lineScheduleTask()`, `lineScheduleTaskWithBuf()`, and both delayed variants
+return whether required work was admitted. A `false` result means cleanup has
+already released the scheduler's line reference and, for a buffer variant, the
+buffer; the callback will never run. Reset any `*_scheduled` latch before
+choosing synchronous reconciliation or a terminal owner path.
+
+Delayed line tasks require the current line owner worker. Timer allocation or
+timed-queue insertion failure is a refusal, never permission to invoke the
+callback early: minimum-delay callbacks may reschedule themselves, so inline
+fallback can recurse without bound. Cross-worker required lifecycle work needs
+an explicit owner or Stop registry if target-side timer setup can fail after the
+setup message was admitted. Only deliberately lossy payload or observational
+statistics sites may discard a scheduling result, and those exceptions are
+source-policy registered.
+
+The shared `pipe_tunnel` follows the same rule for ordered cross-worker streams.
+One explicit pair owner holds the borrowed/owned roles and references; any lost
+Init, data, control, or Finish atomically makes the pair terminal. Each side
+detaches on its owner worker, only the created companion line is destroyed, and
+pre-stop/stop registry draining is the no-message fallback. The pair retains
+both physical line references until both sides and every queued message have
+detached; releasing a target reference at the first-side detach would let a
+concurrent sender race storage reuse.
+
 ### Who May Destroy a Line
 
 Only the tunnel that **created** a line may call `lineDestroy()` on it —
@@ -115,6 +158,33 @@ such as "Client", "Server", "Listener", or "Connector":
 
 `tests/line_ownership_policy_test.py` records the classification of every
 production creation site and fails when a new one appears unclassified.
+
+### Shutdown-complete owners and adapters
+
+Immediate `Finish` ownership is only half of the normal-line contract. Every
+autonomous creator must also be able to enumerate all of its live lines during
+worker shutdown. Publish each new line into exactly one owner-worker inventory
+before any re-entrant `Init` or other callback can expose it, and remove the
+entry exactly once on every close path. Clear the slot or idle-table entry
+*before* invoking `Finish`: the callback can re-enter, and a repeated stop must
+see an empty slot and do nothing.
+
+A connection-admitting/source owner stops admission, enumerates its remaining
+lines, destroys its state, sends `Finish` away from any sender as applicable,
+and returns with every owned line logically dead. A connection-holding tail
+adapter has a different obligation: enumerate every line whose `Init` reached
+it, detach and close its OS resource, destroy its adapter state, and send exactly
+one downstream `Finish` so the real creator closes the line. A tail owns no
+responsibility before its `Init`; the autonomous or internal creator must cover
+that interval itself.
+
+Source-owner draining runs on the owning event worker while the event loop,
+chain, tunnel states, tail adapters, and line pools are still alive, and before
+middle/end worker hooks require their borrowed child sets to be empty. Middle
+tunnels must not build duplicate inventories for borrowed lines to compensate
+for shutdown order. They do inventory and drain normal lines they create
+internally. Persistent packet lines and documented terminal absorbers with no
+per-line resource are explicit exceptions rather than missing inventories.
 
 Every other tunnel must **propagate `Finish`** and let the owner destroy the
 line. Calling `lineDestroy()` on a line you did not create is a serious bug.

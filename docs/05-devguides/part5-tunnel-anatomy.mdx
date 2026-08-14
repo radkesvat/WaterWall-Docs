@@ -31,6 +31,7 @@ tunnels/MyTunnel/
     index.c              # onIndex hook (usually delegates to the default)
     prepair.c            # onPrepare hook
     start.c              # onStart hook
+    pre_stop.c           # optional onPreStop producer-quiesce hook
     stop.c               # onStop hook
     destroy.c            # onDestroy hook: free state, then tunnelDestroy()
     api.c                # runtime API entry (tunnelApi)
@@ -60,7 +61,7 @@ callback files stay readable. Follow that convention; reviewers expect it.
 | `instance/node.c` | Returns the `node_t` describing this tunnel type: `type`, `version`, `createHandle`, `flags`, `required_padding_left`, `layer_group`, and neighbor layer constraints. |
 | `instance/create.c` | `tunnelCreate(node, sizeof(tstate), sizeof(lstate))`, assign the twelve flow callbacks and the lifecycle hooks, parse and validate JSON settings, allocate per-worker resources, clean up on any failure. |
 | `instance/chain.c` / `index.c` | The `onChain` / `onIndex` hooks. Most tunnels keep the framework defaults; adapter stubs here may just abort to prove the default is used. |
-| `instance/prepair.c` / `start.c` / `stop.c` | `onPrepare` / `onStart` / `onStop`. Begin/stop real work; bootstrap packet lines in `onStart` when needed (see [Part 4](./part4-packet-tunnels.mdx)). |
+| `instance/prepair.c` / `start.c` / `pre_stop.c` / `stop.c` | `onPrepare` / `onStart` / `onPreStop` / `onStop`. Bootstrap work in `onStart`; close producer admission in `onPreStop`; join, detach, and free shared resources in `onStop`. |
 | `instance/destroy.c` | `onDestroy`: free settings, SSL contexts, pools, thread-local arrays, then call `tunnelDestroy(t)`. |
 | `instance/api.c` | The `tunnelApi` runtime entry. It receives an `sbuf_t` message, must recycle it, and returns an `api_result_t`. |
 | `common/line_state.c` | `LinestateInitialize` (called from `Init`) and `LinestateDestroy` (zeroes the aligned line-state region). |
@@ -116,6 +117,17 @@ The fields you will set most often (all defined in `ww/objects/node.h`):
 | `kNodeFlagNoChain` | Works without being in a chain (e.g. a database/user-auth node). |
 | `kNodeFlagSingleton` | Only one instance allowed in the whole config. |
 
+### External-node ABI layouts
+
+`tunnel_t`, `node_t`, and `line_t` are external-node ABI structures. External
+node libraries compile their member offsets and inline accessors into the
+library, so historical members cannot be reordered or shifted. A new field may
+use only layout padding proven on every supported 32-bit and 64-bit target;
+otherwise it requires an explicit, versioned ABI break. In particular,
+`tunnel_t.onPreStop` occupies the alignment gap immediately before
+`tunnel_t.state[]`, preserving the legacy callback table and flexible-state
+offset.
+
 ## `create.c`: Building the Instance
 
 `create.c` is the only place a tunnel is allocated. The pattern, distilled from
@@ -156,6 +168,20 @@ tunnel_t *tlsclientTunnelCreate(node_t *node)
     return t;
 }
 ```
+
+### The global two-phase stop
+
+Orderly shutdown has a global producer prepass: the node manager calls
+`onPreStop` on every tunnel in every loaded configuration before it calls any
+`onStop`. Use `onPreStop` to close admission gates and quiesce producers so one
+configuration cannot enqueue work into a neighbour that another configuration
+has already stopped. Only after that complete prepass may `onStop` join threads,
+detach callbacks, and free shared resources.
+
+Failure cleanup may call `onStop` for a partially started instance without the
+global prepass. Therefore `onStop` must remain independently safe and may not
+assume that `onPreStop` ran. Worker-owned cleanup through `onWorkerStop` is a
+separate phase on each registered worker.
 
 Use the project's JSON helpers (`getStringFromJsonObject`,
 `getBoolFromJsonObjectOrDefault`, `getIntFromJsonObjectOrDefault`, etc.) and

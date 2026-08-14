@@ -1,0 +1,298 @@
+---
+sidebar_position: 7
+title: "راهنمای توسعه، بخش ۷: Shutdown و Signalها"
+sidebar_label: "بخش ۷: Shutdown و Signalها"
+description: "سه API خاتمهٔ برنامه، state machine مربوط به shutdown، داوری exit code، ترتیب Stop/Join worker و device و روش طبقه‌بندی call siteهای خاتمه."
+---
+
+# بخش ۷: Shutdown و Signalها
+
+WaterWall فقط یک محل برای teardown پردازش دارد: **worker 0، روی main thread و
+دقیقاً یک بار**. اجرای callbackهای shutdown، join کردن workerها، توقف nodeها و
+نابودی global state همگی در همان‌جا انجام می‌شوند. این محدودیت سلیقه‌ای نیست؛
+اجرای cleanup روی worker دیگری می‌تواند همان thread را join کند یا منتظر lockی
+بماند که خودش نگه داشته است. Signal handler در POSIX و console-handler thread در
+Windows نیز context امنی برای cleanup معمول نیستند.
+
+در عین حال درخواست منظم از thread دیگر نباید به `_Exit()` فوری تبدیل شود. بازیابی
+route، DNS و iptables، ‏hookهای `onStop` و scriptهای پیش از پایین‌آوردن device تنها
+در مسیر cleanup ثبت‌شده اجرا می‌شوند.
+
+## ۱. سه API
+
+هر سه تابع در `wlibc.h` اعلان شده‌اند:
+
+```c
+bool           requestProgramShutdown(int exit_code);
+_Noreturn void abortProgramNow(int exit_code);
+_Noreturn void terminateProgram(int exit_code);
+```
+
+### `requestProgramShutdown(code)`
+
+Exit status را ثبت می‌کند، sequence مربوط به shutdown را روی worker 0 schedule
+می‌کند و **برمی‌گردد**. منتظر teardown نمی‌ماند تا worker 0 بعداً بتواند thread
+درخواست‌کننده را join کند. Caller باید بلافاصله با `return`، ‏`goto cleanup` یا
+propagate کردن خطا unwind شود؛ تبدیل یک call قدیمی `_Noreturn` بدون افزودن این
+control flow یک bug است.
+
+نتیجهٔ `true` یعنی نخستین درخواست enqueue شده یا با shutdown در حال اجرا ادغام
+شده است. `false` فقط وقتی برمی‌گردد که handoff به worker 0 در دسترس نباشد و هیچ
+درخواستی پذیرفته نشده باشد. در آن حالت fail-closed کنید:
+
+```c
+if (! requestProgramShutdown(1))
+{
+    abortProgramNow(1);
+}
+return;
+```
+
+### `abortProgramNow(code)`
+
+برای corruption، invariant شکسته یا مسیری است که ممکن است lockهای نامعلوم را
+نگه داشته باشد. Exit code را با همان policy داوری می‌کند و بدون اجرای cleanup
+ثبت‌شده از `_Exit()` خارج می‌شود.
+
+### `terminateProgram(code)`
+
+API سازگاری قدیمی است. فقط روی main thread shutdown منظم انجام می‌دهد؛ خارج از
+main thread یک abort سخت است، TID/WID متخلف را log می‌کند و در Debug assert می‌شود.
+هر call خارج main thread را یک site مهاجرت‌نکرده در نظر بگیرید.
+
+## ۲. State machine مربوط به Shutdown
+
+```text
+RUNNING -> REQUESTED -> STOPPING -> FINALIZING -> exit()
+```
+
+`program_shutdown_phase_e` منبع حقیقت است. `GSTATE.application_stopping_flag`
+فقط یک compatibility flag منتشرشده است: در `REQUESTED` هنوز false می‌ماند تا wakeup
+کنترلی تحویل شود؛ worker 0 هنگام ورود به `STOPPING` آن را true می‌کند. فقط worker 0
+گذار `REQUESTED -> STOPPING` را انجام می‌دهد و فقط برندهٔ آن گذار cleanup را اجرا
+می‌کند.
+
+### Pre-stop سراسری پیش از Stop نودها
+
+در آغاز `STOPPING`، ‏`nodemanagerStop()` دو pass سراسری انجام می‌دهد:
+
+1. `onPreStop` همهٔ tunnelها در همهٔ configurationها را صدا می‌زند تا admission
+   producerها بسته و sourceهای callback جدید quiesce شوند؛
+2. تنها بعد از پایان کل prepass، هر `onStop` می‌تواند threadها را join، callbackها
+   را detach و منابع مشترک را آزاد کند.
+
+ترتیب به‌شکل `preStop(A), stop(A), preStop(B)` نیست. با این حال `onStop` باید مسیر
+startup ناقص را که prepass نداشته نیز تحمل کند. `onWorkerStop` فاز مستقلی روی worker
+مالک است.
+
+### ترتیب drain کردن normal line روی هر worker
+
+بعد از بازگشت loop، ‏`workerDestroyOwnResources()` admission معمول پیام/producer
+را می‌بندد ولی loop، chain، tunnelها، adapterها و poolها را هنگام drain زنده نگه
+می‌دارد:
+
+1. inventoryهای authoritative مربوط به external source owner، از جمله idle table
+   هر worker برای `UdpListener` در SocketManager، drain می‌شوند؛
+2. hookهای `onWorkerStop` هر chain از source به tail اجرا می‌شوند؛ source ownerها
+   lineهای خود را می‌بندند، middle tunnelها خالی‌بودن borrowed childها را می‌سنجند
+   و tail adapter هنوز می‌تواند resource را detach و یک `Finish` برگرداند؛
+3. listener I/O، ‏async DNS و پیام‌های admitted پاک و event loop نابود می‌شوند؛
+4. فقط پس از مرگ منطقی همهٔ normal lineها و بازگشت همهٔ referenceها، poolهای worker
+   نابود می‌شوند.
+
+هر سازندهٔ autonomous پیش از `Init` re-entrant line را دقیقاً در یک inventory
+owner-worker منتشر و پیش از callback close آن را حذف می‌کند. Tail فقط lineهایی را
+inventory می‌کند که `Init` آن‌ها به خودش رسیده است؛ بازهٔ پیش از tail بر عهدهٔ
+creator است. Middle tunnel برای borrowed line inventory تکراری نمی‌سازد، ولی
+internal lineهایی را که خودش ساخته drain می‌کند. Packet line و terminal absorber
+بدون resource دسته‌های جدا هستند.
+
+## ۳. داوری Exit Code
+
+Policy مستقل از ترتیب threadهاست:
+
+- مقدار اولیه صفر است؛
+- نخستین کد nonzero برنده است؛
+- صفر یا nonzero بعدی مقدار خطای ثبت‌شده را عوض نمی‌کند؛
+- stop signal کد `128 + signum` را با همین قاعده ثبت می‌کند؛
+- دومین SIGINT/SIGTERM یا console stop فوراً `_Exit(128 + signum)` می‌کند؛
+- درخواست‌های programmatic تکراری ادغام می‌شوند و exit فوری ایجاد نمی‌کنند.
+
+`signalmanagerSetExitCode()` entry point همین داوری است، نه last-writer-wins store.
+
+## ۴. Transport کنترلی Shutdown
+
+Control traffic باید پس از refusal کار معمول نیز زنده بماند. در POSIX یک self-pipe
+اختصاصی وجود دارد: handler فقط signal number و `requestProgramShutdown()` marker
+صفر را می‌نویسد؛ worker 0 کل batch را با priority بالا drain می‌کند. Handler فقط
+به staticهای `volatile sig_atomic_t` دست می‌زند. در Windows از
+`wloopPostControlEvent()` استفاده می‌شود که gate مربوط به terminating application
+را ندارد و event را copy می‌کند. هیچ‌گاه control shutdown را از
+`wloopPostEvent()` معمول عبور ندهید.
+
+## ۵. Stop و Join کردن Workerها
+
+```c
+bool workerRequestStop(worker_t *worker);
+void workerDestroyOwnResources(worker_t *worker);
+bool workerJoin(worker_t *worker);
+```
+
+Worker 0 فقط stop worker دیگر را request و سپس آن را join می‌کند؛ هر worker منابع
+loop-local خود را بعد از خروج loop روی thread خودش نابود می‌کند. Pseudo-worker با
+`has_event_loop` شناخته می‌شود، نه با null بودن `loop`. پیش از نخستین join برای همهٔ
+workerها stop درخواست می‌شود. Join ناموفق `thread_valid` و تمام منابع قابل دسترسی
+thread را نگه می‌دارد و shutdown نهایی را به hard abort می‌برد.
+
+Lifecycle اتمیک `Initialized -> Running -> StopRequested -> Exited -> Joined`
+فقط جلو می‌رود. `control_mutex` request خارجی را با detach شدن loop توسط owner
+serialize می‌کند. `wloopRequestStop()` بدون allocation یک flag release می‌گذارد و
+poller را با eventfd/pipe/socketpair بیدار می‌کند؛ loop پیش از هر iteration با
+acquire آن را می‌خواند، حتی اگر request پیش از `wloopRun()` رسیده باشد.
+
+## ۶. Stop، Join و نابودی Device
+
+`Stop` publication کار جدید را می‌بندد، I/O مسدود را بیدار می‌کند، join همهٔ
+threadهای owned را تأیید و سپس queueهای thread-owned را drain می‌کند. `Destroy`
+بعدتر و پس از quiesce شدن producer خارجی، resourceهای process-visible را آزاد
+می‌کند.
+
+```text
+nodemanagerStop()
+  -> stop/join normal workers
+  -> drain queued lwIP work
+  -> release protocol state and stop/join tcpip_thread
+  -> destroy pseudo-worker and worker-0 resources
+  -> nodemanagerDestroy()
+```
+
+Writerهای TUN/Raw می‌توانند از event worker و lwIP فراخوانی شوند؛ join شدن writer
+thread به‌تنهایی مجوز آزادکردن queue نیست. در lwIP ابتدا netif/listenerها detach،
+سپس workerهای معمول join و بعد callback همکاری‌کننده پشت کارهای صف‌شده اجرا می‌شود
+تا PCB/pbufها آزاد و `tcpip_thread` متوقف و join شود. Custom pbuf worker/pool مبدأ
+را ثبت می‌کند و release خارجی پس از stop worker buffer را destroy می‌کند، نه اینکه
+به pool thread قبلی برگرداند.
+
+### مالکیت delivery در Reader
+
+`device_reader_session_t` یک lifetime gate packed دارد. `CLOSED` و شمارندهٔ entry
+موفق در یک modification order اتمیک‌اند: Enter پیش از Close شمرده می‌شود و Close
+منتظر Leave است؛ Close زودتر Enter را رد می‌کند. Close-and-quiesce کار lifecycle
+owner است و فراخوانی آن از داخل همان callback guarded خطای برنامه‌نویسی است.
+
+هر پیام reader تا delivery یا cleanup یک reference session نگه می‌دارد. Delivery
+وارد gate می‌شود، generation را می‌سنجد، فقط generation فعلی را صدا می‌زند، خارج
+می‌شود، پیام را recycle و reference را آزاد می‌کند. Generation صفر نامعتبر و wrap
+ممنوع است. Producer قدیمی باید پیش از بازشدن generation جدید join شود.
+
+### Generationهای Writer
+
+Submission writer gate یا refcount per-send ندارد. Producer یک acquire load از
+generation منتشرشده انجام می‌دهد و روی channel همان generation `chanTrySend()` را
+صدا می‌زند. Stop publication را با null عوض، channel را close، writer را join،
+leftoverها را drain و generation را retire می‌کند. Generationهای retired تا
+Destroy، پس از stop همهٔ workerها، allocated می‌مانند. Join ناموفق handle و همهٔ
+resourceها را نگه می‌دارد و restart/destruction را منع می‌کند.
+
+Linux Capture خروج reader را زیر `reader_state_mutex` طبقه‌بندی می‌کند؛ Stop و
+wrapper خروج با همان mutex expected/unexpected را تعیین می‌کنند. TUN یک atomic
+relaxed برای `STARTING/UP/STOPPING/FAILED` دارد که فقط همان value را مرتب می‌کند؛
+ترتیب فیلدهای دیگر از thread join، reader gate و writer publication می‌آید.
+
+## ۷. Shutdown درخواست‌شده از Worker
+
+ترتیب درست:
+
+1. bufferهای owned callback را آزاد کنید؛
+2. lockهای owned را باز کنید؛
+3. `requestProgramShutdown()` را صدا بزنید؛
+4. فوراً از control flow معمول برگردید؛
+5. loop بعداً stop را می‌بیند، worker منابع خودش را نابود می‌کند و worker 0 آن را
+   join می‌کند.
+
+درخواست را زیر mutex، rwlock، line lock یا resource موقتی که همین frame باید آزاد
+کند صادر نکنید. فقط bufferی را recycle کنید که callback هنوز مالک آن است. پس از
+درخواست پذیرفته‌شده هیچ line، packet یا timer تازه نسازید و state completion را
+تغییر ندهید؛ caller helperی که «shutdown requested» برمی‌گرداند نیز باید return کند.
+
+### درخواست Shutdown جای بستن Line نیست
+
+درخواست فقط teardown آینده را schedule می‌کند و line فعلی را logically dead
+نمی‌کند. Owner normal line در خطای terminal داخل `Finish` باید ابتدا producerها
+را detach، line state را destroy و `lineDestroy()` کند؛ سپس request و fallback
+abort را اجرا و برگردد. Packet line استثناست و هرگز در runtime نابود نمی‌شود؛ مرگ
+آن hard abort است.
+
+### `onStart` کار را Schedule می‌کند
+
+خود `onStart` main-thread startup است، ولی taskی که از همان فایل روی worker queue
+می‌شود runtime worker callback است. شکست task باید orderly shutdown درخواست کند.
+هر worker فقط timer/slot خودش را در `onWorkerStop` پاک می‌کند.
+
+## ۸. طبقه‌بندی Call Site خاتمه
+
+| دسته | وضعیت | اقدام |
+| --- | --- | --- |
+| A | پایان موفق مورد انتظار | پس از ثبت نتیجه، `requestProgramShutdown(0)` و return |
+| B | خطای runtime منظم با state معتبر | component را failed کنید، resource موقت را آزاد، request کنید و از cleanup معمول خارج شوید |
+| C | خطای per-line/per-connection | معمولاً فقط همان line را ببندید |
+| D | invariant شکسته یا state ناامن | diagnostic صریح و `abortProgramNow()` |
+| E | خطای startup/config روی main thread | `terminateProgram()`؛ پیش از signal manager، ‏`exit()` پس از unwind |
+
+برای مهاجرت site قدیمی `_Noreturn`، returnهای حذف‌شده، buffer ownership، lifetime
+gateها، callbackهای re-entrant، نتیجهٔ توابع non-void و publication state خروج
+worker/device را دوباره بررسی کنید.
+
+در device I/O، فقط wrapper خروج terminal را به Category B می‌رساند. خطاهای
+`EINTR/EAGAIN/EWOULDBLOCK/ENOBUFS/ENOMEM` transient هستند؛ `EINVAL` فقط در write
+packet-local است؛ بقیه، از جمله `EIO/EBADF/ENODEV/ENXIO/EMSGSIZE` terminal هستند.
+`errno` را بلافاصله پس از syscall کپی کنید. `EINVAL` نباید به peer اجازهٔ kill یک
+process بدهد و `EMSGSIZE` پس از check اندازه نشان‌دهندهٔ MTU ناسازگار است.
+
+Verdict ناموفق Tester با input بد peer یک state ممکن و Category B است؛ invariant
+داخلی ناممکن Category D باقی می‌ماند. اگر verdict داخل `Finish` خط owned باشد، helper
+باید line را پیش از گزارش verdict logically dead کند.
+
+مرگ worker packet line همیشه hard abort است. در مقابل، refusal یک normal transport
+line عملیاتی است و معمولاً فقط slot را خالی می‌کند تا بعداً retry شود. نودی مانند
+`WireGuardDevice` باید ابتدا نقش دقیق line را تشخیص دهد.
+
+## ۹. Registry مربوط به Callbackهای Shutdown
+
+پس از freeze، register/remove رد می‌شوند؛ capacity زیر mutex بررسی می‌شود؛ worker 0
+list را freeze و snapshot می‌کند و callbackها را دقیقاً یک بار با ترتیب LIFO و بدون
+نگه‌داشتن mutex اجرا می‌کند. Callback فقط از `signalmanagerSetExitCode()` روی نتیجه
+اثر می‌گذارد. Global-state callback نخست register می‌شود تا در LIFO آخر اجرا شود.
+
+## ۱۰. Policy مربوط به Signal Mask
+
+فقط main thread signalهای stop را unblocked دارد. `threadCreate()` آن‌ها را هنگام
+هر spawn می‌بندد تا child بدون پنجرهٔ race mask را به ارث ببرد. Signalهای fatal
+مانند SIGSEGV/SIGILL/SIGABRT disposition پیش‌فرض را restore و دوباره raise می‌کنند
+و cleanup معمول را اجرا نمی‌کنند.
+
+## ۱۱. Testها
+
+```bash
+ctest --preset linux --output-on-failure -R 'shutdown|signal_manager|wloop_stop|node_manager_stop|thread_transfer'
+python3 tests/tunnels_abort_policy_test.py --mutation-test
+python3 tests/tunnels_orderly_shutdown_policy_test.py --mutation-test
+python3 tests/line_ownership_policy_test.py --mutation-test
+```
+
+Testهای runtime arbitration، signal batch، stop قبل از run، join lwIP و انتقال
+pool را در child process واقعی بررسی می‌کنند. Policy testها body تابع را lexically
+scan و هر anchor را mutation می‌کنند تا comment یا string نتواند جای code واقعی
+را بگیرد. `line_ownership_policy_test.py` همهٔ siteهای `lineCreate()`، owner close،
+packet anchor و finish absorber مستند را inventory می‌کند.
+
+`udplistener_mux_shutdown_order_test` callback واقعی expiry در `UdpListener` را از
+SocketManager پیش از cleanup worker در `MuxClient` اجرا می‌کند و حالت‌های counter،
+timer و fixed، stop تکراری و control بدون Mux را پوشش می‌دهد. Child borrowed همیشه
+به‌دست UdpListener نابود می‌شود و Mux فقط parent داخلی zero-child خود را می‌بندد.
+
+Testهای `*_orderly_shutdown_test` شکست واقعی allocation/timer را inject و دقیقاً یک
+request، نبود abort/terminate، recycle یک‌بارهٔ buffer، نبود publication بعدی و
+بازگشت callback را اثبات می‌کنند. Taskهای enqueueشده در `onStart` از entry point
+واقعی و message queue واقعی drive می‌شوند تا worker ownership و `onWorkerStop`
+صرفاً فرض نشوند.
