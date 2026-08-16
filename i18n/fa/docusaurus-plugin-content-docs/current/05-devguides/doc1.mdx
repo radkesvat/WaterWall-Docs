@@ -9,7 +9,7 @@ description: "مدل Runtime، Objectهای اصلی، جهت Callbackها و چ
 
 این راهنما با تمرکز بر Source Code برای افرادی نوشته شده است که تونل‌های موجود در
 [`tunnels/`](https://github.com/radkesvat/WaterWall) را پیاده‌سازی، اصلاح یا Review
-می‌کنند؛ چه توسعه‌دهنده باشند و چه Coding Agent. راهنما شش بخش دارد. این صفحه
+می‌کنند؛ چه توسعه‌دهنده باشند و چه Coding Agent. راهنما هفت بخش دارد. این صفحه
 (بخش ۱) مدل ذهنی لازم را می‌سازد و بخش‌های بعدی قراردادهایی را با جزئیات توضیح
 می‌دهند که نباید نقض شوند.
 
@@ -36,6 +36,7 @@ Codebase، درستی از هماهنگی با الگوی موجود چرخه‌
 | [بخش ۴: Packet Lineها و تونل‌های Packet](./part4-packet-tunnels.mdx) | معنای Packet Line، تونل‌های Packet خالص و پل‌های Packet/Stream | هر کار مربوط به Layer 3 یا Packet. |
 | [بخش ۵: ساختار یک تونل و روند کار](./part5-tunnel-anatomy.mdx) | چیدمان دایرکتوری، Metadata در `node.c`، فایل `create.c`، Line State و قواعد HTTP | هنگام افزودن یا بازسازی ساختار یک تونل. |
 | [بخش ۶: Build، آزمایش و Review](./part6-build-test-review.mdx) | Presetهای CMake، ‏ctest، اعتبارسنجی، Checklist بازبینی و خروجی Agent | پیش از آنکه تغییری را «تمام‌شده» بدانید. |
+| [بخش ۷: خاتمه‌ی Application](./part7-shutdown-and-signals.mdx) | کنترل‌کننده‌ی Shutdown، ‏Quiesceشدن Workerها، مراحل Lifecycle، ‏Signalها و ترتیب نابودی | هر تغییر در Startup، ‏Shutdown، کنترل Worker یا مالکیت Asynchronous. |
 
 ## ابتدا این فایل‌ها را بخوانید
 
@@ -309,6 +310,98 @@ tunnel_t *templateTunnelCreate(node_t *node)
 اگر یک تغییر پیشنهادی نتواند توضیح دهد که تک‌تک این موارد را چگونه حفظ می‌کند،
 هنوز آماده نیست. ادامه‌ی این راهنما در واقع شرح مفصل همین فهرست است.
 
+### هویت Thread مربوط به Worker و WID
+
+هویت Thread مربوط به Worker در WaterWall صریح است و به‌طور پیش‌فرض نامعتبر در
+نظر گرفته می‌شود:
+
+- **WID یعنی index یک slot ثبت‌شده‌ی Worker**، نه شناسه‌ی Thread در سیستم‌عامل یا
+  Application مانند `getTID()`.
+- Threadهای ثبت‌نشده، از جمله Threadهای reader/writer مربوط به TUN، ‏Threadهای
+  raw device و capture، ‏Threadهای کمکی و Test، مقدار
+  `getWID() == kInvalidWID` یعنی `UINT8_MAX` را می‌بینند.
+- `getWID()` می‌تواند `kInvalidWID` برگرداند. هر Call Site که به State متعلق به
+  Worker دسترسی دارد باید هویت Thread را با Predicateهایی مانند
+  `currentThreadIsEventWorker()` یا `workerWIDIsRegistered(wid)` بررسی کند.
+- **Threadهای کمکی** باید کارِ دارای مالکیت را از طریق صف پیام Worker ارسال کنند و
+  هرگز نباید مستقیماً یک Pool محلی Worker را قرض بگیرند. Custom Event خام Loop فقط
+  برای عملیات بدون مالکیت و متعلق به خود Loop رزرو شده است.
+- **Pseudo-worker مربوط به lwIP** ثبت‌شده است؛ یعنی `workerWIDIsRegistered()` برای
+  آن `true` است، اما Event Worker نیست و `workerWIDIsEventWorker()` برایش `false`
+  است، زیرا Event Loop متعلق به WaterWall ندارد.
+- Threadهای native/library برای Log و تشخیص خطا از `getTID()` استفاده می‌کنند و تا
+  زمانی که صریحاً با `workerBindCurrentThread()` متصل نشوند WID نامعتبر دارند.
+
+### انتخاب Helper مناسب برای Context مربوط به Worker
+
+هرگز `getWID()` را مستقیماً در بررسی Affinity، ‏index یک Array یا lookup منبع
+به‌کار نبرید. محدودترین Helper سازگار با Context موجود را انتخاب کنید. Helper
+دامنه‌ی معتبر را در قرارداد خود کد می‌کند و اجازه نمی‌دهد یک Thread ثبت‌نشده یا
+Pseudo-worker مربوط به lwIP صرفاً به‌دلیل برابری اتفاقی از بررسی عبور کند.
+
+| Context | استفاده |
+| --- | --- |
+| Callback یک `line_t *` دارد | `lineIsOnCurrentEventWorker(line)`، ‏`lineGetWID(line)`، ‏`lineGetBufferPool(line)`، ‏`lineReuseBuffer(line, buf)` |
+| Callback پیام Worker یک `worker_t *worker` دارد | `worker->wid`، ‏`worker->buffer_pool`، ‏`worker->loop`؛ TLS را دوباره نخوانید. |
+| Callback مربوط به Event/Timer/I/O یک Loop یا Event دارد | یک بار `getLoopEventWorkerWID(weventGetLoop(ev))` را بگیرید و مقدار محلی را دوباره استفاده کنید. |
+| Callback واقعی Event Loop بدون Line یا Worker | `getCurrentEventWorker()`، ‏`getCurrentEventWorkerWID()`، ‏`getCurrentEventWorkerBufferPool()`، ‏`getCurrentEventWorkerLoop()` |
+| Callback چرخه‌ی عمر که `wid` صریح دریافت کرده است | `currentThreadIsEventWorkerWID(wid)` |
+| کدی که بنا بر طراحی به Worker 0 نیاز دارد | WID صریح `0` همراه `currentThreadIsEventWorkerWID(0)`؛ هرگز آن را از TLS پیش‌فرض استنباط نکنید. |
+| API قابل‌دسترسی از بیرون یا در غیر این صورت Fallible | `tryGetCurrentEventWorker()` یا `currentThreadIsEventWorker()`؛ سپس Error یا `NULL` برگردانید یا کار را Queue کنید. |
+| کدی که ممکن است روی lwIP اجرا شود | `workerWIDIsRegistered()` یا WID مقصد صریح؛ هرگز Array مربوط به Event Worker. |
+| Thread کمکی Device | فقط Pool/Channel متعلق به Device؛ تحویل به یک Event Worker صریح. |
+| فقط Logging | استفاده‌ی خام از `getWID()` مجاز است، به شرط عبور از `workerWIDForLog()` و چاپ با `%d` در کنار `getTID()`؛ مقدار `-1` یعنی ثبت‌نشده. |
+
+Accessorهای `getCurrentEventWorker*()` که Pointer برمی‌گردانند فقط برای Callbackهای
+داخلی‌اند که قراردادشان از قبل حضور روی Event Worker را تضمین می‌کند. این توابع
+به‌جای fallback به Worker 0، ‏Abort می‌کنند. بنابراین هر چیزی که از Thread دستگاه،
+Callback یک Library یا API عمومی قابل‌دسترسی است باید از شکل Predicate استفاده کند
+و در صورت نبود Context معتبر به‌طور تمیز Fail شود.
+
+```c
+// Line callback: affinity and pool ownership both come from the line.
+if (! lineIsOnCurrentEventWorker(l))
+{
+    sendWorkerMessageForceQueueWithCleanup(lineGetWID(l), doWork, cleanup, t, l, buf);
+    return;
+}
+lineReuseBuffer(l, buf);
+
+// Worker-message callback: the message was delivered to exactly one worker.
+static void onWorkerMessage(worker_t *worker, void *arg1, void *arg2, void *arg3)
+{
+    line_t *packet_line = tunnelchainGetWorkerPacketLine(tunnelGetChain(t), worker->wid);
+    ...
+}
+
+// Timer callback: derive the owner from the loop, validate once, reuse it.
+const wid_t wid = getLoopEventWorkerWID(weventGetLoop(timer));
+ts->worker_timers[wid] = NULL;
+
+// lwIP callback: only the target packet worker may act inline.
+if (currentThreadIsEventWorkerWID(route_ctx->packet_wid)) { emitInline(); }
+else                                                     { queueToPacketWorker(); }
+
+// Device thread: device-owned resources only, delivery by explicit WID.
+sbuf_t *buf = bufferpoolGetLargeBuffer(dev->reader_buffer_pool);
+sendWorkerMessageForceQueueWithCleanup(target_wid, deliver, cleanup, dev, buf, NULL);
+```
+
+پاک‌سازی Buffer میان Threadها با Recycleکردن یکسان نیست. `reuseBuffer(buf)` یعنی
+«روی Event Worker فعلی دوباره استفاده کن» و Call Siteای را که Pool محلی Worker
+ندارد رد می‌کند. وقتی روی Worker مالک Buffer نیستید، آزادسازی درست
+`sbufDestroy(buf)` است؛ این مسیرها را به `reuseBuffer()` تبدیل نکنید.
+
+APIهای معمول تونل، یعنی `<node>TunnelApi()`، روی Event Worker اجرا می‌شوند و
+مالکیت پیام خود را می‌گیرند. پیام را با `tunnelapiRecycleMessage()` یا
+`tunnelapiUnsupportedMessage()` در `ww/objects/node.h` مصرف کنید. هر دو تابع وقتی
+Caller روی Event Worker نیست Buffer را نابود می‌کنند و `kApiResultError`
+برمی‌گردانند، نه اینکه Pool مربوط به Worker 0 را قرض بگیرند.
+
+`tests/worker_identity_source_policy_test.py` این قواعد را enforce می‌کند: nesting
+تازه‌ی `getWorkerXxx(getWID())`، تصمیم مالکیت با `getWID() == 0` خام، مقایسه‌ی خام
+Affinity با WID فعلی و Boilerplate مربوط به Recycle پیام Tunnel API رد می‌شوند.
+
 ## واژه‌نامه
 
 | اصطلاح | مفهوم |
@@ -321,6 +414,8 @@ tunnel_t *templateTunnelCreate(node_t *node)
 | **tstate** | Tunnel State؛ مختص Instance و مشترک میان همه‌ی Lineها. |
 | **lstate** | Line State؛ مختص Line و خصوصی برای یک تونل. |
 | **Packet Line** | یک `line_t` پایدار به‌ازای هر Worker در زنجیره‌های Layer 3؛ Line اتصال نیست. |
+| **WID** | index یک slot ثبت‌شده‌ی Worker در بازه‌ی `0 .. WORKERS_COUNT - 1`؛ روی Thread ثبت‌نشده `kInvalidWID` است. |
+| **kInvalidWID** | مقدار Sentinel برابر `UINT8_MAX` برای Thread ثبت‌نشده یا کمکی. |
 | **Re-entrancy** | حالتی که Callback میان‌تونلی پیش از بازگشت کنترل، به‌صورت Synchronous دوباره وارد تونل شما می‌شود و ممکن است Line را ببندد. |
 | **Reflection** | Forwardکردن اشتباه Callback به‌سمتی که قبلاً Finish شده است؛ یکی از علت‌های رایج Crash. |
 

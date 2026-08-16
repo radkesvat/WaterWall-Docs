@@ -31,8 +31,7 @@ tunnels/MyTunnel/
     index.c              # onIndex hook (usually delegates to the default)
     prepair.c            # onPrepare hook
     start.c              # onStart hook
-    pre_stop.c           # optional onPreStop producer-quiesce hook
-    stop.c               # onStop hook
+    stop.c               # lifecycle-v2 quiesce, drain, and stop hooks
     destroy.c            # onDestroy hook: free state, then tunnelDestroy()
     api.c                # runtime API entry (tunnelApi)
   common/
@@ -63,7 +62,7 @@ tunnels/MyTunnel/
 | `instance/node.c` | برگرداندن `node_t` توصیف‌کننده‌ی نوع تونل: `type`، ‏`version`، ‏`createHandle`، ‏`flags`، ‏`required_padding_left`، ‏`layer_group` و محدودیت Layer همسایه‌ها. |
 | `instance/create.c` | فراخوانی `tunnelCreate(node, sizeof(tstate), sizeof(lstate))`، تنظیم دوازده Callback جریان و Lifecycle Hookها، ‏Parse و اعتبارسنجی تنظیمات JSON، تخصیص منابع هر Worker و پاک‌سازی در هر مسیر خطا. |
 | `instance/chain.c` / `index.c` | Hookهای `onChain` / `onIndex`. بیشتر تونل‌ها رفتار پیش‌فرض فریم‌ورک را حفظ می‌کنند؛ Stub مربوط به Adapter ممکن است فقط Abort کند تا نشان دهد رفتار پیش‌فرض باید استفاده شود. |
-| `instance/prepair.c` / `start.c` / `pre_stop.c` / `stop.c` | Hookهای `onPrepare` / `onStart` / `onPreStop` / `onStop`. کار را در `onStart` آغاز کنید، admission producerها را در `onPreStop` ببندید و منابع مشترک را در `onStop` join، detach و آزاد کنید. |
+| `instance/prepair.c` / `start.c` / `stop.c` | Hookهای `onPrepare` / `onStart` و Shutdown در lifecycle-v2. کار را در `onStart` آغاز کنید؛ admission را در `onQuiesceRequest` ببندید؛ کارهای وابسته به Worker را در `onWorkerQuiesce` جدا کنید؛ در `onQuiesceWait` منتظر producerهای خارجی بمانید؛ Lineهای owned را در `onWorkerStop` drain کنید؛ و منابع مشترک باقی‌مانده را در `onStop` آزاد کنید. |
 | `instance/destroy.c` | Hook مربوط به `onDestroy`: آزادکردن تنظیمات، SSL Contextها، Poolها و Arrayهای Thread-local و سپس فراخوانی `tunnelDestroy(t)`. |
 | `instance/api.c` | ورودی Runtime برای `tunnelApi`. یک پیام `sbuf_t` دریافت می‌کند، باید آن را Recycle کند و یک `api_result_t` برگرداند. |
 | `common/line_state.c` | `LinestateInitialize` که از `Init` فراخوانی می‌شود و `LinestateDestroy` که ناحیه‌ی هم‌تراز Line State را Zero می‌کند. |
@@ -119,15 +118,16 @@ node_t nodeTcpListenerGet(void)
 | `kNodeFlagNoChain` | بدون حضور در زنجیره کار می‌کند؛ مانند Node مربوط به Database/User-auth. |
 | `kNodeFlagSingleton` | در کل فایل پیکربندی فقط یک Instance از آن مجاز است. |
 
-### Layout مربوط به ABI نودهای خارجی
+### ABI چرخه‌ی عمر نودهای خارجی
 
-ساختارهای `tunnel_t`، ‏`node_t` و `line_t` بخشی از ABI نودهای خارجی‌اند. Library
-خارجی offset اعضا و accessorهای inline را هنگام compile در خود ثبت می‌کند؛ بنابراین
-اعضای تاریخی را نمی‌توان reorder یا جابه‌جا کرد. فیلد جدید فقط وقتی می‌تواند از
-padding layout استفاده کند که آن فضا روی همهٔ targetهای ۳۲ و ۶۴ بیتی پشتیبانی‌شده
-اثبات شده باشد؛ در غیر این صورت به شکست ABI صریح و versioned نیاز است. به‌طور خاص
-`tunnel_t.onPreStop` در فاصلهٔ alignment بلافاصله پیش از `tunnel_t.state[]` قرار
-دارد و table قدیمی callbackها و offset بخش flexible state را حفظ می‌کند.
+ساختارهای `tunnel_t`، ‏`node_t` و `line_t` بخشی از ABI نودهای خارجی‌اند. Libraryهای
+خارجی offset اعضا، signatureهای Callback و accessorهای Inline را هنگام Compile در
+خود ثبت می‌کنند. جدول Lifecycle دارای Context، ‏ABI v2 است و عمداً Layout قدیمی
+Callbackهای Stop را می‌شکند. یک Node دینامیک باید تابع
+`waterwallNodeLifecycleAbiVersion()` را Export کند و مقدار
+`WW_EXTERNAL_NODE_LIFECYCLE_ABI_VERSION` را برگرداند. Loader پیش از resolve یا
+فراخوانی Node getter این descriptor را بررسی می‌کند؛ descriptor گمشده یا ناسازگار
+رد می‌شود و از طریق Layout ناسازگار Callbackها normalize نمی‌شود.
 
 ## ‏`create.c`: ساخت Instance
 
@@ -170,18 +170,29 @@ tunnel_t *tlsclientTunnelCreate(node_t *node)
 }
 ```
 
-### Stop سراسری دومرحله‌ای
+### مراحل Shutdown در lifecycle-v2
 
-Shutdown منظم یک prepass سراسری producer دارد: node manager ابتدا `onPreStop`
-همهٔ tunnelها در همهٔ configurationهای بارگذاری‌شده را صدا می‌زند و تنها پس از
-پایان کامل آن، اجرای هر `onStop` را آغاز می‌کند. در `onPreStop` gateهای admission
-را ببندید و producerها را quiesce کنید تا یک configuration نتواند برای همسایه‌ای
-که configuration دیگری متوقف کرده callback تازه enqueue کند. پس از این prepass،
-`onStop` می‌تواند threadها را join، callbackها را detach و منابع مشترک را آزاد کند.
+مالکیت Lifecycle صریح و دارای Context است. Shutdown پردازه همه‌ی Chainهای
+بارگذاری‌شده را از source به tail در مراحل زیر پیمایش می‌کند:
 
-مسیر پاک‌سازی startup ناقص ممکن است بدون prepass سراسری به `onStop` برسد. بنابراین
-`onStop` باید مستقل و امن باقی بماند و فرض نکند `onPreStop` قبلاً اجرا شده است.
-پاک‌سازی worker-owned با `onWorkerStop` فاز جداگانه‌ای روی هر worker ثبت‌شده است.
+1. `onQuiesceRequest` روی Main Thread اجرا می‌شود، admission محلی را می‌بندد،
+   درخواست توقف producerها را صادر می‌کند و نباید منتظر بماند.
+2. `onWorkerQuiesce` روی هر Worker مالک اجرا می‌شود و Timer، ‏Watcher و Handleهای
+   queueشده‌ی مختص همان Worker را detach می‌کند.
+3. `onQuiesceWait` پس از Quiesceشدن همه‌ی Workerها روی Main Thread اجرا می‌شود و
+   Rootهای Callback خارجیِ از قبل پذیرفته‌شده را join یا detach می‌کند.
+4. `onWorkerStop` هنگام Drain روی هر Worker مالک اجرا می‌شود. Ownerهای source پیش
+   از Hookهای middle و tail، ‏Inventory مربوط به Lineهای خود را می‌بندند.
+5. `onStop` پس از Drainشدن همه‌ی Workerها روی Main Thread اجرا می‌شود و منابع
+   مشترک باقی‌مانده را آزاد می‌کند.
+6. `onDestroy` فقط وقتی روی Main Thread اجرا می‌شود که دیگر هیچ Worker، ‏Message،
+   ‏Line یا producer خارجی نتواند به Instance ارجاع دهد.
+
+همه‌ی Callbackها یک `ww_lifecycle_context_t` فقط‌خواندنی دریافت می‌کنند. Rollback
+ساخت، توقف private child به‌دست Owner و restart محلی Device scopeهای مستقل خود و
+Policy مربوط به Close از نوع abortive را دارند. Componentها نباید با Pollکردن
+State سراسری Shutdown، ‏Scope را استنباط کنند. حذف زنده‌ی Configuration یک Scope
+پشتیبانی‌شده‌ی Lifecycle نیست.
 
 از Helperهای JSON پروژه، مانند `getStringFromJsonObject`،
 `getBoolFromJsonObjectOrDefault` و `getIntFromJsonObjectOrDefault` استفاده کنید و

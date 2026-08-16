@@ -1,594 +1,465 @@
 ---
 sidebar_position: 7
-title: "Developer Guide Part 7: Shutdown & Signals"
-sidebar_label: "Part 7: Shutdown & Signals"
-description: "The three process shutdown APIs, the shutdown phase state machine, exit-code arbitration, worker stop/join rules, and how to classify a termination call site."
+title: "Developer Guide Part 7: Application Termination"
+sidebar_label: "Part 7: Application Termination"
+description: "The shutdown controller, worker quiescence protocol, lifecycle-v2 component stages, task settlement, signals, devices, and destruction order."
 ---
 
-# Part 7: Shutdown & Signals
+# Part 7: Application Termination
 
-WaterWall has exactly one place where process teardown runs: **worker 0, the
-main thread, exactly once**. Registered shutdown callbacks, worker joining, node
-teardown and global-state destruction all happen there.
+WaterWall has one orderly process-termination authority. The application
+shutdown controller records requests and exit status; the main thread performs
+the ownership-based shutdown sequence after worker 0 leaves normal event-loop
+dispatch. Workers, loops, tunnels, devices, queues, and protocol code respond to
+explicit local lifecycle operations from their owners. They do not poll the
+process controller.
 
-That constraint is not stylistic. The global-state shutdown callback stops and
-joins the other workers, so running it from one of those workers can join the
-current thread or wait for a lock the current thread holds. Running it from a
-POSIX signal handler or a Windows console-handler thread is worse: those
-contexts may interrupt code that owns arbitrary locks.
+Fatal termination is separate. `abortProgramNow()` deliberately skips orderly
+cleanup and is reserved for corruption, invariant failure, or a failed orderly
+handoff whose state cannot safely continue.
 
-At the same time, an orderly shutdown requested by another thread must not be
-converted into an immediate `_Exit()` that skips cleanup. Route, DNS and
-iptables restoration, node `onStop` hooks and device pre-down scripts all live in
-the registered cleanup path.
+## 1. Process shutdown controller
 
-## 1. The three APIs
-
-All three are declared in `wlibc.h`, so every translation unit sees them.
-
-```c
-bool           requestProgramShutdown(int exit_code);
-_Noreturn void abortProgramNow(int exit_code);
-_Noreturn void terminateProgram(int exit_code);   // legacy compatibility
-```
-
-### `requestProgramShutdown(code)` — orderly, thread-safe, **returns**
-
-Records the exit status, schedules the shutdown sequence on worker 0, and
-returns to its caller. It never waits for teardown, which is exactly what lets
-worker 0 join the requesting thread afterwards.
-
-The caller must unwind normally immediately after. Because the function returns,
-**every migrated call site needs an explicit `return`, `goto cleanup`, or error
-propagation** — the old `_Noreturn` behaviour used to hide missing control flow.
-
-It returns `true` when this call queued the first request *or* when a shutdown
-was already in flight and the request coalesced into it. It returns `false` only
-when the worker-0 handoff is unavailable and no shutdown was accepted. Handle
-`false` by failing closed:
-
-```c
-if (! requestProgramShutdown(0))
-{
-    abortProgramNow(1);
-}
-return;
-```
-
-### `abortProgramNow(code)` — immediate `_Exit()`, no cleanup
-
-For corrupted state, broken invariants, and failures reached while arbitrary
-locks may still be held. It arbitrates the exit code through the same policy and
-then leaves without touching the registered cleanup path.
-
-### `terminateProgram(code)` — legacy compatibility
-
-Orderly shutdown **only on the main thread**. Off the main thread it is still a
-hard abort that skips registered cleanup, and it now logs the offending TID/WID
-saying so (and asserts in debug builds). Treat any off-main `terminateProgram()`
-as an unmigrated call site.
-
-## 2. Shutdown phase state machine
+The controller advances monotonically through:
 
 ```text
-RUNNING ──requestProgramShutdown()/signal/console──▶ REQUESTED
-REQUESTED ──worker 0, exactly once──▶ STOPPING
-STOPPING ──workers stopped and joined──▶ FINALIZING ──▶ exit()
+Running
+  -> Requested
+  -> ClosingAdmissions
+  -> QuiescingWorkers
+  -> QuiescingExternalProducers
+  -> DrainingWorkers
+  -> StoppingComponents
+  -> DestroyingWorkers
+  -> Finalizing
 ```
 
-The phase (`program_shutdown_phase_e`) is the single source of truth.
-`GSTATE.application_stopping_flag` is a *published compatibility flag* derived
-from it:
+`requestProgramShutdown(code)` is the public orderly-request facade. The first
+request records three independent facts: diagnostic origin, cleanup scope, and
+exit status. Cleanup scope comes from the runtime-commit milestone, never from
+the origin: every request accepted before commit selects `StartupRollback`, and
+every request accepted afterward selects `ProcessShutdown`. A signal during
+startup therefore remains a signal while still receiving rollback cleanup.
 
-- it stays **false** while shutdown is merely `REQUESTED`, so the control wakeup
-  can still be delivered and the requester can unwind;
-- worker 0 sets it **true** when it enters `STOPPING`.
+The first request is one controller-to-worker transaction. While holding the
+controller mutex, it selects the scope and installs worker 0's level-triggered
+quiesce request, including normal/message admission closure. Only then does it
+publish `Requested`. If worker 0 cannot accept the local request, the controller
+remains `Running`. Once accepted, a degraded wake does not roll the request back.
+The lock order is controller mutex followed by worker control mutex; worker
+failure paths release their worker lock before reporting globally.
 
-Only worker 0 performs `REQUESTED -> STOPPING`, and only the pass that wins that
-transition runs cleanup.
+After all startup stages and required task admissions succeed, but before
+`workers_run_flag` is published, the main startup owner calls the runtime-commit
+operation. Commit and request acceptance serialize on the controller mutex, so a
+request either wins and causes rollback or loses to a committed runtime. Repeated
+requests coalesce. A later first non-zero status may raise a successful status
+until origin, scope, and status are frozen together on entry to `Finalizing`.
 
-### Global node pre-stop before node stop
+`Requested` promises only that the request record exists and the main execution
+controller must enter shutdown. It does not mean that admission has closed, a
+callback has returned, a line is dead, or an object is safe to reclaim.
 
-At the start of `STOPPING`, `nodemanagerStop()` performs two process-wide passes:
+Only SignalManager's OS handoff and the main coordinator inspect the
+process-wide phase. There is no `application_stopping_flag`, leaf
+`isApplicationTerminating()` check, or secondary component-visible shutdown
+state.
 
-1. it calls every tunnel's `onPreStop` in every configuration, closing producer
-   admission and quiescing sources of new callbacks;
-2. only after the complete prepass does it call any `onStop`, where tunnels may
-   join threads, detach callbacks, and release shared resources.
+## 2. Request handoff and worker 0
 
-The order is global, not `preStop(config A) -> stop(config A) -> preStop(config
-B)`. This prevents a still-running producer in one configuration from targeting
-resources already stopped in another. `onStop` must nevertheless tolerate a
-partial-start/failure path that invokes it without the global prepass. Per-worker
-`onWorkerStop` cleanup remains separate and runs on the owning worker.
+On POSIX, the async signal handler stores the first signal in a
+`volatile sig_atomic_t` mailbox and writes a best-effort byte to a nonblocking
+self-pipe. A full pipe already represents a pending wake. The handler takes no
+application lock and performs no cleanup. Worker 0 consumes the mailbox and
+publishes the typed controller request. Mailbox take-and-clear blocks the exact
+graceful signal set, publishes a captured signal before unblocking, and restores
+the caller's exact previous mask. The startup-failure boundary performs mailbox
+take, signal publication, and `StartupFailure` publication while that same set
+remains blocked. A signal already captured when the mask is acquired wins the
+immutable origin; one delivered only after acquisition is ordered after the
+boundary and cannot replace an accepted startup failure. The main startup path
+also consumes the mailbox at stage checkpoints.
 
-### Worker-local normal-line drain order
+On Windows, a process-lifetime atomic entry gate combines handler admission and
+the active entrant count. A handler acquires it before reading manager or
+controller storage. Destruction closes the gate, unregisters the OS handler,
+releases waiters, and waits only for admitted entrants. A late entrant uses the
+manager-free fatal-status fallback. Console close/logoff/shutdown handling may
+wait a bounded time where the OS contract requires it.
 
-After a worker loop returns, `workerDestroyOwnResources()` closes ordinary
-message/producer admission but keeps the loop, chain, tunnels, adapters, and
-line/buffer pools alive while normal lines are drained. The order is:
+The callback does not destroy its event loop, workers, nodes, or global state.
+`wloopRun()` observes the local request between callback roots and returns a
+typed result. `runMainThread()` then calls the coordinator outside the event
+dispatch stack.
 
-1. drain authoritative external source-owner inventories, currently including
-   SocketManager's per-worker `UdpListener` idle tables;
-2. walk each chain from source to tail through `onWorkerStop`, so autonomous
-   source owners close their remaining lines before middle tunnels validate
-   that borrowed child sets are empty, and tail adapters remain available to
-   detach their resources and return one downstream `Finish`;
-3. close listener I/O, clean async DNS and admitted pending messages, and destroy
-   the event loop; then
-4. destroy worker-local pools only after every normal line is logically dead and
-   every physical reference has returned.
+A second operator signal may use SignalManager's immediate-exit escape hatch.
+`abortProgramNow()` performs only lock-free status arbitration and immediate
+`_Exit`/`ExitProcess`; it emits no diagnostic that could block on a full stream.
+The fatal-status integer is compile-time required to be always lock-free on the
+C11 path. The Windows fallback uses the corresponding lock-free Interlocked
+primitive. Its operations remain relaxed because the integer publishes no other
+state.
+On POSIX, fatal crash signals restore their default disposition, unblock and
+re-raise the signal, with `_Exit(128 + signum)` only as a fallback. Windows fatal
+handlers terminate with the arbitrated status because POSIX signal/core semantics
+do not apply there.
 
-Every autonomous normal-line creator publishes a line in exactly one
-owner-worker inventory before re-entrant `Init`, removes the entry before any
-close callback, and makes repeated drain harmless. Tail adapters inventory only
-lines whose `Init` reached them; a line still in an upstream resolver or other
-pre-tail interval remains the creator's responsibility. Middle tunnels do not
-duplicate inventories for borrowed lines, although they must drain internal
-normal lines they created. Packet lines and documented resource-free terminal
-absorbers are separate lifecycle categories.
+## 3. Worker lifecycle
 
-## 3. Exit-code arbitration
-
-Deterministic, independent of thread scheduling:
-
-- the initial exit code is zero;
-- **the first non-zero code wins**;
-- a later zero can never overwrite a recorded error;
-- a later non-zero can never replace an earlier non-zero;
-- a stop signal records `128 + signum` under the same rule;
-- a second SIGINT/SIGTERM (or console stop event) forces an immediate
-  `_Exit(128 + signum)` as the operator escape hatch;
-- duplicate programmatic requests coalesce and never force an immediate exit.
-
-`signalmanagerSetExitCode()` *is* the arbitration entry point; it is not a
-last-writer-wins store.
-
-## 4. Shutdown-control transport
-
-Control traffic must survive after normal application work is refused.
-
-- **POSIX**: a dedicated self-pipe. The async handler writes the signal number;
-  `requestProgramShutdown()` writes a `0` request marker. Worker 0 watches the
-  read end at high priority, drains the whole batch, arbitrates the exit code,
-  and then runs the shutdown. The handler itself touches only
-  `volatile sig_atomic_t` statics — never the manager object, which can be freed
-  during late teardown.
-- **Windows**: `wloopPostControlEvent()`, which is `wloopPostEvent()` without the
-  `isApplicationTerminating()` gate. Both copy the event, so a stack-allocated
-  `wevent_t` is fine.
-
-`wloopPostEvent()` keeps rejecting ordinary application work during shutdown.
-Never route shutdown control through it.
-
-## 5. Worker stop and join
-
-```c
-bool workerRequestStop(worker_t *worker);        // thread-safe, never waits
-void workerDestroyOwnResources(worker_t *worker); // owner thread only, once
-bool workerJoin(worker_t *worker);
-```
-
-Rules:
-
-- worker 0 only **requests** a remote stop, then joins;
-- a worker thread destroys its own event-loop-local resources after its loop
-  returns;
-- worker 0 destroys its own resources on worker 0;
-- pseudo-workers (no event loop — currently lwIP) are identified by
-  `worker->has_event_loop`, **not** by a null `loop`, because a normal worker
-  clears its loop during teardown;
-- every spawned worker is asked to stop before the first join, so shutdown does
-  not serialize on one slow worker.
-- a failed join leaves `thread_valid` set and prevents worker-resource/global
-  destruction. Terminal shutdown hard-aborts at that point because a
-  possibly-live worker can still access those resources.
-
-`worker_t::lifecycle` is an atomic, monotonically advancing
-`worker_lifecycle_e` (`Initialized → Running → StopRequested → Exited → Joined`).
-A per-worker `control_mutex` serializes a remote stop request against the owner
-detaching its own loop, so a stop racing a worker's self-exit is safe in both
-orderings and nothing is destroyed twice.
-
-Under the hood, `wloopRequestStop()` sets an atomic `stop_requested` on the loop
-with release ordering and wakes the poller through its eventfd/pipe/socketpair.
-It enqueues nothing and allocates nothing. The loop checks the flag with acquire
-ordering before each iteration, so a request issued *before* `wloopRun()` started
-is honored too. There are no cross-thread writes to `wloop_t::flags`.
-
-## 6. Device stop, join, and destruction
-
-Device `Stop` and `Destroy` have different ownership jobs:
-
-- `Stop` unpublishes new work, wakes blocked I/O, verifies every owned thread
-  join, and only then drains thread-owned queues;
-- `Destroy` runs later, after external producers are quiescent, and frees
-  retained process-visible resources.
-
-The global order is deliberately:
+Every ordinary event worker follows:
 
 ```text
-nodemanagerStop()
-  -> request/stop/join normal workers
-  -> drain queued lwIP work
-  -> release protocol state and stop/join tcpip_thread
-  -> destroy pseudo-worker and worker-0 resources
-  -> nodemanagerDestroy()
+Initialized
+  -> Running
+  -> QuiesceRequested
+  -> Quiesced
+  -> DrainRequested
+  -> Drained
+  -> TeardownRequested
+  -> Exited
+  -> Joined
 ```
 
-`tundeviceWrite()` and `rawdeviceWrite()` can run on event-loop workers and the
-lwIP path. Device destruction therefore cannot reclaim a writer queue merely
-because its own writer thread joined; it waits until the global order above has
-stopped every producer context.
+The main coordinator publishes requests. The owner worker publishes
+acknowledgements only after the represented work is complete. A worker mutex and
+condition variable carry drain and teardown releases after normal event-loop
+dispatch has ended; lifecycle commands are not smuggled through a normal event
+queue.
 
-The lwIP pseudo-worker owns WaterWall pools, but `tcpip_init()` also creates a
-real OS thread. Node `Stop` first detaches PacketsToConnection netifs and
-listeners. Global shutdown next joins every ordinary worker, because those
-workers can still enter the lwIP core lock from tunnel callbacks. It then posts
-a cooperative callback behind already queued lwIP work. That callback releases
-active/bound/listening TCP and UDP state, including retained out-of-order pbufs,
-and stops `tcpip_thread`; the shutdown owner joins it before destroying the
-lwIP pseudo-worker or any global resource. A custom pbuf records its originating
-worker and pool; after ordinary workers have stopped, a foreign-thread release
-destroys the buffer rather than inserting it into the originating thread's
-pool.
+Worker 0 uses the same semantics but executes its quiesce, drain, and teardown
+stages directly on the main thread. The lwIP slot is a pseudo-worker: it owns
+pools but no WaterWall event loop or spawned worker thread. Its resources are
+destroyed only after the lwIP thread has joined.
 
-### Reader delivery ownership
+A quiesced worker:
 
-A `device_reader_session_t` owns one packed lifetime gate. `CLOSED` and the
-successful-entry count share one atomic modification order: an Enter CAS before
-Close contributes to the count and Close waits for Leave; a Close first makes
-the Enter reject. Open-release publishes installed session fields to
-Enter-acquire, and Leave-release publishes completed callback work to Close's
-acquire observation of zero.
+- admits no new normal asynchronous work;
+- is running no normal callback root and will begin no later one;
+- has settled accepted queued and timed worker messages;
+- has detached component timers and watchers for its WID;
+- has returned from normal loop dispatch;
+- still owns the loop, queue, tunnel, line, and pool resources required for
+  drain and teardown.
 
-Close-and-quiesce is a lifecycle-owner operation. Calling it from inside the
-same guarded callback is a programming error, because the owner would wait for
-itself. There is no release-build "skip the wait" path.
+## 4. Normal callback boundaries
 
-Each queued reader message retains a session reference until delivery or queue
-cleanup. Delivery enters the gate, compares a relaxed generation tag, calls the
-device only for the current generation, leaves the gate, recycles the message,
-and finally releases its reference. Generation zero is invalid and generation
-wrap is refused, so a pre-restart message cannot become current again. The old
-reader producer thread must be joined before a new generation opens: gate
-quiescence covers callbacks, not a producer still able to post.
+A normal callback root is one scheduler or external-producer entry into ordinary
+application behavior: an I/O callback, timer, idle, custom event, queued worker
+message, device delivery, or lwIP delivery. Synchronous nested tunnel callbacks
+belong to the admitted root for that exact `wloop_t`; a callback on loop A has no
+inherited authority on loop B. Direct writes follow the same rule on NIO and
+IOCP: an independent caller acquires target-loop admission across the system
+send, interest registration, queue insertion, and asynchronous-operation
+publication. A synchronous write callback is a target-loop callback root: it
+runs with the target loop as its only normal authority and restores any outer
+source-loop authority on return. Admission is released before invoking user
+code, so closed admission suppresses any later root and the backend settles the
+transferred buffer or queued operation exactly once.
 
-### Writer generations
+Independent WIO writes may originate on another thread, but callers must
+serialize writes to one `wio_t`; there is no recursive per-WIO mutex contract.
+Zero-length TCP writes and existing stream-queue branches cross the same target
+loop gate. Rejection sends no bytes, does not close the WIO as a side effect, and
+consumes the transferred buffer once. UDP zero-length datagrams remain valid
+datagrams.
 
-Writer submission intentionally has no gate or per-send refcount. A producer
-performs one acquire load of an immutable published generation and calls
-`chanTrySend()` on that generation's channel. Stop exchanges publication to
-null, closes the selected channel, joins the writer, drains leftovers, and
-retires the closed generation.
+The event loop checks its local quiescence request:
 
-A producer that loaded the old pointer before Stop may finish its send attempt
-against the allocated, now-closed channel; it can never cross into a replacement
-queue. A call paused before the pointer load may select a later generation.
-Retired generations remain allocated until device destruction, after all
-workers and pseudo-workers have stopped. This trades one queue allocation per
-restart (up to 128K pointer slots for Linux TUN/Raw) for a writer hot path with
-no lifetime RMW, TLS scan, hazard pointer, or quiescence wait. Repeated runtime
-restart is therefore safe but intentionally not memory-neutral.
+1. before polling;
+2. immediately after polling;
+3. before each timer, idle, ready I/O, custom event, completion, and worker
+   message callback root;
+4. between entries in captured batches and queue drains.
 
-Every device join follows the same failure rule: a failed join retains the
-thread handle/joinable flag and all resources the thread may access. It blocks
-drain, retirement, restart, and destruction until a later join succeeds.
-After a successful join, a restartable device explicitly releases the debug
-thread ownership of its reader/writer buffer pool. The next thread generation
-then claims the pool on first access; resetting ownership while the old thread
-can still run is forbidden.
+If a request arrives during a callback, that callback returns normally. The loop
+does not begin another normal root. A level-triggered request plus a poller wake
+provides progress even when no ordinary event can be admitted.
 
-Linux Capture classifies reader exit under `reader_state_mutex`. Stop sets
-`reader_stop_requested` while holding that mutex before clearing the relaxed
-loop flag or waking the reader. The exiting wrapper takes the same mutex:
-whichever side acquires it first decides expected versus unexpected exit.
-Neither an acquire load nor any other atomic load is a "fresh value" primitive.
+Raw `wevent_t` custom posting is private to event-loop and worker plumbing and
+may carry no application-owned payload. Normal posts are rejected once admission
+closes. Posting stores a local copy whose loop metadata is always normalized to
+the destination; caller storage cannot spoof callback authority. A narrower
+control queue admits required WIO cleanup until worker quiescence drains it,
+then closes its own admission before `Quiesced` is published. Control callbacks
+run with no inherited normal authority, so normal work they intentionally start
+must acquire fresh admission. Arbitrary ownership-bearing application tasks
+must use an API with an explicit run-or-cancel contract.
 
-TUN keeps one relaxed lifecycle atomic for `STARTING`, `UP`, `STOPPING`, and
-`FAILED` arbitration. It orders only that value. Thread creation/join, the
-reader gate, and writer-generation publication provide the ordering for
-companion fields.
+## 5. Run-or-cancel ownership
 
-## 7. Worker-originated shutdown, step by step
+An accepted worker message executes exactly one of its callback or cleanup
+paths. Queue admission and closure linearize under the worker lifetime lock and
+queue lock. Pending queued and timed messages are canceled on their owner worker
+before it acknowledges quiescence; queue destruction never silently drops them.
 
-1. release every buffer the callback owns;
-2. unlock every lock it holds;
-3. call `requestProgramShutdown()`;
-4. return immediately through normal control flow;
-5. the worker loop later observes its stop request;
-6. the worker destroys its own resources and returns from its thread routine;
-7. worker 0 joins it.
+Posting APIs distinguish the two ownership styles used by the runtime:
 
-The canonical shape is:
+- cleanup-on-refusal APIs reject and execute the registered cleanup immediately;
+- retain-on-refusal APIs return ownership to the caller when the message was not
+  accepted;
+- after acceptance, the task system owns the arguments until either callback or
+  cleanup settles them.
+
+Delayed submission makes the same distinction during timer setup. A
+retain-on-refusal call that cannot install a same-worker timer returns the
+payload to its caller without invoking cleanup. If a queued setup wrapper was
+accepted and timer allocation later fails on the target worker, ownership had
+already transferred, so cleanup runs once with `ResourceFailure`.
+
+Checked submissions return `worker_message_submit_result_e`: accepted,
+rejected with caller ownership retained, or rejected after cleanup ran. Cleanup
+receives a `worker_message_cancel_reason_e` that distinguishes unavailable
+targets, closed admission, enqueue/resource failure, quiescence, and teardown.
+Intentional quiescence and teardown cancellation are normal ownership settlement,
+not new process failures.
+
+Same-worker inline execution remains valid after a concurrent admission close
+only when it is a synchronous nested operation inside an already-admitted normal
+callback root. Shutdown cleanup cannot regain normal admission merely because
+its TLS WID matches the target.
+
+Cleanup releases ownership. It must not restart application work, call an
+unbounded neighbor graph, or request another shutdown merely because intentional
+quiescence canceled the task.
+
+## 6. Lifecycle ABI v2
+
+Every tunnel has a total, context-bearing lifecycle callback table. Process
+shutdown invokes these exact stages source-to-tail:
+
+| Stage | Context | Contract |
+| --- | --- | --- |
+| `onQuiesceRequest` | main thread | Close local source, producer, rearm, and component admission and issue stop wakes. It is bounded and nonblocking. |
+| `onWorkerQuiesce` | owner worker | Detach this WID's component timers, watchers, async handles, and queued handles while loop and tunnel state remain alive. |
+| `onQuiesceWait` | main thread | After all workers are quiesced, join or detach external callback roots and prove local gates empty. Preserve resources required by line drain. |
+| `onWorkerStop` | owner worker | Drain authoritative source inventories and internally owned normal lines. Never invent an inventory for borrowed lines. |
+| `onStop` | main thread | After all workers are drained, close final writers, sockets, PCBs, netifs, and shared state. Touch no worker-affine timer or watcher. |
+| `onDestroy` | main thread | Reclaim the instance after callbacks, messages, lines, external threads, and worker references are gone. |
+
+All callbacks receive a read-only `ww_lifecycle_context_t`. Supported scopes are
+process shutdown, startup rollback, owner-driven private-child stop, and local
+device restart. The context also specifies graceful or abortive close policy.
+Components choose behavior from this context, not from ambient process state.
+
+Live removal of a running configuration is not supported by this lifecycle. It
+would require its own per-configuration execution lease and publication/removal
+contract.
+
+Private child tunnels are driven through the owned-child lifecycle helpers. A
+child inserted into a normal NodeManager chain is not driven twice by its parent;
+the central traversal already owns it.
+
+### External nodes
+
+Lifecycle v2 intentionally changes the external `tunnel_t` layout and callback
+signatures. A dynamic node library must export:
 
 ```c
-if (! requestProgramShutdown(1))
+uint32_t waterwallNodeLifecycleAbiVersion(void)
 {
-    abortProgramNow(1);
+    return WW_EXTERNAL_NODE_LIFECYCLE_ABI_VERSION;
 }
-return;
 ```
 
-`abortProgramNow()` is the **handoff-failure fallback only**. Reaching for it
-first turns an ordinary resource failure into a teardown that skips every
-registered cleanup callback.
+The loader validates this symbol before resolving or invoking a node getter.
+Libraries with a missing or mismatched descriptor are rejected. WaterWall never
+calls a legacy one-argument callback through a context-bearing function pointer
+and does not normalize an old layout.
 
-### Cleanup before the request, and nothing after it
+## 7. Ordered shutdown sequence
 
-Steps 1 and 2 are not advice, they are the precondition. Never call
-`requestProgramShutdown()` while holding a tunnel mutex, a read/write lock, a
-line lock, or any transient resource this callback must release itself — worker 0
-runs the real teardown and cannot take a lock the failing worker still owns.
+The main coordinator performs:
 
-Recycle only what the current callback still owns. A buffer already pushed into a
-line-state queue or stream stays reachable and is released by normal line/tunnel
-teardown; recycling it again is a double free.
+1. call every `onQuiesceRequest` and close normal admission for every worker;
+2. request quiescence for all ordinary workers, quiesce worker 0, then wait for
+   every `Quiesced` acknowledgement;
+3. call every `onQuiesceWait` to join or detach external producers;
+4. release every worker into drain; SocketManager drains its UDP source-owner
+   table before NodeManager invokes `onWorkerStop` source-to-tail;
+5. wait for every `Drained` acknowledgement, then call every `onStop`;
+6. release ordinary workers into loop/message/pool teardown, wait for `Exited`,
+   and join non-main workers;
+7. stop and join lwIP, then destroy pseudo-worker pools;
+8. run late, non-owning exit observers and the explicit application finalizer;
+9. freeze exit status and destroy nodes, SocketManager, pools, shortcuts, worker
+   synchronization, signal infrastructure, and global storage;
+10. exit with the frozen status.
 
-After an accepted request the callback is done. Do not create a line, send a
-packet, arm another timer, mutate completion state, or call a later startup step.
-When a helper reports "shutdown requested" to its caller, that caller must return
-too — a timer failure that a caller reads as success leaves the callback running
-as though a timer were armed. `packetsenderWaitUntilDeadline()` shows the shape:
-it returns a three-valued result so `ready`, `waiting` and `shutdown-requested`
-cannot collapse into one boolean.
+Logging remains available through late cleanup diagnostics. SignalManager's exit
+observer registry is not a general ownership stack: observers may emit final
+diagnostics or adjust the still-unfrozen status, but they do not own workers,
+nodes, devices, or queues.
 
-### Requesting a shutdown is not closing a line
+## 8. Lines during drain
 
-`requestProgramShutdown()` **schedules** global teardown on worker 0. It does not
-make any current line logically dead, and it does not run before this callback
-returns: the worker callback unwinds normally, through every suspended and
-re-entrant frame between it and the event loop. Those frames keep observing
-`lineIsAlive(line)`.
+The line rules from [Part 2](./part2-lines-and-callbacks.mdx) do not change.
+Source admission closes before inventories drain. SocketManager's UDP owner table
+drains before tunnel worker hooks, and each chain is traversed source-to-tail so
+middle tunnels see borrowed child sets only after their true owners have closed
+them.
 
-So a shutdown request never substitutes for the owner Finish postcondition in
-[Part 2](./part2-lines-and-callbacks). When a `Finish` handler for a **normal
-line the tunnel created** reaches a terminal failure, the order is:
+The event loop, chain, tunnel state, tail resources needed for `Finish`, and line
+and buffer pools remain alive throughout worker drain. Only a normal line's
+creator calls `lineDestroy()`, and every owner drain leaves its normal lines
+logically dead. Runtime shutdown never destroys a packet line.
 
-1. record the diagnostic and the failure verdict;
-2. detach the line's producers (io callbacks, timers, idle items, maps);
-3. destroy this tunnel's line state;
-4. `lineDestroy()` the line, so it is dead before the handler returns;
-5. `requestProgramShutdown(code)`, with the `abortProgramNow(code)` fallback if
-   the worker-0 handoff is refused;
-6. return.
+ReverseClient keeps every pair it creates in a per-worker owner registry from
+publication until close, including connecting, unused, and active pairs. Its
+shared idle table is only a starvation timeout index; activation removes an item
+from that index without removing ownership. Expiry, adjacent Finish, re-entrant
+Init failure, and worker drain all use one pair-close path that unregisters
+before neighbor callbacks and makes both created lines dead. Worker drain first
+settles idle items, then closes every pair still present in the owner registry.
 
-Steps 2–4 come *before* step 5 for the same reason as every other cleanup here:
-this callback is the last frame that still owns that state. `TesterClient`'s
-incomplete-response branch
-(`testerclientFailOwnedLine()` in `tunnels/TesterClient/common/helpers.c`) is the
-worked example, and
-`tests/unittests/testerclient_orderly_shutdown_test.c` holds an outer reference
-across the callback to prove the line is dead when it returns.
+IdleTable expiration messages temporarily own delivery, not the owner's index.
+If delivery is canceled while the item is still attached, cleanup clears the
+pending marker and restores the item to the expiration heap with its original
+deadline. Cleanup never substitutes for the worker-affine expiration callback.
+Explicit removal, worker detachment, or table destruction leaves the item
+message-owned so cancellation frees it once instead of restoring it. Expiration
+staging is also transactional: reservation failure leaves both indexes untouched,
+and later staging growth failure restores the exact popped item before stopping
+the scan. Item creation exposes a handle only after both the map and expiration
+heap own it; heap-publication failure rolls the map insertion back.
 
-The exception is the same one as everywhere else: a persistent worker **packet
-line** is never destroyed at runtime, so a terminal failure on one hard-aborts
-instead (Category D).
+An orderly shutdown request is not line destruction. A `Finish` handler for an
+owned normal line must still detach producers, destroy line state, and make the
+line logically dead before returning, even when it also requests process
+shutdown.
 
-### `onStart` schedules work; it does not run it
+## 9. Timers, watchers, and deferred timer reclamation
 
-Do not infer execution context from a filename. `instance/start.c` contains both
-kinds of code:
+Component timers and watchers are worker-affine. `onQuiesceRequest` closes their
+rearm/admission state; `onWorkerQuiesce` deletes the component's published timer
+or watcher pointer on its owner worker.
 
-- what `onStart` itself runs is a **main-thread startup** context (Category E);
-- what `onStart` *enqueues* with a worker-message API is a **runtime worker
-  callback** (Category B), even though it is defined in the same file.
+Generic loop quiescence deactivates any remaining timer and clears its callback
+and userdata. The allocation is kept on a loop-owned deferred list because line
+state may still contain the timer pointer and delete it during the subsequent
+owner-line drain. `wtimerDelete()` recognizes that state and performs the final
+free exactly once. Loop destruction frees only residual deferred timers after
+drain.
 
-By the time such a task runs, the workers are up and the shutdown handoff exists,
-so a failure inside it must request an orderly shutdown, not `terminateProgram()`.
-`authenticationclientStartPingTimer()`, `keepaliveclientStartWorkerTimer()` and
-`packetstostreamStartWorkerTimer()` are all in `instance/start.c` and all
-Category B.
+A due one-shot is marked for reclamation before its callback runs. A successful
+`wtimerReset()` revives it. If self-rearm is refused, the callback clears every
+authoritative owner slot and settles represented work, then returns without
+deleting or retaining the executing timer; pending-event release performs the
+single reclamation. This differs from a callback suppressed by quiescence, whose
+allocation remains available for owner-worker cleanup.
 
-A worker that fails this way must not clean up on behalf of anyone else. Timers
-other workers already published stay in their slots; each worker deletes its own
-slot in `onWorkerStop` during the orderly shutdown.
+On IOCP, cancellation is not completion. Quiescence suppresses user callbacks,
+but kernel operation records remain alive until canceled completions retire.
+WIO memory is reclaimed only after those references have drained.
 
-## 8. Classifying a termination call site
+## 10. External devices and lwIP
 
-Do **not** classify by log level or by whether the exit code is non-zero. For
-each site, record which threads can reach it, what it owns, and whether the
-containing function can return.
+TUN, raw, and capture devices split stop into request and wait operations. The
+request phase closes local delivery/rearm admission and signals reader or writer
+threads without joining. The wait phase joins external callback roots while
+device and tunnel state remain valid. Final stop releases remaining interface,
+writer, route, DNS, and platform resources after worker line drain.
 
-| Category | Situation | Action |
-| --- | --- | --- |
-| **A** | Expected successful completion (test drivers, report writers) | `requestProgramShutdown(0)` + `return`, after the success marker is committed |
-| **B** | Orderly runtime failure with structurally valid local state (worker loop error, unrecoverable device I/O) | mark the component failed, release buffers/handles, `requestProgramShutdown(code)`, exit through the normal cleanup path |
-| **C** | Per-line / per-connection failure | usually close only the affected line; do not broaden into a tunnel behaviour change without a focused test showing process termination is wrong there |
-| **D** | Invariant violation or unsafe state (suspected corruption, impossible callback, a lock intentionally still held, unknown state validity) | `abortProgramNow()` with an explicit diagnostic |
-| **E** | Main-thread startup/configuration failure | `terminateProgram()` is fine; before the signal manager exists, plain `exit()` after unwinding what was initialized |
+Every TUN backend calls `deviceReaderSessionEndRequest()` in the request phase
+and defers `deviceReaderSessionEndWait()` to BringDown. Linux and Darwin stop
+pipes are nonblocking and close-on-exec; `EINTR` is retried, a full pipe means a
+wake is already armed, and bounded reader polling prevents a hard wake failure
+from turning join into an unbounded wait. Every opened reader generation follows
+the same close, signal, `EndWait`, join, pool-owner reset, generation-retire
+order during rollback, restart, and shutdown. Writer generation retirement
+follows reader retirement, and `Down` is published only after required ownership
+is gone. `UdpStatelessSocket`
+similarly closes its async-session gate on the main thread but closes its WIO
+only from `onWorkerQuiesce` on the recorded `io_wid`.
 
-When migrating a `_Noreturn` site, re-check: functions that omitted a `return`
-because the call could not return; buffers already recycled before the call;
-device lifetime gates whose comments assume the callback cannot resume;
-callbacks that may destroy a line re-entrantly; non-void return values; and
-worker/device routines that must publish an exited/failed state.
+Device delivery uses local generation/session gates. A producer entering before
+gate closure may finish; a later entrant is refused and releases its retained
+ownership. An old reader generation is joined before restart opens a new one.
+Writer publication is exchanged to null before its channel closes; retired
+generations remain allocated until no producer can retain their immutable
+publication.
 
-### Reaching Category B from a device I/O routine
+Every failed join retains the native handle and resources the thread can access.
+Destroying them underneath a potentially live thread is never an orderly fallback.
 
-A device thread only reaches Category B by **returning**. Its wrapper
-(`tundeviceNoteUnexpectedThreadExit()`) is what publishes `FAILED` and requests
-the shutdown, so an error the routine swallows with `continue` never gets there:
-the device stays advertised as usable while every packet is discarded. A process
-that exits can be restarted by a supervisor; one that spins cannot be noticed.
+lwIP callback admission is detached before its thread is asked to stop. Its
+thread joins after ordinary workers and component stop, and only then may the
+pseudo-worker's pools be destroyed.
 
-So POSIX device I/O errors are classified against a whitelist
-(`ww/devices/tun/tun_io_error.h`), never by guessing:
+## 11. Choosing a termination API
 
-| Class | Errors | Action |
-| --- | --- | --- |
-| Transient | `EINTR`, `EAGAIN`/`EWOULDBLOCK`, `ENOBUFS`, `ENOMEM` | retry / go back to the poll loop |
-| Packet-local (**writes only**) | `EINVAL` | drop that packet, keep the device |
-| Terminal | everything else, including `EIO`, `EBADF`, `ENODEV`, `ENXIO`, `EMSGSIZE` | return from the routine |
+Classify the state, not the log level:
 
-Two rules that are easy to get backwards:
+| Situation | Action |
+| --- | --- |
+| Expected runtime completion | Commit the result, release local ownership, call `requestProgramShutdown(0)`, and return. |
+| Orderly runtime failure with structurally valid state | Publish component failure, release callback-local ownership, call `requestProgramShutdown(code)`, and unwind normally. |
+| Per-line failure | Close that line through its owner contract; do not make it process-wide without a product requirement. |
+| Invariant violation or unsafe/corrupt state | Log and call `abortProgramNow(code)`. |
+| Startup failure | Return/record startup status bottom-up, release local resources and locks, and let the top startup owner select `StartupRollback` once. |
+| Pre-controller command/configuration failure | Release parser-owned state and return an exit code directly. |
 
-- **`EINVAL` on write must stay packet-local.** The kernel rejects a malformed
-  frame that way, and frames reaching a TUN writer come from remote peers.
-  Making it terminal hands any peer a one-packet process kill.
-- **`EMSGSIZE` on write is terminal.** Oversized packets are already dropped
-  before the syscall, so `EMSGSIZE` means the configured MTU exceeds the device's
-  real MTU — an operator misconfiguration that never recovers.
+Do not call `requestProgramShutdown()` while holding a transient lock or buffer
+that the current callback must release. Publishing the request does not preempt
+the callback. After an accepted request, return through normal control flow and
+do not arm new work.
 
-Capture `errno` (or `GetLastError()`) into a local **immediately** after the
-failing call. Buffer recycling and the loggers both run before the classification
-and either can overwrite it, which silently reclassifies a device loss as a
-transient.
+The ambiguous `terminateProgram()` API does not exist. Runtime sites use a typed
+orderly request or the independent lock-free fatal path; startup sites propagate
+status to their owner.
 
-### A failed test verdict is not an impossible internal state
+Major startup stages return `ww_startup_result_t`. One synchronous top-level
+stage may install a thread-local `ww_startup_context_t` as a bounded dynamic
+error collector, with nested scopes around historical fixed-ABI tunnel
+callbacks. The context is restored deterministically before worker event loops
+run and asynchronous callbacks must not use it. APIs that already have a useful
+result type should still return errors explicitly.
 
-`TesterClient` and `TesterServer` reach termination for two unrelated reasons, and
-the distinction decides the category:
+After imported-tunnel loading, configuration parse and installation, and
+SocketManager startup, the main thread consumes the signal mailbox regardless
+of whether the stage result already failed. The shared startup-failure boundary
+uses the mask-protected SignalManager arbitration operation described above. A
+signal already in the mailbox therefore retains `Signal` as the immutable origin
+while both causes still select `StartupRollback`; a signal deferred after mask
+acquisition is handled later and cannot retroactively replace `StartupFailure`.
+Later stages are not entered.
 
-- **A valid runtime failure verdict** — the peer sent an early, extra, duplicate,
-  malformed-size, mismatching, trailing or overflowing payload, finished before
-  verification completed, or the watchdog expired. The test driver reached a real
-  result, so this is Category B: recycle the buffer the callback still owns, then
-  go through the one verdict helper (`testerclientFail()` /
-  `testerserverFail()`) and return.
+## 12. Validation
 
-  One extra step when the verdict is reached **inside a `Finish` handler for a
-  normal line the tester owns**: the verdict helper only reports, it does not
-  close anything, so that branch must go through `testerclientFailOwnedLine()`
-  instead. It detaches the worker slot, destroys the line state, marks the line
-  dead, and only then reports the verdict — the owner postcondition and the
-  Category-B shape at once.
-- **An impossible internal state** — a payload generator asked for a payload its
-  own validated configuration can never produce, a buffer pool reporting zero
-  writable capacity, a close scheduled before verification, a response counter
-  disagreeing with its own mask. Nothing a peer sends can produce these, so they
-  are Category D: log and `abortProgramNow(1)` directly, never through the verdict
-  helper.
-
-Keeping those helpers to a single meaning is what makes both readable, so a
-generator whose every failure is an invariant becomes non-nullable: its callers
-use the returned buffer without a NULL check.
-
-### Packet-line death stays a hard abort
-
-A worker packet line is process-lifetime state: it is allocated in
-`tunnelchainFinalize()` and destroyed only in `tunnelchainDestroy()`. If one dies
-at runtime, that contract has already been violated, and orderly teardown can no
-longer assume line state is structurally valid. Those sites hard-abort even
-though they run on a worker — `initializeLineOnTargetWorker()`,
-`wireguarddeviceQueueWorkerPacketInit()`, `packetsenderStartWorker()`,
-`packetsenderSendReadyPackets()`, `testerserverResponseSendTask()`, and any
-`Finish` received on a packet line.
-
-The opposite case is an *ordinary* line being rejected. A neighbouring connector
-refusing one transport line is operational, not process-wide:
-`wireguarddeviceQueueWorkerTransportLineInit()` logs a warning and returns, leaves
-the slot `NULL`, and lets `wireguarddeviceEnsureTransportLine()` retry on a later
-output. It calls none of the three process APIs.
-
-`WireGuardDevice` shows both halves in one handler, which is why it has to check
-the exact role first: `wireguarddeviceHandleTransportLineFinish()` treats a
-`Finish` on one of its own per-worker transport lines as an ordinary owned-line
-close (clear the slot, `lineDestroy()`), and a `Finish` on the chain's worker
-packet line as the Category-D violation above.
-
-## 9. Shutdown callback registry
-
-- registration and removal are rejected once the list is frozen for the
-  traversal;
-- the capacity check happens inside the registry mutex;
-- worker 0 freezes and snapshots the list, then runs each callback **exactly
-  once** in LIFO order;
-- the registry mutex is never held while a callback runs;
-- a callback influences the result through `signalmanagerSetExitCode()`; it must
-  not try to continue the sequence by re-entering the shutdown API.
-
-The global-state callback is registered first, so LIFO runs it last — after every
-other subsystem callback has had the workers available.
-
-## 10. Signal-mask policy
-
-Only the main thread has the handled stop signals unblocked. Every
-application-owned thread keeps them blocked. This is enforced in `threadCreate()`,
-which blocks them around every spawn so the child inherits the mask with no
-delivery window — including threads created after `signalmanagerStart()` (device,
-lwIP, TUN/raw/capture threads).
-
-Fatal crash signals (SIGSEGV, SIGILL, SIGABRT, …) restore the default
-disposition and re-raise. They never run ordinary cleanup.
-
-## 11. Tests
+Focused validation should cover the behavior changed:
 
 ```bash
-ctest --preset linux --output-on-failure -R 'shutdown|signal_manager|wloop_stop|node_manager_stop|thread_transfer'
+ctest --preset linux-unit-release --output-on-failure \
+  -R 'shutdown|signal|worker.*quies|wloop_(stop|wakeup)|lifecycle_node_abi|device_lifetime|reader_session|lwip'
+
+# Focused race coverage on supported Linux toolchains
+ctest --preset linux-tsan-unit --output-on-failure
 ```
 
-- `shutdown_manager_test` — off-main orderly requests, once-only cleanup on the
-  main thread, exit-code arbitration, request coalescing, requester unwinding
-  (probe mutex), and handoff failure.
-- `shutdown_signal_test` — SIGTERM idle and against a busy worker, SIGINT status,
-  a signal batched behind a programmatic request, the second-signal escape hatch,
-  and proof that callbacks do not run in the async handler's context.
-- `wloop_stop_request_test` — stop wakes a blocked loop, survives being requested
-  before the loop runs, is idempotent, and is safe racing the loop's own exit.
-- `node_manager_stop_once_test` — `nodemanagerStop()` idempotence, the global
-  all-configuration `onPreStop` prepass, partial-stop safety, and worker-stop
-  separation.
-- `lwip_shutdown_test` — retained TCP out-of-order pbuf release plus cooperative
-  `tcpip_thread` join.
-- `buffer_pool_thread_transfer_test` — post-join pool ownership transfer between
-  two simultaneously allocated, distinct thread identities.
+Important fixtures prove:
 
-Every successful shutdown path exits the process, so these tests fork a child per
-scenario and report back over an inherited pipe.
+- durable degraded-wake acceptance, saturated POSIX wake handling, request
+  coalescing, first-reason selection, and final status arbitration;
+- the worker-0 callback returns before coordination;
+- two-worker quiesce, drain, teardown, and join ordering;
+- callback-batch suppression after the first quiesce request;
+- exact callback-or-cleanup settlement for queued and timed messages;
+- component request passes complete before any wait pass;
+- SocketManager source-owner drain precedes tunnel worker hooks;
+- the real `shutdown_production_sequence` composition is a multi-worker smoke
+  test for UDP source ownership, mux carrier/child ownership, queued work, and
+  coordinator process exit; it is not an external-producer wait or complete
+  phase-ledger proof;
+- focused ReverseClient units drain connecting and active pairs, cover re-entrant
+  Init close and adjacent Finish before drain, and require an empty owner registry
+  before destroying the timeout index; the reverse TCP bridge remains the smoke
+  test;
+- device/session enter-versus-close and join-versus-reclamation races;
+- lifecycle ABI v2 acceptance and pre-getter rejection of missing or mismatched
+  descriptors;
+- no production leaf reads a process-wide shutdown phase.
 
-### Call-site policy tests
-
-```bash
-python3 tests/tunnels_abort_policy_test.py --mutation-test
-python3 tests/tunnels_orderly_shutdown_policy_test.py --mutation-test
-python3 tests/line_ownership_policy_test.py --mutation-test
-ctest --preset linux --output-on-failure -R 'orderly_shutdown|abort_runtime|owned_line|line_ownership'
-```
-
-- `tunnels_abort_policy_test.py` — every audited Category-D site still hard-aborts
-  with exit code 1, and the Category-C/E exclusions never drift into one.
-- `tunnels_orderly_shutdown_policy_test.py` — every Category-B site keeps its
-  request, its fallback, its pre-request cleanup anchors and its caller's
-  immediate return; tester invariants keep hard-aborting; the retryable WireGuard
-  path calls none of the three APIs; main-thread startup sites stay Category E.
-- `line_ownership_policy_test.py` — every production `lineCreate()` site stays
-  classified, no borrowing tunnel starts calling `lineDestroy()`, every registered
-  owner close path still destroys its line, and every registered packet-lifecycle
-  anchor still hard-aborts instead of destroying the packet line. It also sweeps
-  every `tunnels/*/{upstream,downstream}/fin.c` and rejects any handler whose whole
-  body is `discard` statements unless it is registered in
-  `SILENT_FINISH_ALLOWED` with a rationale, so an intentional terminal absorber is
-  distinguishable from a lost propagation or owner close. Transparent middle
-  handlers remain ordinary same-direction forwarding code. This is where the "a
-  shutdown request is not line destruction" rule is pinned in source: it requires
-  the runtime tests below to keep both their content **and** their `add_test`
-  registration, because a test file nothing builds proves nothing.
-
-Both scan function bodies with a lexical C scanner, so a commented-out or quoted
-lookalike cannot satisfy a candidate, and both run a mutation mode that removes
-each load-bearing element in turn and requires the checker to catch it.
-
-`udplistener_mux_shutdown_order_test` drives the real UdpListener expiry callback
-through SocketManager's per-socket drain before MuxClient worker cleanup. It
-covers counter, timer, and fixed Mux selection, repeated drain/stop, and a
-non-Mux control; the borrowed child is always destroyed by UdpListener and Mux
-closes only its now-zero-child internal parent.
-
-The runtime counterparts inject the real failure. `*_orderly_shutdown_test`
-linker-wraps `wtimerAdd` and the three process APIs, then asserts the whole
-contract: exactly one request with exit code 1, no abort, no terminate, every
-transient buffer recycled exactly once, nothing forwarded, no state published,
-and the callback returning.
-
-The failure paths that leave the process run in a forked child, and the child's
-exit code says *which* contract the abort satisfied, so reaching the right
-function through the wrong path still fails:
-
-- a Category-B fallback must follow exactly one refused `requestProgramShutdown(1)`;
-- a Category-D invariant must abort with no request at all.
-
-Tasks that `onStart` only enqueues are driven the way the runtime drives them —
-through the public `onStart` entry point and a real worker message queue — so
-per-worker ownership and `onWorkerStop` cleanup are exercised rather than
-assumed.
+The `linux-tsan-unit` preset builds the focused concurrency units plus the real
+production-sequence and reverse-teardown fixtures. Windows CI owns native
+execution of the console lifetime and IOCP admission tests. Local completion
+should still use the smallest focused set that covers the changed ownership
+boundary. The full production and unit lanes remain a release checkpoint.
