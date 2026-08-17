@@ -62,19 +62,56 @@ describe a diagnostic record as a hermetic or hostile-same-user guarantee.
 Tests are registered with CTest under names like `waterwall.<case>` and are driven
 by the harness in `tests/`. Each integration case lives in `tests/cases/<case>/`.
 
+On Linux, deterministic integration tests execute inside private user and network
+namespaces created without root privileges, with loopback-only isolation
+(`tests/run_in_network_namespace.sh`),
+preventing port collisions and allowing concurrent execution. Tests are organized
+into lanes via `tests/run_test_lane.sh`:
+
+- `support`: production policy and test-harness tests (13 tests), run strictly serially.
+- `functional`: deterministic integration tests (140 tests) run in parallel (`min(32, max(4, 4 * CPUs))` jobs).
+- `external`: integration tests requiring live host internet access (e.g. Reality against Google), run strictly serially.
+- `speed`: multi-stream throughput benchmarks (16 tests), run strictly serially (`RUN_SERIAL TRUE`) to avoid contention.
+- `privileged`: root/TUN probe tests (6 tests) run under `sudo -E`.
+- `all`: runs support, functional, external, and speed lanes in sequence (170 tests total).
+
 The production tree contains integration, smoke, and source-policy tests. Native
 unit tests live in the separate no-LTO tree below. `ctest --preset linux` is
-therefore production-only. Prefer focused checks; run both complete lanes only
-for broad, shared-core, or release-level changes:
+therefore production-only.
 
-Focused checks normally take minutes. Measured planning ranges are roughly
-10–15 minutes for a production-full run, 20–30 minutes for a unit-full run,
-and 30–45 minutes for sequential complete two-lane validation.
+Warm-build reference measurements on a 4-CPU host are about 55 seconds for the
+support lane, 22–24 seconds for the parallel deterministic functional lane (16 jobs),
+less than one second for the serial external lane, 46–48 seconds for the serial speed
+lane, and 14–15 seconds for the privileged lane. The ordinary non-privileged
+production sequence (`all` lane: support + functional + external + speed) takes
+about 2 minutes (~127s). A one-CPU constrained functional run uses four jobs and
+takes about 71 seconds. These are planning values, not portable performance
+guarantees. The `all` total includes the production policy/harness checks; the
+native-unit tree remains separate. Complete production plus native-unit validation
+takes about 3.5 minutes including the privileged lane. The native-unit portion
+measured a median ~74 seconds across three warm `linux-unit-release` runs. These
+values vary with hardware and build warmth.
+
+The shorter runtime makes broad validation practical. Use the full functional
+lane readily for shared networking or tunnel behavior and the ordinary integration
+sequence for broad tunnel or harness work. Run complete production plus native
+units for shared-core contracts, lifecycle/concurrency work, multi-subsystem
+changes, or any change whose impact is difficult to bound. Focused checks remain
+the right choice for narrow or non-behavioral edits.
 
 ```bash
-# Complete production Release tree.
+# Ordinary non-privileged production Release sequence across test lanes.
 cmake --preset linux
 cmake --build --preset linux --config Release --target check_waterwall_tests -j8
+
+# Run the production support lane (policy and test-harness checks).
+bash tests/run_test_lane.sh support build/linux Release
+
+# Run the deterministic functional lane directly in parallel.
+bash tests/run_test_lane.sh functional build/linux Release
+
+# Run all ordinary non-privileged production lanes in sequence.
+bash tests/run_test_lane.sh all build/linux Release
 
 # Complete native-unit Release/no-LTO tree.
 cmake --preset linux-unit-tests
