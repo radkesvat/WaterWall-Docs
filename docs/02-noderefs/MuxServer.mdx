@@ -6,7 +6,7 @@ description: "Reference documentation for the MuxServer node."
 ---
 
 <!--
-Documentation version: 106
+Documentation version: 107
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/MuxServer/description.md, and both files must keep the same documentation version.
 -->
 
@@ -78,6 +78,7 @@ responsible for destroying them. It does not create the parent transport line.
   "settings": {
     "child-buffer-limit": 8388608,
     "child-buffer-pause-tolerance": 524288,
+    "parent-buffer-limit": 8388608,
     "log-main-line-stats": false
   },
   "next": "service-side-node"
@@ -103,11 +104,13 @@ by a matching `MuxClient`.
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
 | `child-buffer-limit` | integer | `8388608` | Maximum queued bytes for one paused child. Must be greater than `0`. If reached, the child is closed with a MUX `Close` frame. |
-| `child-buffer-pause-tolerance` | integer | `524288` | Queue threshold where the child sends `FlowPause` and may pause parent reads. Must be `0` or greater. Values above `child-buffer-limit` are capped to the limit. |
+| `child-buffer-pause-tolerance` | integer | `524288` | Fallback queue threshold for sending `FlowPause` when the normal child pause callback has not already sent it. Must be `0` or greater. Values above `child-buffer-limit` are capped to the limit. |
+| `parent-buffer-limit` | integer | `8388608` | Per-parent budget for queued child-destined data. When reached, the actual largest queued child is closed; equal-size ties prefer the least recently active child. Set to `0` to disable the aggregate budget. |
 | `log-main-line-stats` | boolean | `false` | When enabled, parent lines log stats every `5000` ms. |
 
-Stats include worker id, parent read/write pause state, child count, child
-read-pause count, and child write-pause count.
+Stats include worker id, parent write-pause state, aggregate queued bytes, child
+count, child read-pause count, and child write-pause count. The legacy
+`parent-line-read-paused` field remains present as `no` for compatibility.
 
 Mode settings such as `timer`, `counter`, and `fixed-connections-count` belong
 only to `MuxClient`. `MuxServer` follows the frames it receives and does not
@@ -184,23 +187,29 @@ MUX keeps backpressure per child:
   service-side child are paused.
 - If parent-delivered data arrives for a paused child, data is queued on that
   child.
-- Once one child's queue reaches `child-buffer-pause-tolerance`, the child sends
-  `FlowPause` and parent input may be paused.
-- The same tolerance is also applied to aggregate queued child data on the
-  parent line.
+- `FlowPause` is normally sent by the child pause callback before data is queued;
+  `child-buffer-pause-tolerance` is a fallback for an ordering edge where it was
+  not sent yet.
 - Once queued data drops below `min(512 KiB, child-buffer-limit)`, `FlowResume`
-  and parent read resume can be sent.
+  can be sent.
+- Queue pressure never pauses reads on the shared parent transport, so one
+  blocked destination cannot stop unrelated child frames from being demultiplexed.
 - If one child's queue reaches `child-buffer-limit`, the child is closed.
+- If total queued child data reaches `parent-buffer-limit`, the child with the
+  actual largest queue is closed. Equal-size ties prefer the least recently
+  active child.
+- Setting `parent-buffer-limit` to `0` disables only the aggregate budget; the
+  per-child limit still applies.
 
-This lets one slow child stop its own stream without forcing every other child
-on the same parent to stop immediately.
+This isolates a slow child and bounds queue memory without creating parent-wide
+head-of-line blocking.
 
 ## Finish And Close Handling
 
 If `MuxServer` receives a `Close` frame for a child, it detaches the child from
-the parent, releases any parent-read pause held by that child, destroys the
-child's MUX state, sends upstream `Finish` to `next`, and destroys the child
-line if it is still alive.
+the parent, releases its queued-byte accounting, destroys the child's MUX state,
+sends upstream `Finish` to `next`, and destroys the child line if it is still
+alive.
 
 If the service-facing side closes a child, `MuxServer` sends a `Close` frame
 back to `MuxClient`, destroys local child state, and destroys the owned child
