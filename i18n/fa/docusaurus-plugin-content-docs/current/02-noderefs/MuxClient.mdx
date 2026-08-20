@@ -5,7 +5,7 @@ sidebar_label: "MuxClient"
 description: "راهنمای نود MuxClient در WaterWall."
 ---
 
-<!-- Written from version 107 of the English doc. -->
+<!-- Written from version 110 of the English doc. -->
 
 # MuxClient
 
@@ -131,9 +131,24 @@ server side: TcpListener -> TlsServer -> HttpServer -> MuxServer -> TcpConnector
 | `child-buffer-limit` | integer | `25165824` | بیشترین تعداد بایت صف‌شده برای یک child در حالت pause. باید بزرگ‌تر از `0` باشد. با رسیدن به سقف، child با فریم `Close` بسته می‌شود. |
 | `child-buffer-pause-tolerance` | integer | `524288` | حدی که child یک `FlowPause` می‌فرستد و parent reads ممکن است pause شوند. باید `0` یا بزرگ‌تر باشد. مقادیر بالاتر از `child-buffer-limit` به همان حد cap می‌شوند. |
 | `parent-buffer-limit` | integer | `33554432` | سقف بودجه داده‌های صف‌شده برای childها به‌ازای هر parent. با رسیدن به سقف، child با بیشترین صف بسته می‌شود؛ در صورت مساوی بودن، اولویت با child کم‌فعالیت‌تر است. برای غیرفعال کردن سقف تجمیعی مقدار `0` را قرار دهید. |
+| `detached-buffer-limit` | integer | بر اساس `ram-profile` | سقف بایت به‌ازای هر worker برای صف childهای مسدودشده‌ای که پس از از دست رفتن parent نگه داشته می‌شوند. رسیدن به سقف فقط child مسدودشده‌ای را که به‌تازگی detached شده است abort می‌کند. برای غیرفعال کردن این سقف تجمیعی مقدار `0` را قرار دهید. |
+| `detached-child-limit` | integer | بر اساس `ram-profile` | سقف تعداد به‌ازای هر worker برای childهای مسدودشده‌ای که پس از از دست رفتن parent نگه داشته می‌شوند. رسیدن به سقف فقط child مسدودشده‌ای را که به‌تازگی detached شده است abort می‌کند. برای غیرفعال کردن این سقف تجمیعی مقدار `0` را قرار دهید. |
 | `log-main-line-stats` | boolean | `false` | اگر فعال باشد، parent lineها هر `5000` ms آمار را در لاگ می‌نویسند. |
 
-آمار شامل worker id، وضعیت pause read/write والد، تعداد child، تعداد read-pause child و تعداد write-pause child است.
+اگر این دو گزینه در تنظیمات نود نوشته نشوند، مقدار پیش‌فرض آن‌ها از `misc.ram-profile` سراسری انتخاب می‌شود:
+
+| پروفایل RAM | سقف پیش‌فرض بایت detached | سقف پیش‌فرض childهای detached |
+| --- | ---: | ---: |
+| S1 (`minimal` / `ultralow`) | `33554432` (`32 MiB`) | `4096` |
+| S2 | `80740352` (`77 MiB`) | `5677` |
+| M1 (`client`) | `127926272` (`122 MiB`) | `7258` |
+| M2 (`client-larger`) | `174063616` (`166 MiB`) | `8838` |
+| L1 | `221249536` (`211 MiB`) | `10419` |
+| L2 (`server`، پیش‌فرض سراسری) | `268435456` (`256 MiB`) | `12000` |
+
+مقادیر بین کمینه و بیشینه روی شش رده مرتب پروفایل RAM به‌صورت خطی درون‌یابی می‌شوند و سقف بایت به نزدیک‌ترین MiB گرد می‌شود. نوشتن صریح هر گزینه در تنظیمات نود، فقط مقدار مشتق‌شده از پروفایل برای همان گزینه را جایگزین می‌کند.
+
+آمار شامل worker id، وضعیت write-pause والد، مجموع بایت‌های صف‌شده، `children-close-pending`، تعداد child، تعداد childهای read-pause و تعداد childهای write-pause است. فیلد قدیمی `parent-line-read-paused` برای سازگاری همچنان با مقدار `no` در لاگ باقی می‌ماند.
 
 ## مدل parent و child
 
@@ -216,7 +231,7 @@ forward نخواهد شد.
 | upstream `Finish` child | `Close` می‌فرستد، یا `Open + Close` اگر هنوز payload stream را باز نکرده؛ در صورت نیاز parent exhausted بیکار را می‌بندد. |
 | downstream `Payload` والد | فریم‌های MUX از `MuxServer` را تجزیه می‌کند و `Data`، `Close`، `FlowPause` و `FlowResume` را به child مناسب می‌فرستد. |
 | downstream `Pause` / `Resume` والد | write pressure والد را به child نویسنده اخیر یا همه childها (اگر نویسنده اخیر نامشخص باشد) بازتاب می‌دهد. |
-| downstream `Finish` والد | parent را finishing علامت می‌زند، همه childها را به سمت نود قبلی flush/finish می‌کند، state parent و parent line تحت مالکیت خود را از بین می‌برد. |
+| downstream `Finish` والد | state و line تحت مالکیت parent را بی‌درنگ از بین می‌برد، صف‌های پذیرفته‌شده childها را به drainهای مستقل از parent منتقل می‌کند و هر child را پس از خالی و قابل‌نوشتن شدن صف آن finish می‌کند. |
 | upstream `Est` | غیرفعال؛ رسیدن به این callback fatal است. |
 | downstream `Init` | غیرفعال؛ رسیدن به این callback fatal است. |
 
@@ -236,6 +251,10 @@ MUX backpressure را per-child نگه می‌دارد:
 
 به این ترتیب یک child کُند می‌تواند stream خود را متوقف کند، بی‌آنکه همه childهای دیگر روی همان parent فوراً متوقف شوند.
 
+فریم `Close` رسیده از peer پس از همه فریم‌های `Data` قبلی همان `cid` اعمال می‌شود. اگر مقصد محلی child در حالت pause باشد، `MuxClient` بایت‌های قبلی را نگه می‌دارد و منتظر Resume می‌ماند؛ هیچ `Payload`ی را برخلاف Pause اجباری ارسال نمی‌کند و `Finish` محلی را فقط پس از خالی و قابل‌نوشتن شدن صف می‌فرستد. فریم‌های بعدی برای آن `cid` بسته‌شده دور ریخته می‌شوند و childهای نامرتبط روی همان parent به کار عادی ادامه می‌دهند.
+
+اگر parent transport از دست برود، parent line همچنان بی‌درنگ بسته می‌شود. صف‌هایی که پیش‌تر برای childها پذیرفته شده‌اند به drainهایی مستقل از parent تبدیل می‌شوند: childهای قابل‌نوشتن فوراً کامل می‌شوند و childهای pauseشده پس از Resume ادامه می‌دهند، بدون آنکه parent مرده را نگه دارند یا به آن دسترسی پیدا کنند. داده خروجی تازه از child در این حالت رد می‌شود. `detached-buffer-limit` و `detached-child-limit` مجموع backlog باقی‌مانده را به‌ازای هر worker محدود می‌کنند. `MuxClient` مالک child lineها نیست؛ بنابراین owner واقعی source همچنان مسئول فهرست‌کردن و finish کردن آن‌ها هنگام shutdown است.
+
 ## Buffer و Padding
 
 `MuxClient` MUX headerها را به payload خروجی parent prepend می‌کند. متادیتای نود:
@@ -247,7 +266,7 @@ layer_group = kNodeLayer4
 
 این `16` بایت لازم است، زیرا نخستین payloadِ child ممکن است دو header داشته باشد: یکی برای `Open` و دیگری برای `Data`. داده‌ها و فریم‌های کنترلی بعدی تنها یک header هشت‌بایتی دارند.
 
-بایت‌های ورودی parent در یک stream خواندن جمع می‌شوند تا فریم کامل MUX آماده باشد. اگر این stream از `1 MiB` بزرگ‌تر شود، parent و همه childهای متصل بسته می‌شوند.
+بایت‌های ورودی parent در یک stream خواندن جمع می‌شوند تا فریم کامل MUX آماده باشد. اگر این stream از `1 MiB` بزرگ‌تر شود، `MuxClient` باقی‌مانده ناقص parent را دور می‌ریزد، parent line را می‌بندد و همان رفتار detached drain را برای صف childهایی که پیش‌تر parse شده‌اند اعمال می‌کند.
 
 ## نکته‌های عملی
 
@@ -257,4 +276,6 @@ layer_group = kNodeLayer4
 - `connection-capacity` فقط برای counter mode اعمال می‌شود.
 - `per-worker-connections-count` فقط برای fixed parent pool mode اعمال می‌شود.
 - با چند worker، اندازه pool ثابت parentها نیز با تعداد workerها بالا می‌رود. برای مثال، `per-worker-connections-count: 2` با چهار worker می‌تواند تا هشت parent transport line بسازد.
+- `Finish` محلی child یا shutdown منظم برنامه ممکن است صف detached باقی‌مانده را به‌جای forward کردن آزاد کند.
+- detached drain هیچ بایتی از پروتکل MUX یا نیازمندی قابلیت peer را تغییر نمی‌دهد.
 - `MuxClient` یک تونل میانی است، نه endpoint عمومی.

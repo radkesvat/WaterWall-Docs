@@ -6,7 +6,7 @@ description: "Reference documentation for the MuxServer node."
 ---
 
 <!--
-Documentation version: 107
+Documentation version: 109
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/MuxServer/description.md, and both files must keep the same documentation version.
 -->
 
@@ -64,7 +64,7 @@ like a separate WaterWall connection.
 - Wraps downstream child payloads back into MUX `Data` frames.
 - Sends child finish events back to `MuxClient` as `Close` frames.
 - Queues parent-delivered data when a child's write side is paused.
-- Closes all child lines when the parent transport finishes.
+- Detaches accepted child queues when the parent transport finishes and drains them under child backpressure.
 
 `MuxServer` creates the child `line_t` objects behind the parent and is
 responsible for destroying them. It does not create the parent transport line.
@@ -79,6 +79,8 @@ responsible for destroying them. It does not create the parent transport line.
     "child-buffer-limit": 25165824,
     "child-buffer-pause-tolerance": 524288,
     "parent-buffer-limit": 33554432,
+    "detached-buffer-limit": 268435456,
+    "detached-child-limit": 12000,
     "log-main-line-stats": false
   },
   "next": "service-side-node"
@@ -106,11 +108,28 @@ by a matching `MuxClient`.
 | `child-buffer-limit` | integer | `25165824` | Maximum queued bytes for one paused child. Must be greater than `0`. If reached, the child is closed with a MUX `Close` frame. |
 | `child-buffer-pause-tolerance` | integer | `524288` | Fallback queue threshold for sending `FlowPause` when the normal child pause callback has not already sent it. Must be `0` or greater. Values above `child-buffer-limit` are capped to the limit. |
 | `parent-buffer-limit` | integer | `33554432` | Per-parent budget for queued child-destined data. When reached, the actual largest queued child is closed; equal-size ties prefer the least recently active child. Set to `0` to disable the aggregate budget. |
+| `detached-buffer-limit` | integer | By `ram-profile` | Per-worker byte limit for blocked child queues retained after parent loss. Reaching it aborts only the newly detached blocked child. Set to `0` to disable this bound. |
+| `detached-child-limit` | integer | By `ram-profile` | Per-worker count limit for blocked children retained after parent loss. Reaching it aborts only the newly detached blocked child. Set to `0` to disable this bound. |
 | `log-main-line-stats` | boolean | `false` | When enabled, parent lines log stats every `5000` ms. |
 
+The two detached limits use these defaults when their node settings are omitted:
+
+| RAM profile | Default detached bytes | Default detached children |
+| --- | ---: | ---: |
+| S1 (`minimal` / `ultralow`) | `33554432` (`32 MiB`) | `4096` |
+| S2 | `80740352` (`77 MiB`) | `5677` |
+| M1 (`client`) | `127926272` (`122 MiB`) | `7258` |
+| M2 (`client-larger`) | `174063616` (`166 MiB`) | `8838` |
+| L1 | `221249536` (`211 MiB`) | `10419` |
+| L2 (`server`, the global default) | `268435456` (`256 MiB`) | `12000` |
+
+Defaults are linearly interpolated over the six ordered RAM-profile tiers, with the byte limit rounded to the
+nearest whole MiB. An explicit setting overrides the profile-derived value independently for that limit.
+
 Stats include worker id, parent write-pause state, aggregate queued bytes, child
-count, child read-pause count, and child write-pause count. The legacy
-`parent-line-read-paused` field remains present as `no` for compatibility.
+count, children waiting for ordered Close completion, child read-pause count,
+and child write-pause count. The legacy `parent-line-read-paused` field remains
+present as `no` for compatibility.
 
 Mode settings such as `timer`, `counter`, and `fixed-connections-count` belong
 only to `MuxClient`. `MuxServer` follows the frames it receives and does not
@@ -168,7 +187,7 @@ node should already fit that limit.
 | parent upstream `Init` | Initializes parent state, optionally schedules stats logging, and reports downstream `Est` to the previous node. |
 | parent upstream `Payload` | Parses MUX frames from `MuxClient`; creates children for `Open`; routes `Data`, `Close`, `FlowPause`, and `FlowResume` by `cid`. |
 | parent upstream `Pause` / `Resume` | Reflects parent write pressure to the most recent writer child, or to all children if no recent writer is known. |
-| parent upstream `Finish` | Marks the parent finishing, flushes/finishes all children toward `next`, and destroys parent state. |
+| parent upstream `Finish` | Destroys parent state immediately, transfers accepted child queues to child-only drains, and finishes each child after its queue becomes empty and writable. |
 | child downstream `Payload` | Prepends a MUX `Data` header and sends the frame back on the parent toward the previous node. |
 | child downstream `Pause` / `Resume` | Sends `FlowPause` / flushes queued data and possibly sends `FlowResume`. |
 | child downstream `Finish` | Sends a MUX `Close` frame, destroys the owned child line state, and destroys the owned child line. |
@@ -206,17 +225,22 @@ head-of-line blocking.
 
 ## Finish And Close Handling
 
-If `MuxServer` receives a `Close` frame for a child, it detaches the child from
-the parent, releases its queued-byte accounting, destroys the child's MUX state,
-sends upstream `Finish` to `next`, and destroys the child line if it is still
-alive.
+If `MuxServer` receives a `Close` frame for a child, the Close remains ordered
+after every earlier queued `Data` byte. A paused child remains addressable by
+`cid`; later frames for that closed `cid` are discarded, Resume continues the
+FIFO drain, and Finish plus owned-line destruction happen only at the
+empty-and-writable barrier.
 
 If the service-facing side closes a child, `MuxServer` sends a `Close` frame
 back to `MuxClient`, destroys local child state, and destroys the owned child
 line.
 
-If the parent transport closes, `MuxServer` finishes every attached child and
-then destroys the parent MUX state.
+If the parent transport closes, `MuxServer` destroys the borrowed parent's MUX
+state immediately and transfers each accepted child queue into a worker-local
+owned registry. Writable queues finish immediately; paused queues drain on
+later Resume without retaining or dereferencing the dead parent. New outbound
+child data is rejected. The two detached limits bound residual queues per
+worker.
 
 ## Buffer And Padding Notes
 
@@ -231,8 +255,9 @@ layer_group_prev_node = kNodeLayer4
 ```
 
 Incoming parent bytes are accumulated in a read stream until a full MUX frame is
-available. If the parent read stream grows above `1 MiB`, `MuxServer` closes all
-attached children and finishes the parent toward the previous node.
+available. If the parent read stream grows above `1 MiB`, `MuxServer` discards
+the incomplete remainder, finishes the parent toward the previous node, and
+uses the same detached drain for already parsed child queues.
 
 ## Practical Notes
 
@@ -240,3 +265,7 @@ attached children and finishes the parent toward the previous node.
 - `MuxServer` has no client-side concurrency mode settings.
 - A `TcpConnector` after `MuxServer` creates one service connection per child.
 - `MuxServer` is a middle tunnel, not a generic endpoint.
+- A service-side Finish or orderly worker shutdown may discard residual
+  detached data. Worker shutdown forwards no queued Payload, even for a writable
+  child, before closing every remaining owned child.
+- No MUX wire change or peer capability is introduced.

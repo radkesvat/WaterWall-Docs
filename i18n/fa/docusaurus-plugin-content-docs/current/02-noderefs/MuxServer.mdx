@@ -5,7 +5,7 @@ sidebar_label: "MuxServer"
 description: "راهنمای نود MuxServer در WaterWall."
 ---
 
-<!-- Written from version 106 of the English doc. -->
+<!-- Written from version 109 of the English doc. -->
 
 # MuxServer
 
@@ -56,7 +56,7 @@ server side: TcpListener -> TlsServer -> HttpServer -> MuxServer -> TcpConnector
 - payload childهای downstream را دوباره داخل MUX `Data` frame می‌پیچد.
 - رویدادهای Finishِ child را به شکل فریم `Close` به `MuxClient` برمی‌گرداند.
 - اگر سمت نوشتن child pause باشد، داده رسیده از parent را در صف نگه می‌دارد.
-- همه child lineها را هنگام finish شدن parent transport می‌بندد.
+- هنگام finish شدن parent transport، صف‌های پذیرفته‌شده childها را detached می‌کند و با رعایت backpressure هر child تخلیه می‌کند.
 
 `MuxServer` objectهای child از نوع `line_t` را پشت parent می‌سازد و مسئول آزاد کردن آن‌هاست. Parent transport line را خودش نمی‌سازد.
 
@@ -70,6 +70,8 @@ server side: TcpListener -> TlsServer -> HttpServer -> MuxServer -> TcpConnector
     "child-buffer-limit": 25165824,
     "child-buffer-pause-tolerance": 524288,
     "parent-buffer-limit": 33554432,
+    "detached-buffer-limit": 268435456,
+    "detached-child-limit": 12000,
     "log-main-line-stats": false
   },
   "next": "service-side-node"
@@ -96,9 +98,24 @@ server side: TcpListener -> TlsServer -> HttpServer -> MuxServer -> TcpConnector
 | `child-buffer-limit` | integer | `25165824` | بیشترین تعداد بایت صف‌شده برای یک child در حالت pause. باید بزرگ‌تر از `0` باشد. با رسیدن به سقف، child با فریم `Close` بسته می‌شود. |
 | `child-buffer-pause-tolerance` | integer | `524288` | حدی که child یک `FlowPause` می‌فرستد و parent reads ممکن است pause شوند. باید `0` یا بزرگ‌تر باشد. مقادیر بالاتر از `child-buffer-limit` به همان حد cap می‌شوند. |
 | `parent-buffer-limit` | integer | `33554432` | سقف بودجه داده‌های صف‌شده برای childها به‌ازای هر parent. با رسیدن به سقف، child با بیشترین صف بسته می‌شود؛ در صورت مساوی بودن، اولویت با child کم‌فعالیت‌تر است. برای غیرفعال کردن سقف تجمیعی مقدار `0` را قرار دهید. |
+| `detached-buffer-limit` | integer | بر اساس `ram-profile` | سقف بایت به‌ازای هر worker برای صف childهای مسدودشده‌ای که پس از از دست رفتن parent نگه داشته می‌شوند. رسیدن به سقف فقط child مسدودشده‌ای را که به‌تازگی detached شده است abort می‌کند. برای غیرفعال کردن این سقف مقدار `0` را قرار دهید. |
+| `detached-child-limit` | integer | بر اساس `ram-profile` | سقف تعداد به‌ازای هر worker برای childهای مسدودشده‌ای که پس از از دست رفتن parent نگه داشته می‌شوند. رسیدن به سقف فقط child مسدودشده‌ای را که به‌تازگی detached شده است abort می‌کند. برای غیرفعال کردن این سقف مقدار `0` را قرار دهید. |
 | `log-main-line-stats` | boolean | `false` | اگر فعال باشد، parent lineها هر `5000` ms آمار را در لاگ می‌نویسند. |
 
-آمار شامل worker id، وضعیت pause read/write والد، تعداد child، تعداد read-pause child و تعداد write-pause child است.
+اگر این دو گزینه در تنظیمات نود نوشته نشوند، مقدار پیش‌فرض آن‌ها از `misc.ram-profile` سراسری انتخاب می‌شود:
+
+| پروفایل RAM | سقف پیش‌فرض بایت detached | سقف پیش‌فرض childهای detached |
+| --- | ---: | ---: |
+| S1 (`minimal` / `ultralow`) | `33554432` (`32 MiB`) | `4096` |
+| S2 | `80740352` (`77 MiB`) | `5677` |
+| M1 (`client`) | `127926272` (`122 MiB`) | `7258` |
+| M2 (`client-larger`) | `174063616` (`166 MiB`) | `8838` |
+| L1 | `221249536` (`211 MiB`) | `10419` |
+| L2 (`server`، پیش‌فرض سراسری) | `268435456` (`256 MiB`) | `12000` |
+
+مقادیر بین کمینه و بیشینه روی شش رده مرتب پروفایل RAM به‌صورت خطی درون‌یابی می‌شوند و سقف بایت به نزدیک‌ترین MiB گرد می‌شود. نوشتن صریح هر گزینه در تنظیمات نود، فقط مقدار مشتق‌شده از پروفایل برای همان گزینه را جایگزین می‌کند.
+
+آمار شامل worker id، وضعیت write-pause والد، مجموع بایت‌های صف‌شده، تعداد child، تعداد childهای منتظر تکمیل ترتیبی `Close`، تعداد childهای read-pause و تعداد childهای write-pause است. فیلد قدیمی `parent-line-read-paused` برای سازگاری همچنان با مقدار `no` در لاگ باقی می‌ماند.
 
 حالت‌هایی مانند `timer`، `counter` و `fixed-connections-count` فقط در `MuxClient` تنظیم می‌شوند. `MuxServer` بر اساس فریم‌های دریافتی عمل می‌کند و به mode کلاینت وابسته نیست.
 
@@ -151,7 +168,7 @@ flagهای frame:
 | upstream `Init` والد | state parent را مقداردهی اولیه می‌کند، در صورت نیاز ثبت آمار را زمان‌بندی می‌کند و `Est` را در downstream به نود قبلی گزارش می‌دهد. |
 | upstream `Payload` والد | فریم‌های MUX از `MuxClient` را تجزیه می‌کند، برای `Open` child می‌سازد و `Data`، `Close`، `FlowPause` و `FlowResume` را بر اساس `cid` می‌فرستد. |
 | upstream `Pause` / `Resume` والد | write pressure والد را به child نویسنده اخیر یا همه childها (اگر نویسنده اخیر نامشخص باشد) بازتاب می‌دهد. |
-| upstream `Finish` والد | parent را finishing علامت می‌زند، همه childها را به سمت `next` flush/finish می‌کند و state parent را از بین می‌برد. |
+| upstream `Finish` والد | state والد را بی‌درنگ از بین می‌برد، صف‌های پذیرفته‌شده childها را به drainهای مستقل از parent منتقل می‌کند و هر child را پس از خالی و قابل‌نوشتن شدن صف آن finish می‌کند. |
 | downstream `Payload` child | یک MUX `Data` header prepend می‌کند و frame را روی parent به سمت نود قبلی می‌فرستد. |
 | downstream `Pause` / `Resume` child | `FlowPause` می‌فرستد / داده queue شده را flush می‌کند و در صورت نیاز `FlowResume` می‌فرستد. |
 | downstream `Finish` child | یک فریم MUX از نوع `Close` می‌فرستد و state و line مربوط به child تحت مالکیت خود را از بین می‌برد. |
@@ -178,11 +195,11 @@ MUX backpressure را per-child نگه می‌دارد:
 
 ## Finish و Close
 
-اگر `MuxServer` برای یک child فریم `Close` بگیرد، child را از parent جدا می‌کند، هر pause مربوط به خواندن parent را که آن child نگه داشته آزاد می‌کند، state مربوط به MUX را از بین می‌برد، `Finish` را در upstream به `next` می‌فرستد و، اگر child line هنوز زنده باشد، آن را آزاد می‌کند.
+اگر `MuxServer` برای یک child فریم `Close` بگیرد، این Close پس از همه بایت‌های `Data` قبلیِ صف‌شده اعمال می‌شود. child در حالت pause همچنان با `cid` قابل‌شناسایی می‌ماند؛ فریم‌های بعدی برای آن `cid` بسته‌شده دور ریخته می‌شوند، Resume تخلیه FIFO را ادامه می‌دهد و `Finish` به‌همراه آزاد کردن line تحت مالکیت فقط در مرز خالی و قابل‌نوشتن شدن صف انجام می‌شود.
 
 اگر سمت service-facing یک child را ببندد، `MuxServer` یک فریم `Close` به `MuxClient` می‌فرستد و سپس state محلی و child line تحت مالکیت خود را از بین می‌برد.
 
-اگر parent transport بسته شود، `MuxServer` همه childهای متصل را finish می‌کند و سپس state مربوط به MUX در parent را از بین می‌برد.
+اگر parent transport بسته شود، `MuxServer` state مربوط به MUX در parent قرض‌گرفته‌شده را بی‌درنگ از بین می‌برد و صف هر child پذیرفته‌شده را به registry تحت مالکیت و worker-local منتقل می‌کند. صف‌های قابل‌نوشتن فوراً finish می‌شوند؛ صف‌های pauseشده پس از Resume و بدون نگه‌داشتن یا دسترسی به parent مرده تخلیه می‌شوند. داده خروجی تازه از child رد می‌شود. دو سقف detached، صف‌های باقی‌مانده را به‌ازای هر worker محدود می‌کنند.
 
 ## Buffer و Padding
 
@@ -195,7 +212,7 @@ layer_group_next_node = kNodeLayer4
 layer_group_prev_node = kNodeLayer4
 ```
 
-بایت‌های ورودی parent در یک stream خواندن جمع می‌شوند تا فریم کامل MUX آماده باشد. اگر این stream از `1 MiB` بزرگ‌تر شود، `MuxServer` همه childهای متصل را می‌بندد و parent را به سمت نود قبلی finish می‌کند.
+بایت‌های ورودی parent در یک stream خواندن جمع می‌شوند تا فریم کامل MUX آماده باشد. اگر این stream از `1 MiB` بزرگ‌تر شود، `MuxServer` باقی‌مانده ناقص را دور می‌ریزد، parent را به سمت نود قبلی finish می‌کند و برای صف childهایی که پیش‌تر parse شده‌اند همان detached drain را به کار می‌گیرد.
 
 ## نکته‌های عملی
 
@@ -203,3 +220,5 @@ layer_group_prev_node = kNodeLayer4
 - `MuxServer` تنظیمات حالت concurrency سمت کلاینت را ندارد.
 - یک `TcpConnector` بعد از `MuxServer` برای هر child یک اتصال سرویس جداگانه می‌سازد.
 - `MuxServer` یک تونل میانی است، نه endpoint عمومی.
+- `Finish` سمت سرویس یا shutdown منظم worker ممکن است داده detached باقی‌مانده را دور بریزد. هنگام shutdown، پیش از بستن همه childهای تحت مالکیت، هیچ `Payload` صف‌شده‌ای حتی برای child قابل‌نوشتن forward نمی‌شود.
+- هیچ تغییری در بایت‌های پروتکل MUX یا قابلیت موردنیاز peer ایجاد نشده است.
