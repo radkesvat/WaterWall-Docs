@@ -575,6 +575,39 @@ and then trust the adapter to flush. Do **not** keep protocol state alive just t
   toward a finished direction (see above). Do not emit them casually; spurious
   pause/resume can deadlock a stream.
 
+### Backpressure Has Two Boundaries
+
+`Pause` is a strict permission change for future payload delivery, but it is not
+proof that every queue in the pipeline is empty. Keep these two moments separate:
+
+- **After receiving `Pause`:** the producer must not initiate another `Payload`
+  toward the paused side until it receives `Resume`. `Pause` is not merely a hint
+  and does not authorize bypassing that neighbor. A queue that must drain through
+  the paused side waits; a terminal path either retains already accepted bytes
+  under its close policy or takes its documented overflow/abort path.
+- **Before emitting `Pause`:** a consumer, especially an adapter writing to an OS
+  resource, may deliberately accept a bounded amount of data before signaling
+  backpressure. `TcpListener`, `TcpConnector`, and `UdpConnector` use local write
+  queues and thresholds to absorb short stalls and callback/event-loop latency.
+  Those bytes were accepted before the producer saw `Pause`, so this does not
+  violate the contract.
+
+Likewise, `Resume` means the consumer can accept payload again under its local
+policy; it does not certify that every adapter, event-loop, OS, or middle-tunnel
+queue is empty. A payload already handed to a callback remains owned by the
+receiver and may be queued according to that node's policy.
+
+Do not generalize adapter tolerance into arbitrary buffering in transparent
+middle tunnels. A tunnel with no explicit queue normally forwards `Pause` and
+`Resume` immediately. A node that intentionally absorbs pressure must preserve
+FIFO order and buffer ownership, enforce explicit byte/item bounds, define an
+overflow or close policy, resume only when it can accept payload again, and
+remain safe if emitting `Pause` re-enters and destroys the line.
+
+Numeric thresholds and hysteresis are implementation details. Read the target
+adapter's `payload.c`, `helpers.c`, and `structure.h`; do not copy one adapter's
+current tolerance into another node or into this guide as a universal value.
+
 ## Worked Example: Tracing a Payload
 
 Consider the chain:
@@ -626,6 +659,9 @@ Before you call a flow change done:
   then return?
 - If you send final protocol bytes during `Finish`, do you mark the sender side
   finished before the send and block reflected `Pause`/`Resume`?
+- After receiving `Pause`, does the producer stop new payload delivery until
+  `Resume`? Is any intentional pre-Pause tolerance bounded, FIFO-preserving,
+  accounted, and backed by a clear Resume or overflow/close path?
 - Does only the line **owner** ever call `lineDestroy()`?
 - Did you classify each line as **owned normal**, **borrowed normal**, or
   **packet** before editing its `Finish` path?
