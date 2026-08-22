@@ -1,12 +1,19 @@
 ---
 sidebar_position: 4
 ---
+<!--
+Documentation version: 152
+-->
 
 # Part 4: Choosing Nodes
 
 WaterWall nodes are small pieces that become useful when they are composed into a
 chain. Before writing a config, decide what kind of traffic you have and which
 side owns the socket or interface.
+
+The tables below are a selection guide rather than a complete inventory. Use
+[All Nodes](../noderefs/all-nodes) when you need to find a specialized node, then
+read that node's reference page before putting it in a chain.
 
 The most common chain shape is:
 
@@ -58,21 +65,27 @@ topology.
 
 Transform nodes sit in the middle and change how data is carried.
 
-Common paired transforms:
+Common paired transforms and transport nodes:
 
 | Client side | Server side | Purpose |
 | --- | --- | --- |
 | `MuxClient` | `MuxServer` | Multiplex multiple logical lines over fewer transport connections. |
 | `EncryptionClient` | `EncryptionServer` | AEAD-encrypt framed payloads. |
+| `ObfuscatorClient` | `ObfuscatorServer` | Apply matching lightweight XOR obfuscation; this is not encryption. |
 | `TlsClient` | `TlsServer` | Use real TLS on the wire. |
 | `HttpClient` | `HttpServer` | Carry payload through HTTP/1.1, HTTP/2, or WebSocket-style flows. |
 | `VlessClient` | `VlessServer` | VLESS client/server framing. |
 | `TrojanClient` | `TrojanServer` | Trojan-style client/server framing. |
 | `RealityClient` | `RealityServer` | Reality-style client/server behavior. |
 | `Socks5Client` | `Socks5Server` | Connect to or expose SOCKS5 behavior. |
+| `HeaderClient` | `HeaderServer` | Carry WaterWall port metadata or trusted IPv4 PROXY-protocol information. |
+| `Bgp4Client` | `Bgp4Server` | Use BGP-like stream framing; these nodes do not implement BGP routing. |
 | `ReverseClient` | `ReverseServer` | Build reverse tunnels when the server side cannot accept direct inbound connections. |
+| `ConnectionFisherClient` | `ConnectionFisherServer` | Race candidate paths and retain the first one confirmed by its peer. |
 | `HalfDuplexClient` | `HalfDuplexServer` | Split upload and download over separate directions. |
 | `KeepAliveClient` | `KeepAliveServer` | Add heartbeat behavior to detect broken paths. |
+| `TcpOverUdpClient` | `TcpOverUdpServer` | Carry a stream over a packet-preserving UDP path using KCP. |
+| `UdpOverTcpClient` | `UdpOverTcpServer` | Preserve UDP-style datagram boundaries over a stream transport. |
 
 Paired nodes must face the correct counterpart. For example, do not put
 `EncryptionClient` on both sides of the same encrypted tunnel.
@@ -86,10 +99,13 @@ Utility nodes help with policy, testing, and debugging:
 | `Router` | Branch a connection to different targets based on source, destination, protocol, domain, or credentials. |
 | `SniffRouter` | Route based on sniffed traffic metadata. |
 | `Bridge` | Connect two separately declared chain sections inside one config. |
+| `AuthenticationClient` / `AuthenticationServer` | Synchronize and serve authenticated-user data for participating nodes; this is a control path, not ordinary data forwarding. |
+| `SoftIpLimiter` | Limit the source IPs that can use the same early VLESS or Trojan identity. |
 | `SpeedLimit` | Limit throughput. |
 | `BlackHole` | Drop traffic or terminate a path intentionally. |
 | `LoggerTunnel` | Log payload or traffic events for debugging. |
 | `Disturber` | Simulate loss, corruption, or delay for tests. |
+| `JunkDatagramSender` | Send generated noise before real traffic on a datagram-preserving path. |
 | `TesterClient` / `TesterServer` | Generate and validate test traffic. |
 | `SpeedTestClient` / `SpeedTestServer` | Run throughput-oriented tests. |
 
@@ -166,22 +182,29 @@ Packet chains are not the same as TCP connection chains. Some packet paths use a
 worker-level packet line that persists across many packets. Do not design packet
 configs as if every packet creates and destroys a normal TCP-style connection.
 
-## Packet and Stream Bridges
+## Packet, Stream, and Connection Bridges
 
-Some deployments need to carry packet traffic through a stream transport such as
-TCP or TLS. Boundary nodes handle that conversion.
+Some deployments need to cross packet, stream, and connection-oriented
+boundaries. Boundary nodes handle those conversions.
 
-| Node | Direction |
+| Node | Boundary or role |
 | --- | --- |
+| `ConnectionToPackets` | Connection with a destination context to raw IPv4 TCP/UDP packets. |
+| `PacketsToConnection` | Raw IPv4 packets to normal WaterWall TCP/UDP connection lines. |
 | `PacketsToStream` | Packet side to stream side. |
 | `StreamToPackets` | Stream side back to packet side. |
-| `PacketsToConnection` | Packet/lwIP traffic to normal WaterWall connection lines. |
-| `PacketSplitStream` | Split one packet side into separate persistent upload and download stream lines. |
+| `PacketSplitStream` | Special packet-line split helper for named upload and return branches. |
 
-Current `PacketsToStream` and `StreamToPackets` are IPv4-only. They do not add a
-custom length header; they write raw IPv4 packets into the stream and recover
-packet boundaries from each packet's IPv4 total-length field. IPv6 and non-IPv4
-payloads are dropped by those two nodes.
+`PacketsToStream` and `StreamToPackets` are a framing pair. They are currently
+IPv4-only, add no custom length header, write raw IPv4 packets into the stream,
+and recover packet boundaries from each packet's IPv4 total-length field.
+
+`ConnectionToPackets` and `PacketsToConnection` are a flow bridge instead. They
+use the in-process lwIP stack to turn normal WaterWall TCP/UDP lines into raw
+IPv4 packets and back again. `ConnectionToPackets` needs a configured virtual
+`source-ipv4`, only supports IPv4, and needs a return path for that address.
+`PacketSplitStream` is more specialized: it does not frame or convert packets by
+itself, but splits a packet-line layout into named upload and return branches.
 
 Basic two-server packet-over-stream shape:
 
@@ -251,6 +274,19 @@ For packet traffic over a stream:
 packet side A: TunDevice -> PacketsToStream -> TcpConnector
 packet side B: TcpListener -> StreamToPackets -> TunDevice
 ```
+
+For an IPv4, rootless SOCKS CONNECT-to-packet path:
+
+```text
+local side:  TcpListener -> Socks5Server -> ConnectionToPackets -> WireGuardDevice -> UdpStatelessSocket
+remote side: UdpStatelessSocket -> WireGuardDevice -> PacketsToConnection -> TcpUdpConnector
+```
+
+`Socks5Server` supplies the requested destination for `ConnectionToPackets`.
+Configure its `source-ipv4` as a unique virtual address that the remote peer
+allows and routes back. This is a userspace flow bridge, not a replacement for
+capturing arbitrary host traffic; use `TunDevice` when you need an OS-level
+packet interface.
 
 For WireGuard:
 
