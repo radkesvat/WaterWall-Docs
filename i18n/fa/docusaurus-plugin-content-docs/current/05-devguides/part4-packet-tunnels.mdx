@@ -12,12 +12,13 @@ Documentation version: 152
 # بخش ۴: Packet Lineها و تونل‌های Packet
 
 WaterWall علاوه بر Streamهای معمول، جریان Packetهای Layer 3 مانند دستگاه TUN،
-مسیرهای WireGuard-style و پردازش Raw Packet را نیز مدیریت می‌کند. مدل Packet از
-نوع `line_t` استفاده می‌کند، اما چرخه‌ی عمر آن **کاملاً متفاوت** است. یکی از
-مخرب‌ترین اشتباه‌ها در این Codebase آن است که Packet Line را Line مختص اتصال
-در نظر بگیرید.
+مسیرهای شبیه WireGuard و پردازش Raw Packet را نیز مدیریت می‌کند. مدل Packet از
+نوع `line_t` استفاده می‌کند، اما چرخهٔ عمر آن **کاملاً متفاوت** است. یکی از
+مخرب‌ترین اشتباه‌ها در این کد پروژه آن است که Packet Line را Line مختص اتصال در
+نظر بگیرید.
 
-پیش از تغییر هر چیزی زیر یک Node از نوع Layer 3، این بخش را بخوانید. مراجع اصلی:
+پیش از تغییر هر چیزی زیر یک Node از نوع Layer 3، این بخش را بخوانید. منابع معیار و
+مرجع نهایی:
 `ww/net/chain.c`، ‏`ww/net/packet_tunnel.c`، ‏`ww/net/line.h` و خود تونل‌های
 Packet.
 
@@ -28,23 +29,30 @@ Packet Line یک `line_t` واقعی است، اما برخلاف Line اتصا�
 - برای هر زنجیره‌ی دارای Node از نوع Layer 3، **یک بار به‌ازای هر Worker** تخصیص
   می‌یابد؛
 - میان **همه‌ی Packetهایی** که آن Worker پردازش می‌کند مشترک است؛
-- به چرخه‌ی عمر اتصال TCP/UDP وابسته نیست؛
-- در Runtime عادی بسته نمی‌شود؛
+- به چرخهٔ عمر اتصال TCP/UDP وابسته نیست؛
+- در زمان اجرای عادی بسته نمی‌شود؛
 - فقط زمانی نابود می‌شود که **خود زنجیره** نابود شود.
 
-Source Code در این مورد صریح است. در `tunnelchainFinalize()` از
-`ww/net/chain.c`، اگر زنجیره Node از نوع Packet داشته باشد، یک Packet Line برای
-هر Worker ساخته می‌شود:
+کد منبع در این مورد صریح است. در `tunnelchainFinalize()` از
+`ww/net/chain.c`، اگر زنجیره Node از نوع Packet داشته باشد، برای هر Worker یک
+Packet Line ساخته می‌شود (در اینجا پاک‌سازی Poolهای پیرامون کد حذف شده است):
 
 ```c
-tc->packet_lines = (line_t **) memoryAllocate(sizeof(line_t) * tc->workers_count);
+line_t **packet_lines = memoryAllocate(sizeof(*packet_lines) * tc->workers_count);
+if (! packet_lines)
+{
+    startupFailureRecord(1);
+    return;
+}
+
+// ... ساخت و اعتبارسنجی Pool مربوط به Line همهٔ Workerها ...
+tc->packet_lines = packet_lines;
 
 for (wid_t i = 0; i < tc->workers_count; i++)
 {
-    // ... create the worker line pool ...
     if (tc->contains_packet_node)
     {
-        tc->packet_lines[i] = lineCreateForWorker(0, tc->line_pools, i);
+        packet_lines[i] = lineCreateForWorker(0, tc->line_pools, i);
     }
 }
 ```
@@ -63,14 +71,169 @@ for (uint32_t i = 0; i < tc->workers_count; i++)
 
 Packet Line هر Worker را با `tunnelchainGetWorkerPacketLine(chain, wid)` بگیرید.
 
-:::danger Packet Line را هرگز در Runtime نابود نکنید
+:::danger Packet Line را هرگز در زمان اجرا نابود نکنید
 در کارکرد عادی روی Packet Line تابع `lineDestroy()` را فراخوانی نکنید و هیچ
 منطقی طراحی نکنید که انتظار داشته باشد Packet Line پس از `Finish` دوباره ساخته
-شود. برخی Adapterهای Packet مانند `TunDevice` و `UdpStatelessSocket` در Buildهای
+شود. برخی Adapterهای Packet مانند `TunDevice` و `UdpStatelessSocket` در نسخه‌های
 Debug با Assert بررسی می‌کنند که Packet Line پس از Forwardشدن یک Packet همچنان
-زنده باشد. اگر تغییر شما اجازه می‌دهد Packet Line هنگام Runtime بمیرد، تقریباً
-به‌طور قطع Bug دارد.
+زنده باشد. اگر تغییر شما اجازه می‌دهد Packet Line هنگام اجرا بمیرد، تقریباً
+به‌طور قطع دچار خطاست.
 :::
+
+## دریافت `Finish` در زمان اجرای Packet Line
+
+[بخش ۲](part2-lines-and-callbacks.mdx) الزام می‌کند که Handler مربوط به `Finish`
+در مالک یک Line **عادی**، هنگام بازگشت شرط `! lineIsAlive(line)` را برقرار کرده
+باشد. **Packet Lineها بدون هیچ استثنایی از این شرط مستثنا هستند.** مالک Packet
+Line خود زنجیره است، نه هیچ‌یک از تونل‌ها، و فقط `tunnelchainDestroy()` اجازه دارد
+آن را نابود کند. این بخش از قرارداد مطلق است: Handler هر کار دیگری که انجام دهد،
+هرگز نباید روی Packet Line تابع `lineDestroy()` را فراخوانی کند.
+
+با این حال، معنای رسیدن `Finish` به یک Packet Line کاملاً به بخش دریافت‌کننده در
+زنجیره، جهتی که Callback از آن رسیده و نقش Handler بستگی دارد. سه دسته وجود
+دارد. جایگاه تونل در زنجیره اطلاعات مفیدی می‌دهد، اما به‌تنهایی برای انتخاب یکی
+از این دسته‌ها کافی نیست.
+
+### دستهٔ ۱ — لنگر چرخهٔ عمر Packet: ردکردن بسته‌شدن ناممکن
+
+یک Adapter یا Bridge مربوط به Packet ممکن است State مربوط به Packet Pipeline
+آن Worker را روی Packet Line نگه دارد، بی‌آنکه اصولاً بسته‌شدن آن نقش معنایی
+داشته باشد. منظور از «Adapter» در اینجا مرز یا نقطهٔ پایانی Packet Pipeline است،
+**نه** تونلی که مالک `line_t` باشد. در یک زنجیرهٔ درست هیچ بخشی برای آن نقش مشخص
+`Finish` نمی‌فرستد؛ بنابراین رسیدن `Finish` به آن Handler و در آن جهت یعنی یکی
+از همسایه‌ها قرارداد را شکسته است:
+
+- هرگز `lineDestroy()` را فراخوانی نکنید؛
+- خطا را آشکارا و فوری گزارش کنید: `LOGF(...)` و سپس `abortProgramNow(1)`؛ این
+  سیاست پروژه برای نقض قرارداد Packet Line است؛
+- آن را به فرایند عادی بستن اتصال تبدیل نکنید؛
+- نابودی واقعی Line را به `tunnelchainDestroy()` بسپارید.
+
+Adapterهایی که State را روی Packet Line نگه می‌دارند دقیقاً همین کار را انجام
+می‌دهند:
+
+```c
+void tundeviceTunnelDownStreamFinish(tunnel_t *t, line_t *l)
+{
+    discard t;
+    LOGF("TunDevice: unexpected downstream Finish on worker packet line %u", (unsigned int) lineGetWID(l));
+    abortProgramNow(1);
+}
+```
+
+نمونه‌ها عبارت‌اند از `TunDevice` و `RawSocket`؛ سمت Packet در upstream در
+`PacketsToConnection` و `PacketsToStream`؛ سمت Packet در downstream در
+`StreamToPackets`؛ همچنین `PacketSplitStream`، حالت‌های Packet در `TesterClient`
+و `TesterServer` و نقش Packet Line در `WireGuardDevice`. این دسته‌بندی برای هر
+Handler است، نه برچسبی برای کل تونل: همان Bridge ممکن است در سمت دیگر خود مالک
+Lineهای عادی باشد و آن‌ها را به‌شکل معمول ببندد.
+
+آزمون `tests/unittests/packet_adapter_finish_test.c` ثابت می‌کند فراخوانی‌های
+لنگر پوشش‌داده‌شده بازنمی‌گردند.
+
+### دستهٔ ۲ — تبدیل‌گر میانی شفاف: Forwardکردن چرخهٔ عمر
+
+تونل میانی‌ای که Payloadهای Packet را تبدیل می‌کند، صرفاً به‌خاطر این کار
+مالک یا پایان‌دهندهٔ چرخهٔ عمر Line نمی‌شود. چنین تونلی باید `Init`، ‏`Est`،
+‏`Pause`، ‏`Resume`، ‏`Finish` و هر Callback دیگری را که به تبدیل آن مربوط
+نیست، در همان جهت Forward کند:
+
+- Callbackهای upstream با `tunnelNextUpStream*` ادامه می‌یابند؛
+- Callbackهای downstream با `tunnelPrevDownStream*` ادامه می‌یابند؛
+- Callback دریافت‌شده هرگز به‌سمت فرستندهٔ خود بازتابانده نمی‌شود.
+
+`PingClient` این Callbackهای عبوری چرخهٔ عمر را از `packettunnelCreate()` به ارث
+می‌برد؛ `PingServer` نیز Forwarding صریح و معادل آن‌ها را تنظیم می‌کند. پشتیبانی
+از Payload قرارداد جداگانه‌ای است: هر دو سر Ping v2 برای مالکیت بافر و
+اعتبارسنجی Worker به Packet Line دقیق همان Worker در زنجیره نیاز دارند. ترتیب‌های
+پشتیبانی‌شده در لبه‌های آن‌ها چنین است:
+
+```text
+TunDevice -> PingClient -> RawSocket
+RawSocket -> PingServer -> TunDevice
+```
+
+بنابراین یک توپولوژی معمولیِ Line عادی مانند
+`UdpListener <-> PingServer <-> UdpConnector` ترکیب پشتیبانی‌شده‌ای برای Ping v2
+نیست. `packettunnelCreate()` همچنان Callbackهای عبوری استاندارد چرخهٔ عمر را نگه
+می‌دارد، اما Handler پیاده‌سازی‌شدهٔ Payload ممکن است نقش محدودتر و دقیق‌تری برای
+Packet Line الزام کند.
+
+### دستهٔ ۳ — جذب‌کنندهٔ انتهایی عمدی: رسیدگی محلی و مستندسازی
+
+Packet Line همچنان یک `line_t` است و یک زنجیره می‌تواند به‌طور مجاز آن را در یک
+Adapter عادیِ Stream پایان دهد. آن Adapter همان‌طور که یک Line اتصال را قرض
+می‌گیرد، Packet Line را نیز قرض می‌گیرد و سمت خودش را به دلایل خودش می‌بندد.
+
+نمونهٔ موجود در پروژه `PacketSender -> UdpConnector` است که آزمون
+`tests/cases/udp_connector_listener_packet_loss_multiworker` آن را اجرا می‌کند:
+
+```text
+PacketSender ──(Packet Line آن Worker)──> UdpConnector ──> شبکه
+```
+
+`UdpConnector` برای هر Line یک Socket از نوع UDP باز می‌کند و پس از بیکارشدن
+Flow آن را منقضی می‌کند. فرایند انقضا `tunnelPrevDownStreamFinish()` را در جهت
+downstream روی **Packet Line همان Worker** می‌فرستد و Callback به
+`packetsenderTunnelDownStreamFinish()` می‌رسد. این اتفاق نقض قرارداد نیست و نباید
+برنامه را متوقف کند. `PacketSender` هیچ State مختص Line و هیچ `prev` ندارد؛ پس
+بسته‌شدن را بدون Forwardکردن یا نابودکردن Packet Line جذب می‌کند. بااین‌حال باید
+Timer و حلقهٔ ارسال آن Worker را متوقف کند، زیرا دریافت `Finish` مقصد upstream را
+برای همیشه می‌بندد.
+
+این دسته‌بندی به جهت وابسته است. Handler مربوط به downstream در `PacketSender`
+جذب‌کننده است، اما Handler مربوط به upstream آن همچنان باید با خطای کشنده متوقف
+شود، زیرا ابتدای زنجیره هیچ `prev`ای ندارد که بتواند به‌شکل مجاز Callbackی برای
+آن بفرستد.
+`PacketReceiver` نیز جذب‌کنندهٔ عمدی دیگری است: هیچ State مختص Line ندارد، ممکن
+است یکی از دو انتهای زنجیره باشد و تکمیل کار را به‌جای `Finish` از طریق Timer و
+مسیر گزارش خود اعلام می‌کند.
+
+بسته‌شدن را Forward کنید، منابع تحت مالکیت خود را آزاد کنید، نقض قرارداد را گزارش
+دهید، یا در Handler توضیح دهید که هیچ State مختص Line و هیچ جهت بعدی ندارید و در
+نتیجه جذب بسته‌شدن تمام کاری است که باید انجام شود. بدنه‌ای که فقط از دستورهای
+`discard` تشکیل شده باشد، حالت آخر را از یک خطا متمایز نمی‌کند.
+
+جذب‌کننده‌های مجاز فعلی عبارت‌اند از `BlackHole`، یعنی مقصد انتهای زنجیره که هر
+Line را قرض می‌گیرد؛ `PacketReceiver`، یعنی انتهای زنجیره‌ای که با Timer و فایل
+گزارش می‌دهد؛ و Handler مربوط به downstream در `PacketSender`، یعنی دستهٔ ۳ بالا.
+
+آزمون `tests/line_ownership_policy_test.py` همهٔ فایل‌های
+`tunnels/*/{upstream,downstream}/fin.c` را پیمایش می‌کند و Handlerی را که تمام
+بدنه‌اش فقط دستورهای `discard` است رد می‌کند، مگر اینکه همراه با دلیلی مکتوب در
+`SILENT_FINISH_ALLOWED` آمده باشد. به این ترتیب، Forwarding جاافتاده یا بسته‌نشدن
+Line به‌دست مالک نمی‌تواند ظاهری شبیه یک عملیات تهی عمدی پیدا کند.
+
+پس پرسش درست هرگز فقط «آیا این یک Packet Line است؟» یا «آیا این تونل در انتهای
+زنجیره است؟» نیست. باید بپرسید: **«این Handler دقیق و این جهت چه نقشی دارد، تونل
+چه چیزی را روی این Line نگه می‌دارد و چه کسی هنوز منتظر آن است؟»**
+
+### Handlerهای دومنظوره باید ابتدا نقش دقیق Line را بررسی کنند
+
+برخی Nodeها هم‌زمان هم یک Packet Line پایدار می‌بینند و هم مالک Lineهای عادی
+هستند. Handler باید پیش از انجام هر کاری تشخیص دهد کدام‌یک را دریافت کرده است:
+
+- `WireGuardDevice` در سمت Packet خود تونلی ساخته‌شده با `packettunnelCreate()`
+  است، اما برای سمت رمزگذاری‌شده نیز به‌ازای هر Worker یک **Line انتقال عادی**
+  می‌سازد. `Finish` روی Line انتقال، Close عادیِ Line تحت مالکیت است: Slot را
+  نابود کنید و `lineDestroy()` را فراخوانی کنید. `Finish` روی Packet Line نقض
+  قرارداد است و باید Abort کند.
+- `PacketsToStream` و `PacketsToConnection`، ‏State مربوط به Bridge را روی Packet
+  Line نگه می‌دارند و در عین حال مالک Lineهای عادی‌ای هستند که پشت آن می‌سازند.
+
+نقش را با کمک زنجیره تشخیص دهید، نه بر اساس نام یا حدس:
+
+```c
+if (tunnelchainIsWorkerPacketLine(tunnelGetChain(t), l))
+{
+    LOGF("MyNode: unexpected Finish on worker packet line %u", (unsigned int) lineGetWID(l));
+    abortProgramNow(1);
+}
+/* از اینجا به بعد یک Line عادی است؛ شرط پس از اجرای مالک در بخش ۲ را اعمال کنید. */
+```
+
+هر دسته‌بندی عمدی که با نقش Line یا جهت تغییر می‌کند باید کنار Handler مستند شود
+و یک آزمون جلوگیری از بازگشت خطا آن را پوشش دهد.
 
 ## Packet Lineها State مشترک Worker هستند
 
@@ -106,33 +269,49 @@ Debug با Assert بررسی می‌کنند که Packet Line پس از Forward�
 کد `ww/net/packet_tunnel.c`:
 
 ```c
-tunnel_t *packettunnelCreate(node_t *node, uint16_t tstate_size, uint16_t lstate_size)
+tunnel_t *packettunnelCreate(node_t *node, size_t tstate_size, size_t lstate_size)
 {
-    assert(lstate_size == 0); // packet tunnels don't have lines
+    if (UNLIKELY(lstate_size != 0))
+    {
+        return NULL; // تونل‌های Packet خالص State مختص Line ندارند
+    }
+
     tunnel_t *t = tunnelCreate(node, tstate_size, 0);
-    // ... installs packet-tunnel default callbacks ...
+    if (! t)
+    {
+        return NULL; // سرریز اندازهٔ State یا شکست تخصیص
+    }
+
+    // ... Callbackهای پیش‌فرض الزامی Payload مربوط به Packet را نصب می‌کند ...
+    return t;
 }
 ```
 
 نکات اصلی:
 
-- `packettunnelCreate()` با Assert الزام می‌کند که **`lstate_size == 0`** باشد.
-  تونل Packet خالص State مختص Line ندارد.
-- انتظار می‌رود این تونل‌ها **Callbackهای Payload مربوط به Packet** را Override
+- `packettunnelCreate()` **الزام می‌کند `lstate_size == 0` باشد** و در صورت نقض
+  این قرارداد، نامعتبر بودن اندازهٔ State یا شکست تخصیص حافظه مقدار `NULL`
+  برمی‌گرداند. تونل‌های Packet خالص State مختص Line ندارند و سازندهٔ آن‌ها
+  باید پیش از تعیین Callbackها یا دسترسی به State تونل، نتیجه را بررسی کند.
+- انتظار می‌رود این تونل‌ها **Callbackهای Payload مربوط به Packet** را جایگزین
   کنند.
-- چند Callback پیش‌فرض Stream-style عمداً نامعتبرند. برای مثال، Handlerهای
-  پیش‌فرض Payload در upstream/downstream تابع `LOGF(...)` و سپس
-  `terminateProgram(1)` را اجرا می‌کنند تا در صورت فراموش‌کردن Override، برنامه
-  با خطایی روشن Crash کند:
+- Callbackهای پیش‌فرض Payload عمداً نامعتبرند: `LOGF(...)` و سپس
+  `abortProgramNow(1)` را فراخوانی می‌کنند تا فراموش‌کردن این جایگزینی با خطایی
+  آشکار برنامه را متوقف کند:
 
 ```c
-void packettunnelDefaultUpStreamPayload(tunnel_t *self, line_t *line, sbuf_t *payload)
+static void packettunnelDefaultUpStreamPayload(tunnel_t *self, line_t *line, sbuf_t *payload)
 {
     LOGF("Unexpected call to default up stream payload for a packet tunnel, "
          "this function must be overridden");
-    terminateProgram(1);
+    abortProgramNow(1);
 }
 ```
+
+- `Init`، ‏`Est`، ‏`Pause`، ‏`Resume` و `Finish` همان Callbackهای عبوری
+  استاندارد و هم‌جهت چرخهٔ عمر را به ارث می‌برند. هر تونل فقط زمانی یکی از آن‌ها
+  را جایگزین می‌کند که نقش دقیق Handler آن، مطابق دسته‌بندی بالا، به ردکردن یک
+  Close ناممکن در نقش لنگر، ‏Forwarding صریح یا جذب انتهایی عمدی نیاز داشته باشد.
 
 نمونه‌ها: `IpOverrider`، ‏`IpManipulator`، ‏`PingClient`، ‏`PingServer` و
 `WireGuardDevice`.
@@ -140,18 +319,19 @@ void packettunnelDefaultUpStreamPayload(tunnel_t *self, line_t *line, sbuf_t *pa
 برای تونل‌های Packet خالص:
 
 - بی‌دلیل منطق چرخه‌ی عمر Line شبیه اتصال را اضافه نکنید.
-- فرض نکنید `Init` / `Finish` مانند تونل‌های معمول Stream عمل می‌کنند؛ ابتدا
-  پیاده‌سازی واقعی Callbackها را ببینید.
-- برخی Callbackهای پیش‌فرض عمداً Abort می‌کنند؛ دقیقاً بدانید کدام‌ها را باید
-  Override کنید.
+- ‏`lstate_size == 0` به‌معنای «فقط Packet Line» نیست. یک تونل Packet از نوع
+  `kNodeLayerAnything`، ‏Lineهای عادی اتصال را نیز عبور می‌دهد.
+- برخی Callbackهای پیش‌فرض عمداً برنامه را متوقف می‌کنند؛ دقیقاً بدانید کدام‌ها
+  را باید جایگزین کنید.
 
 ### ۲. پل‌های متکی به Packet Line با `tunnelCreate`
 
 تونل‌های دیگری با `tunnelCreate()` معمولی ساخته می‌شوند، اما **Packet Line مربوط
-به Worker را Anchor** برای State پل در همان Worker قرار می‌دهند. این تونل‌ها از
-مرز Runtime مبتنی بر Packet و Runtime مبتنی بر اتصال عبور می‌کنند.
+به Worker را به‌عنوان لنگر** برای State پل در همان Worker به کار می‌گیرند. این
+تونل‌ها از مرز زمان اجرای مبتنی بر Packet و زمان اجرای مبتنی بر اتصال عبور
+می‌کنند.
 
-نمونه‌ها و چیزی که Anchor می‌کنند:
+نمونه‌ها و Stateای که نگه می‌دارند:
 
 | پل | نقش |
 | --- | --- |
@@ -168,57 +348,90 @@ Line، ‏Lineهای عادی را پشت آن بسازید یا مدیریت ک
 
 مقداردهی Packet Line با Line اتصال متفاوت است.
 
-در زنجیره‌ای که **Head آن یک Node از نوع Packet در Layer 3 است**، ‏Node Manager
+در زنجیره‌ای که **ابتدای آن یک Node از نوع Packet در Layer 3 است**، مدیر Node
 هنگام راه‌اندازی روی Packet Line هر Worker یک `Init` در upstream می‌فرستد؛ **یک
 بار برای هر Worker، نه یک بار برای هر Packet**. بنابراین `Init` مربوط به Packet
-Line یک رویداد Bootstrap/Worker است، نه بازشدن اتصال.
+Line یک رویداد راه‌اندازی اولیهٔ Worker است، نه بازشدن اتصال.
 
-اما اگر پلی به Packet Lineها متکی باشد و Head زنجیره **خودش** Node از نوع Layer 3
-نباشد، Init خودکار رخ نمی‌دهد و Bridge باید آن را فعال کند. `StreamToPackets`
-دقیقاً همین کار را در `onStart()` انجام می‌دهد: Bootstrap را در Queue همه‌ی
-Workerها می‌گذارد تا تونل‌های سمت Packet بعد از Startup، ‏`Init` خود را ببینند و
-مسیرهای Init به‌صورت Inline دوباره وارد یکدیگر نشوند:
+اما اگر پلی به Packet Lineها متکی باشد و ابتدای زنجیره **خودش** Node از نوع
+Layer 3 نباشد، Init خودکار رخ نمی‌دهد و Bridge باید آن را فعال کند.
+`StreamToPackets` دقیقاً همین کار را در `onStart()` انجام می‌دهد: راه‌اندازی اولیه
+را در صف همهٔ Workerها می‌گذارد تا تونل‌های سمت Packet، ‏`Init` خود را پس از
+راه‌اندازی ببینند، نه از راه بازورودِ درجا به مسیرهای `Init`:
 
 ```c
 static void streamtopacketsQueueWorkerPacketInit(void *worker, void *arg1, void *arg2, void *arg3)
 {
+    discard worker;
+    discard arg2;
+    discard arg3;
+
     tunnel_t *t = arg1;
-    line_t   *l = tunnelchainGetWorkerPacketLine(tunnelGetChain(t), getWID());
-    tunnelNextUpStreamInit(t, l);
-    assert(lineIsAlive(l));
+    line_t   *l = tunnelchainGetWorkerPacketLine(tunnelGetChain(t), getCurrentEventWorkerWID());
+
+    if (UNLIKELY(! withLineLocked(l, tunnelNextUpStreamInit, t)))
+    {
+        LOGF("StreamToPackets: worker packet line died during packet-side init");
+        abortProgramNow(1);
+    }
 }
 
 void streamtopacketsTunnelOnStart(tunnel_t *t)
 {
     for (wid_t wi = 0; wi < getWorkersCount(); wi++)
     {
-        sendWorkerMessageForceQueue(wi, streamtopacketsQueueWorkerPacketInit, t, NULL, NULL);
+        if (UNLIKELY(
+                sendWorkerMessageForceQueueWithCleanup(wi, streamtopacketsQueueWorkerPacketInit, NULL, t, NULL, NULL) !=
+                kWorkerMessageSubmitAccepted))
+        {
+            LOGF("StreamToPackets: failed to admit required packet-side Init on worker %u", (unsigned int) wi);
+            startupFailureRecord(1);
+            return;
+        }
     }
 }
 ```
 
 بنابراین هنگام ساخت یا تغییر Bridge مربوط به Packet، فرض نکنید Packet Line از
-قبل به‌صورت خودکار Init شده است. بررسی کنید آیا Init را Node Manager می‌فرستد،
-چون Chain Head از نوع Layer 3 است، یا تونل شما باید در `onStart()` آن را فعال کند.
+قبل به‌صورت خودکار Init شده است. بررسی کنید آیا Init را مدیر Node می‌فرستد، چون
+ابتدای زنجیره از نوع Layer 3 است، یا تونل شما باید در `onStart()` آن را فعال کند.
 
 ## جهت تونل‌های جفت: قاعده‌ی PingClient / PingServer
 
-نقش Transform و جهت Forward شدن Callback دو تصمیم جدا هستند. جفت مستقیم به این
-شکل است:
+نقش Transform و جهت Forward شدن Callback دو تصمیم جدا هستند. Ping wire v2 دو
+نشست مستقل Echo دارد:
 
 ```text
-plain request -> PingClient -> PingServer -> plain request
-plain response <- PingClient <- PingServer <- plain response
+دادهٔ Client: PingClient -- Echo Request --> PingServer
+              PingClient <-- Echo Reply دقیق -- PingServer
+
+دادهٔ Server: PingClient <-- Echo Request -- PingServer
+              PingClient -- Echo Reply دقیق --> PingServer
 ```
 
-- در Payload جهت upstream، ‏`PingClient` داده را Encapsulate و `PingServer` آن را
-  Decapsulate می‌کند. هر دو با `tunnelNextUpStreamPayload()` Forward می‌کنند.
-- در Payload جهت downstream، ‏`PingServer` داده را Encapsulate و `PingClient` آن
-  را Decapsulate می‌کند. هر دو با `tunnelPrevDownStreamPayload()` Forward می‌کنند.
+- مسیر upstream در `PingClient` و مسیر downstream در `PingServer`، دادهٔ محلی
+  خود را در Echo Request نوع `8` قرار می‌دهند. همتای آن‌ها Request را در Callback
+  متناظر Decode می‌کند و Packet داخلی را در همان جهت Callback ادامه می‌دهد.
+- Reply نوع `0` مربوط به Request دریافت‌شده، پیش از تحویل Request اصلی به فرستنده
+  بازمی‌گردد. Reply فقط نقش تأیید را دارد؛ فرستنده Reply منطبق را مصرف می‌کند و
+  Payload آن را تحویل نمی‌دهد.
+- Correlation و جلوگیری از Replay بر عهدهٔ یک Tracker همگام‌شده و دارای ظرفیت
+  محدود برای هر Node از نوع Ping است. Flow Affinity دستگاه تعیین می‌کند کدام
+  Packet Line یک Callback را اجرا کند؛ WID آن Line هویت Correlation میان Request
+  و Reply نیست.
+- دریافت‌کنندهٔ Request دو بافر مجزا منتشر می‌کند. Clone ساخته‌شده برای Reply
+  به‌سمت فرستندهٔ Request برمی‌گردد، درحالی‌که نسخهٔ اصلی Decode‌شده در همان جهتی
+  ادامه می‌یابد که Request از آن دریافت شده بود.
+- بنابراین Handler مربوط به Request در upstream در `PingServer`، ‏Clone مربوط به
+  Reply را با `tunnelPrevDownStreamPayload()` و نسخهٔ اصلی Decode‌شده را با
+  `tunnelNextUpStreamPayload()` می‌فرستد. Handler مربوط به Request در downstream
+  در `PingClient`، ‏Clone را با `tunnelNextUpStreamPayload()` و نسخهٔ اصلی
+  Decode‌شده را با `tunnelPrevDownStreamPayload()` می‌فرستد.
 
-فراخوانی helper جهت downstream از Callback جهت upstream در `PingServer`، request
-را به سمت فرستنده منعکس می‌کند. همچنین Encapsulate کردن در upstream مربوط به
-`PingServer` باعث می‌شود request دوبار Transform شود.
+بازگرداندن **خود Request دریافت‌شده** به‌سمت فرستنده، بازتابی نامعتبر است. ارسال
+Echo Reply دقیق و جداگانه‌ای که در جهت مخالف ساخته شده، الزام Wire Protocol است.
+به همین ترتیب، Encapsulateکردن نسخهٔ اصلی در Callback مربوط به upstream در
+`PingServer` باعث می‌شود داده دو بار Transform شود.
 
 روش کار برای هر تونل Packet:
 
@@ -243,21 +456,57 @@ TesterClient(packet-mode=true)
     -> TesterServer(packet-mode=true)
 ```
 
-request جهت upstream باید پیش از رسیدن به `TesterServer` بازیابی شود و response
-جهت downstream باید پیش از رسیدن به `TesterClient` بازیابی شود. دست‌کم یک Test
-اضافه کنید که اگر `PingServer` در upstream به‌جای Decapsulation دوباره
-Encapsulation انجام داد، **Fail** شود.
+درخواست upstream باید ابتدا Reply دقیق بگیرد و سپس پیش از رسیدن به
+`TesterServer` بازیابی شود. دادهٔ جهت معکوس باید Echo Request جداگانه باشد، Reply
+دقیق بگیرد و پیش از رسیدن به `TesterClient` بازیابی شود. پوشش آزمایشی‌ای اضافه
+کنید که اگر `PingServer` در upstream به‌جای Decode دوباره Encapsulate کند، یک Reply
+دو بار تحویل شود یا دادهٔ Server در Reply مربوط به Request اصلی قرار گیرد،
+با شکست روبه‌رو شود.
 
-## خلاصه‌ی قواعد تغییرات Packet-oriented
+قرارداد `Finish` در Packet Line پوشش آزمایشی جداگانه‌ای دارد و هر Handler جدید
+در سمت Packet باید به آن افزوده شود:
 
-- Packet Lineها را هنگام Runtime نبندید.
-- منطق معمول `Finish` مختص اتصال را روی Packet Line اجرا نکنید، مگر آنکه Source
-  Code صریحاً انتظارش را داشته باشد.
+- `tests/unittests/packet_adapter_finish_test.c`، ‏Handlerهای `Finish` مربوط به
+  Adapterهای لنگر را واقعاً در یک فرایند فرزند فراخوانی می‌کند و الزام می‌کند
+  فرایند فرزند به‌جای بازگشت از Handler، متوقف شود.
+- `tests/unittests/packetsender_orderly_shutdown_test.c` ثابت می‌کند وقتی یک
+  Payload به‌شکل Re-entrant یک `Finish` در downstream تولید می‌کند، `PacketSender`
+  بدون نابودکردن Packet Line همان Worker، ‏Timer در انتظار را لغو می‌کند و دستهٔ
+  آماده‌ای شامل چند Packet را متوقف می‌سازد.
+- `tests/line_ownership_policy_test.py` در صورتی با شکست روبه‌رو می‌شود که یک فایل `fin.c`
+  به بازگشتی بدون توضیح تبدیل شود یا ثبت CTest مربوط به یکی از آزمون‌های قرارداد
+  حذف شود.
+
+## خلاصهٔ قواعد تغییرات مبتنی بر Packet
+
+- Packet Lineها را هنگام اجرا نبندید و هرگز روی آن‌ها `lineDestroy()` را
+  فراخوانی نکنید.
+- شرط پس از اجرای `Finish` برای مالک که در بخش ۲ آمده، **برای Packet Lineها صدق
+  نمی‌کند**.
+- هر Handler و جهت مربوط به `Finish` در Packet Line را در یکی از سه نقش قرار
+  دهید: Anchor یک Close ناممکن را با `LOGF` و `abortProgramNow(1)` رد می‌کند؛
+  تبدیل‌گر میانی شفاف آن را در همان جهت Forward می‌کند؛ و جذب‌کنندهٔ انتهایی
+  عمدی توضیح می‌دهد چرا چیزی برای Forwardکردن یا آزادکردن وجود ندارد.
+- رفتار `PacketSender` به جهت بستگی دارد: downstream، ‏Close مجاز رسیده از
+  `UdpConnector` را جذب می‌کند، اما upstream همچنان Fatal است. `PacketReceiver`
+  نیز یک جذب‌کنندهٔ انتهایی عمدی است.
+- Handlerی که ممکن است هم Packet Line و هم Line عادی دریافت کند، باید پیش از هر
+  Cleanup بر اساس نقش دقیق آن‌ها با `tunnelchainIsWorkerPacketLine()` شاخه‌بندی
+  کند.
+- `packettunnelCreate()` فقط به‌معنای `lstate_size == 0` است. چند Node ساخته‌شده
+  با آن از نوع `kNodeLayerAnything` هستند و Lineهای عادی اتصال را نیز عبور
+  می‌دهند؛ به همین دلیل Callbackهای چرخهٔ عمر آن، Callbackهای عبوری ساده باقی
+  می‌مانند.
+- Handler مربوط به `Finish` که کاری انجام نمی‌دهد باید دلیل آن را روشن کند:
+  `Finish`/بسته‌شدن را Forward کنید، منابع را آزاد کنید، نقض قرارداد را گزارش دهید، یا
+  مستند کنید که هیچ State مختص Line و هیچ جهت بعدی ندارید.
+- منطق عادی `Finish` مختص اتصال را روی Packet Line اجرا نکنید، مگر آنکه قرارداد
+  نقش دقیق Handler صریحاً آن را الزام کند.
 - State مربوط به Packet Line را State محلی و مشترک Worker در نظر بگیرید.
 - Routing Context و `recalculate_checksum` را Metadata تغییرپذیر مختص Packet
   بدانید، نه هویت پایدار Session.
 - برای چرخه‌ی عمر مختص Flow، پشت سمت Packet یک Line عادی بسازید.
-- تونلی که با `packettunnelCreate()` ساخته می‌شود State مختص Line ندارد و
+- تونل ساخته‌شده با `packettunnelCreate()` هیچ State مختص Line ندارد و
   `lstate_size == 0` است.
 - پلی که State را روی Packet Line متصل می‌کند، آن State را در طول پردازش تعداد
   زیادی Packet همان Worker نگه می‌دارد.
@@ -266,8 +515,8 @@ Encapsulation انجام داد، **Fail** شود.
 مهم‌ترین اشتباهی که باید از آن دوری کنید:
 
 ```text
-Using packet lines as if they were normal connection lines with an ordinary
-Init -> Payload -> Finish per-connection lifecycle. They are not.
+استفاده از Packet Lineها به‌گونه‌ای که گویی Lineهای عادی اتصال با چرخهٔ عمر معمول
+Init -> Payload -> Finish برای هر اتصال‌اند. چنین نیستند.
 ```
 
 ---
