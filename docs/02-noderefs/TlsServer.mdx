@@ -6,7 +6,7 @@ description: "Reference documentation for the TlsServer node."
 ---
 
 <!--
-Documentation version: 152
+Documentation version: 153
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/TlsServer/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/TlsServer.mdx, and all files must keep the same documentation version.
 -->
 
@@ -128,7 +128,7 @@ Both files must be valid for OpenSSL context creation.
 | `session-cache-size` | `20480` | Builtin OpenSSL session cache size. |
 | `session-tickets` | `true` | Enables TLS session tickets. |
 | `fallback-node-name` | not set | Fallback branch for clearly non-TLS input before TLS commit. Aliases: `fallback-node`, `fallback`. |
-| `fallback-intentional-delay-ms` | `7` | Delay for upstream payloads sent to fallback. Set `0` to disable. |
+| `fallback-intentional-delay-ms` | `7` | Delay for upstream payloads sent to fallback. Nonzero delay uses configured jitter. At `0`, an active unpaused fallback with no older FIFO batch or scheduled drain forwards inline; paused or older bytes remain FIFO and Resume drains them before later payload can overtake. |
 | `fallback-intentional-delay-jitter-ms` | `1` | Random jitter around delayed fallback payload scheduling. Ignored when delay is `0`. |
 | `tls13-record-shaping` | absent | Experimental sender-side TLS 1.3 padding and delay configuration. |
 | `verbose` | `false` | Enables detailed TLS lifecycle logging. |
@@ -287,16 +287,19 @@ The classifier looks at the initial upstream bytes:
 - bytes that start like TLS handshake records, such as `16 03`, stay on the TLS path
 - once OpenSSL produces a ServerHello, the line is committed to the protected TLS branch
 
-When fallback starts, `TlsServer` releases TLS resources for that line, initializes the fallback branch, and forwards the
-saved bytes unchanged after the configured delay and jitter. From then on, payloads pass through fallback without TLS
-encryption or decryption.
+When fallback starts, `TlsServer` releases TLS resources for that line and initializes the fallback branch. During normal
+live operation, nonzero delay forwards saved bytes and later upstream batches under the configured delay and jitter. At
+delay zero, an active unpaused fallback with no older FIFO batch or scheduled drain forwards inline; paused or older bytes
+remain FIFO and Resume schedules their drain before later payload can overtake them. From then on, payloads pass through
+fallback without TLS encryption or decryption. The delayed upstream fallback FIFO is bounded to 1 MiB per line.
 
 TLS-looking but malformed, oversized, incomplete, or slow handshakes are closed on the TLS path. They are not routed to
 fallback after TLS classification.
 
-Fallback delay is applied only to upstream payloads. Downstream responses from fallback are not intentionally delayed. If
-upstream `Finish` arrives while fallback payloads are delayed, the finish waits until the queued fallback payloads have
-been delivered.
+Fallback delay is applied only to normal live upstream payloads. Downstream responses from fallback are not intentionally
+delayed. On upstream `Finish`, queued bytes synchronously flush in FIFO order before fallback `Finish` when fallback can
+still accept payload. If it has already paused payload, `TlsServer` discards the still-local batch and closes fallback
+instead of bypassing backpressure; the remaining intentional delay is not kept alive.
 
 For public camouflage, the best fallback is usually another real TLS service, often nginx, with similar certificate, SNI,
 ALPN, cipher, ticket, and protocol-version behavior. A plain HTTP fallback behind a TLS public port is usually easier to
@@ -317,8 +320,8 @@ destroys local TLS state, and then propagates WaterWall `Finish` downstream.
 
 If the peer sends a clean TLS shutdown, `TlsServer` treats it as upstream finish toward the next node.
 
-Fatal OpenSSL failures destroy local state and close the relevant directions. In fallback mode, finish is passed through
-the fallback branch, with upstream finish waiting behind delayed fallback payloads when needed.
+Fatal OpenSSL failures destroy local state and close the relevant directions. In fallback mode, an initialized fallback
+branch is also closed before the previous side is finished.
 
 ## Padding
 

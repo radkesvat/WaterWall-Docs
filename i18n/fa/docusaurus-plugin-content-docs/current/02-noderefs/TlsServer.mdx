@@ -6,7 +6,7 @@ description: "راهنمای نود TlsServer در WaterWall."
 ---
 
 <!--
-Documentation version: 152
+Documentation version: 153
 -->
 
 # TlsServer
@@ -127,7 +127,7 @@ Fallback فقط تا پیش از قطعی شدن مسیر TLS قابل انتخ�
 | `session-cache-size` | `20480` | اندازه cache داخلی OpenSSL. |
 | `session-tickets` | `true` | TLS session ticketها را فعال می‌کند. |
 | `fallback-node-name` | تنظیم نشده | branch جایگزین برای ورودی‌ای که پیش از قطعی شدن مسیر TLS، آشکارا غیر TLS است. نام‌های `fallback-node` و `fallback` هم پذیرفته می‌شوند. |
-| `fallback-intentional-delay-ms` | `7` | تأخیر عمدی برای payloadهای upstream در fallback؛ مقدار `0` آن را غیرفعال می‌کند. |
+| `fallback-intentional-delay-ms` | `7` | تأخیر عمدی برای payloadهای upstream در fallback؛ در delay غیرصفر jitter اعمال می‌شود. در `0`، fallback فعال و بدون pause که FIFO قدیمی یا drain زمان‌بندی‌شده ندارد payload را inline می‌گیرد؛ byteهای paused یا پشت FIFO قدیمی می‌مانند و Resume drain را پیش از payloadهای بعدی زمان‌بندی می‌کند تا سبقت نگیرند. |
 | `fallback-intentional-delay-jitter-ms` | `1` | jitter تصادفی برای زمان‌بندی payloadهای fallback؛ اگر delay صفر باشد نادیده گرفته می‌شود. |
 | `tls13-record-shaping` | تنظیم نشده | تنظیم آزمایشی padding و delay سمت فرستنده برای TLS 1.3. |
 | `verbose` | `false` | جزئیات بیشتری از lifecycle مربوط به TLS را log می‌کند. |
@@ -288,15 +288,19 @@ classifier، byteهای ابتدایی upstream را بررسی می‌کند:
 - byteهایی که شبیه TLS handshake شروع می‌شوند، مانند `16 03`، در مسیر TLS می‌مانند
 - با تولید ServerHello توسط OpenSSL، مسیر line روی branch محافظت‌شده TLS قطعی می‌شود
 
-با شروع fallback، `TlsServer` منابع TLS مربوط به line را آزاد و branch جایگزین را مقداردهی اولیه می‌کند. byteهای ذخیره‌شده
-پس از delay و jitter تنظیم‌شده، بدون تغییر به آن branch فرستاده می‌شوند. از آن به بعد payloadها بدون رمزنگاری یا رمزگشایی
-TLS از fallback عبور می‌کنند.
+با شروع fallback، `TlsServer` منابع TLS مربوط به line را آزاد و branch جایگزین را مقداردهی اولیه می‌کند. در عملیات عادی
+و delay غیرصفر، byteهای ذخیره‌شده و batchهای upstream بعدی با delay و jitter تنظیم‌شده فرستاده می‌شوند. در delay صفر،
+fallback فعال و بدون pause که FIFO قدیمی یا drain زمان‌بندی‌شده ندارد payload را inline می‌گیرد؛ byteهای paused یا قدیمی
+به‌ترتیب FIFO می‌مانند و Resume drain آن‌ها را پیش از payloadهای بعدی زمان‌بندی می‌کند تا سبقت نگیرند. از آن به بعد
+payloadها بدون رمزنگاری یا رمزگشایی TLS از fallback عبور می‌کنند.
 
 handshakeهایی که ظاهر TLS دارند اما malformed، بیش‌ازحد بزرگ، ناقص یا کند هستند در همان مسیر TLS بسته می‌شوند؛ پس از
 تشخیص اولیه دیگر به fallback فرستاده نخواهند شد.
 
-تأخیر fallback فقط روی payloadهای upstream اعمال می‌شود و پاسخ‌های downstream عمداً به تأخیر نمی‌افتند. اگر upstream
-`Finish` در حالی برسد که payloadی هنوز در صف تأخیر است، `Finish` تا تحویل آن payload صبر می‌کند.
+تأخیر fallback فقط روی payloadهای upstream در عملیات عادی اعمال می‌شود و FIFO آن تا 1 MiB برای هر line محدود است. پاسخ‌های
+downstream عمداً به تأخیر نمی‌افتند. اگر upstream `Finish` برسد، byteهای صف‌شده فقط وقتی fallback payload می‌پذیرد
+هم‌زمان و به‌ترتیب FIFO پیش از `Finish` fallback flush می‌شوند؛ اگر fallback از قبل pause شده باشد، batch محلی دور ریخته
+و fallback بدون دور زدن backpressure بسته می‌شود. delay باقی‌مانده پس از `Finish` زنده نگه داشته نمی‌شود.
 
 برای camouflage روی یک پورت عمومی، بهتر است fallback یک سرویس واقعی TLS، معمولاً nginx، با certificate، SNI، ALPN،
 cipher، ticket و نسخه protocol مشابه `TlsServer` باشد. قرار دادن HTTP ساده پشت یک پورت عمومی TLS معمولاً خیلی راحت‌تر
@@ -316,8 +320,8 @@ fingerprint می‌شود.
 
 اگر peer یک TLS shutdown تمیز بفرستد، `TlsServer` آن را `Finish` در جهت upstream و به سمت نود بعدی در نظر می‌گیرد.
 
-خطاهای fatal در OpenSSL باعث پاک شدن state محلی و بسته شدن جهت‌های لازم می‌شوند. در fallback mode، `Finish` از branch
-جایگزین عبور می‌کند و `Finish` جهت upstream، در صورت نیاز، منتظر payloadهای تأخیردار می‌ماند.
+خطاهای fatal در OpenSSL باعث پاک شدن state محلی و بسته شدن جهت‌های لازم می‌شوند. در fallback mode، branch جایگزین نیز
+پیش از بسته شدن سمت قبلی بسته می‌شود؛ delay باقی‌مانده برای `Finish` نگه داشته نمی‌شود.
 
 ## Padding
 

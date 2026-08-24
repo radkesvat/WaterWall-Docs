@@ -5,7 +5,7 @@ sidebar_label: "Part 2: Lines & Lifetime"
 description: "The connection lifecycle, re-entrancy hazards, line locking, and the clean-finish patterns that keep WaterWall tunnels free of use-after-free bugs."
 ---
 <!--
-Documentation version: 153
+Documentation version: 155
 -->
 
 # Part 2: Lines, Callbacks & Lifetime Safety
@@ -504,17 +504,19 @@ back on the finished side, so it has nothing to remember. A speculative
 patched instead of fixed — the same anti-pattern as an `initialized` flag.
 
 There is exactly **one** situation that justifies directional-close state: the
-tunnel must **send final bytes before it closes** (the next subsection). That send
-re-enters the adapter, which can emit `Pause`/`Resume`, and the flag is what lets
-your pause/resume handlers drop anything that would reflect toward the
-already-finished side. The flag is bookkeeping for *that* hazard and nothing else.
+tunnel must **send final bytes before it closes**, including a bounded delayed
+fallback batch (the next subsections). That send re-enters the adapter or branch,
+which can emit `Pause`/`Resume`, and the flag is what lets handlers drop anything
+that would reflect toward the already-finished side. The flag is bookkeeping for
+that hazard and nothing else.
 
 Real tunnels carry exactly this state and no more. The names differ; the role is
 identical:
 
 | Tunnel | Directional-close state | Why it needs it |
 | --- | --- | --- |
-| `TlsServer` | `upstream_finished`, `downstream_finishing` | Sends TLS alert / close and resolves fallback before closing |
+| `TlsServer` | `upstream_finished`, `downstream_finishing`, `fallback_close_draining` | Sends TLS alert / close and settles delayed fallback before closing |
+| `TrojanServer`, `VlessServer` | `fallback_close_draining` | Settles a delayed fallback batch without reflecting toward the finished previous side |
 | `TcpOverUdpClient` | `can_downstream` | Must finish its reliable-stream teardown before closing |
 | `TcpOverUdpServer` | `can_upstream` | The same, in the opposite direction |
 | `HttpClient`, `HttpServer`, `Socks5Server` | `prev_finished`, `next_finished` | Send final protocol bytes before transport close |
@@ -566,6 +568,46 @@ Do not invent a new `initialized` flag for this. Reuse the tunnel's existing
 directional finish/close state, or — if the tunnel genuinely lacks one and this is
 the final-bytes case — add an explicit directional close flag. As stressed above,
 this is the **only** place such a flag belongs.
+
+### Delayed Fallback Batches Before Closing
+
+A scheduled line task holds a physical line reference only. It does **not** keep
+the line logically alive, and its runner intentionally skips the callback after
+the owner destroys the line. A borrowed middle tunnel therefore must never park an
+upstream `Finish` behind a line timer merely because its fallback payload queue is
+delayed.
+
+For an initialized fallback branch, use this close order:
+
+1. Mark the previous side finished and publish a fallback-drain gate before any
+   final branch `Payload` callback. An empty queue can destroy local state and
+   synchronously finish the initialized branch immediately.
+2. For a non-empty bounded FIFO, capture the branch and line pool, detach the
+   queue from line state, range-check its total, and coalesce it in FIFO order
+   into one buffer. One callback prevents a synchronous `Pause` from being
+   followed by another newly initiated payload from the same batch.
+3. If the branch was already paused, it cannot receive even that one payload.
+   Recycle the still-local batch and finish it, or move it to a genuinely detached
+   owner; do not bypass backpressure to preserve close-time bytes.
+4. While the final callback runs, absorb `Init`, `Est`, `Pause`, and `Resume`, and
+   recycle any returned `Payload`. A re-entrant downstream `Finish` records that
+   the branch already closed and is absorbed, so no reflected or duplicate branch
+   `Finish` follows.
+5. Re-check `lineIsAlive()` after the final payload while holding the temporary
+   lock. If it died, unlock and return without touching line state. Otherwise
+   destroy local line state before the final branch `Finish`; after that finish,
+   only unlock and return.
+
+The old timer has no cancellation handle. Emptying/detaching its queue logically
+cancels the work; once the real owner destroys the line, the scheduled runner
+becomes a harmless reference release. Preserving the exact remaining delay after
+`Finish` instead requires a detached session object that owns copied buffers,
+timer state, and branch resources without any `line_t` or line-state reference.
+That is a different design, not an excuse to keep a borrowed line alive.
+
+With delay zero, the safe locked inline path is available only when fallback is
+unpaused and has no older FIFO batch or scheduled drain. Retained bytes resume
+through the scheduled drain, so later payload cannot overtake them.
 
 ### Adapters Flush On Their Own
 
