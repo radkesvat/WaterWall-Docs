@@ -1,88 +1,62 @@
 ---
-sidebar_position: 340
+sidebar_position: 349
 title: "PingClient"
 sidebar_label: "PingClient"
-description: "Reference documentation for the PingClient node."
+description: "Reference documentation for the PingClient Echo v2 packet tunnel."
 ---
 
 <!--
-Documentation version: 152
-Sync note: Any change to this file must also be applied to WaterWall/tunnels/PingClient/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/PingClient.mdx, and all files must keep the same documentation version.
+Documentation version: 154
+Sync note: Keep this file aligned with tunnels/PingClient/description.md and the versioned translation notice.
 -->
 
 # PingClient
 
-`PingClient` is a pure layer-3 packet tunnel that disguises packet payload as
-ICMP-shaped traffic. It is not a latency probe and it is not related to
-`KeepAliveClient`; it rewrites packets.
+`PingClient` is the client-side endpoint of Ping wire v2. It carries a complete
+inner IPv4 packet in a real ICMP Echo Request, and consumes the exact Echo Reply
+as a wire acknowledgement. It is a pure packet tunnel with no connection line
+state.
 
-`PingClient` is created with WaterWall's packet-tunnel API, so it has no
-per-line state and runs on worker packet lines supplied by the chain.
-
-## Direction Model
-
-`PingClient` transforms payload in two directions:
-
-| Direction | Behavior |
-| --- | --- |
-| upstream `Payload` | Encapsulates or rewrites the packet according to `strategy`, then forwards with `tunnelNextUpStreamPayload()`. |
-| downstream `Payload` | Reverses the strategy for matching peer traffic, then forwards with `tunnelPrevDownStreamPayload()`. |
-
-Direct `PingClient -> PingServer` adjacency is the canonical pair. PingClient
-wraps the upstream request and PingServer restores it in its upstream callback
-before continuing to the next node. On the return path, PingServer wraps the
-downstream response and PingClient restores it in its downstream callback.
-
-```text
-plain request -> PingClient -> PingServer -> plain request
-plain response <- PingClient <- PingServer <- plain response
-```
-
-## Typical Placement
-
-With a packet transport:
+Use the paired edges in this order:
 
 ```text
 TunDevice -> PingClient -> RawSocket
 RawSocket -> PingServer -> TunDevice
 ```
 
-In local tests, use one direct packet chain:
+## Two Independent Echo Sessions
+
+Ping v2 never puts new application data into an Echo Reply.
 
 ```text
-TesterClient(packet-mode=true) -> PingClient -> PingServer -> TesterServer(packet-mode=true)
+client data: PingClient -- Echo Request(data) --> PingServer
+             PingClient <-- Echo Reply(same bytes) -- PingServer
+
+server data: PingClient <-- Echo Request(data) -- PingServer
+             PingClient -- Echo Reply(same bytes) --> PingServer
 ```
 
-## Compatibility And Migration
+The peer sends a type-0 Echo Reply first, then delivers the received request's
+inner IPv4 packet once. The request originator matches and consumes the reply,
+so echoed bytes are not delivered twice.
 
-This direction change is intentionally breaking for old PingServer topologies.
-The client order above is unchanged, but an existing
-`TunDevice -> PingServer -> RawSocket` server chain must become
-`RawSocket -> PingServer -> TunDevice`. Replace paired-Bridge Ping layouts with
-direct `PingClient -> PingServer` adjacency. The PingClient implementation,
-settings, and wire format are unchanged, so an older PingClient remains
-wire-compatible with the new PingServer when their settings match. The strict
-requirement is to deploy the new PingServer binary together with the new server
-topology; an old PingServer needs the old server topology. Upgrading both peers
-together can still simplify operations, but it is not required by the protocol.
-MTU requirements remain strategy-dependent.
+| PingClient callback | Behavior |
+| --- | --- |
+| upstream plain packet | Build a type-8 Echo Request; forward upstream. |
+| downstream peer request | Build/send a type-0 reply upstream; strip and forward the original request downstream. |
+| downstream matching reply | Consume as acknowledgement. |
 
-## Configuration Example
+## Settings
 
 ```json
 {
-  "name": "icmp-client",
+  "name": "ping-client",
   "type": "PingClient",
   "settings": {
-    "strategy": "wrap-in-new-ip-and-icmp-header",
-    "identifier": 4660,
-    "check-identifier": true,
-    "source": "198.51.100.10",
-    "dest": "203.0.113.20",
-    "xor-byte": 90,
-    "roundup-size": true,
-    "sequence-start": 0,
-    "ipv4-id-start": 0,
+    "local-ipv4": "198.51.100.10",
+    "peer-ipv4": "203.0.113.20",
+    "identifier": "random",
+    "sequence-start": 1,
     "ttl": 64,
     "tos": 0
   },
@@ -90,238 +64,57 @@ MTU requirements remain strategy-dependent.
 }
 ```
 
-`settings` may be omitted or empty. Defaults are used when fields are not set.
-If `settings` is present, it must be an object.
-
-## Strategies
-
-### `wrap-in-new-ip-and-icmp-header`
-
-Wraps the whole inner IPv4 packet in a fresh outer IPv4 packet:
-
-```text
-outer IPv4 header -> ICMP echo header -> original IPv4 packet
-```
-
-Details:
-
-- input must be a complete, self-consistent IPv4 packet
-- outer protocol is set to ICMP
-- outer ICMP is echo request (`type 8`) with code `0`
-- outer IPv4 `ttl`, `tos`, and IPv4 ID come from settings/counters
-- `source` and `dest` are optional
-- when `source` is omitted, the outer source address is copied from the inner
-  packet source
-- when `dest` is omitted, the outer destination address is copied from the inner
-  packet destination
-- downstream decapsulation accepts ICMP echo request and echo reply packets
-- downstream decapsulation checks `identifier` only when `check-identifier` is
-  enabled
-- downstream decapsulation does not verify configured source/destination
-  addresses
-- after a matching envelope is found, the ICMP payload is stripped and
-  forwarded even if the recovered bytes are not a valid IPv4 packet
-
-If the input cannot be parsed as IPv4, the packet is forwarded unchanged. A
-valid IPv4 packet that is too large to wrap is also forwarded unchanged. If
-required left padding is not available, the packet is dropped and a warning is
-logged.
-
-### `wrap-in-icmp-header-and-reuse-ipv4-addresses`
-
-Reuses the existing IPv4 header instead of adding a new outer IPv4 header. This
-is the default strategy.
-
-```text
-existing IPv4 header -> ICMP echo header -> original transport bytes -> metadata trailer
-```
-
-Details:
-
-- input must be a complete, self-consistent IPv4 packet
-- source address, destination address, TOS, TTL, IPv4 ID, DF flag, and IPv4
-  options are preserved
-- IPv4 protocol is changed to ICMP
-- the original transport payload is moved into the ICMP payload
-- a 5-byte trailer is appended to the ICMP payload
-- trailer bytes include magic `0x57 0x50`, original IPv4 protocol, and original
-  transport length
-- fragmented IPv4 packets are forwarded unchanged because this strategy cannot
-  restore them safely
-- packets that cannot fit after ICMP wrapping are forwarded unchanged
-
-On decapsulation, the peer reads the trailer, restores the original protocol and
-transport length, recalculates the IPv4 packet checksum, and forwards the
-restored packet.
-
-### `wrap-in-only-icmp-header`
-
-Treats input as raw bytes and prepends only an ICMP echo header:
-
-```text
-ICMP echo header -> raw payload
-```
-
-Details:
-
-- input is not required to be an IPv4 packet
-- no IPv4 header is emitted by this node
-- output is ICMP frame data, not a complete IP packet
-- `source`, `dest`, `ttl`, `tos`, and `ipv4-id-start` are not used
-- downstream decapsulation strips the matching ICMP echo header and restores the
-  original raw payload
-
-Use this only in a chain where the surrounding packet path expects ICMP frame
-data rather than a full IP packet.
-
-### `change-only-ipv4-protocol-number`
-
-Only swaps the IPv4 protocol number in place. It does not add an ICMP header and
-does not prepend a new IPv4 header.
-
-Details:
-
-- requires `swap-protocol`
-- upstream changes packets whose IPv4 protocol equals `swap-protocol` to ICMP
-- downstream changes ICMP packets back to `swap-protocol`
-- only the IPv4 header checksum is recalculated immediately
-- transport bytes are left unchanged
-- `identifier`, `check-identifier`, `sequence-start`, `ipv4-id-start`,
-  `xor-byte`, and `roundup-size` are not used by this strategy
-
-`swap-protocol` accepts `"TCP"`, `"UDP"`, `"ICMP"`, or an integer protocol
-number from `0` to `255`.
-
-## Settings
-
-| Setting | Type | Default | Description |
+| Setting | Required | Default | Description |
 | --- | --- | --- | --- |
-| `strategy` | string | `wrap-in-icmp-header-and-reuse-ipv4-addresses` | Packet disguise mode. |
-| `identifier` | integer | `44975` (`0xAFAF`) | ICMP echo identifier for ICMP envelope modes. Range: `0..65535`. |
-| `check-identifier` | boolean | `true` | When enabled, downstream ICMP envelopes must match `identifier`; mismatches are forwarded unchanged. |
-| `sequence-start` | integer | `0` | Initial ICMP echo sequence counter for ICMP envelope modes. Range: `0..65535`. |
-| `ipv4-id-start` | integer | `0` | Initial outer IPv4 identification counter for `wrap-in-new-ip-and-icmp-header`. Range: `0..65535`. |
-| `ttl` | integer | `64` | Outer IPv4 TTL for `wrap-in-new-ip-and-icmp-header`. Range: `0..255`. |
-| `tos` | integer | `0` | Outer IPv4 TOS byte for `wrap-in-new-ip-and-icmp-header`. Range: `0..255`. |
-| `xor-byte` | integer | disabled | Optional XOR byte applied to ICMP payload in ICMP envelope modes. Range: `0..255`; unset/`-1` disables it. |
-| `roundup-size` | boolean | `false` | Pads ICMP payload in ICMP envelope modes. |
-| `roundup` | boolean | `false` | Legacy alias for `roundup-size`. |
-| `source` | IPv4 string | copied from inner packet | Optional outer source for `wrap-in-new-ip-and-icmp-header`. |
-| `dest` | IPv4 string | copied from inner packet | Optional outer destination for `wrap-in-new-ip-and-icmp-header`. |
-| `swap-protocol` | string or integer | required for protocol-swap strategy | Protocol restored from ICMP on downstream path. |
-| `swap-identifier` | string or integer | unset | Legacy alias for `swap-protocol`. |
+| `local-ipv4` | yes | — | Local source of requests/replies. |
+| `peer-ipv4` | yes | — | Request destination and expected source of peer carrier traffic. |
+| `identifier` | no | `"random"` | Stable local request-session ID. Integer `0..65535` is a deterministic override; random defaults are nonzero. |
+| `sequence-start` | no | `1` | First local request sequence, `0..65535`; wrap is valid. |
+| `ttl` | no | `64` | Locally generated packet TTL. |
+| `tos` | no | `0` | Local request TOS. Generated replies copy the peer request TOS. |
 
-## Roundup And XOR
+Client and server identifiers are intentionally independent. A reply mirrors
+the request's identifier and sequence rather than the responder configuration.
 
-`xor-byte` and `roundup-size` apply only to the ICMP envelope strategies.
+## Wire and Safety Rules
 
-When `roundup-size` is enabled:
-
-- `wrap-in-new-ip-and-icmp-header` and `wrap-in-only-icmp-header` store the
-  original payload length as a 2-byte prefix inside the ICMP payload, then add
-  random padding
-- `wrap-in-icmp-header-and-reuse-ipv4-addresses` stores the original transport
-  length in the 5-byte trailer and may add random padding before the trailer
-- decapsulation uses the prefix or trailer to remove padding
-
-Current `PingClient` roundup buckets are:
+The wire format is exactly:
 
 ```text
-56, 128, 256, 512, 1024
+20-byte IPv4 header -> 8-byte ICMP Echo header -> complete inner IPv4 packet
 ```
 
-If none of those buckets can fit but the maximum ICMP payload can fit, the
-maximum payload size is used.
+- Local requests: type `8`, code `0`, configured source/destination/TOS/TTL,
+  DF set, IPv4 ID `0`, local identifier, and ascending sequence.
+- Peer replies: type `0`, code `0`, reversed addresses, copied request
+  identifier/sequence/payload length/payload bytes, copied request TOS, local
+  TTL, and cleared fragmentation bits.
+- Reply IPv4 IDs come from a securely seeded tuple-scoped Linux-like
+  approximation. This is not host-global Linux kernel state.
 
-When `xor-byte` is set, the ICMP payload is XORed after padding/trailer
-construction and XORed again before decapsulation metadata is read.
+Input must be an exact IPv4 packet no larger than `1472` bytes. Valid inner IPv4
+fragments are supported; outer carrier fragmentation, invalid checksums,
+malformed lengths, IPv6/non-IPv4 input, and oversized packets are dropped.
+Structurally valid traffic unrelated to the configured carrier tuple passes
+through unchanged in the same direction.
 
-## MTU And Packet-Size Limits
+One synchronized node-wide tracker has a 1024-entry outstanding ring and a
+1024-entry replay ring. Device worker affinity is not correlation identity: a
+reply or duplicate request can arrive on another packet-line WID and still
+match. Duplicate peer requests get another reply but deliver their inner data
+once. The 28-byte carrier overhead gives a 1500-byte maximum packet; Ping does
+not fragment, perform PMTU discovery, or adjust MSS.
 
-**Warning:** `PingClient` does not fragment packets, discover the path MTU, or
-reduce an upstream TCP MSS. Its size checks use the compile-time
-`kMaxAllowedPacketLength`, currently `1500` bytes; they do not use `misc.mtu`.
-`misc.mtu` only becomes relevant here when another node, such as `TunDevice`,
-uses it as an input MTU default.
+## Breaking Migration From v1
 
-At the current 1500-byte Ping limit, the largest input that each strategy can
-transform is:
+Only the six settings above are accepted. `strategy`, all `wrap-*`/`warp-*`
+modes, `source`, `dest`, protocol-swap settings, `check-identifier`,
+`ipv4-id-start`, `xor-byte`, `roundup-size`, and `roundup` are removed and
+produce a migration error.
 
-| Strategy | Minimum added bytes | Maximum input, `roundup-size=false` | Maximum input, `roundup-size=true` |
-| --- | ---: | ---: | ---: |
-| `wrap-in-new-ip-and-icmp-header` | 28-byte outer IPv4 + ICMP headers | 1472 | 1470 |
-| `wrap-in-icmp-header-and-reuse-ipv4-addresses` | 8-byte ICMP header + 5-byte trailer | 1487 | 1487 |
-| `wrap-in-only-icmp-header` | 8-byte ICMP header | 1492 | 1490 |
-| `change-only-ipv4-protocol-number` | 0 | 1500 | not applicable |
+Replace `source`/`dest` with `local-ipv4`/`peer-ipv4`; reverse them on the
+server. Upgrade both peers together: v2 is not compatible with the removed
+wire formats.
 
-The ICMP-only row measures its raw input and output frame; this strategy does
-not emit an IP header.
-
-When a valid input exceeds the applicable limit, the current ICMP envelope
-strategies normally forward the original packet unchanged instead of
-fragmenting or wrapping it. This is not a safe substitute for MTU planning: the
-packet is no longer disguised as the configured ICMP envelope and may be
-filtered or routed differently.
-
-For a common `TunDevice -> PingClient -> RawSocket` path whose real packet MTU
-is 1500, configure `TunDevice.settings.device-mtu` no higher than the applicable
-table value. Setting both `misc.mtu` and `device-mtu` to `1400` is a simple
-conservative choice when the Ping strategy may change, but it is not required
-when the exact overhead is known.
-
-`roundup-size` can pad an accepted packet all the way to the 1500-byte Ping
-limit. Consequently, a 1400-byte input is safe for a direct 1500-byte output
-path, but roundup may consume the remaining space; it does not necessarily
-leave 100 bytes for another encapsulation layer after `PingClient`. Account for
-every later header as well, and use the smaller of the real path MTU and every
-downstream node's packet limit.
-
-## Packet Handling Notes
-
-- IPv4 packet strategies require complete IPv4 packets whose buffer length
-  exactly matches IPv4 total length.
-- IPv6/non-IPv4 packets that cannot be rewritten are generally forwarded
-  unchanged.
-- Fragmented IPv4 packets are forwarded unchanged in reuse-header mode.
-- Matching downstream ICMP envelopes with malformed roundup metadata or
-  malformed reuse trailers are dropped and logged.
-- Matching downstream ICMP can be echo request or echo reply.
-- If `check-identifier` is enabled and the ICMP identifier does not match, the
-  packet is forwarded unchanged rather than decapsulated.
-- `source`/`dest` are not checked during decapsulation.
-
-## Compatibility Aliases
-
-The parser still accepts several historical misspellings and aliases:
-
-- `warp-in-new-ip-and-icmp-header`
-- `wrap-in-new-ipv4-and-icmp-header`
-- `warp-in-new-ipv4-and-icmp-header`
-- `warp-in-icmp-header-and-reuse-ipv4-addresses`
-- `wrap-in-icmp-header-and-reuse-ip-addresses`
-- `warp-in-icmp-header-and-reuse-ip-addresses`
-- `wrap-in-icmp-header-and-update-ipv4-header`
-- `warp-in-icmp-header-and-update-ipv4-header`
-- `warp-in-only-icmp-header`
-- `wrap-payload-in-only-icmp-header`
-- `warp-payload-in-only-icmp-header`
-- `change-only-ip4-protocol-number`
-- `change-only-ip4-packet-identifier-number`
-
-Prefer the canonical strategy names in new configs.
-
-## Node Metadata
-
-The `28` bytes cover the maximum prepend path: a `20`-byte IPv4 header plus an `8`-byte ICMP echo header.
-
-Source-backed metadata:
-
-| Property | Value |
-| --- | --- |
-| node flags | `kNodeFlagNone` |
-| `can_have_prev` | `true` |
-| `can_have_next` | `true` |
-| `layer_group` | `kNodeLayer3` |
-| `layer_group_prev_node` | `kNodeLayer3` |
-| `layer_group_next_node` | `kNodeLayer3` |
-| `required_padding_left` | `28` bytes |
+Correct Echo semantics reduce protocol fingerprints but do not make arbitrary,
+high-rate tunnel traffic indistinguishable from interactive `ping` traffic.

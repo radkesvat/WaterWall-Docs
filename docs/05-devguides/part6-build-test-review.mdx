@@ -35,7 +35,7 @@ Tunnel targets are named after the tunnel directory, e.g. `TcpConnector`,
 The configured tree lives in `build/linux/`, and the binary is produced per
 configuration, e.g. `build/linux/Release/Waterwall` (also `Debug/` and
 `RelWithDebInfo/`). Other preset trees exist under `build/` (`linux-gcc-x64`,
-`linux-clang-x64`, `linux-asan`, and more); do not mix them within a single
+`linux-clang-x64`, `linux-tsan-unit`, and more); do not mix them within a single
 verification flow.
 
 ### Build Rules
@@ -45,6 +45,24 @@ verification flow.
 - Do **not** mix build trees (`build/`, `build/linux`, `build/linux-gcc-x64`)
   inside one verification flow — you can end up testing a stale binary.
 - Prefer preset target builds over root-tree builds.
+
+## Formatting C And Headers
+
+Run the portable `clang-format` command with the repository's `.clang-format`
+file on every C or header file you modify:
+
+```bash
+clang-format -i --style=file path/to/changed_file.c
+clang-format --dry-run -Werror --style=file path/to/changed_file.c
+```
+
+Each development environment is responsible for making `clang-format` resolve to
+its installed project-compatible formatter; repository documentation must not pin
+a distribution-specific executable name. New files must be fully conformant. Some
+legacy files are not, so do not reformat untouched code wholesale: format and
+verify the changed ranges with `--lines=<start>:<end>` when a full-file pass would
+rewrite unrelated lines. If the command is unavailable, report what remains
+unformatted or unverified rather than silently skipping the check.
 
 ### Build-Authority Modes
 
@@ -71,6 +89,10 @@ namespaces created without root privileges, with loopback-only isolation
 preventing port collisions and allowing concurrent execution. Tests are organized
 into lanes via `tests/run_test_lane.sh`:
 
+Deterministic cases must not use public DNS or depend on host-network port
+availability. A case that intentionally needs live internet belongs in the
+explicit `external` lane instead.
+
 The privileged lane uses the same network isolation, but because its wrapper is
 already invoked through `sudo -E`, it retains the caller's user namespace and
 creates only a private network namespace. This preserves access to runner-owned
@@ -78,11 +100,11 @@ workspace paths; nesting root inside a mapped user namespace would lose that
 host-filesystem permission authority.
 
 - `support`: production policy and test-harness tests (13 tests), run strictly serially.
-- `functional`: deterministic integration tests (140 tests) run in parallel (`min(32, max(4, 4 * CPUs))` jobs).
+- `functional`: deterministic integration tests (139 tests) run in parallel (`min(32, max(4, 4 * CPUs))` jobs).
 - `external`: integration tests requiring live host internet access (e.g. Reality against Google), run strictly serially.
 - `speed`: multi-stream throughput benchmarks (16 tests), run strictly serially (`RUN_SERIAL TRUE`) to avoid contention.
 - `privileged`: root/TUN probe tests (6 tests) run under `sudo -E`.
-- `all`: runs support, functional, external, and speed lanes in sequence (170 tests total).
+- `all`: runs support, functional, external, and speed lanes in sequence (169 tests total).
 
 The production tree contains integration, smoke, and source-policy tests. Native
 unit tests live in the separate no-LTO tree below. `ctest --preset linux` is
@@ -197,7 +219,8 @@ tests/run_waterwall_case.sh \
 There are many roundtrip cases to model new tests on, including
 `encryption_roundtrip`, `mux_*_roundtrip`, `http1_*` / `http2_*`,
 `packets_stream_bridge_roundtrip`, and the `ping_*_roundtrip` family. Pick the one
-closest to your tunnel and copy its shape.
+closest to your tunnel as a structural reference, then verify that its assertions
+actually exercise the changed behavior and failure mode.
 
 :::tip Write a test that would fail if direction were reversed
 The highest-value test for a flow or packet change is one that breaks if you swap
@@ -206,6 +229,34 @@ that single assertion catches the most common regression in this codebase. See t
 direction rules in [Part 2](./part2-lines-and-callbacks.mdx) and
 [Part 4](./part4-packet-tunnels.mdx).
 :::
+
+## Choosing Validation And Regression Coverage
+
+Validation should answer the product question directly and remain proportional to
+risk:
+
+- Start with the smallest check that exercises the change: inspection, formatting,
+  a focused target, an existing focused test, or a direct integration case.
+- Expand to the functional lane for shared networking/tunnel behavior or changes
+  spanning cases. Use all production lanes plus native units for shared-core,
+  lifecycle/concurrency, multi-subsystem, security-sensitive, or difficult-to-bound
+  changes.
+- Documentation, comments, and clearly non-behavioral mechanical changes may need
+  only inspection, link/diff checks, or a relevant policy check. Do not run a broad
+  lane merely because code changed or because the lane is available.
+- New observable behavior, meaningful edge cases, changed contracts, and
+  reproducible bugs likely to regress normally receive focused coverage. When
+  practical, a regression test should fail before the fix and pass afterward.
+- A new test is unnecessary when existing coverage already demonstrates the exact
+  behavior, reproduction is impractical, or the change has no meaningful behavior
+  to assert. State that reason instead of manufacturing a test or a new harness.
+- One direct check may establish a narrow deterministic invariant. Use repetition,
+  sanitizers, stress, fault injection, or broader tests when concurrency, timing,
+  security, or nondeterminism makes one observation insufficient.
+
+A validation failure or unavailable environment is evidence about the validation
+attempt, not a pass and not automatic proof that the product is wrong. Preserve the
+exact failure and distinguish **failed** from **inconclusive** evidence.
 
 ## Syntax-Only Checks
 
@@ -238,9 +289,11 @@ internal compiler error: Bus error
 This often happens while compiling **core** files such as `ww/libc/wlibc.c` —
 before your edited tunnel is even reached.
 
-Treat a GCC ICE / bus error as a **build-environment problem first**, not as
-evidence that your tunnel code is wrong. Do not start debugging tunnel source over
-it.
+An ICE or bus error is **inconclusive**. It is often a stale/ad-hoc build-tree or
+host-resource failure, but it can also be a compiler defect exposed by the changed
+translation unit. It proves neither that the tunnel is wrong nor that it is
+correct. Reproduce first with a clean supported preset before deciding what to
+debug, and never report that lane as passed.
 
 ### Fallback Strategy When Compilation Is Blocked
 
@@ -249,29 +302,147 @@ Work down this list:
 1. `cmake --preset linux`
 2. `cmake --build --preset linux --target <ChangedTargets> -j8`
 3. `cmake --build --preset linux -j8`
-4. If GCC still crashes, report it as a compiler/build-environment issue.
-5. Continue with the strongest verification that still works:
+4. If the failure remains, try another supported project preset/toolchain when it
+   can answer the same question (for example, the corresponding Clang preset).
+5. Report the exact compiler failure and mark the affected validation
+   **inconclusive**.
+6. Continue with the strongest verification that still works:
    - preset-based target builds,
    - syntax-only checks using `build/linux/compile_commands.json`,
    - focused code review against the contracts in this guide.
+
+Syntax-only checks and review are useful diagnostics, but they do not replace the
+missing link/runtime evidence for a behavioral change. State exactly what remains
+unverified.
 
 Summary of build priorities:
 
 - prefer the `linux` preset,
 - prefer preset target builds over the root `build/` tree,
 - prefer `build/linux/compile_commands.json` over guessed compile flags,
-- treat a GCC ICE / bus error as an environment problem first.
+- treat a GCC ICE / bus error as inconclusive until a clean supported build
+  establishes otherwise.
 
-## The Review Checklist
+## Optional Optimization And Evidence Review
 
-Before merging a tunnel change, confirm every item that applies:
+This section applies when an optional optimization candidate or the benchmark,
+parser, manifest, or evidence machinery used to decide it is in scope. It does not
+limit ordinary product review, and it does not limit a task that explicitly asks
+to repair reusable test or benchmark infrastructure. An explicit maintainer/user
+request for that infrastructure is the separate approval described below.
+
+Validation is support work, not a second product. It should catch a realistic
+regression or answer a predeclared engineering question without recursively trying
+to prove that every tool in the evidence chain is itself perfect.
+
+### Classify findings without suppressing them
+
+For optimization/evidence work, distinguish:
+
+1. **Production correctness** — a concrete contract, ownership, lifetime,
+   concurrency, security, portability, or user-visible defect in shipped code.
+2. **Direct regression coverage** — realistic missing coverage for changed product
+   behavior that is likely to regress.
+3. **Performance decision** — evidence that a specific production candidate meets,
+   misses, or cannot be measured against a frozen workload and gate.
+4. **Support-machinery quality** — a defect or hardening opportunity in a runner,
+   parser, manifest, test seam, artifact collector, or other evidence tool.
+
+This classification sets priority; it is never a reason to hide a valid finding.
+A support-tool defect blocks the current decision when it can skip relevant
+behavior, create a false pass/fail, corrupt the metric, or otherwise change that
+decision. Otherwise report it as non-blocking follow-up work instead of expanding
+the current candidate review. A production-review request does not authorize an
+unrelated benchmark-infrastructure redesign, and benchmark cleanup must not change
+production behavior merely to make evidence pass.
+
+### Force a terminal candidate decision
+
+Before collecting data, freeze the workload, metrics, thresholds, sample and order
+count, host requirements, and candidate boundaries. Then:
+
+- Give every isolated optional candidate one terminal disposition: **keep**,
+  **revert/defer**, or **inconclusive on this host**. Do not leave it indefinitely
+  pending while growing the acceptance system around it.
+- A measured regression or failure to earn the declared gain selects the simpler
+  baseline. An inconclusive result also defaults to the simpler production baseline;
+  the candidate may be deferred for a better benchmark host.
+- A host that cannot reliably execute the frozen workload is non-decision-capable.
+  Record that fact. Do not tune the workload after seeing results, retry until
+  favorable, weaken a gate, or create alternate harness identities to force a
+  decision.
+- By default, allow one bounded incidental harness-repair pass after the first
+  end-to-end attempt. Further repair belongs to an explicitly requested,
+  separately scoped infrastructure task.
+- Once direct correctness checks pass and the terminal disposition is recorded,
+  run broad product validation once on the final retained production set. Do not
+  repeatedly rerun it after every evidence-tool revision.
+
+When only non-blocking evidence-machinery limitations remain, report them with the
+terminal product disposition. Do not create another product implementation plan
+unless an independently reproducible production defect appears or reusable
+infrastructure was explicitly requested.
+
+### Do not create proofs of proofs
+
+Unless a separately scoped security, supply-chain, or reproducible-build threat
+model requires them, do not add or require:
+
+- verifier replay, validator self-validation, test-of-test mutation frameworks, or
+  attestations of the acceptance transaction;
+- binary/tool/source hashes, copied verifier source in every result directory,
+  child-process ancestry proofs, filesystem provenance, or CI-runner identity;
+- general shell/CMake command parsers whose purpose is only to prove that recorded
+  commands match recorded flags;
+- exhaustive fail-closed schemas for diagnostic fields that cannot change the
+  scoped correctness or keep/revert decision; or
+- a product setting, protocol field, runtime branch, counter, API, or lifecycle hook
+  added solely to make optional evidence easier to authenticate.
+
+A direct deterministic check is often enough for a narrow build option, path,
+ownership balance, timeout, or emitted metric. Timing, concurrency, security, and
+nondeterminism may require repeated or independent evidence; the rule forbids
+recursive meta-validation, not risk-appropriate testing.
+
+### Keep support code and artifacts subordinate
+
+- Prefer existing tests and small fixtures. If new evidence code materially exceeds
+  the production change or creates a framework, stop unless that infrastructure
+  scope was explicitly authorized.
+- Test seams and counters added solely for evidence must compile out of ordinary
+  production builds. A production API added only for a benchmark needs separate
+  product justification and approval.
+- Raw benchmark output, copied manifests, temporary state trees, and repeated runner
+  snapshots are generated artifacts. Keep one concise results summary in source and
+  bulky reproducibility bundles outside normal history unless requested.
+- If optional proof machinery becomes harder to trust than the direct check, prefer
+  simplifying, replacing, or removing it over adding another validator. Removal is
+  still a code change and follows the task's authorization boundary.
+
+## Code Review Rules And Tunnel Checklist
+
+This checklist is a minimum, not the boundary of review. Inspect changed behavior
+and affected callers, callees, neighbors, and error paths for undefined behavior,
+bounds and integer errors, races, memory/resource leaks, exhaustion or denial of
+service, security problems, invalid configuration handling, compatibility,
+portability, and build/test defects. Existing patterns, passing tests, policy
+checks, and comments are evidence, not proof.
+
+Report a concrete trigger and impact for each finding, distinguish confirmed
+defects from questions or optional improvements, and report material out-of-scope
+defects without silently editing them. If no actionable finding exists, say so and
+name material residual risks or validation gaps rather than inventing stylistic
+findings.
+
+For a tunnel change, confirm every applicable item below:
 
 **Lifecycle and direction**
 
 - `Init` initializes this tunnel's line state before any callback can use it.
 - Upstream callbacks are forwarded only with `tunnelNextUpStream*`.
 - Downstream callbacks are forwarded only with `tunnelPrevDownStream*`.
-- No `initialized` flag was added that the source does not require.
+- No `initialized` flag was added unless an explicitly documented line-role or
+  callback contract requires state before ordinary `Init`.
 
 **Line safety**
 
@@ -280,14 +451,30 @@ Before merging a tunnel change, confirm every item that applies:
 - On a `false` from `withLineLocked()`, the code does not touch `line`, line state,
   or `LinestateDestroy()`.
 - Only the line **owner** calls `lineDestroy()`.
+- Every normal-line owner receiving `Finish` detaches producers and inventories,
+  destroys its state, and returns with `! lineIsAlive(line)` on every error,
+  timeout, and terminal-verdict branch.
+- A borrowed-line path destroys only its own state and never calls
+  `lineDestroy()`.
+- `requestProgramShutdown()` is never used instead of closing an owned line.
 
 **Finish**
 
 - `Finish` destroys local state before propagating a real close.
 - Middle-tunnel teardown finishes upstream first, then downstream, then returns.
-- `Pause`/`Resume` are blocked from reflecting toward a finished side.
+- No `Payload`, `Est`, `Pause`, `Resume`, or `Finish` reflects toward the side that
+  sent `Finish`.
 - If final protocol bytes are sent during `Finish`, the sender side is marked
-  finished before the send.
+  finished before the locked re-entrant send, and the handler unlocks and returns
+  without touching destroyed state.
+
+**Backpressure**
+
+- After receiving `Pause`, a producer initiates no new payload toward that consumer
+  until `Resume`.
+- Any intentional pre-Pause tolerance is bounded, FIFO-preserving, accounted, and
+  has a clear resume or overflow/close path. Transparent middle tunnels do not
+  invent buffering merely because adapters have bounded queues.
 
 **Buffers and padding**
 
@@ -300,11 +487,20 @@ Before merging a tunnel change, confirm every item that applies:
 - Packet lines are kept alive during normal runtime.
 - Packet-line state is treated as worker-local shared state.
 - Packet-line init source (node manager vs. manual `onStart`) is verified.
+- Every packet-line `Finish` handler is classified for that exact role and
+  direction: fatal anchor, same-direction transparent forwarding, or documented
+  terminal absorption. No category destroys the packet line.
 
 **Validation**
 
 - Tests exercise the intended callback direction.
 - Validation used preset build metadata, not guessed compiler flags.
+- Every modified C/header file was formatted with `clang-format` (or the missing
+  tool was reported explicitly).
+- Regression coverage was added where it materially protects behavior, or the
+  reason existing coverage/non-test validation is sufficient is stated.
+- Validation scope is proportional: focused for narrow changes and broad/full for
+  shared, concurrent, security-sensitive, or difficult-to-bound work.
 
 ## Common Pitfalls (Master List)
 
@@ -326,30 +522,33 @@ A consolidated list of the failure modes this guide exists to prevent:
   composition.
 - Treating packet-line state as per-connection state, or destroying packet lines
   at runtime.
+- Assigning callbacks or accessing tunnel state before checking a nullable
+  `tunnelCreate()` / `adapterCreate()` / `packettunnelCreate()` result.
+- Indexing worker-owned arrays with raw `getWID()` instead of using line, worker,
+  loop, or checked event-worker context.
+- Treating an existing implementation as proof of correctness instead of checking
+  its contract and callers.
 - Hand-assembling compile commands when preset build metadata exists.
+- Reporting a compiler crash or unavailable environment as passed validation.
 
 ## Expected Output From a Coding Agent
 
-When an AI coding agent works on WaterWall, its response should follow this
-structure. The format forces the important contracts into the open; a change that
-cannot articulate them is not ready.
+Adapt the response to the request and lead with the outcome. A completed change or
+review should still make these facts easy to verify:
 
-1. **Understanding** — a brief statement of the relevant tunnel flow (draw the
-   chain, mark directions, name the line owner).
-2. **The change** — the bug or requested feature, precisely.
-3. **How it stays correct** — how the change preserves:
-   - lifecycle ordering,
-   - line safety,
-   - direction ownership,
-   - buffer and padding rules,
-   - packet-line semantics (if relevant).
-4. **Implementation** — the actual change, matching the closest mature tunnel
-   pattern.
-5. **Validation** — commands run, build result, tests, and any fallback checks.
-6. **Risks** — remaining edge cases or follow-ups.
+1. **Result** — what changed, or the confirmed findings in severity order.
+2. **Correctness evidence** — the concrete behavior, callers, and applicable
+   lifecycle, line, direction, buffer, packet, worker, or shutdown contracts.
+3. **Validation** — commands actually run, their results, and any failed or
+   inconclusive checks. Do not imply that an unrun lane passed.
+4. **Residual risk** — material gaps, assumptions, or follow-up work.
 
-If something is unclear, infer conservatively from the source and existing
-WaterWall patterns. Do not invent a new lifecycle model.
+Do not force unrelated tunnel analysis into a documentation or tooling result.
+Conversely, a tunnel change that cannot identify its callback direction and exact
+line role is not ready. When something consequential remains unclear, investigate
+source, tests, callers, and documentation and ask a focused maintainer question if
+the repository cannot decide it; do not treat an existing pattern as proof or
+invent a lifecycle concept as an incidental workaround.
 
 ---
 

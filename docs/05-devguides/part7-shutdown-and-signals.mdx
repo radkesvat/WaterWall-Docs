@@ -5,7 +5,7 @@ sidebar_label: "Part 7: Application Termination"
 description: "The shutdown controller, worker quiescence protocol, lifecycle-v2 component stages, task settlement, signals, devices, and destruction order."
 ---
 <!--
-Documentation version: 152
+Documentation version: 154
 -->
 
 # Part 7: Application Termination
@@ -325,6 +325,16 @@ and later staging growth failure restores the exact popped item before stopping
 the scan. Item creation exposes a handle only after both the map and expiration
 heap own it; heap-publication failure rolls the map insertion back.
 
+Worker-local and shared idle tables have different shutdown boundaries. Quiesce
+each `local_idle_table_t` timer on its exact owner worker before line drain, then
+drain the entire local table inline and destroy it while that worker's loop,
+callbacks, lines, and pools remain alive. Never transfer a local table or item
+handle to another worker. For `idle_table_t`, drain each owner WID's active
+inventory on that WID before final shared-table destruction. An item already
+owned by a posted expiration message is detached by owner drain rather than
+called back or freed there; the message callback or cleanup retains delivery and
+table ownership until it settles exactly once.
+
 An orderly shutdown request is not line destruction. A `Finish` handler for an
 owned normal line must still detach producers, destroy line state, and make the
 line logically dead before returning, even when it also requests process
@@ -335,6 +345,12 @@ shutdown.
 Component timers and watchers are worker-affine. `onQuiesceRequest` closes their
 rearm/admission state; `onWorkerQuiesce` deletes the component's published timer
 or watcher pointer on its owner worker.
+
+The process-global resource sampler follows this order on worker 0: stop its
+periodic timer during worker quiescence, then allow the last published snapshot
+to age stale naturally before global-state destruction. Worker-local idle tables
+are likewise quiesced before their callbacks' reachable tunnel or line state is
+drained; owner-worker stop removes remaining items and destroys the empty table.
 
 Generic loop quiescence deactivates any remaining timer and clears its callback
 and userdata. The allocation is kept on a loop-owned deferred list because line

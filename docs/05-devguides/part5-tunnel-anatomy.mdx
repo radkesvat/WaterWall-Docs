@@ -12,8 +12,8 @@ Documentation version: 152
 
 This part maps the contracts from Parts 1-4 onto the actual files you edit. Once
 you know which file owns which responsibility, adding or fixing a tunnel becomes
-mechanical: change the smallest thing in the right place and keep the lifecycle
-intact.
+mechanical: make the smallest complete root-cause change in the right place and
+keep the lifecycle intact.
 
 ## Directory Layout
 
@@ -74,10 +74,11 @@ callback files stay readable. Follow that convention; reviewers expect it.
 
 Framework-owned worker messages, timers, WIO callbacks, and async DNS requests
 settle before component destruction under lifecycle-v2, so those contexts may
-carry `tunnel_t *` directly. This is not a general lifetime rule: a callback root
-outside the worker lifecycle, such as a device reader thread, must close local
-admission and wait for active operations through an owner-specific mechanism such
-as `quiescence_gate_t` before the tunnel or device state is reclaimed.
+carry `tunnel_t *` directly when they also validate and use their explicit owner
+worker. This is not a general lifetime rule: a callback root outside the worker
+lifecycle, such as a device reader thread, must close local admission and wait for
+active operations through an owner-specific mechanism such as
+`quiescence_gate_t` before the tunnel or device state is reclaimed.
 
 ## `node.c`: Declaring the Node
 
@@ -126,7 +127,13 @@ During chain startup, `NodeManager` strictly enforces node capabilities and laye
 - **Edge-domain constraint propagation:** The runtime constructs a directed edge graph representing callback connections between adjacent tunnels, seeds each edge domain (`{L3}`, `{L4}`, or `{L3, L4}`) from participating node and neighbor layer requirements, and propagates `SameAs` and `Opposite` relations monotonically to a fixed point. Any edge domain converging to `{}` immediately fails startup with a clear diagnostic identifying both nodes and sides.
 - **Conditional SameAs vs Strict Opposite:** `SameAs` relative constraints (`kNodeLayerSameAsPrev`, `kNodeLayerSameAsNext`) are conditional: when the referenced side is absent, no equality relation is added, and the node's placement flags (`kNodeFlagChainHead`, `kNodeFlagChainEnd`, `kNodeFlagNoChain`) determine whether boundary placement is permitted. In contrast, `Opposite` constraints (`kNodeLayerOppositePrev`, `kNodeLayerOppositeNext`) are strict and always require both participating sides to be present.
 - **State-held cross-tunnel relations:** For nodes whose callback targets are established dynamically at runtime (such as paired `Bridge` tunnels), tunnels register logical layer relations directly on the chain via `tunnelchainRegisterLayerRelation()`. Registered relations couple the participating edge domains (e.g. equating Bridge A prev edge with Bridge B prev edge, and Bridge A next edge with Bridge B next edge) during solver execution and persist across chain combinations (`tunnelchainCombine()`).
-- **Fixed and relative bridges:** Fixed-side bridges (such as `ConnectionToPackets` and `StreamToPackets`) explicitly declare concrete layer requirements on their adjacent edges. Dynamic bidirectional bridges (such as `WireGuardDevice`) declare `Opposite` relations that couple opposite edge domains without prematurely collapsing unresolved intermediate subchains.
+- **Fixed and relative bridges:** Fixed-side bridges explicitly declare concrete
+  layer requirements on their adjacent edges rather than claiming
+  `kNodeLayerAnything`. `ConnectionToPackets` is L4 on `prev` and L3 on `next`;
+  `PacketsToConnection` is L3 on `prev` and L4 on `next`; `StreamToPackets` is L4
+  on `prev` and L3 on `next`. Dynamic bidirectional bridges such as
+  `WireGuardDevice` declare `Opposite` relations that couple opposite edge domains
+  without prematurely collapsing unresolved intermediate subchains.
 - **Packet chain classification & bootstrap:** A chain allocates worker packet lines and sets `contains_packet_node = true` only when at least one edge is forced to `{L3}`, a node or edge requirement is fixed to `L3`, or an `Opposite` relation exists. Persistent packet line `Init` messages are queued at runtime only when the chain head's next edge is resolved to `{L3}`.
 - **Failure semantics:** Any validation or solver failure logs a fatal diagnostic (`LOGF`) and records a startup failure (`startupFailureRecord(1)`), causing WaterWall to reject the configuration and perform a clean startup rollback.
 
@@ -156,38 +163,51 @@ rejected rather than normalized through an incompatible callback layout.
 `TlsClient`:
 
 1. `tunnel_t *t = tunnelCreate(node, sizeof(tstate), sizeof(lstate));`
-2. Assign all twelve flow callbacks and the lifecycle hooks.
-3. Read settings from `node->node_settings_json`, validating each one.
-4. Allocate per-worker resources (e.g. one SSL context per worker).
-5. **On any failure, clean up and bail out** — destroy partial state and the
+2. Check `t` immediately and return `NULL` if creation failed.
+3. Assign all twelve flow callbacks and the lifecycle hooks.
+4. Read settings from `node->node_settings_json`, validating each one.
+5. Allocate per-worker resources (e.g. one SSL context per worker).
+6. **On any later failure, clean up and bail out** — destroy partial state and the
    tunnel, return `NULL`.
 
-The cleanup discipline is real and worth copying. `TlsClient` frees the tunnel
-state and the tunnel itself on every error edge:
+`tunnelCreate()`, `adapterCreate()`, and `packettunnelCreate()` are nullable by
+contract. They return `NULL` on invalid or overflowing state sizes or allocation
+failure. Never assign a callback or call `tunnelGetState()` until the result has
+been checked.
+
+The cleanup discipline is real and worth following. The distilled shape is:
 
 ```c
 tunnel_t *tlsclientTunnelCreate(node_t *node)
 {
     tunnel_t *t = tunnelCreate(node, sizeof(tlsclient_tstate_t), sizeof(tlsclient_lstate_t));
+    if (! t)
+    {
+        return NULL;
+    }
+
     configureTunnelCallbacks(t);
 
     tlsclient_tstate_t *ts       = tunnelGetState(t);
     const cJSON        *settings = node->node_settings_json;
 
-    if (! getandvalidateSniSetting(ts, settings, t))
+    if (! getandvalidateSniSetting(ts, settings))
     {
-        return NULL;   // helper already destroyed t
+        goto fail;
     }
     // ... more validated settings ...
 
     if (! createSslContextPool(&ts->threadlocal_ssl_contexts, /* ... */))
     {
-        tlsclientTunnelstateDestroy(ts);
-        tunnelDestroy(t);
-        return NULL;
+        goto fail;
     }
 
     return t;
+
+fail:
+    tlsclientTunnelstateDestroy(ts);
+    tunnelDestroy(t);
+    return NULL;
 }
 ```
 
@@ -248,7 +268,11 @@ typedef struct tlsclient_lstate_s
 ```
 
 Per-worker arrays (like `threadlocal_ssl_contexts`) live in **tstate** and are
-indexed by `getWID()`. Per-connection state lives in **lstate**.
+indexed only by an explicitly validated worker identity: `lineGetWID(line)` in a
+line callback, `worker->wid` in a worker-message callback, or a checked
+`getCurrentEventWorkerWID()` when the callback contract guarantees an event
+worker. Never index them with raw `getWID()`. Per-connection state lives in
+**lstate**.
 
 ## `line_state.c`: Initialize and Destroy
 
@@ -274,7 +298,8 @@ code):
 - Initialize in `Init`; later callbacks assume the state exists.
 - Destroy once; after `LinestateDestroy()` consider the state dead and zeroed.
 - Never read a field after destroying the state.
-- Do not add an `initialized` boolean unless the source proves it is required.
+- Do not add an `initialized` boolean unless an explicitly documented
+  line-role/callback contract requires state before ordinary `Init`.
 
 ## HTTP-Specific Rules
 
@@ -300,7 +325,11 @@ apply:
 
 ## The Implementation Workflow
 
-Use this order for any new feature or fix:
+Use this order for any new feature or fix. Inspect the repository first; ask a
+focused question only when a consequential requirement, compatibility choice, or
+scope boundary cannot be resolved from code and documentation. Make and record
+reasonable assumptions for low-risk implementation details instead of delegating
+them back to the maintainer.
 
 1. **Draw the chain flow.** Mark the Up-end and Down-end, and label which callback
    direction owns the transformation.
@@ -310,18 +339,25 @@ Use this order for any new feature or fix:
    `ww/net/chain.c`.
 5. **If framing/prepending is involved,** read `ww/bufio/shiftbuffer.h` and
    `buffer_pool.h`, plus nearby tunnels' `node.c` padding.
-6. **Pick the closest mature tunnel pattern** and stay close to it.
-7. **Implement the smallest change** that preserves composition.
-8. **Add or update a focused test** for any behavior that can regress —
-   especially one that would fail if a direction were reversed.
+6. **Compare relevant mature tunnel patterns**, but verify them against the
+   contract, callers, and neighbors rather than copying them blindly.
+7. **Implement the smallest complete root-cause fix** that preserves composition.
+   Do not minimize the diff by retaining a known defect, duplicating unsafe logic,
+   or patching only a symptom.
+8. **Decide whether focused regression coverage is warranted.** It normally is for
+   new behavior, a reproducible regression-prone bug, a meaningful edge case, or a
+   contract change—especially when a test can fail on reversed direction. Reuse
+   existing direct coverage when sufficient, and do not manufacture behavior tests
+   for mechanical or documentation-only work.
 9. **Validate** with the preset build and the relevant tests (see
    [Part 6](./part6-build-test-review.mdx)).
 
 :::warning Avoid speculative abstractions
-A new generic layer is rarely the fix here. Correctness comes from matching the
-existing lifecycle, not from a cleverer abstraction. If you find yourself
-introducing a new lifecycle concept to make one tunnel work, stop and re-read the
-closest reference tunnel.
+A new generic layer is rarely the fix here. Preserve the established lifecycle
+contract and prefer a direct complete fix. If one tunnel appears to require a new
+lifecycle concept, stop and verify the need against the core contract and every
+affected caller; do not use a reference tunnel as proof that either the old or new
+shape is correct.
 :::
 
 ---

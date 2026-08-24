@@ -5,7 +5,7 @@ sidebar_label: "Part 1: Overview & Mental Model"
 description: "The runtime model, core objects, callback directions, and tunnel lifecycle you must understand before changing any WaterWall tunnel."
 ---
 <!--
-Documentation version: 152
+Documentation version: 154
 -->
 
 # WaterWall Developer Guide
@@ -22,11 +22,14 @@ lifetime**, **per-line state**, **buffer padding**, **packet-line behavior**, an
 user's configuration.
 
 :::tip The single most important rule
-Do not design a new lifecycle model for one tunnel. Start from the runtime
-contracts in [`ww/net/`](https://github.com/radkesvat/WaterWall/tree/main/ww/net),
-then copy the shape of a mature tunnel that already solves a similar problem.
-In this codebase, correctness comes from matching the existing lifecycle pattern,
-not from inventing a more general one.
+Do not design a new lifecycle model as an incidental fix for one tunnel. Start
+from the intended contracts in this guide and the current mechanics in
+[`ww/net/`](https://github.com/radkesvat/WaterWall/tree/main/ww/net), then compare
+relevant mature tunnels that solve a similar problem. A reference implementation
+is evidence, not proof: verify it against the contract, its callers, and its
+neighbors, because a repeated pattern can contain a repeated bug. An explicitly
+requested lifecycle redesign is cross-cutting work, not forbidden work; account
+for every affected implementation, test, and contract document.
 :::
 
 ## How This Guide Is Organized
@@ -43,8 +46,11 @@ not from inventing a more general one.
 
 ## Read These Files First
 
-Before changing tunnel behavior, read the source that owns the contract. These
-are short, dense, and authoritative.
+Before changing tunnel behavior, read the source that implements the contract.
+These files are short and dense, and they define the current mechanics. They are
+not proof that the implementation is defect-free. If source, tests, and this guide
+disagree, investigate and report the mismatch rather than silently normalizing to
+the existing code.
 
 | Area | Files |
 | --- | --- |
@@ -58,16 +64,18 @@ are short, dense, and authoritative.
 
 ## Good Reference Tunnels
 
-Pick the closest existing pattern and stay near it. These tunnels are mature and
-exercise specific contracts cleanly:
+Use the closest existing patterns as comparisons, not as templates to copy
+blindly. These tunnels exercise useful contract shapes, but their behavior still
+has to be checked against the exact role being changed:
 
 | Reference | Read it for |
 | --- | --- |
-| `TcpListener`, `TcpConnector` | Adapter behavior: a real socket on one end, line creation/destruction |
+| `TcpListener`, `UdpListener` | Chain-head adapters that own an OS resource and create/destroy their normal lines |
+| `TcpConnector`, `UdpConnector` | Chain-tail adapters that own an OS resource but borrow the line created upstream |
 | `TlsClient`, `EncryptionClient` | Stateful protocol wrapping, per-line state, clean finish with final bytes |
 | `MuxClient` | Internal line ownership, parent/child lines, re-entrant safety |
 | `PacketsToStream`, `StreamToPackets`, `PacketsToConnection` | Packet-to-stream boundaries and packet-line anchored bridges |
-| `PingClient`, `PingServer` | Direct paired packet transforms and same-direction forwarding |
+| `PingClient`, `PingServer` | Direct paired ICMP Echo transforms, same-direction decoded data, and opposite-direction exact replies |
 | `template` | The minimal skeleton every tunnel starts from |
 
 ## The Runtime Model
@@ -191,12 +199,15 @@ which is a pure pass-through to the neighbor in the same direction (see
 downstream payload handler at the default and let bytes flow straight through.
 
 :::warning Do not reverse directions
-Do not flip forwarding helpers because a server-side tunnel "feels opposite."
-Draw the actual chain, mark the Up-end and Down-end, then decide separately
-whether that callback encodes or decodes. In a direct `PingClient -> PingServer`
-pair, both nodes forward the request upstream even though one encodes and the
-other decodes; the inverse transformations both forward the response
-downstream. See [Part 4](./part4-packet-tunnels.mdx).
+Do not flip the forwarding helper for the received buffer because a server-side
+tunnel "feels opposite." Draw the actual chain, mark the Up-end and Down-end, and
+classify every emitted buffer separately. In Ping v2, the decoded original
+continues in the received request's callback direction, while a separately cloned
+exact Echo Reply travels in the opposite direction as an acknowledgement.
+PingServer therefore replies downstream from its upstream request handler, and
+PingClient replies upstream from its downstream request handler. Reverse-direction
+application data starts a separate Echo Request. See
+[Part 4](./part4-packet-tunnels.mdx).
 :::
 
 ### Which Forwarding Function Do I Call?
@@ -236,9 +247,17 @@ createHandle(node)         // node.c -> create.c: allocate, assign callbacks, pa
       |
     ...                     // runtime: flow callbacks run here
       |
-   onStop  /  onWorkerStop // stop tunnel / stop per-worker resources
+   onQuiesceRequest        // main thread: close admission; request producer stop; do not wait
       |
-   onDestroy               // free tunnel and its state
+   onWorkerQuiesce         // each owner worker: detach timers/watchers/worker-affine handles
+      |
+   onQuiesceWait           // main thread: join/detach already-admitted external callback roots
+      |
+   onWorkerStop            // each owner worker: drain owned normal lines and worker resources
+      |
+   onStop                  // main thread: release remaining shared component resources
+      |
+   onDestroy               // main thread: reclaim the instance after all references are gone
 ```
 
 What each hook is for:
@@ -251,14 +270,17 @@ What each hook is for:
 | `onIndex` | `tunnelDefaultOnIndex` assigns the line-state offset | Runs once after topology expansion and layer resolution reach a fixed point. The final solved edge domains may be consumed here, but chain topology must not be changed. Rarely overridden. |
 | `onPrepare` | no-op | Pre-start setup that needs the chain to exist. |
 | `onStart` | no-op | Begin listening/connecting; bootstrap packet lines (see Part 4). |
-| `onStop` | no-op | Stop accepting work, begin teardown. |
-| `onWorkerStop` | no-op | Release worker-local resources for one worker id. |
+| `onQuiesceRequest` | no-op | Main-thread, bounded, nonblocking admission closure and producer-stop request. Do not join or release line-drain resources here. |
+| `onWorkerQuiesce` | no-op | On each owner worker, detach that WID's timers, watchers, and worker-affine handles before the worker acknowledges quiescence. |
+| `onQuiesceWait` | no-op | On the main thread after workers quiesce, join or detach external callback roots while resources needed by line drain remain alive. |
+| `onWorkerStop` | no-op | On each owner worker during drain, close authoritative source inventories and internally owned normal lines before middle/tail validation. |
+| `onStop` | no-op | On the main thread after every worker drains, release remaining shared resources; touch no worker-affine timer or watcher. |
 | `onDestroy` | `tunnelDestroy` frees the instance | Free settings, SSL contexts, pools, then call `tunnelDestroy`. |
 
-Most tunnels only override `onPrepare`, `onStart`, `onStop`, and `onDestroy`, plus
-the flow callbacks. The chaining and indexing defaults are correct for almost
-everything; leave them alone unless the source of a reference tunnel proves you
-need otherwise.
+Most tunnels override only the lifecycle stages for resources they actually own,
+plus the relevant flow callbacks. Keep the chaining and indexing defaults unless
+the tunnel's topology contract requires something else, and verify any deviation
+against the solved-topology rules rather than copying a reference mechanically.
 
 Layer results have two distinct consumption points. Use `onSolvedTopology` only
 when a tunnel must act before indexing—for example, to insert private topology
@@ -278,6 +300,10 @@ Every tunnel starts from the same shape (this is the `template` tunnel's
 tunnel_t *templateTunnelCreate(node_t *node)
 {
     tunnel_t *t = tunnelCreate(node, sizeof(template_tstate_t), sizeof(template_lstate_t));
+    if (! t)
+    {
+        return NULL;
+    }
 
     t->fnInitU    = &templateTunnelUpStreamInit;
     t->fnEstU     = &templateTunnelUpStreamEst;
@@ -307,7 +333,7 @@ metadata, `line_state.c`, and where each callback lives.
 
 ## What "Correct" Means Here
 
-A correct tunnel change preserves **all** of the following at once:
+A correct tunnel change preserves every **applicable** item below at once:
 
 - tunnel composability (works regardless of neighbors)
 - line lifecycle rules (init in `Init`, destroy once, owner-only destruction)
@@ -331,6 +357,15 @@ Worker thread identity in WaterWall is explicit and invalid by default:
 - **Auxiliary threads** must post ownership-bearing work through the worker message queue and must **never borrow a worker-local pool** directly. Raw loop custom events are reserved for loop-owned, non-owning operations.
 - **lwIP pseudo-worker** is registered (`workerWIDIsRegistered()` returns true), but is not an event worker (`workerWIDIsEventWorker()` returns false) as it owns no WaterWall event loop.
 - Native/library threads use `getTID()` for logging/diagnostics and remain WID-invalid unless explicitly bound via `workerBindCurrentThread()`.
+
+Process resource snapshots follow the same ownership rule. Host and cgroup
+providers run only during synchronous global-state initialization and the
+worker-0 background sampler. On Linux, the sampler publishes the maximum used
+percentage and minimum remaining allowance across the visible finite cgroup
+hierarchy; ambiguous or hidden constraints remain unavailable for conservative
+consumer fallback. Hot worker paths consume that coherently published,
+bounded-atomic tuple; they never open system files, refresh stale host state,
+allocate, wait, or take the sampler mutex.
 
 ### Choosing a Worker-Context Helper
 
@@ -401,11 +436,33 @@ borrowing worker 0's pool.
 new `getWorkerXxx(getWID())` nesting, raw `getWID() == 0` ownership decisions,
 raw current-WID affinity comparisons, and tunnel-API recycle boilerplate.
 
+### Choosing an Idle Table
+
+Choose `local_idle_table_t` when item creation, lookup, refresh, removal,
+expiration callback, drain, and destruction all belong to one event worker. It
+has no synchronization or cross-worker delivery: never pass the table or one of
+its borrowed item handles to another worker.
+
+Choose `idle_table_t` only when one table must index items owned by multiple
+event workers and expiration must be posted to each item's recorded owner. Its
+indexes are synchronized, but a returned item handle is still a borrowed,
+worker-owned reference; the shared table is not a general-purpose thread-safe
+handle container. Do not choose it merely because its name or mutex sounds
+safer. Shared refresh is intentionally lock-free and leaves heap reordering to
+the timer scan.
+
+Both tables have the same logical lifetime rule: successful removal clears
+lookup visibility and invalidates every raw handle before returning. A consumer
+that stores a handle clears that authoritative slot before removal and never
+reads the item afterward. Their physical reclamation differs: local removal
+normally frees immediately, while a shared item can remain heap- or
+message-owned until safe settlement.
+
 ## Glossary
 
 | Term | Meaning |
 | --- | --- |
-| **Adapter** | A chain-head or chain-end tunnel that owns an OS resource (socket, TUN, raw socket). Creates and destroys lines. |
+| **Adapter** | A chain-head or chain-end tunnel that owns an OS resource (socket, TUN, raw socket). Resource ownership does not imply `line_t` ownership: a source such as `TcpListener` creates normal lines, while a tail such as `TcpConnector` borrows them. |
 | **Middle tunnel** | A non-adapter tunnel that transforms callbacks/payloads and must stay composable. |
 | **Line** | One `line_t`; a single connection (or a worker packet line). Holds all tunnels' per-line state. |
 | **Upstream** | The forward/outbound direction, toward `next` (the Up-end). |

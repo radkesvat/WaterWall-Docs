@@ -6,7 +6,7 @@ description: "Reference documentation for the MuxServer node."
 ---
 
 <!--
-Documentation version: 152
+Documentation version: 153
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/MuxServer/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/MuxServer.mdx, and all files must keep the same documentation version.
 -->
 
@@ -80,6 +80,14 @@ responsible for destroying them. It does not create the parent transport line.
     "child-buffer-pause-tolerance": 524288,
     "child-buffer-resume-threshold": 262144,
     "parent-buffer-limit": 33554432,
+    "max-children": 10000,
+    "max-live-children": 262144,
+    "initial-child-idle-timeout-ms": 10000,
+    "active-child-idle-timeout-ms": 300000,
+    "memory-high-watermark-percent": 85,
+    "memory-low-watermark-percent": 75,
+    "memory-reserve": 268435456,
+    "memory-fallback-max-live-children": 12000,
     "detached-buffer-limit": 268435456,
     "detached-child-limit": 12000,
     "log-main-line-stats": false
@@ -109,7 +117,15 @@ by a matching `MuxClient`.
 | `child-buffer-limit` | integer | `25165824` | Maximum queued bytes for one paused child. Must be greater than `0`. If reached, the child is closed with a MUX `Close` frame. |
 | `child-buffer-pause-tolerance` | integer | `524288` | Fallback queue threshold for sending `FlowPause` when the normal child pause callback has not already sent it. Must be `0` or greater. Values above `child-buffer-limit` are capped to the limit. |
 | `child-buffer-resume-threshold` | integer | `262144` | Low-water mark for sending `FlowResume` after the local child becomes writable. Must be greater than `0`. Values above `child-buffer-limit` are capped to the limit. Raising it resumes the peer earlier but weakens hysteresis and may increase pause/resume cycling. |
-| `parent-buffer-limit` | integer | `33554432` | Per-parent budget for queued child-destined data. When reached, the actual largest queued child is closed; equal-size ties prefer the least recently active child. Set to `0` to disable the aggregate budget. |
+| `parent-buffer-limit` | integer | `33554432` | Per-parent budget for queued child-destined data. When reached, the actual largest queued child is closed; equal-size ties prefer the oldest attached child. Set to `0` to disable the aggregate budget. |
+| `max-children` | integer | `10000` | Hard maximum attached live children on one parent. Must be positive and no greater than `max-live-children`; historical destroyed CIDs do not count. |
+| `max-live-children` | integer | `262144` | Hard maximum reserved or initialized children across this MuxServer instance, all parents, and all workers. Draining and detached children count until their MuxServer state is destroyed. |
+| `initial-child-idle-timeout-ms` | integer | `10000` | Idle timeout after `Open` and before the first nonempty Data payload. Must be positive. |
+| `active-child-idle-timeout-ms` | integer | `300000` | Refreshing idle timeout after nonempty payload activity begins. Must be positive and at least the initial timeout. |
+| `memory-high-watermark-percent` | integer | `85` | Close memory admission at or above this host or finite-cgroup usage. Must be in `[1, 99]`. |
+| `memory-low-watermark-percent` | integer | `75` | Reopen only when every applicable usage is at or below this value and reserve headroom recovered. Must be in `[1, 99]` and lower than the high watermark. |
+| `memory-reserve` | integer | By `ram-profile` | Close admission when effective available bytes reach this reserve. Must be in `[0, INT_MAX]`; `0` disables only this byte reserve. |
+| `memory-fallback-max-live-children` | integer | By `ram-profile` | Conservative aggregate ceiling while memory sampling is unsupported, unavailable, or older than one second. Must be positive and no greater than `max-live-children`. |
 | `detached-buffer-limit` | integer | By `ram-profile` | Per-worker byte limit for blocked child queues retained after parent loss. Reaching it aborts only the newly detached blocked child. Set to `0` to disable this bound. |
 | `detached-child-limit` | integer | By `ram-profile` | Per-worker count limit for blocked children retained after parent loss. Reaching it aborts only the newly detached blocked child. Set to `0` to disable this bound. |
 | `log-main-line-stats` | boolean | `false` | When enabled, parent lines log stats every `5000` ms. |
@@ -127,6 +143,11 @@ The two detached limits use these defaults when their node settings are omitted:
 
 Defaults are linearly interpolated over the six ordered RAM-profile tiers, with the byte limit rounded to the
 nearest whole MiB. An explicit setting overrides the profile-derived value independently for that limit.
+
+The admission reserve and fallback ceiling use the same initial six-tier
+values shown above: detached bytes become the memory reserve and detached
+children become the fallback live-child ceiling. Admission and detached-drain
+defaults are separate policies even though their current values match.
 
 Stats include worker id, parent write-pause state, aggregate queued bytes, child
 count, children waiting for ordered Close completion, child read-pause count,
@@ -154,7 +175,25 @@ When an `Open` frame arrives:
 4. It links the child to the parent.
 5. It sends upstream `Init` to `next` on the child line.
 
-Duplicate `Open` frames for an existing `cid` are ignored.
+Parent-to-child dispatch uses a hash index, so lookup and duplicate detection
+remain average O(1). A duplicate `Open` for any indexed child, including a
+peer-close drain, is a protocol violation and closes that parent.
+
+Before allocation, a fresh Open must pass the per-parent hard limit, the
+per-instance atomic reservation limit, and cached memory admission. Resource
+rejection sends `Close(cid)` without creating a child and preserves the parent
+and siblings. A parent has a 1024-rejection burst bucket refilled at 64 tokens
+per second; sustained rejected-Open abuse closes only that parent.
+
+The global sampler publishes memory every `500` ms and snapshots expire after
+one second. On Linux, cgroup pressure is the maximum used percentage and the
+minimum remaining allowance across every visible finite cgroup v2/v1 level;
+`MemAvailable` still bounds effective headroom. Ambiguous or hidden cgroup
+constraints use the conservative fallback. Windows uses available physical
+memory. Workers consume only the cached atomic tuple, and the high/low
+watermarks provide hysteresis. Stale or unsupported data uses the profile
+fallback ceiling and cannot reopen a gate previously closed by fresh pressure.
+Memory admission affects new Opens only.
 
 ## Frame Format
 
@@ -198,6 +237,23 @@ node should already fit that limit.
 
 Frames for unknown cids and unknown frame kinds are dropped.
 
+## Child Idle Reclamation
+
+Every admitted child starts with `initial-child-idle-timeout-ms`. The first
+nonempty incoming Data payload or nonempty payload produced by `next` promotes
+it to `active-child-idle-timeout-ms`; every later nonempty payload refreshes the
+active deadline. Open, Close, flow control, Init/Est, and zero-length Data do not
+count as activity.
+
+Expiry closes only that child, emits `Close(cid)` while its parent is available,
+and preserves the parent and siblings. Detached expiry uses the detached-abort
+path. Explicit close removes the timer item immediately, so timer memory follows
+live children rather than historical churn.
+
+These limits and timers do not change MUX wire bytes. A parent stays reusable
+for its full transport lifetime, and destroying a child makes its count capacity
+available again on that same parent and MuxServer instance.
+
 ## Backpressure And Queues
 
 MUX keeps backpressure per child:
@@ -217,8 +273,8 @@ MUX keeps backpressure per child:
   blocked destination cannot stop unrelated child frames from being demultiplexed.
 - If one child's queue reaches `child-buffer-limit`, the child is closed.
 - If total queued child data reaches `parent-buffer-limit`, the child with the
-  actual largest queue is closed. Equal-size ties prefer the least recently
-  active child.
+  actual largest queue is closed. Equal-size ties prefer the oldest attached
+  child.
 - Setting `parent-buffer-limit` to `0` disables only the aggregate budget; the
   per-child limit still applies.
 

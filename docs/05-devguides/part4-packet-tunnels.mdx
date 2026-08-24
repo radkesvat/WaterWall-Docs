@@ -31,17 +31,25 @@ A packet line is a real `line_t`, but unlike a connection line it is:
 - destroyed only when the **chain itself** is destroyed.
 
 The source is explicit. In `tunnelchainFinalize()` (`ww/net/chain.c`), when the
-chain contains a packet node, one packet line is created per worker:
+chain contains a packet node, one packet line is created per worker (abridged here
+without the surrounding pool cleanup):
 
 ```c
-tc->packet_lines = (line_t **) memoryAllocate(sizeof(line_t) * tc->workers_count);
+line_t **packet_lines = memoryAllocate(sizeof(*packet_lines) * tc->workers_count);
+if (! packet_lines)
+{
+    startupFailureRecord(1);
+    return;
+}
+
+// ... create and validate every worker's line pool ...
+tc->packet_lines = packet_lines;
 
 for (wid_t i = 0; i < tc->workers_count; i++)
 {
-    // ... create the worker line pool ...
     if (tc->contains_packet_node)
     {
-        tc->packet_lines[i] = lineCreateForWorker(0, tc->line_pools, i);
+        packet_lines[i] = lineCreateForWorker(0, tc->line_pools, i);
     }
 }
 ```
@@ -128,17 +136,20 @@ and any other callback unrelated to its transform in the same direction:
 - a received callback is never reflected toward its sender.
 
 `PingClient` inherits these lifecycle pass-throughs from `packettunnelCreate()`;
-`PingServer` installs equivalent explicit `Finish` forwarding. Keeping the
-transform separate from the lifecycle allows flexible chains such as:
+`PingServer` installs equivalent explicit lifecycle forwarding. Payload support
+is a separate contract: both Ping v2 endpoints require the chain's exact worker
+packet line for buffer ownership and worker validation. Their supported edge
+orders are:
 
 ```text
-UdpListener <-> PingServer <-> UdpConnector
+TunDevice -> PingClient -> RawSocket
+RawSocket -> PingServer -> TunDevice
 ```
 
-Here `PingServer` can decapsulate the ICMP-wrapped packet on the relevant payload
-path while the ordinary UDP line lifecycle continues through it unchanged.
-`packettunnelCreate()` therefore keeps the standard lifecycle pass-throughs and
-only makes unimplemented packet **payload** callbacks fatal.
+An ordinary normal-line topology such as
+`UdpListener <-> PingServer <-> UdpConnector` is therefore not a supported Ping
+v2 composition. `packettunnelCreate()` keeps standard lifecycle pass-throughs,
+but an implemented payload handler may still enforce a stricter packet-line role.
 
 ### Category 3 — intentional terminal absorber: handle locally and document
 
@@ -245,18 +256,30 @@ Some tunnels are created with `packettunnelCreate()` instead of `tunnelCreate()`
 From `ww/net/packet_tunnel.c`:
 
 ```c
-tunnel_t *packettunnelCreate(node_t *node, uint16_t tstate_size, uint16_t lstate_size)
+tunnel_t *packettunnelCreate(node_t *node, size_t tstate_size, size_t lstate_size)
 {
-    assert(lstate_size == 0); // packet tunnels don't have lines
+    if (UNLIKELY(lstate_size != 0))
+    {
+        return NULL; // pure packet tunnels have no per-line state
+    }
+
     tunnel_t *t = tunnelCreate(node, tstate_size, 0);
-    // ... installs packet-tunnel default callbacks ...
+    if (! t)
+    {
+        return NULL; // state-size overflow or allocation failure
+    }
+
+    // ... installs mandatory packet-payload defaults ...
+    return t;
 }
 ```
 
 Key facts:
 
-- `packettunnelCreate()` **asserts `lstate_size == 0`**. Pure packet tunnels have
-  no per-line state.
+- `packettunnelCreate()` **requires `lstate_size == 0`** and returns `NULL` when
+  that contract, state-size validation, or allocation fails. Pure packet tunnels
+  have no per-line state, and their constructors must check the result before
+  assigning callbacks or accessing tunnel state.
 - They are expected to **override the packet payload callbacks**.
 - The default payload callbacks are intentionally invalid: they call `LOGF(...)`
   and `abortProgramNow(1)`, so they crash loudly if you forget to override them:
@@ -322,17 +345,32 @@ rather than re-entering init paths inline:
 ```c
 static void streamtopacketsQueueWorkerPacketInit(void *worker, void *arg1, void *arg2, void *arg3)
 {
+    discard worker;
+    discard arg2;
+    discard arg3;
+
     tunnel_t *t = arg1;
-    line_t   *l = tunnelchainGetWorkerPacketLine(tunnelGetChain(t), getWID());
-    tunnelNextUpStreamInit(t, l);
-    assert(lineIsAlive(l));
+    line_t   *l = tunnelchainGetWorkerPacketLine(tunnelGetChain(t), getCurrentEventWorkerWID());
+
+    if (UNLIKELY(! withLineLocked(l, tunnelNextUpStreamInit, t)))
+    {
+        LOGF("StreamToPackets: worker packet line died during packet-side init");
+        abortProgramNow(1);
+    }
 }
 
 void streamtopacketsTunnelOnStart(tunnel_t *t)
 {
     for (wid_t wi = 0; wi < getWorkersCount(); wi++)
     {
-        sendWorkerMessageForceQueue(wi, streamtopacketsQueueWorkerPacketInit, t, NULL, NULL);
+        if (UNLIKELY(
+                sendWorkerMessageForceQueueWithCleanup(wi, streamtopacketsQueueWorkerPacketInit, NULL, t, NULL, NULL) !=
+                kWorkerMessageSubmitAccepted))
+        {
+            LOGF("StreamToPackets: failed to admit required packet-side Init on worker %u", (unsigned int) wi);
+            startupFailureRecord(1);
+            return;
+        }
     }
 }
 ```
@@ -343,22 +381,39 @@ head is layer-3) or whether your tunnel must trigger it in `onStart()`.
 
 ## Paired Tunnel Direction (the PingClient / PingServer Rule)
 
-Transform role and callback forwarding direction are separate decisions. The
-direct pair is:
+Transform role and callback forwarding direction are separate decisions. Ping
+wire v2 uses two independent Echo sessions:
 
 ```text
-plain request -> PingClient -> PingServer -> plain request
-plain response <- PingClient <- PingServer <- plain response
+client data: PingClient -- Echo Request --> PingServer
+             PingClient <-- exact Echo Reply -- PingServer
+
+server data: PingClient <-- Echo Request -- PingServer
+             PingClient -- exact Echo Reply --> PingServer
 ```
 
-- On upstream payload, `PingClient` encapsulates and `PingServer` decapsulates.
-  Both forward with `tunnelNextUpStreamPayload()`.
-- On downstream payload, `PingServer` encapsulates and `PingClient` decapsulates.
-  Both forward with `tunnelPrevDownStreamPayload()`.
+- PingClient upstream and PingServer downstream originate type-8 requests with
+  their local data. Their peer decodes the request in its corresponding
+  callback and forwards the inner packet in the same callback direction.
+- A received request's type-0 reply travels back to its sender before the
+  original request is delivered. It is an acknowledgement only; the sender
+  consumes a matching reply instead of delivering its payload.
+- Correlation and replay suppression belong to one bounded synchronized tracker
+  per Ping node. Device flow affinity chooses the packet line that runs a
+  callback; its WID is not request/reply correlation identity.
+- A request receiver publishes two distinct buffers. The generated reply clone
+  travels back toward the request sender, while the decoded original continues
+  in the direction in which the request was received.
+- Consequently, PingServer's upstream request handler sends the reply clone with
+  `tunnelPrevDownStreamPayload()` and the decoded original with
+  `tunnelNextUpStreamPayload()`. PingClient's downstream request handler sends
+  the clone with `tunnelNextUpStreamPayload()` and the decoded original with
+  `tunnelPrevDownStreamPayload()`.
 
-Calling a downstream helper from PingServer's upstream callback would reflect the
-request toward its sender. Likewise, encapsulating in PingServer's upstream
-callback would transform the request twice.
+Sending the **original received request** back toward its sender would be an
+invalid reflection. Sending the separately generated exact Echo Reply in that
+opposite direction is required by the wire protocol. Likewise, encapsulating
+the original in PingServer's upstream callback would transform it twice.
 
 The procedure for any packet tunnel:
 
@@ -383,10 +438,11 @@ TesterClient(packet-mode=true)
     -> TesterServer(packet-mode=true)
 ```
 
-The upstream request must be restored before TesterServer sees it, and the
-downstream response must be restored before TesterClient sees it. Add at least
-one test that would **fail** if PingServer upstream encapsulated instead of
-decapsulating.
+The upstream request must be acknowledged and restored before TesterServer sees
+it; reverse data must become a separate Echo Request and be acknowledged before
+TesterClient sees it. Add coverage that would fail if PingServer upstream
+encapsulated instead of decoding, if a reply were delivered twice, or if server
+data were put into the original request's reply.
 
 The packet-line `Finish` contract has its own coverage, and a new packet-side
 handler belongs in it:
@@ -419,8 +475,8 @@ handler belongs in it:
   lifecycle callbacks stay plain pass-throughs.
 - A `Finish` handler that does nothing must say why: propagate, release, report,
   or document that you own no per-line state and have no onward direction.
-- Do not run normal per-connection `Finish` logic on packet lines unless the
-  source clearly expects it.
+- Do not run normal per-connection `Finish` logic on packet lines unless the exact
+  handler-role contract explicitly requires it.
 - Treat packet-line state as worker-local shared state.
 - Treat routing context and `recalculate_checksum` as mutable per-packet metadata,
   never as durable session identity.

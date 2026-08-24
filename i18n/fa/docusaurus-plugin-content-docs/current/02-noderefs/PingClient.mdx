@@ -1,279 +1,40 @@
 ---
-sidebar_position: 340
+sidebar_position: 349
 title: "PingClient"
 sidebar_label: "PingClient"
-description: "راهنمای نود PingClient در WaterWall."
 ---
 
-<!--
-Documentation version: 152
--->
+<!-- Documentation version: 154 -->
 
 # PingClient
 
-`PingClient` یک packet tunnel خالص در لایه ۳ است که payloadهای packet را به شکل ترافیک شبیه ICMP درمی‌آورد. این نود latency را اندازه نمی‌گیرد و ارتباطی با `KeepAliveClient` ندارد؛ کار آن بازنویسی packetهاست.
-
-`PingClient` با packet-tunnel API واتروال ساخته می‌شود؛ بنابراین per-line state ندارد و روی worker packet lineهایی اجرا می‌شود که chain در اختیارش می‌گذارد.
-
-## مدل Direction
-
-`PingClient` در هر دو جهت payload را تغییر می‌دهد:
-
-| جهت | رفتار |
-| --- | --- |
-| upstream `Payload` | بسته به `strategy`، packet را encapsulate یا بازنویسی می‌کند و سپس با `tunnelNextUpStreamPayload()` می‌فرستد. |
-| downstream `Payload` | تبدیل متناظر را برای ترافیک matching سمت peer برعکس می‌کند و سپس با `tunnelPrevDownStreamPayload()` می‌فرستد. |
-
-جفت استاندارد، اتصال مستقیم `PingClient -> PingServer` است. `PingClient`، ‏request
-جهت upstream را wrap می‌کند و `PingServer` آن را در callback جهت upstream بازیابی
-و به نود بعدی می‌فرستد. در مسیر برگشت، `PingServer`، ‏response جهت downstream را
-wrap می‌کند و `PingClient` آن را در callback جهت downstream بازیابی می‌کند.
-
-```text
-plain request -> PingClient -> PingServer -> plain request
-plain response <- PingClient <- PingServer <- plain response
-```
-
-## جایگاه رایج
-
-با یک packet transport:
-
-```text
-TunDevice -> PingClient -> RawSocket
-RawSocket -> PingServer -> TunDevice
-```
-
-در تست‌های محلی از یک chain مستقیم استفاده کنید:
-
-```text
-TesterClient(packet-mode=true) -> PingClient -> PingServer -> TesterServer(packet-mode=true)
-```
-
-## سازگاری و مهاجرت
-
-این تغییر جهت برای topologyهای قدیمی `PingServer` عمداً breaking است. ترتیب
-client تغییری نمی‌کند، اما chain قدیمی
-`TunDevice -> PingServer -> RawSocket` باید به
-`RawSocket -> PingServer -> TunDevice` تغییر کند. topologyهای Ping مبتنی بر
-Bridge جفت‌شده را با اتصال مستقیم `PingClient -> PingServer` جایگزین کنید.
-پیاده‌سازی `PingClient`، ‏settingها و wire format تغییری نکرده‌اند؛ بنابراین
-`PingClient` قدیمی، در صورت یکسان بودن settingها، همچنان با `PingServer` جدید
-در سطح wire سازگار است. الزام اصلی این است که binary جدید `PingServer` همراه
-با topology جدید سرور deploy شود؛ `PingServer` قدیمی به topology قدیمی سرور
-نیاز دارد. upgrade هم‌زمان هر دو peer می‌تواند عملیات را ساده‌تر کند، اما الزام
-protocol نیست. نیازهای MTU همچنان به strategy بستگی دارند.
-
-## نمونه تنظیم
-
-```json
-{
-  "name": "icmp-client",
-  "type": "PingClient",
-  "settings": {
-    "strategy": "wrap-in-new-ip-and-icmp-header",
-    "identifier": 4660,
-    "check-identifier": true,
-    "source": "198.51.100.10",
-    "dest": "203.0.113.20",
-    "xor-byte": 90,
-    "roundup-size": true,
-    "sequence-start": 0,
-    "ipv4-id-start": 0,
-    "ttl": 64,
-    "tos": 0
-  },
-  "next": "raw-out"
-}
-```
-
-`settings` می‌تواند حذف شود یا خالی باشد. برای فیلدهای تنظیم‌نشده از مقدار پیش‌فرض استفاده می‌شود و اگر `settings` وجود داشته باشد، باید از نوع object باشد.
-
-## Strategyها
-
-### `wrap-in-new-ip-and-icmp-header`
-
-کل packet داخلی IPv4 را درون یک packet بیرونی جدید از نوع IPv4 قرار می‌دهد:
-
-```text
-outer IPv4 header -> ICMP echo header -> original IPv4 packet
-```
-
-جزئیات:
-
-- ورودی باید یک packet کامل و سازگار IPv4 باشد
-- protocol بیرونی ICMP می‌شود
-- ICMP بیرونی echo request (`type 8`) با code `0` است
-- `ttl`، `tos` و IPv4 ID بیرونی از settings/counterها می‌آیند
-- `source` و `dest` اختیاری هستند
-- اگر `source` حذف شده باشد، source address بیرونی از packet داخلی کپی می‌شود
-- اگر `dest` حذف شده باشد، destination address بیرونی از packet داخلی کپی می‌شود
-- downstream decapsulation هم ICMP echo request و هم echo reply را قبول می‌کند
-- downstream decapsulation فقط وقتی `check-identifier` فعال باشد `identifier` را چک می‌کند
-- downstream decapsulation آدرس‌های source/destination تنظیم‌شده را verify نمی‌کند
-- پس از پیدا شدن envelope متناظر، ICMP payload حذف و داده باقی‌مانده فرستاده می‌شود؛ حتی اگر بایت‌های بازیابی‌شده packet معتبر IPv4 نباشند
-
-اگر ورودی به‌عنوان IPv4 قابل parse نباشد، packet بدون تغییر عبور می‌کند. یک IPv4 packet معتبر که برای wrap شدن بیش از حد بزرگ باشد نیز بدون تغییر عبور می‌کند. اگر left padding لازم موجود نباشد، packet کنار گذاشته می‌شود و یک warning ثبت می‌گردد.
-
-### `wrap-in-icmp-header-and-reuse-ipv4-addresses`
-
-به‌جای افزودن یک header بیرونی جدید برای IPv4، از همان header موجود استفاده می‌کند. این strategy پیش‌فرض است.
-
-```text
-existing IPv4 header -> ICMP echo header -> original transport bytes -> metadata trailer
-```
-
-جزئیات:
-
-- input باید یک IPv4 packet کامل و self-consistent باشد
-- source address، destination address، TOS، TTL، IPv4 ID، DF flag و IPv4 options حفظ می‌شوند
-- IPv4 protocol به ICMP تغییر می‌کند
-- original transport payload به ICMP payload منتقل می‌شود
-- یک trailer پنج‌بایتی به ICMP payload اضافه می‌شود
-- trailer شامل magic `0x57 0x50`، original IPv4 protocol و original transport length است
-- packetهای fragment‌شده IPv4 بدون تغییر عبور می‌کنند، چون این strategy نمی‌تواند با اطمینان آن‌ها را بازیابی کند
-- packetهایی که پس از ICMP wrapping در اندازه مجاز جا نمی‌شوند، بدون تغییر عبور می‌کنند
-
-هنگام decapsulation، peer تریلر را می‌خواند، protocol و طول transport اصلی را بازیابی می‌کند، checksum مربوط به IPv4 را دوباره محاسبه می‌کند و packet بازیابی‌شده را می‌فرستد.
-
-### `wrap-in-only-icmp-header`
-
-ورودی را مجموعه‌ای از بایت‌های خام در نظر می‌گیرد و فقط یک ICMP echo header به ابتدای آن اضافه می‌کند:
-
-```text
-ICMP echo header -> raw payload
-```
-
-جزئیات:
-
-- input لازم نیست IPv4 packet باشد
-- این نود IPv4 header تولید نمی‌کند
-- output، ICMP frame data است، نه IP packet کامل
-- `source`، `dest`، `ttl`، `tos` و `ipv4-id-start` استفاده نمی‌شوند
-- decapsulation در جهت downstream، ICMP echo header متناظر را برمی‌دارد و payload خام اصلی را بازیابی می‌کند
-
-این strategy را فقط در chainی به کار ببرید که نودهای اطراف آن ICMP frame data انتظار دارند، نه یک IP packet کامل.
-
-### `change-only-ipv4-protocol-number`
-
-فقط protocol number مربوط به IPv4 را درجا جابه‌جا می‌کند؛ نه ICMP header اضافه می‌کند و نه header تازه‌ای برای IPv4 می‌سازد.
-
-جزئیات:
-
-- به `swap-protocol` نیاز دارد
-- upstream packetهایی را که IPv4 protocol آن‌ها برابر `swap-protocol` است به ICMP تغییر می‌دهد
-- downstream packetهای ICMP را به `swap-protocol` برمی‌گرداند
-- فقط IPv4 header checksum فوراً recalculated می‌شود
-- transport bytes بدون تغییر باقی می‌مانند
-- `identifier`، `check-identifier`، `sequence-start`، `ipv4-id-start`، `xor-byte` و `roundup-size` در این strategy استفاده نمی‌شوند
-
-`swap-protocol` مقدارهای `"TCP"`، `"UDP"`، `"ICMP"` یا integer protocol number از `0` تا `255` را می‌پذیرد.
-
-## تنظیمات
-
-| گزینه | نوع | پیش‌فرض | توضیح |
-| --- | --- | --- | --- |
-| `strategy` | string | `wrap-in-icmp-header-and-reuse-ipv4-addresses` | حالت packet disguise. |
-| `identifier` | integer | `44975` (`0xAFAF`) | ICMP echo identifier برای ICMP envelope modeها. range: `0..65535`. |
-| `check-identifier` | boolean | `true` | در حالت فعال، ICMP envelopeهای downstream باید `identifier` یکسان داشته باشند؛ موارد نامطابق بدون تغییر عبور می‌کنند. |
-| `sequence-start` | integer | `0` | counter اولیه ICMP echo sequence برای ICMP envelope modeها. range: `0..65535`. |
-| `ipv4-id-start` | integer | `0` | counter اولیه outer IPv4 identification برای `wrap-in-new-ip-and-icmp-header`. range: `0..65535`. |
-| `ttl` | integer | `64` | outer IPv4 TTL برای `wrap-in-new-ip-and-icmp-header`. range: `0..255`. |
-| `tos` | integer | `0` | outer IPv4 TOS byte برای `wrap-in-new-ip-and-icmp-header`. range: `0..255`. |
-| `xor-byte` | integer | disabled | XOR byte اختیاری روی ICMP payload در ICMP envelope modeها. range: `0..255`؛ unset/`-1` آن را disable می‌کند. |
-| `roundup-size` | boolean | `false` | ICMP payload را در ICMP envelope modeها pad می‌کند. |
-| `roundup` | boolean | `false` | legacy alias برای `roundup-size`. |
-| `source` | IPv4 string | copied from inner packet | outer source اختیاری برای `wrap-in-new-ip-and-icmp-header`. |
-| `dest` | IPv4 string | copied from inner packet | outer destination اختیاری برای `wrap-in-new-ip-and-icmp-header`. |
-| `swap-protocol` | string یا integer | برای protocol-swap strategy لازم است | Protocolی که در جهت downstream از ICMP بازیابی می‌شود. |
-| `swap-identifier` | string یا integer | unset | legacy alias برای `swap-protocol`. |
-
-## Roundup و XOR
-
-`xor-byte` و `roundup-size` فقط روی ICMP envelope strategyها اعمال می‌شوند.
-
-وقتی `roundup-size` فعال باشد:
-
-- `wrap-in-new-ip-and-icmp-header` و `wrap-in-only-icmp-header` طول payload اصلی را به‌عنوان prefix دوبایتی داخل ICMP payload ذخیره می‌کنند، سپس random padding اضافه می‌کنند
-- `wrap-in-icmp-header-and-reuse-ipv4-addresses` طول original transport را در trailer پنج‌بایتی ذخیره می‌کند و ممکن است قبل از trailer random padding اضافه کند
-- decapsulation با prefix یا trailer، padding را حذف می‌کند
-
-Bucketهای roundup فعلی `PingClient`:
-
-```text
-56, 128, 256, 512, 1024
-```
-
-اگر هیچ‌کدام از این bucketها جا نشود اما maximum ICMP payload جا شود، maximum payload size استفاده می‌شود.
-
-اگر `xor-byte` تنظیم شده باشد، پس از ساخت padding یا trailer روی ICMP payload، XOR اعمال می‌شود و هنگام decapsulation پیش از خواندن metadata دوباره XOR خواهد شد.
-
-## محدودیت‌های MTU و اندازه Packet
-
-**هشدار:** `PingClient` packetها را fragment نمی‌کند، path MTU را تشخیص نمی‌دهد و TCP MSS در upstream را کاهش نمی‌دهد. بررسی اندازه در این نود بر اساس `kMaxAllowedPacketLength` در زمان compile است که در حال حاضر `1500` بایت است؛ این بررسی از `misc.mtu` استفاده نمی‌کند. `misc.mtu` در اینجا فقط زمانی اثرگذار می‌شود که نود دیگری مانند `TunDevice` آن را به‌عنوان MTU پیش‌فرض ورودی به کار ببرد.
-
-با محدودیت فعلی 1500 بایتی Ping، بیشترین اندازه ورودی که هر strategy می‌تواند تبدیل کند به این صورت است:
-
-| Strategy | حداقل بایت افزوده‌شده | بیشترین ورودی با `roundup-size=false` | بیشترین ورودی با `roundup-size=true` |
-| --- | ---: | ---: | ---: |
-| `wrap-in-new-ip-and-icmp-header` | outer IPv4 و ICMP header به اندازه 28 بایت | 1472 | 1470 |
-| `wrap-in-icmp-header-and-reuse-ipv4-addresses` | ICMP header هشت‌بایتی و trailer پنج‌بایتی | 1487 | 1487 |
-| `wrap-in-only-icmp-header` | ICMP header هشت‌بایتی | 1492 | 1490 |
-| `change-only-ipv4-protocol-number` | 0 | 1500 | اعمال نمی‌شود |
-
-ردیف ICMP-only اندازه ورودی خام و frame خروجی آن را نشان می‌دهد؛ این strategy هیچ IP headerی تولید نمی‌کند.
-
-اگر ورودی معتبر از محدودیت مربوط به strategy بزرگ‌تر باشد، ICMP envelope strategyهای فعلی معمولاً به‌جای fragment یا wrap کردن، packet اصلی را بدون تغییر عبور می‌دهند. این رفتار جایگزین امنی برای برنامه‌ریزی MTU نیست: packet دیگر به شکل ICMP envelope تنظیم‌شده پنهان نشده است و ممکن است به‌شکل متفاوتی filter یا route شود.
-
-در مسیر رایج `TunDevice -> PingClient -> RawSocket` که MTU واقعی packet در آن 1500 است، مقدار `TunDevice.settings.device-mtu` را بیشتر از مقدار متناظر در جدول تنظیم نکنید. تنظیم هر دو مقدار `misc.mtu` و `device-mtu` روی `1400` یک انتخاب محافظه‌کارانه و ساده برای زمانی است که ممکن است strategy مربوط به Ping تغییر کند؛ اما اگر overhead دقیق مشخص باشد، استفاده از 1400 الزامی نیست.
-
-`roundup-size` می‌تواند یک packet پذیرفته‌شده را تا محدودیت کامل 1500 بایتی Ping بزرگ کند. در نتیجه، ورودی 1400 بایتی برای مسیر خروجی مستقیم با MTU برابر 1500 امن است؛ اما roundup ممکن است تمام فضای باقی‌مانده را مصرف کند و لزوماً 100 بایت برای یک لایه encapsulation دیگر بعد از `PingClient` باقی نمی‌گذارد. header تمام لایه‌های بعدی را نیز محاسبه کنید و مقدار کوچک‌تر میان MTU واقعی مسیر و محدودیت packet تمام نودهای downstream را در نظر بگیرید.
-
-## نکته‌های Packet Handling
-
-- strategyهای IPv4 packet به IPv4 packet کامل نیاز دارند که buffer length آن دقیقاً با IPv4 total length برابر باشد.
-- packetهای IPv6 یا غیر IPv4 که قابل بازنویسی نیستند معمولاً بدون تغییر عبور می‌کنند.
-- packetهای fragment‌شده IPv4 در reuse-header mode بدون تغییر عبور می‌کنند.
-- downstream ICMP envelopeهای matching با metadata roundup خراب یا reuse trailer خراب drop و log می‌شوند.
-- downstream ICMP matching می‌تواند echo request یا echo reply باشد.
-- اگر `check-identifier` فعال باشد و ICMP identifier مطابقت نداشته باشد، packet بدون decapsulation و بدون تغییر عبور می‌کند.
-- `source`/`dest` هنگام decapsulation چک نمی‌شوند.
-
-`required_padding_left = 28` بدترین مسیر prepend را پوشش می‌دهد:
-
-```text
-20-byte IPv4 header + 8-byte ICMP echo header
-```
-
-## Aliasهای سازگاری
-
-Parser هنوز چند misspelling و alias تاریخی را می‌پذیرد:
-
-- `warp-in-new-ip-and-icmp-header`
-- `wrap-in-new-ipv4-and-icmp-header`
-- `warp-in-new-ipv4-and-icmp-header`
-- `warp-in-icmp-header-and-reuse-ipv4-addresses`
-- `wrap-in-icmp-header-and-reuse-ip-addresses`
-- `warp-in-icmp-header-and-reuse-ip-addresses`
-- `wrap-in-icmp-header-and-update-ipv4-header`
-- `warp-in-icmp-header-and-update-ipv4-header`
-- `warp-in-only-icmp-header`
-- `wrap-payload-in-only-icmp-header`
-- `warp-payload-in-only-icmp-header`
-- `change-only-ip4-protocol-number`
-- `change-only-ip4-packet-identifier-number`
-
-در configهای جدید از نام canonical هر strategy استفاده کنید.
-
-## متادیتای نود
-
-متادیتای برگرفته از کد منبع:
-
-| ویژگی | مقدار |
-| --- | --- |
-| node flags | `kNodeFlagNone` |
-| `can_have_prev` | `true` |
-| `can_have_next` | `true` |
-| `layer_group` | `kNodeLayer3` |
-| `layer_group_prev_node` | `kNodeLayer3` |
-| `layer_group_next_node` | `kNodeLayer3` |
-| `required_padding_left` | `28` bytes |
+> اطلاعیهٔ نسخهٔ ۲: این صفحه جایگزین مستندات قدیمی Ping wire v1 است. گزینه‌ها و
+> راهبردهای قدیمی مانند `strategy`، `wrap-*`/`warp-*`، `source`، `dest`،
+> `check-identifier`، `xor-byte` و `roundup-size` دیگر معتبر نیستند و برنامه آن‌ها
+> را با خطای مهاجرت رد می‌کند.
+
+`PingClient` در نسخهٔ ۲ یک بستهٔ کامل IPv4 را در یک ICMP Echo Request واقعی
+حمل می‌کند. همتای آن، `PingServer`، Echo Reply با نوع `0` و با شناسه، شمارهٔ
+ترتیب و دادهٔ دقیق همان درخواست می‌فرستد. Reply فقط تأیید دریافت است و دادهٔ
+جدید جهت مخالف همیشه در یک Echo Request جدید حمل می‌شود.
+
+رهگیری درخواست‌های در انتظار و جلوگیری از replay در یک رهگیر همگام‌شده برای
+کل node انجام می‌شود و به WID خط بسته وابسته نیست؛ هر حلقه حداکثر ۱۰۲۴ ورودی
+دارد.
+
+تنظیمات معتبر فقط این‌ها هستند:
+
+| گزینه | الزامی | پیش‌فرض |
+| --- | --- | --- |
+| `local-ipv4` | بله | — |
+| `peer-ipv4` | بله | — |
+| `identifier` | خیر | `"random"` |
+| `sequence-start` | خیر | `1` |
+| `ttl` | خیر | `64` |
+| `tos` | خیر | `0` |
+
+حداکثر بستهٔ داخلی ۱۴۷۲ بایت است و سربار حامل ۲۸ بایت است. IPv4 داخلیِ
+fragmented معتبر است، ولی حامل خارجی fragmented، IPv6، بستهٔ malformed یا
+checksum نامعتبر رد می‌شود. برای توضیح کامل و مثال پیکربندی فعلی، به
+[مرجع انگلیسی PingClient](https://github.com/radkesvat/WaterWall-Docs/blob/main/docs/02-noderefs/PingClient.mdx)
+مراجعه کنید.
