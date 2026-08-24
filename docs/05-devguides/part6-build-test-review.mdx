@@ -5,7 +5,7 @@ sidebar_label: "Part 6: Build, Test & Review"
 description: "CMake presets, focused builds, the integration test harness, build-environment gotchas, the full review checklist, and the report format expected from coding agents."
 ---
 <!--
-Documentation version: 153
+Documentation version: 154
 -->
 
 # Part 6: Building, Testing & Reviewing
@@ -118,17 +118,20 @@ production sequence (`all` lane: support + functional + external + speed) takes
 about 2 minutes (~127s). A one-CPU constrained functional run uses four jobs and
 takes about 71 seconds. These are planning values, not portable performance
 guarantees. The `all` total includes the production policy/harness checks; the
-native-unit tree remains separate. Complete production plus native-unit validation
-takes about 3.5 minutes including the privileged lane. The native-unit portion
-measured a median ~74 seconds across three warm `linux-unit-release` runs. These
-values vary with hardware and build warmth.
+native-unit tree remains separate. Complete production plus the Release native-unit
+lane takes about 3.5 minutes including the privileged lane. The Release native-unit
+portion measured a median ~74 seconds across three warm `linux-unit-release` runs.
+This measurement does not include the additional Debug unit lane; cloud CI runs
+Release and Debug in parallel so Debug adds runner work without normally adding its
+full duration to the critical path. These values vary with hardware and build
+warmth.
 
 The shorter runtime makes broad validation practical. Use the full functional
 lane readily for shared networking or tunnel behavior and the ordinary integration
-sequence for broad tunnel or harness work. Run complete production plus native
-units for shared-core contracts, lifecycle/concurrency work, multi-subsystem
-changes, or any change whose impact is difficult to bound. Focused checks remain
-the right choice for narrow or non-behavioral edits.
+sequence for broad tunnel or harness work. Run complete production plus both
+native-unit configurations for shared-core contracts, lifecycle/concurrency work,
+multi-subsystem changes, or any change whose impact is difficult to bound. Focused
+checks remain the right choice for narrow or non-behavioral edits.
 
 ```bash
 # Ordinary non-privileged production Release sequence across test lanes.
@@ -144,33 +147,45 @@ bash tests/run_test_lane.sh functional build/linux Release
 # Run all ordinary non-privileged production lanes in sequence.
 bash tests/run_test_lane.sh all build/linux Release
 
-# Complete native-unit Release/no-LTO tree.
+# Complete native-unit suite: optimized Release plus asserted Debug behavior.
 cmake --preset linux-unit-tests
 cmake --build --preset linux-unit-release -j8
 ctest --preset linux-unit-release --output-on-failure
+cmake --build --preset linux-unit-debug -j8
+ctest --preset linux-unit-debug --output-on-failure
 ```
 
 ### Native Unit Tests
 
-Native unit tests have a dedicated `Release` tree with IPO/LTO disabled before
-any project target is created. This preserves Release optimization and `NDEBUG`
-while avoiding mixed-LTO links. Production Release remains IPO/LTO-enabled, so
-complete validation uses both lanes:
+Native unit tests have a dedicated multi-configuration tree with IPO/LTO disabled
+before any project target is created. Release preserves optimization and `NDEBUG`
+while avoiding mixed-LTO links; Debug activates assertions and other contract
+guardrails. Production Release remains IPO/LTO-enabled, so complete behavioral
+validation uses the production lane and both native-unit configurations:
 
 ```bash
 # Production Release: build the shipped binary plus the production-full suite.
 cmake --preset linux
 cmake --build --preset linux --config Release --target check_waterwall_tests -j8
 
-# Native units: canonical Release/no-LTO lane.
+# Native units: optimized Release/no-LTO behavior.
 cmake --preset linux-unit-tests
 cmake --build --preset linux-unit-release -j8
 ctest --preset linux-unit-release --output-on-failure
+
+# Native units: assertions and Debug guardrails in the same no-LTO tree.
+cmake --build --preset linux-unit-debug -j8
+ctest --preset linux-unit-debug --output-on-failure
 ```
 
-`linux-unit-debug` is available for diagnosis but is not a substitute for the
-canonical Release/no-LTO run. Never build native unit tests in the production
-tree: it contains the LTO-enabled libraries used by `Waterwall`.
+For focused behavioral work, prefer the relevant `linux-unit-debug` selection
+first: assertions usually identify a violated ownership, lifecycle, or state
+contract closer to its cause. Repeat that coverage with `linux-unit-release`
+before completion because optimization and `NDEBUG` can expose different behavior.
+Broad/shared changes run both complete presets. Debug is not a substitute for
+Release, AddressSanitizer, UndefinedBehaviorSanitizer, or ThreadSanitizer. Never
+build native unit tests in the production tree: it contains the LTO-enabled
+libraries used by `Waterwall`.
 
 Crypto backend validation follows the same two-tree rule. Each production preset
 such as `linux-sodium-crypto` has a matching native-unit preset such as
@@ -196,9 +211,10 @@ compile/link commands, and representative WaterWall, lwIP, and TlsClient
 artifacts. That is enough to catch the mixed-LTO regression without building a
 second attestation system around the compiler, build tool, or verifier.
 
-On macOS and Windows, CI builds `waterwall_platform_unit_tests`, runs the same
-direct no-LTO policy, and executes the registered unit tests. The Debug preset
-remains diagnostic and is not a substitute for the Release/no-LTO lane.
+Linux cloud CI runs the complete `linux-unit-release` and `linux-unit-debug`
+presets as independent parallel jobs. On macOS and Windows, CI builds
+`waterwall_platform_unit_tests`, runs the same direct no-LTO policy, and executes
+the registered platform unit tests in Release.
 
 Run one case by its registered name (use an anchored regex):
 
