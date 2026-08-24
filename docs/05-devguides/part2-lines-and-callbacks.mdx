@@ -5,7 +5,7 @@ sidebar_label: "Part 2: Lines & Lifetime"
 description: "The connection lifecycle, re-entrancy hazards, line locking, and the clean-finish patterns that keep WaterWall tunnels free of use-after-free bugs."
 ---
 <!--
-Documentation version: 155
+Documentation version: 157
 -->
 
 # Part 2: Lines, Callbacks & Lifetime Safety
@@ -183,12 +183,15 @@ responsibility before its `Init`; the autonomous or internal creator must cover
 that interval itself.
 
 Source-owner draining runs on the owning event worker while the event loop,
-chain, tunnel states, tail adapters, and line pools are still alive, and before
-middle/end worker hooks require their borrowed child sets to be empty. Middle
-tunnels must not build duplicate inventories for borrowed lines to compensate
-for shutdown order. They do inventory and drain normal lines they create
-internally. Persistent packet lines and documented terminal absorbers with no
-per-line resource are explicit exceptions rather than missing inventories.
+chain, tunnel states, tail adapters, and line pools are still alive. NodeManager
+visits tunnels in chain storage order, which is not guaranteed to be
+source-to-tail. A middle or tail worker hook therefore cannot require borrowed
+line sets to be empty based on neighbour ordering, and it must not build a
+duplicate inventory merely to compensate. Middle tunnels do inventory and drain
+normal lines they create internally. Final `onDestroy`, after all worker drains,
+may diagnose a residual borrowed registry. Persistent packet lines and
+documented terminal absorbers with no per-line resource are explicit exceptions
+rather than missing inventories.
 
 Every other tunnel must **propagate `Finish`** and let the owner destroy the
 line. Calling `lineDestroy()` on a line you did not create is a serious bug.
@@ -269,6 +272,13 @@ When a helper returns `false`:
   that killed the line already did that,
 - if you still own a buffer you did not hand off, recycle it without touching the
   dead line state.
+
+Re-entrancy can also cross exact-line boundaries. A callback on line A may enter
+a shared neighbouring tunnel that closes a different tracked line B. If a caller
+keeps B in a pointer array or registry snapshot and will examine it after the
+callback on A, it must retain B with `lineLock()` before the first callback and
+release that reference on every path. Locking only A, or holding a registry mutex
+while copying raw pointers and then releasing it, does not preserve B's storage.
 
 :::tip When you do *not* need the wrapper
 If you call a forwarding helper and then immediately `return` with no further work
