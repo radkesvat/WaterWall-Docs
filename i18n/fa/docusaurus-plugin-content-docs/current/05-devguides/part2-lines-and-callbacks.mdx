@@ -6,7 +6,7 @@ description: "چرخه‌ی عمر اتصال، خطرهای Re-entrancy، قف�
 ---
 
 <!--
-Documentation version: 152
+Documentation version: 157
 -->
 
 # بخش ۲: Lineها، Callbackها و ایمنی طول عمر
@@ -190,12 +190,14 @@ Lineهایی را که `Init` آن‌ها به او رسیده فهرست کند
 مسئولیتی ندارد؛ سازنده‌ی خودگردان یا داخلی باید آن فاصله‌ی زمانی را پوشش دهد.
 
 Drainکردن مالک Source روی Event Worker مالک انجام می‌شود؛ زمانی که Event Loop،
-Chain، ‏Tunnel Stateها، ‏Adapterهای انتهایی و Line Poolها هنوز زنده‌اند و پیش از
-اجرای Hookهای Worker در تونل‌های میانی و انتهایی که خالی‌بودن مجموعه‌ی Lineهای
-فرزند قرضی را الزام می‌کنند. تونل‌های میانی نباید برای جبران ترتیب Shutdown،
-‏Inventory دیگری
-از Lineهای قرضی بسازند. آن‌ها فقط Lineهای عادی‌ای را که خودشان در داخل می‌سازند
-ثبت و Drain می‌کنند. Packet Lineهای پایدار و Terminal Absorberهای مستندی که منبع
+Chain، ‏Tunnel Stateها، ‏Adapterهای انتهایی و Line Poolها هنوز زنده‌اند.
+NodeManager تونل‌ها را به ترتیب ذخیره‌سازی در زنجیره می‌بیند و این ترتیب تضمین
+نمی‌شود Source-to-tail باشد. بنابراین Hook مربوط به Worker در یک تونل میانی یا
+انتهایی نمی‌تواند با تکیه بر ترتیب همسایه‌ها خالی‌بودن مجموعه‌ی Lineهای قرضی را
+الزام کند و نباید صرفاً برای جبران این موضوع Inventory تکراری بسازد. تونل‌های
+میانی فقط Lineهای عادی‌ای را که خودشان در داخل می‌سازند ثبت و Drain می‌کنند.
+`onDestroy` نهایی، پس از Drain همه‌ی Workerها، می‌تواند باقی‌ماندن یک Registry
+قرضی را تشخیص دهد. Packet Lineهای پایدار و Terminal Absorberهای مستندی که منبع
 مختص Line ندارند، استثناهای صریح‌اند؛ نه Inventoryهای فراموش‌شده.
 
 هر تونل دیگری باید `Finish` را **منتقل کند** و نابودی Line را به مالک بسپارد.
@@ -279,6 +281,14 @@ if (! withLineLockedWithBuf(line, tunnelNextUpStreamPayload, t, buf))
   را کشته، این کار را قبلاً انجام داده است؛
 - اگر هنوز مالک Bufferای هستید که تحویل نداده‌اید، بدون دسترسی به State مرده‌ی
   Line آن را Recycle کنید.
+
+Re-entrancy می‌تواند از مرز یک Line دقیق نیز عبور کند. Callback روی Line ‏A ممکن
+است وارد یک تونل همسایه‌ی مشترک شود و Line ‏B دیگری را که ثبت شده ببندد. اگر
+فراخواننده B را در Arrayای از Pointerها یا Snapshot یک Registry نگه می‌دارد و پس
+از Callback روی A آن را بررسی خواهد کرد، باید پیش از نخستین Callback با
+`lineLock()` یک Reference از B نگه دارد و آن Reference را در همه‌ی مسیرها آزاد
+کند. Lockکردن فقط A، یا نگه‌داشتن Mutex مربوط به Registry هنگام کپی Pointerهای خام
+و سپس آزادکردن آن، حافظه‌ی B را زنده نگه نمی‌دارد.
 
 :::tip چه زمانی به Wrapper نیازی نیست؟
 اگر Helper مربوط به Forwarding را فراخوانی و بلافاصله `return` می‌کنید، بدون آنکه
@@ -417,6 +427,11 @@ Lineهایی که **مالکشان هستید** باز هم متفاوت‌ان�
    فراخوانی کند.
 6. بلافاصله برگردد و به هیچ State نابودشده‌ای دست نزند.
 
+در مالکیت مبتنی بر Key یا زمان، ورودی Map/Timer را جدا و Handle مصرف‌کننده را پیش
+از فراخوانی Re-entrant مربوط به `Finish` یا نابودکردن Line پاک کنید. یک ورودی
+Index‌شده‌ی Idle باید هنگام Close صریح فوراً حذف شود؛ نگه‌داشتن Tombstone با
+Deadline دور باعث می‌شود حافظه با Churn تاریخی رشد کند، نه با مالکیت زنده.
+
 سازنده‌ای مانند `MuxClient` دقیقاً همین کار را می‌کند. قطعه‌کد زیر از
 `muxclientTunnelDownStreamFinish()` است؛ یعنی Slot مربوط به `fnFinD`، پس **next**
 فرستنده است. فرزندهای Parent در سمت `prev` آویزان‌اند و فقط در همین جهت می‌توان
@@ -515,9 +530,10 @@ Finish‌شده دوباره فراخوانی نشود؛ پس چیزی برای 
 است، نه راه‌حل آن؛ درست مانند Anti-pattern مربوط به `initialized`.
 
 دقیقاً **یک** موقعیت وجود دارد که State مربوط به Close جهت‌دار را توجیه می‌کند:
-تونل باید **پیش از بسته‌شدن Byteهای پایانی بفرستد**؛ موضوع بخش بعد. این ارسال دوباره
-وارد Adapter می‌شود و Adapter می‌تواند `Pause`/`Resume` تولید کند. Flag به Handlerهای
-Pause/Resume اجازه می‌دهد هر رویدادی را که به‌سمت Finish‌شده Reflection می‌کند کنار
+تونل باید **پیش از بسته‌شدن Byteهای پایانی بفرستد**؛ از جمله یک Batch محدود و
+با‌تأخیر مربوط به Fallback که در بخش‌های بعد توضیح داده می‌شود. این ارسال دوباره
+وارد Adapter یا Branch می‌شود و می‌تواند `Pause`/`Resume` تولید کند. Flag به
+Handlerها اجازه می‌دهد هر رویدادی را که به‌سمت Finish‌شده Reflection می‌کند کنار
 بگذارند. وظیفه‌ی این Flag فقط ثبت همین خطر است، نه چیز دیگر.
 
 تونل‌های واقعی دقیقاً همین مقدار State و نه بیشتر را نگه می‌دارند. نام‌ها متفاوت،
@@ -525,7 +541,8 @@ Pause/Resume اجازه می‌دهد هر رویدادی را که به‌سم�
 
 | تونل | State مربوط به Close جهت‌دار | دلیل نیاز |
 | --- | --- | --- |
-| `TlsServer` | `upstream_finished`، `downstream_finishing` | پیش از Close، ‏TLS Alert/Close را می‌فرستد و Fallback را Resolve می‌کند. |
+| `TlsServer` | `upstream_finished`، `downstream_finishing`، `fallback_close_draining` | پیش از Close، ‏TLS Alert/Close را می‌فرستد و Fallback با‌تأخیر را تسویه می‌کند. |
+| `TrojanServer`، `VlessServer` | `fallback_close_draining` | یک Batch با‌تأخیر مربوط به Fallback را بدون Reflection به‌سمت قبلیِ Finish‌شده تسویه می‌کنند. |
 | `TcpOverUdpClient` | `can_downstream` | باید پیش از Close، ‏Teardown مربوط به Reliable Stream را به پایان برساند. |
 | `TcpOverUdpServer` | `can_upstream` | همان رفتار در جهت مخالف. |
 | `HttpClient`، `HttpServer`، `Socks5Server` | `prev_finished`، `next_finished` | پیش از بسته‌شدن Transport، ‏Byteهای پایانی پروتکل را می‌فرستند. |
@@ -578,6 +595,49 @@ Re-entrant ایجاد می‌کند.
 Finish/Close جهت‌دار استفاده کنید؛ یا اگر واقعاً چنین Stateای ندارد و این مورد
 همان سناریوی Byteهای پایانی است، Flag صریحی برای Close جهت‌دار بیفزایید. همان‌طور
 که تأکید شد، این **تنها** جای درست چنین Flagی است.
+
+### Batchهای با‌تأخیر Fallback پیش از Close
+
+یک Task زمان‌بندی‌شده برای Line فقط یک Reference فیزیکی نگه می‌دارد؛ Line را از
+نظر منطقی زنده نگه نمی‌دارد و Runner آن پس از نابودکردن Line به‌دست مالک، عمداً
+Callback را اجرا نمی‌کند. بنابراین یک تونل میانیِ قرض‌گیرنده هرگز نباید فقط
+به‌دلیل Delayداشتن Queue مربوط به Payloadهای Fallback، ‏`Finish` در upstream را
+پشت Timer همان Line متوقف کند.
+
+برای یک Branch مقداردهی‌شده‌ی Fallback، ترتیب Close زیر را به کار ببرید:
+
+1. پیش از هر Callback نهایی `Payload` روی Branch، سمت قبلی را Finish‌شده علامت
+   بزنید و Gate مربوط به Drainکردن Fallback را منتشر کنید. اگر Queue خالی است،
+   می‌توان State محلی را نابود و Branch مقداردهی‌شده را بلافاصله و همگام Finish
+   کرد.
+2. برای FIFO محدود و غیرخالی، ‏Branch و Line Pool را ثبت کنید، Queue را از Line
+   State جدا کنید، مجموع اندازه را Range-check کنید و آن را با حفظ ترتیب FIFO در
+   یک Buffer ادغام کنید. یک Callback واحد مانع می‌شود پس از `Pause` همگام، همان
+   Batch یک Payload تازه‌ی دیگر آغاز کند.
+3. اگر Branch از قبل Pause شده است، حتی همان یک Payload را هم نمی‌تواند دریافت
+   کند. Batchی را که هنوز محلی است Recycle و Branch را Finish کنید، یا آن را به
+   مالکی واقعاً جدا منتقل کنید؛ برای حفظ Byteهای هنگام Close، ‏Backpressure را دور
+   نزنید.
+4. هنگام اجرای Callback نهایی، ‏`Init`، ‏`Est`، ‏`Pause` و `Resume` را جذب و هر
+   `Payload` بازگشتی را Recycle کنید. یک `Finish` در downstream که به‌شکل
+   Re-entrant می‌رسد ثبت می‌کند که Branch از قبل بسته شده و جذب می‌شود تا
+   `Finish` بازتابی یا تکراری برای Branch فرستاده نشود.
+5. پس از Payload نهایی و در حالی که Lock موقت را نگه داشته‌اید، دوباره
+   `lineIsAlive()` را بررسی کنید. اگر Line مرده است، Unlock کنید و بدون دست‌زدن به
+   Line State برگردید. در غیر این صورت، Line State محلی را پیش از `Finish` نهایی
+   Branch نابود کنید؛ پس از آن Finish فقط Unlock کنید و برگردید.
+
+Timer قدیمی Handle لغو ندارد. خالی یا جداکردن Queue کار را از نظر منطقی لغو
+می‌کند؛ پس از آنکه مالک واقعی Line را نابود کرد، Runner زمان‌بندی‌شده به آزادسازی
+بی‌خطر یک Reference تبدیل می‌شود. حفظ دقیق Delay باقی‌مانده پس از `Finish` نیازمند
+Session Object جداگانه‌ای است که مالک Bufferهای کپی‌شده، State مربوط به Timer و
+منابع Branch باشد و هیچ Referenceای به `line_t` یا Line State نداشته باشد. این یک
+طراحی متفاوت است، نه دلیلی برای زنده نگه‌داشتن Line قرضی.
+
+وقتی Delay صفر است، مسیر Inline ایمن و Lock‌شده فقط زمانی در دسترس است که Fallback
+Pause نباشد و هیچ Batch قدیمی‌تر FIFO یا Drain زمان‌بندی‌شده‌ای وجود نداشته باشد.
+Byteهای نگه‌داشته‌شده از مسیر Drain زمان‌بندی‌شده Resume می‌شوند تا Payload بعدی
+از آن‌ها سبقت نگیرد.
 
 ### Adapterها خودشان Flush می‌کنند
 

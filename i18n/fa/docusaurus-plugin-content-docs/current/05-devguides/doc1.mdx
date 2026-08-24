@@ -6,7 +6,7 @@ description: "مدل زمان اجرا، اشیای اصلی، جهت Callbackه
 ---
 
 <!--
-Documentation version: 152
+Documentation version: 155
 -->
 
 # راهنمای توسعه‌ی WaterWall
@@ -281,7 +281,7 @@ createHandle(node)         // node.c -> create.c: تخصیص، تعیین Callba
 | `onQuiesceRequest` | بدون عملیات | روی Thread اصلی، در زمانی محدود و بدون مسدودکردن، پذیرش را می‌بندد و توقف Producer را درخواست می‌کند. اینجا Join نکنید و منابع لازم برای Drainکردن Lineها را آزاد نکنید. |
 | `onWorkerQuiesce` | بدون عملیات | روی هر Worker مالک، پیش از تأیید Quiescence، ‏Timerها، ‏Watcherها و Handleهای وابسته به همان WID را جدا می‌کند. |
 | `onQuiesceWait` | بدون عملیات | پس از Quiesceشدن Workerها، روی Thread اصلی ریشه‌های Callback خارجیِ از قبل پذیرفته‌شده را Join یا Detach می‌کند؛ منابع لازم برای Drain Lineها باید همچنان زنده بمانند. |
-| `onWorkerStop` | بدون عملیات | هنگام Drain روی هر Worker مالک، فهرست‌های مرجعِ Lineهای Source و Lineهای عادیِ تحت مالکیت داخلی را پیش از اعتبارسنجی تونل‌های میانی و انتهایی می‌بندد. |
+| `onWorkerStop` | بدون عملیات | هنگام Drain روی هر Worker مالک، فقط Inventoryهای مرجع Source و Lineهای عادیِ تحت مالکیت داخلی را می‌بندد. ترتیب ذخیره‌سازی زنجیره تضمینی برای ترتیب همسایه‌ها نیست؛ Registryهای Line قرضی را فقط در `onDestroy` نهایی و پس از Drain همه‌ی مالکان اعتبارسنجی کنید. |
 | `onStop` | بدون عملیات | پس از Drainشدن همه‌ی Workerها، منابع مشترک باقی‌مانده را روی Thread اصلی آزاد می‌کند؛ نباید به Timer یا Watcher وابسته به Worker دست بزند. |
 | `onDestroy` | `tunnelDestroy`، ‏Instance را آزاد می‌کند | آزادکردن تنظیمات، SSL Contextها و Poolها و سپس فراخوانی `tunnelDestroy`. |
 
@@ -378,6 +378,15 @@ tunnel_t *templateTunnelCreate(node_t *node)
 - Threadهای native/library برای Log و تشخیص خطا از `getTID()` استفاده می‌کنند و تا
   زمانی که صریحاً با `workerBindCurrentThread()` متصل نشوند WID نامعتبر دارند.
 
+Snapshotهای منابع پردازه نیز از همین قاعده‌ی مالکیت پیروی می‌کنند. Providerهای
+Host و cgroup فقط هنگام مقداردهی همگام Global State و در Sampler پس‌زمینه‌ی Worker
+0 اجرا می‌شوند. در Linux، ‏Sampler بیشترین درصد مصرف و کمترین ظرفیت باقی‌مانده را
+در سلسله‌مراتب محدود و قابل‌مشاهده‌ی cgroup منتشر می‌کند؛ محدودیت‌های مبهم یا
+پنهان برای Fallback محافظه‌کارانه‌ی مصرف‌کننده همچنان ناموجود محسوب می‌شوند.
+مسیرهای داغ Worker، ‏Tuple اتمیک محدود و یکپارچه‌ی منتشرشده را مصرف می‌کنند و
+هرگز فایل سیستمی باز نمی‌کنند، State قدیمی Host را تازه نمی‌کنند، تخصیص یا انتظار
+ندارند و Mutex مربوط به Sampler را نمی‌گیرند.
+
 ### انتخاب Helper مناسب برای Context مربوط به Worker
 
 هرگز `getWID()` را مستقیماً در بررسی Affinity، ‏index یک Array یا lookup منبع
@@ -448,6 +457,26 @@ Caller روی Event Worker نیست Buffer را نابود می‌کنند و `k
 تو‌در‌توکردن تازه‌ی `getWorkerXxx(getWID())`، تصمیم مالکیت با `getWID() == 0` خام،
 مقایسه‌ی خام Affinity با WID فعلی و کد تکراری مربوط به Recycle پیام Tunnel API رد
 می‌شوند.
+
+### انتخاب Idle Table مناسب
+
+وقتی ساخت، جست‌وجو، Refresh، حذف، Callback انقضا، Drain و نابودی Item همگی متعلق
+به یک Event Worker هستند، `local_idle_table_t` را انتخاب کنید. این Table هیچ
+همگام‌سازی یا تحویل میان Workerها ندارد؛ هرگز خود Table یا یکی از Handleهای قرضی
+Itemهای آن را به Worker دیگری ندهید.
+
+فقط وقتی `idle_table_t` را انتخاب کنید که یک Table باید Itemهای متعلق به چند
+Event Worker را Index کند و انقضا باید به مالک ثبت‌شده‌ی هر Item ارسال شود.
+Indexهای آن همگام‌سازی شده‌اند، اما Handle بازگشتی همچنان Referenceای قرضی و
+متعلق به Worker است؛ Table مشترک یک Container عمومی و Thread-safe برای Handleها
+نیست. صرفاً به‌دلیل نام یا Mutex آن تصور نکنید امن‌تر است. Refresh مشترک عمداً
+بدون Lock انجام می‌شود و مرتب‌سازی دوباره‌ی Heap را به پیمایش Timer می‌سپارد.
+
+هر دو Table یک قاعده‌ی طول عمر منطقی دارند: حذف موفق، قابلیت Lookup را پاک و همه‌ی
+Handleهای خام را پیش از بازگشت نامعتبر می‌کند. مصرف‌کننده‌ای که Handle را ذخیره
+می‌کند باید آن Slot مرجع را پیش از حذف پاک کند و پس از آن هرگز Item را نخواند.
+بازپس‌گیری فیزیکی متفاوت است: حذف محلی معمولاً فوراً حافظه را آزاد می‌کند، اما یک
+Item مشترک ممکن است تا تسویه‌ی ایمن در مالکیت Heap یا Message باقی بماند.
 
 ## واژه‌نامه
 
