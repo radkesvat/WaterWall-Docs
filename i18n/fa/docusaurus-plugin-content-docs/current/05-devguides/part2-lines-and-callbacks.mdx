@@ -2,11 +2,11 @@
 sidebar_position: 2
 title: "راهنمای توسعه، بخش ۲: Lineها، Callbackها و ایمنی طول عمر"
 sidebar_label: "بخش ۲: Line و طول عمر"
-description: "چرخه‌ی عمر اتصال، خطرهای Re-entrancy، قفل‌کردن Line و الگوهای Finish صحیح که جلوی خطاهای Use-after-free را در تونل‌های WaterWall می‌گیرند."
+description: "چرخه‌ی عمر اتصال، خطرهای Re-entrancy، نگه‌داشتن Reference برای Line و الگوهای Finish صحیح که جلوی خطاهای Use-after-free را در تونل‌های WaterWall می‌گیرند."
 ---
 
 <!--
-Documentation version: 158
+Documentation version: 160
 -->
 
 # بخش ۲: Lineها، Callbackها و ایمنی طول عمر
@@ -67,39 +67,42 @@ Line آغاز می‌شود.
   از `Init` معمول نیاز داشته باشد؛ خود آن استثنا را نیز مستقیماً آزمایش کنید.
 - اگر `Init` یک Helper مربوط به Forwarding و Re-entrant را صدا می‌زند و پس از آن
   هنوز باید به Line دسترسی داشته باشد، از آن محافظت کنید؛ بخش
-  [قفل‌کردن Line](#protecting-a-line-across-re-entrant-callbacks) را ببینید. اگر
-  `Init` فقط Forward می‌کند و برمی‌گردد، نیازی به Lock نیست.
+  [نگه‌داشتن Reference برای Line](#protecting-a-line-across-re-entrant-callbacks) را ببینید. اگر
+  `Init` فقط Forward می‌کند و برمی‌گردد، نیازی به نگه‌داشتن Reference نیست.
 
 ## طول عمر Line: ‏`refcount` و `alive`
 
 هر `line_t` یک `refc` اتمیک و یک Boolean به نام `alive` دارد؛ به `ww/net/line.h`
 نگاه کنید. این دو مفهوم جدا هستند و یکی‌گرفتن آن‌ها باعث Bug می‌شود:
 
-- `lineLock(line)` مقدار `refc` را افزایش می‌دهد و تضمین می‌کند تا زمانی که این
-  Reference را دارید، حافظه آزاد نشود.
-- `lineUnlock(line)` مقدار `refc` را کم می‌کند و وقتی به صفر برسد Line را آزاد
-  می‌کند.
+- `lineRef(line)` مقدار `refc` را افزایش می‌دهد و تضمین می‌کند تا زمانی که این
+  Reference را دارید، تخصیص حافظه آزاد نشود. Reference خط یک Mutex یا Lock نیست
+  و Mutual Exclusion یا انتقال Worker Affinity فراهم نمی‌کند.
+- `lineUnref(line)` یک Reference را آزاد می‌کند. آزادسازی Reference نهایی فقط
+  تخصیص Lineای را بازپس می‌گیرد که از نظر منطقی مرده است؛ رساندن Reference یک Line
+  زنده به صفر، نقض Fatal قرارداد است.
 - `lineDestroy(line)` مقدار `alive = false` را تنظیم و Reference سازنده را آزاد
   می‌کند.
 - `lineIsAlive(line)` می‌گوید آیا Line از نظر **منطقی** هنوز باز است یا نه.
 
 تفاوت مهم:
 
-> داشتن Lock فقط اعتبار **حافظه** را حفظ می‌کند؛ به این معنا نیست که Line از نظر
-> منطقی هنوز زنده است. پس از یک Callback از نوع Re-entrant، ممکن است Line قفل‌شده
-> `alive == false` باشد. پیش از ادامه همیشه دوباره `lineIsAlive()` را بررسی کنید.
+> داشتن Reference خط فقط اعتبار **حافظه‌ی تخصیص‌یافته** را حفظ می‌کند؛ به این
+> معنا نیست که محتوای Line قفل شده است یا Line از نظر منطقی هنوز زنده است.
+> پس از یک Callback از نوع Re-entrant، ممکن است Line ارجاع‌شده `alive == false`
+> باشد. پیش از ادامه همیشه دوباره `lineIsAlive()` را بررسی کنید.
 
 **مرگ منطقی فوری است، اما بازپس‌گیری فیزیکی حافظه نه.** تابع `lineDestroy()` مقدار
-`alive` را پاک می‌کند و یک Reference را کنار می‌گذارد. اگر شخص دیگری هنوز
-`lineLock()` در اختیار داشته باشد، تخصیص حافظه تا زمان Unlockشدن آن قابل‌خواندن
-می‌ماند. دقیقاً به همین دلیل، Postcondition مالک که در ادامه می‌آید هم ارزان است
-و هم می‌توان آن را بررسی کرد:
+`alive` را پاک می‌کند و یک Reference را کنار می‌گذارد. اگر شخص دیگری هنوز با
+`lineRef()` یک Reference در اختیار داشته باشد، تخصیص حافظه تا زمان unrefشدن آن
+همچنان موجود می‌ماند. دقیقاً به همین دلیل، Postcondition مالک که در ادامه می‌آید هم
+ارزان است و هم می‌توان آن را بررسی کرد:
 
 ```c
-lineLock(l);                 /* تخصیص را تا اجرای Assert زنده نگه می‌دارد */
+lineRef(l);                  /* تخصیص را تا اجرای Assert زنده نگه می‌دارد */
 owner->fnFinD(owner, l);
 assert(! lineIsAlive(l));    /* مرگ منطقی فوری است */
-lineUnlock(l);               /* آزادسازی فیزیکی ممکن است همین‌جا رخ دهد */
+lineUnref(l);                /* آزادسازی فیزیکی ممکن است همین‌جا رخ دهد */
 ```
 
 Lineای که از نظر منطقی مرده است هرگز نباید Callback جریان دیگری دریافت کند و تا
@@ -108,7 +111,7 @@ Lineای که از نظر منطقی مرده است هرگز نباید Callbac
 Threadای که آخرین reference را آزاد می‌کند الزاماً event worker همان line نیست.
 ممکن است یک device thread، pseudo-worker مربوط به lwIP یا scheduler ثبت‌نشده، در
 حالی reference معتبر نگه داشته باشد که owner خط را نابود و admission پیام‌ها را
-بسته است. بنابراین آخرین `lineUnlock()` وقتی روی event worker ثبت‌شده نیست از مسیر
+بسته است. بنابراین آخرین `lineUnref()` وقتی روی event worker ثبت‌شده نیست از مسیر
 thread-safe در shared pool استفاده می‌کند؛ فقط event worker ثبت‌شده مجاز است fast
 path مربوط به local pool را به کار ببرد. هنگام teardown، باقی‌ماندن itemهای
 checked-out در line pool یک خطای سخت در ترتیب lifecycle است، پس master pool مشترک
@@ -230,23 +233,23 @@ tunnelPrevDownStreamEst      tunnelPrevDownStreamPause    tunnelPrevDownStreamRe
 هرگز این‌گونه استدلال نکنید: *«فراخوانی برگشته است، پس Line State من هنوز معتبر
 است.»*
 
-### روش A — ‏`withLineLocked()`؛ روش پیشنهادی
+### روش A — ‏`lineCallWithRef()`؛ روش پیشنهادی
 
-`withLineLocked()` و `withLineLockedWithBuf()` در طول Callback یک Reference موقت
+`lineCallWithRef()` و `lineCallWithRefWithBuf()` در طول Callback یک Reference موقت
 نگه می‌دارند و به شما می‌گویند Line زنده مانده است یا نه. پیاده‌سازی واقعی آن‌ها
 در `ww/net/line.h` چنین است:
 
 ```c
-static inline bool withLineLocked(line_t *const line, LineTaskFnNoBuf task, tunnel_t *t)
+static inline bool lineCallWithRef(line_t *const line, LineTaskFnNoBuf task, tunnel_t *t)
 {
-    lineLock(line);
+    lineRef(line);
     task(t, line);
     if (! lineIsAlive(line))
     {
-        lineUnlock(line);
+        lineUnref(line);
         return false;   // Line هنگام Callback مرده است
     }
-    lineUnlock(line);
+    lineUnref(line);
     return true;        // Line هنوز زنده است؛ ادامه‌دادن امن است
 }
 ```
@@ -255,7 +258,7 @@ static inline bool withLineLocked(line_t *const line, LineTaskFnNoBuf task, tunn
 استفاده کنید:
 
 ```c
-if (! withLineLocked(line, tunnelNextUpStreamInit, t))
+if (! lineCallWithRef(line, tunnelNextUpStreamInit, t))
 {
     return;   // Line مرده است؛ به line یا ls دست نزنید
 }
@@ -267,7 +270,7 @@ my_lstate_t *ls = lineGetState(line, t);
 برای Forwardکردن Payload، نسخه‌ی دارای Buffer را به کار ببرید:
 
 ```c
-if (! withLineLockedWithBuf(line, tunnelNextUpStreamPayload, t, buf))
+if (! lineCallWithRefWithBuf(line, tunnelNextUpStreamPayload, t, buf))
 {
     return;
 }
@@ -286,8 +289,8 @@ Re-entrancy می‌تواند از مرز یک Line دقیق نیز عبور ک�
 است وارد یک تونل همسایه‌ی مشترک شود و Line ‏B دیگری را که ثبت شده ببندد. اگر
 فراخواننده B را در Arrayای از Pointerها یا Snapshot یک Registry نگه می‌دارد و پس
 از Callback روی A آن را بررسی خواهد کرد، باید پیش از نخستین Callback با
-`lineLock()` یک Reference از B نگه دارد و آن Reference را در همه‌ی مسیرها آزاد
-کند. Lockکردن فقط A، یا نگه‌داشتن Mutex مربوط به Registry هنگام کپی Pointerهای خام
+`lineRef()` یک Reference از B نگه دارد و آن Reference را در همه‌ی مسیرها آزاد
+کند. نگه‌داشتن Reference فقط برای A، یا نگه‌داشتن Mutex مربوط به Registry هنگام کپی Pointerهای خام
 و سپس آزادکردن آن، حافظه‌ی B را زنده نگه نمی‌دارد.
 
 برای نمونه، client مربوط به SOCKS UDP می‌تواند یک remote backend بسازد که `Init`
@@ -295,36 +298,36 @@ Re-entrancy می‌تواند از مرز یک Line دقیق نیز عبور ک�
 فراخوانی callback remote، ‏Buffer Pool مربوط به **client** را نگه دارد و خود
 client را retain کند؛ retainکردن فقط remote نه lstate نابودشدهٔ client را امن
 می‌کند و نه `lineReuseBuffer(client, ...)` را. اگر client مرده باشد، Byteهای
-محلی باقی‌مانده را با Pool ذخیره‌شده recycle کنید، Reference client را unlock
+محلی باقی‌مانده را با Pool ذخیره‌شده recycle کنید، Reference مربوط به client را unref
 کنید و بدون خواندن State نابودشدهٔ هیچ‌کدام از Lineها بازگردید.
 
 :::tip چه زمانی به Wrapper نیازی نیست؟
 اگر Helper مربوط به Forwarding را فراخوانی و بلافاصله `return` می‌کنید، بدون آنکه
-کار دیگری با Line داشته باشید، قرار دادن آن در `withLineLocked()` سودی ندارد؛
+کار دیگری با Line داشته باشید، قرار دادن آن در `lineCallWithRef()` سودی ندارد؛
 نتیجه‌ی Boolean رفتار شما را عوض نمی‌کند. این حالت برای Pass-through ساده‌ی
 `Init` و `Finish` رایج است.
 :::
 
-### روش B — ‏`lineLock()` / `lineUnlock()` دستی
+### روش B — ‏`lineRef()` / `lineUnref()` دستی
 
-وقتی روی چند فراخوانی به کنترل صریح نیاز دارید، به‌صورت دستی Lock کنید:
+وقتی روی چند فراخوانی به کنترل صریح نیاز دارید، به‌صورت دستی Reference نگه دارید:
 
 ```c
-lineLock(line);
+lineRef(line);
 
 // یک یا چند Callback که ممکن است Re-entrant باشند ...
 
 if (! lineIsAlive(line))
 {
-    lineUnlock(line);
+    lineUnref(line);
     return;
 }
 
 // هنوز زنده است؛ ادامه‌دادن امن است.
-lineUnlock(line);
+lineUnref(line);
 ```
 
-قواعد: هر چیزی را که Lock می‌کنید حتماً Unlock کنید؛ پس از Destroyکردن Tunnel
+قواعد: هر چیزی را که ref می‌کنید حتماً unref کنید؛ پس از Destroyکردن Tunnel
 State آن را نخوانید؛ و اگر Helper هم Line State شما را نابود و هم `Finish` را
 Propagate می‌کند، Caller باید بلافاصله برگردد.
 
@@ -419,7 +422,7 @@ Lineهایی که **مالکشان هستید** باز هم متفاوت‌ان�
 > ```
 
 این Postcondition فقط درباره‌ی مرگ **منطقی** است. ممکن است Referenceهای بازِ
-`lineLock()` تخصیص حافظه را تا خارج‌شدن Frameهای معلق یا Re-entrant زنده نگه دارند؛ لازم
+`lineRef()` تخصیص حافظه را تا خارج‌شدن Frameهای معلق یا Re-entrant زنده نگه دارند؛ لازم
 نیست پیش از بازگشت Handler، حافظه واقعاً آزاد شده باشد.
 
 مالک باید پیش از بازگشت این کارها را انجام دهد:
@@ -578,7 +581,7 @@ Re-entrant ایجاد می‌کند.
 
 ساختار امن الزامی:
 
-1. `lineLock(line)` را فراخوانی کنید، چون قرار است Byteها را به‌شکل Re-entrant
+1. `lineRef(line)` را فراخوانی کنید، چون قرار است Byteها را به‌شکل Re-entrant
    بفرستید.
 2. **ابتدا سمت فرستنده را Finish‌شده علامت بزنید**. از State جهت‌دار موجود تونل،
    مانند `prev_finished`، ‏`next_finished`، ‏`can_downstream = false` یا
@@ -587,7 +590,7 @@ Re-entrant ایجاد می‌کند.
 3. Byteهای پایانی پروتکل را به‌سمت دیگر بفرستید.
 4. Line State محلی این تونل را نابود کنید.
 5. `Finish` واقعی WaterWall را Propagate کنید.
-6. `lineUnlock(line)` را فراخوانی کنید.
+6. `lineUnref(line)` را فراخوانی کنید.
 7. بلافاصله برگردید و پس از آن به Line State محلی دست نزنید.
 
 نمونه‌های جهت:
@@ -630,10 +633,10 @@ Callback را اجرا نمی‌کند. بنابراین یک تونل میان�
    `Payload` بازگشتی را Recycle کنید. یک `Finish` در downstream که به‌شکل
    Re-entrant می‌رسد ثبت می‌کند که Branch از قبل بسته شده و جذب می‌شود تا
    `Finish` بازتابی یا تکراری برای Branch فرستاده نشود.
-5. پس از Payload نهایی و در حالی که Lock موقت را نگه داشته‌اید، دوباره
-   `lineIsAlive()` را بررسی کنید. اگر Line مرده است، Unlock کنید و بدون دست‌زدن به
+5. پس از Payload نهایی و در حالی که Reference موقت را نگه داشته‌اید، دوباره
+   `lineIsAlive()` را بررسی کنید. اگر Line مرده است، unref کنید و بدون دست‌زدن به
    Line State برگردید. در غیر این صورت، Line State محلی را پیش از `Finish` نهایی
-   Branch نابود کنید؛ پس از آن Finish فقط Unlock کنید و برگردید.
+   Branch نابود کنید؛ پس از آن Finish فقط unref کنید و برگردید.
 
 Timer قدیمی Handle لغو ندارد. خالی یا جداکردن Queue کار را از نظر منطقی لغو
 می‌کند؛ پس از آنکه مالک واقعی Line را نابود کرد، Runner زمان‌بندی‌شده به آزادسازی
@@ -642,7 +645,7 @@ Session Object جداگانه‌ای است که مالک Bufferهای کپی‌
 منابع Branch باشد و هیچ Referenceای به `line_t` یا Line State نداشته باشد. این یک
 طراحی متفاوت است، نه دلیلی برای زنده نگه‌داشتن Line قرضی.
 
-وقتی Delay صفر است، مسیر Inline ایمن و Lock‌شده فقط زمانی در دسترس است که Fallback
+وقتی Delay صفر است، مسیر Inline ایمن با Reference معتبر فقط زمانی در دسترس است که Fallback
 Pause نباشد و هیچ Batch قدیمی‌تر FIFO یا Drain زمان‌بندی‌شده‌ای وجود نداشته باشد.
 Byteهای نگه‌داشته‌شده از مسیر Drain زمان‌بندی‌شده Resume می‌شوند تا Payload بعدی
 از آن‌ها سبقت نگیرد.
@@ -740,9 +743,9 @@ Byteهای راه دور به Socket مربوط به TcpConnector می‌رسن�
   تونل را مقداردهی می‌کند؟
 - آیا Callbackهای upstream فقط با `tunnelNextUpStream*` و Callbackهای downstream
   فقط با `tunnelPrevDownStream*` Forward می‌شوند؟
-- آیا هر فراخوانی Re-entrant یا بلافاصله Return می‌کند، یا با `withLineLocked()` /
-  Lock دستی و `lineIsAlive()` از Line محافظت می‌کند؟
-- اگر `withLineLocked()` مقدار `false` برگرداند، آیا از دست‌زدن به `line`، ‏`ls` و
+- آیا هر فراخوانی Re-entrant یا بلافاصله Return می‌کند، یا با `lineCallWithRef()` /
+  `lineRef()` دستی و `lineIsAlive()` از Line محافظت می‌کند؟
+- اگر `lineCallWithRef()` مقدار `false` برگرداند، آیا از دست‌زدن به `line`، ‏`ls` و
   `LinestateDestroy()` خودداری می‌کنید؟
 - آیا `Finish`، ‏State محلی را **پیش از** Propagateکردن Close واقعی نابود می‌کند؟
 - هنگام Close از میانه، آیا ابتدا upstream، سپس downstream را Finish می‌کنید و

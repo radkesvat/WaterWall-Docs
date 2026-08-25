@@ -2,10 +2,10 @@
 sidebar_position: 2
 title: "Developer Guide Part 2: Lines, Callbacks & Lifetime Safety"
 sidebar_label: "Part 2: Lines & Lifetime"
-description: "The connection lifecycle, re-entrancy hazards, line locking, and the clean-finish patterns that keep WaterWall tunnels free of use-after-free bugs."
+description: "The connection lifecycle, re-entrancy hazards, line references, and the clean-finish patterns that keep WaterWall tunnels free of use-after-free bugs."
 ---
 <!--
-Documentation version: 158
+Documentation version: 160
 -->
 
 # Part 2: Lines, Callbacks & Lifetime Safety
@@ -63,36 +63,39 @@ Rules for `Init`:
   explicitly documented line-role/callback contract truly requires state before
   ordinary `Init`, and cover that exception directly.
 - If your `Init` calls a re-entrant forwarding helper and then still needs to
-  touch the line afterward, protect it (see [Line Locking](#protecting-a-line-across-re-entrant-callbacks)).
-  If your `Init` just forwards and returns, you do not need to lock.
+  touch the line afterward, protect it (see [Line References](#protecting-a-line-across-re-entrant-callbacks)).
+  If your `Init` just forwards and returns, you do not need to hold a reference.
 
 ## Line Lifetime: refcount and `alive`
 
 A `line_t` carries an atomic `refc` and a boolean `alive` (see `ww/net/line.h`).
 These are two different ideas, and conflating them causes bugs:
 
-- `lineLock(line)` increments `refc`. It guarantees the memory will not be freed
-  while you hold the reference.
-- `lineUnlock(line)` decrements `refc`, freeing the line when it reaches zero.
+- `lineRef(line)` increments `refc`. It guarantees the allocation memory will not
+  be freed while you hold the reference. A line reference is **not** a mutex or
+  lock: it provides no mutual exclusion and does not transfer worker affinity.
+- `lineUnref(line)` releases one reference. A final release physically reclaims
+  only a logically dead line; releasing a live line to zero is a fatal contract violation.
 - `lineDestroy(line)` sets `alive = false` and drops the creator's reference.
 - `lineIsAlive(line)` reports whether the line is still **logically** open.
 
 The crucial distinction:
 
-> Holding a lock keeps the **memory** valid. It does **not** mean the line is
-> still logically alive. After a re-entrant callback, a locked line may be
+> Holding a line reference keeps the **allocation memory** valid. It does **not**
+> lock line contents, grant cross-thread access, or mean the line is still
+> logically alive. After a re-entrant callback, a referenced line may be
 > `alive == false`. Always re-check `lineIsAlive()` before continuing.
 
 **Logical death is immediate; physical reclamation is not.** `lineDestroy()`
-clears `alive` and drops one reference. If anyone else still holds a `lineLock()`
-the allocation stays readable until they unlock — which is exactly what makes the
-owner postcondition below both checkable and cheap:
+clears `alive` and drops one reference. If anyone else still holds a reference
+via `lineRef()` the allocation remains present until they unref — which is
+exactly what makes the owner postcondition below both checkable and cheap:
 
 ```c
-lineLock(l);                 /* keep the allocation present for the assertion */
+lineRef(l);                  /* keep the allocation present for the assertion */
 owner->fnFinD(owner, l);
 assert(! lineIsAlive(l));    /* logical death is immediate */
-lineUnlock(l);               /* physical free may occur right here */
+lineUnref(l);                /* physical free may occur right here */
 ```
 
 A logically dead line must never receive another flow callback, and by the time
@@ -101,7 +104,7 @@ it is reclaimed every tunnel's line state must already be zeroed.
 The thread which drops the final reference is not necessarily the line's event
 worker. A device thread, lwIP pseudo-worker, or unregistered scheduler can hold
 a legitimate reference while the owner destroys the line and closes message
-admission. The final `lineUnlock()` therefore returns the allocation through a
+admission. The final `lineUnref()` therefore returns the allocation through a
 thread-safe shared-pool path when no registered event worker is current; only a
 registered event worker may use the local-pool fast path. Chain teardown treats
 checked-out line-pool items as a hard ordering violation, so the shared master
@@ -222,23 +225,23 @@ After any of these returns:
 
 Never reason: *"the call returned, so my line state is still valid."*
 
-### Method A — `withLineLocked()` (preferred)
+### Method A — `lineCallWithRef()` (preferred)
 
-`withLineLocked()` and `withLineLockedWithBuf()` hold a temporary reference across
+`lineCallWithRef()` and `lineCallWithRefWithBuf()` hold a temporary reference across
 the callback and tell you whether the line survived. Their actual implementation
 (see `ww/net/line.h`) is:
 
 ```c
-static inline bool withLineLocked(line_t *const line, LineTaskFnNoBuf task, tunnel_t *t)
+static inline bool lineCallWithRef(line_t *const line, LineTaskFnNoBuf task, tunnel_t *t)
 {
-    lineLock(line);
+    lineRef(line);
     task(t, line);
     if (! lineIsAlive(line))
     {
-        lineUnlock(line);
+        lineUnref(line);
         return false;   // line died during the callback
     }
-    lineUnlock(line);
+    lineUnref(line);
     return true;        // line still alive; safe to continue
 }
 ```
@@ -246,7 +249,7 @@ static inline bool withLineLocked(line_t *const line, LineTaskFnNoBuf task, tunn
 Use it whenever you must keep working with the line after a re-entrant call:
 
 ```c
-if (! withLineLocked(line, tunnelNextUpStreamInit, t))
+if (! lineCallWithRef(line, tunnelNextUpStreamInit, t))
 {
     return;   // line died; do not touch line or ls
 }
@@ -258,7 +261,7 @@ my_lstate_t *ls = lineGetState(line, t);
 For payload forwarding, use the buffered variant:
 
 ```c
-if (! withLineLockedWithBuf(line, tunnelNextUpStreamPayload, t, buf))
+if (! lineCallWithRefWithBuf(line, tunnelNextUpStreamPayload, t, buf))
 {
     return;
 }
@@ -276,45 +279,46 @@ When a helper returns `false`:
 Re-entrancy can also cross exact-line boundaries. A callback on line A may enter
 a shared neighbouring tunnel that closes a different tracked line B. If a caller
 keeps B in a pointer array or registry snapshot and will examine it after the
-callback on A, it must retain B with `lineLock()` before the first callback and
-release that reference on every path. Locking only A, or holding a registry mutex
-while copying raw pointers and then releasing it, does not preserve B's storage.
+callback on A, it must retain B with `lineRef()` before the first callback and
+release that reference on every path. Holding a reference only on A, or holding
+a registry mutex while copying raw pointers and then releasing it, does not
+preserve B's storage.
 
 For example, a SOCKS UDP client can create a backend remote line whose `Init`
 closes the control association and provider-owned client line. The caller must
 capture the client's buffer pool and retain the **client** before invoking the
 remote callback; retaining only the remote makes neither the dead client's
 lstate nor `lineReuseBuffer(client, ...)` safe after return. If the client died,
-recycle still-local bytes through the captured pool, unlock the retained client,
+recycle still-local bytes through the captured pool, unref the retained client,
 and return without reading either line's destroyed state.
 
 :::tip When you do *not* need the wrapper
 If you call a forwarding helper and then immediately `return` with no further work
-on the line, wrapping it in `withLineLocked()` buys you nothing — the boolean
+on the line, wrapping it in `lineCallWithRef()` buys you nothing — the boolean
 result would not change your behavior. This is common for plain `Init` and
 `Finish` pass-throughs.
 :::
 
-### Method B — Manual `lineLock()` / `lineUnlock()`
+### Method B — Manual `lineRef()` / `lineUnref()`
 
-Use manual locking when you need explicit control across several calls:
+Use manual reference management when you need explicit control across several calls:
 
 ```c
-lineLock(line);
+lineRef(line);
 
 // one or more potentially re-entrant callbacks ...
 
 if (! lineIsAlive(line))
 {
-    lineUnlock(line);
+    lineUnref(line);
     return;
 }
 
 // still alive: safe to continue
-lineUnlock(line);
+lineUnref(line);
 ```
 
-Rules: always unlock what you lock; never read tunnel state after destroying it;
+Rules: always unref what you ref; never read tunnel state after destroying it;
 if a helper both destroys your line state and propagates `Finish`, the caller must
 return immediately afterward.
 
@@ -404,7 +408,7 @@ obligation — the next section.
 > assert(! lineIsAlive(line));
 > ```
 
-The postcondition is about **logical** death only. Outstanding `lineLock()`
+The postcondition is about **logical** death only. Outstanding `lineRef()`
 references may keep the allocation present until suspended or re-entrant frames
 unwind; the memory does not have to be freed before the handler returns.
 
@@ -562,7 +566,7 @@ The hazard, step by step:
 
 The required safe shape:
 
-1. `lineLock(line)` — you are about to send bytes re-entrantly.
+1. `lineRef(line)` — you are about to send bytes re-entrantly.
 2. **Mark the sender side finished first**, using the tunnel's existing
    directional state (`prev_finished`, `next_finished`, `can_downstream = false`,
    `can_upstream = false`, etc.). Your `Pause`/`Resume` handlers must check this
@@ -570,7 +574,7 @@ The required safe shape:
 3. Send the final protocol bytes toward the other side.
 4. Destroy this tunnel's local line state.
 5. Propagate the real WaterWall `Finish`.
-6. `lineUnlock(line)`.
+6. `lineUnref(line)`.
 7. Return immediately. Do not touch local line state afterward.
 
 Direction examples:
@@ -612,9 +616,9 @@ For an initialized fallback branch, use this close order:
    the branch already closed and is absorbed, so no reflected or duplicate branch
    `Finish` follows.
 5. Re-check `lineIsAlive()` after the final payload while holding the temporary
-   lock. If it died, unlock and return without touching line state. Otherwise
+   reference. If it died, unref and return without touching line state. Otherwise
    destroy local line state before the final branch `Finish`; after that finish,
-   only unlock and return.
+   only unref and return.
 
 The old timer has no cancellation handle. Emptying/detaching its queue logically
 cancels the work; once the real owner destroys the line, the scheduled runner
@@ -623,7 +627,7 @@ becomes a harmless reference release. Preserving the exact remaining delay after
 timer state, and branch resources without any `line_t` or line-state reference.
 That is a different design, not an excuse to keep a borrowed line alive.
 
-With delay zero, the safe locked inline path is available only when fallback is
+With delay zero, the safe referenced inline path is available only when fallback is
 unpaused and has no older FIFO batch or scheduled drain. Retained bytes resume
 through the scheduled drain, so later payload cannot overtake them.
 
@@ -721,8 +725,8 @@ Before you call a flow change done:
 - Are upstream callbacks forwarded only with `tunnelNextUpStream*`, and downstream
   only with `tunnelPrevDownStream*`?
 - Does every re-entrant call either return immediately or protect the line with
-  `withLineLocked()` / manual lock + `lineIsAlive()`?
-- On a `false` from `withLineLocked()`, do you avoid touching `line`, `ls`, and
+  `lineCallWithRef()` / manual `lineRef()` + `lineIsAlive()`?
+- On a `false` from `lineCallWithRef()`, do you avoid touching `line`, `ls`, and
   `LinestateDestroy()`?
 - Does `Finish` destroy local state **before** propagating the real close?
 - When closing from the middle, do you finish upstream first, then downstream,
