@@ -6,7 +6,7 @@ description: "Reference documentation for the UdpListener node."
 ---
 
 <!--
-Documentation version: 152
+Documentation version: 155
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/UdpListener/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/UdpListener.mdx, and all files must keep the same documentation version.
 -->
 
@@ -180,6 +180,9 @@ expects `port-range` as a two-item array.
 | positive integer | Request that many bytes directly. |
 
 Both options default to WaterWall's large socket buffer size for UDP listeners.
+The same parsing applies to dynamically opened association sockets: `false`
+leaves their kernel defaults unchanged rather than requesting WaterWall's large
+buffer.
 
 ### Interface and `fwmark`
 
@@ -291,6 +294,46 @@ Current timeouts:
 If the peer line expires, `UdpListener` sends upstream `finish` and destroys the
 line it created.
 
+## Dynamic Endpoint Provider
+
+`UdpListener` also offers a typed, in-process dynamic-endpoint provider for a compatible protocol tunnel in the same
+chain. [`Socks5Server`](./Socks5Server.mdx) is one consumer of this capability. For a normal SOCKS5 service, use
+[`TcpUdpListener`](./TcpUdpListener.mdx): its internal `TcpListener` accepts the required TCP control connection and its
+internal `UdpListener` delegates this provider. A bare `UdpListener` cannot provide a complete SOCKS5 entry by itself
+because it cannot accept that TCP control connection.
+
+This is an `interface.h` capability, not a JSON setting and not an external `instance/api.c` message API. `Socks5Server`
+discovers it automatically from its finalized preceding path; operators do not configure a provider node name.
+
+The provider creates one dedicated UDP socket with an exclusive `port: 0` bind
+on the requesting event worker. It returns an opaque value handle (owner WID
+plus generation), the kernel-assigned local address, and the actual local port.
+The handle is usable only on its owner worker; a stale or repeated close is a
+safe no-op and cannot close a newer endpoint.
+
+Dynamic ingress follows the ordinary chain rather than bypassing it:
+
+```text
+dynamic UDP socket -> UdpListener -> TcpUdpListener (if present) -> next chain
+```
+
+Downstream replies return through that endpoint to its pinned peer. Dynamic
+sockets use the listener address, interface, `fwmark`, send/receive buffers,
+whitelist, and blacklist. They deliberately do **not** use the static `port`,
+port range, balance group, or multiport backend.
+
+Before a dynamic datagram can create or use its provider-owned line, its
+normalized peer IP must equal the endpoint's expected peer IP. A configured
+nonzero source port must match exactly; source port zero pins the first valid
+sender and every later port must match that pin. Mismatching datagrams are
+silently dropped and never close or message the TCP control association.
+
+During quiesce, new dynamic opens and activations are refused. On the owner
+worker the listener first detaches WIO callbacks, then removes each endpoint
+from its worker-local registry and invokes one idempotent close path for its
+provider-owned normal line. This endpoint inventory is distinct from the
+ordinary socket-manager peer table.
+
 ## Notes and Caveats
 
 - `UdpListener` is a UDP chain-head node and requires `next`.
@@ -299,6 +342,10 @@ line it created.
 - `whitelist` and `blacklist` support IPv4 and IPv6 CIDR strings.
 - `fwmark` and device binding are platform-dependent.
 - Paused peer lines drop inbound datagrams instead of buffering them.
+- Dynamic endpoints are internal capability plumbing, not extra public ports
+  configured through `port` or `port-range`.
+- For built-in SOCKS5 UDP service, configure `TcpUdpListener -> ... -> Socks5Server`, not a standalone `UdpListener` or
+  `TcpListener` entry.
 - For packet-level, stateless UDP behavior, `UdpStatelessSocket` may be a better
   fit than `UdpListener`.
 

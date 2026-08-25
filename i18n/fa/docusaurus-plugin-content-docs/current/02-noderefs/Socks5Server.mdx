@@ -6,7 +6,7 @@ description: "راهنمای نود Socks5Server در WaterWall."
 ---
 
 <!--
-Documentation version: 152
+Documentation version: 157
 -->
 
 # Socks5Server
@@ -21,7 +21,7 @@ Documentation version: 152
 - method negotiation در SOCKS5
 - username/password authentication از طریق `AuthenticationClient`
 - دستور `CONNECT`
-- دستور `UDP ASSOCIATE`
+- دستور `UDP ASSOCIATE` با تخصیص پورت پویا از طریق `UdpListener` یا `TcpUdpListener`
 - UDP relay association وابسته به احراز هویت
 
 دستور `BIND` پشتیبانی نمی‌شود و رد می‌شود.
@@ -34,21 +34,93 @@ Documentation version: 152
 TcpListener -> Socks5Server -> TcpConnector
 ```
 
-برای TCP و UDP:
+برای حالت ترکیبی `CONNECT` و UDP:
 
 ```text
-TcpListener -> Socks5Server -> TcpConnector
-UdpListener -> Socks5Server -> UdpConnector
+TcpUdpListener -> [optional middle tunnels] -> Socks5Server -> TcpUdpConnector
 ```
 
-listener مربوط به TCP، control connection پروتکل SOCKS5 را می‌پذیرد. listener
-مربوط به UDP نیز فقط پس از ساخته شدن یک association معتبر از طریق همان control
-connection، datagramهای SOCKS5 را قبول می‌کند.
+فقط یک مسیر callback قبلی وجود دارد، نه دو chain مستقل TCP و UDP که به یک
+`Socks5Server` برسند. `TcpUdpListener` در همین یک مسیر هم control connection
+TCP و هم provider خصوصی UDP پویا را فراهم می‌کند. اگر `udp: true` باشد و مسیر
+قبلی نهایی‌شده provider از نوع `UdpListener`/`TcpUdpListener` نداشته باشد، راه‌اندازی شکست می‌خورد.
+
+:::warning توپولوژی الزامی برای SOCKS5 UDP
+برای استقرار عادی با نودهای داخلی WaterWall از [`TcpUdpListener`](./TcpUdpListener.mdx)
+استفاده کنید. `TcpListener` به‌تنهایی می‌تواند control connection مربوط به SOCKS5
+TCP و دستور `CONNECT` را حمل کند، اما endpoint پویای UDP موردنیاز `UDP ASSOCIATE`
+را فراهم نمی‌کند. یک [`UdpListener`](./UdpListener.mdx) مستقل قابلیت provider را
+ارائه می‌دهد، اما به‌تنهایی نمی‌تواند control connection الزامی TCP را بپذیرد؛
+بنابراین فقط در یک توپولوژی سفارشی fan-in کاربرد دارد که TCP را روی همان مسیر
+callback فراهم کند.
+
+`Socks5Server` این provider را به‌صورت خودکار از مسیر قبلی نهایی‌شدهٔ خود پیدا
+می‌کند. هیچ setting در JSON برای نام provider یا provider API وجود ندارد.
+:::
 
 در حالت احرازشده، `UserController` را دستی پس از `Socks5Server` قرار ندهید؛ نود
 خودش یک `UserController` داخلی می‌سازد و پیش از `next` وارد chain می‌کند.
 
-## نمونه authenticated
+## نمونهٔ کامل توپولوژی TCP/UDP
+
+این پیکربندی حداقلی هر سه نقش الزامی در مسیر داده را نشان می‌دهد: listener ترکیبی
+ورودی، نود پروتکل SOCKS5 و connectorای که مقصد درخواستی هر اتصال TCP یا UDP را
+دنبال می‌کند.
+
+```json
+{
+  "name": "socks5-service",
+  "nodes": [
+    {
+      "name": "socks-entry",
+      "type": "TcpUdpListener",
+      "settings": {
+        "address": "0.0.0.0",
+        "port": 1080,
+        "nodelay": true
+      },
+      "next": "socks-server"
+    },
+    {
+      "name": "socks-server",
+      "type": "Socks5Server",
+      "settings": {
+        "no-auth": true,
+        "connect": true,
+        "udp": true,
+        "ipv4": "203.0.113.10"
+      },
+      "next": "outbound"
+    },
+    {
+      "name": "outbound",
+      "type": "TcpUdpConnector",
+      "settings": {
+        "address": "dest_context->address",
+        "port": "dest_context->port",
+        "nodelay": true,
+        "fastopen": false
+      }
+    }
+  ]
+}
+```
+
+`203.0.113.10` را با آدرس IPv4ای جایگزین کنید که کلاینت‌های SOCKS5 واقعاً بتوانند
+به آن دسترسی داشته باشند. در این نمونه فقط برای واضح ماندن توپولوژی از `no-auth`
+استفاده شده است؛ یک سرویس در دسترس از اینترنت معمولاً باید
+`auth-client-node-name` و یک `AuthenticationClient` پیکربندی‌شده داشته باشد.
+
+آدرس‌ها و پورت‌های این توپولوژی نقش‌های متفاوتی دارند:
+
+| Setting یا مقدار | مفهوم |
+| --- | --- |
+| `TcpUdpListener.settings.address` | آدرس محلی‌ای که listener نوع TCP و socketهای پویای UDP روی آن bind می‌شوند. |
+| `TcpUdpListener.settings.port` | پورت عمومی control مربوط به SOCKS5 TCP. child استاتیک UDP داخلی نیز روی همین پورت گوش می‌دهد، اما `Socks5Server` این پورت ثابت را به‌عنوان association نوع SOCKS UDP نمی‌پذیرد. |
+| `Socks5Server.settings.ipv4` | آدرس IPv4ای که در `BND.ADDR` به کلاینت SOCKS5 اعلام می‌شود؛ کلاینت باید بتواند به آن دسترسی داشته باشد. این مقدار setting مربوط به bind سوکت نیست. |
+| `BND.PORT` در پاسخ | پورت relay نوع UDP که سیستم‌عامل برای هر association به‌صورت پویا انتخاب می‌کند و در پاسخ `UDP ASSOCIATE` برمی‌گرداند. |
+
+## نمونهٔ نود authenticated
 
 ```json
 {
@@ -58,7 +130,7 @@ connection، datagramهای SOCKS5 را قبول می‌کند.
     "auth-client-node-name": "auth-client",
     "connect": true,
     "udp": true,
-    "ipv4": "0.0.0.0",
+    "ipv4": "203.0.113.10",
     "sweep-interval-ms": 1000,
     "verbose": false
   },
@@ -69,6 +141,9 @@ connection، datagramهای SOCKS5 را قبول می‌کند.
 `auth-client` باید نام نودی موجود از نوع `AuthenticationClient` در همان config
 باشد. `Socks5Server` از آن برای lookup استفاده می‌کند و خودش authentication
 client تازه‌ای نمی‌سازد.
+
+`203.0.113.10` را با آدرس IPv4ای جایگزین کنید که به کلاینت‌های SOCKS5 اعلام می‌شود
+و آن کلاینت‌ها بتوانند به آن دسترسی داشته باشند.
 
 ## نمونه no-auth
 
@@ -94,10 +169,14 @@ client تازه‌ای نمی‌سازد.
 | `settings` | object | اجباری است و نباید خالی باشد. |
 | `settings.auth-client-node-name` | string | اجباری است مگر اینکه `no-auth` صریحاً `true` باشد. باید به یک نود `AuthenticationClient` موجود اشاره کند و نمی‌تواند خود همین `Socks5Server` باشد. |
 | `settings.no-auth` | boolean | فقط وقتی لازم است که auth client ندارید؛ برای فعال شدن حالت بدون احراز هویت باید `true` باشد. |
-| `settings.ipv4` / `settings.udp-ipv4` | string | وقتی `udp` فعال است اجباری است. آدرس IPv4 که در پاسخ `UDP ASSOCIATE` اعلام می‌شود. |
+| `settings.ipv4` / `settings.udp-ipv4` | string | وقتی `udp` فعال است اجباری است. آدرس IPv4 قابل‌دسترسی که در `BND.ADDR` پاسخ `UDP ASSOCIATE` اعلام می‌شود؛ این مقدار آدرس bind مربوط به listener نیست. |
 | `next` | string | اجباری است و به مسیر outbound واقعی اشاره می‌کند. |
 
 حداقل یکی از `connect` یا `udp` باید فعال باشد.
+
+وقتی `udp` فعال است، مسیر قبلی نهایی‌شده باید یک provider پویای UDP ارائه دهد.
+در توپولوژی عادی با نودهای داخلی، یعنی سرویس را با `TcpUdpListener` به‌جای
+`TcpListener` آغاز کنید.
 
 ## فیلدهای اختیاری
 
@@ -158,44 +237,61 @@ username و password در حالت احرازشده باید غیرخالی با
 `UDP ASSOCIATE` یک association می‌سازد که مالک آن TCP control line است. این command از همان control line یک stream
 upstream عادی باز نمی‌کند.
 
+provider با پیمایش مسیر callback قبلی نهایی‌شده به‌صورت خودکار پیدا می‌شود.
+tunnelهای میانی اختیاری می‌توانند بین `TcpUdpListener` و `Socks5Server` باقی
+بمانند، به شرطی که آن مسیر همچنان به provider برسد. هیچ setting مربوط به provider
+به JSON نود `Socks5Server` اضافه نمی‌شود.
+
 پاسخ UDP associate از این دو مقدار ساخته می‌شود:
 
-- آدرس `settings.ipv4` یا `settings.udp-ipv4`
-- پورت listener محلی TCP که control connection را قبول کرده است
+- آدرس `settings.ipv4` یا `settings.udp-ipv4` به‌عنوان آدرس پاسخ
+- پورت اختصاصی موقت (ephemeral port) که به‌صورت پویا توسط `UdpListener` (یا `TcpUdpListener`) قبلی برای این کلاینت bind و آماده شده است
 
-برای مثال، اگر control connection روی port محلی `443` پذیرفته شده باشد و `ipv4` برابر `0.0.0.0` باشد، پاسخ به client عملاً
-`0.0.0.0:443` را اعلام می‌کند.
+هنگام دریافت `UDP ASSOCIATE`، نود `Socks5Server` از لیسنر UDP قبلی یک endpoint پویای اختصاصی درخواست می‌کند و پس از باز شدن سوکت و فعال‌سازی آن روی worker فعلی، پورت اختصاص‌یافته را در پاسخ `UDP ASSOCIATE` برمی‌گرداند. اگر bind، فعال‌سازی یا تخصیص پاسخ شکست بخورد، فقط همان association با پاسخ general-failure رد می‌شود و associationهای قبلی سالم می‌مانند. endpoint برگشتی باید از مسیر firewall و NAT قابل‌دسترسی باشد. ترافیک UDP روی port ثابت/استاتیک به‌عنوان SOCKS association پذیرفته نمی‌شود.
 
-اگر hint مربوط به UDP peer در request شامل IP و port مشخص باشد، association با
-همان source کلیدگذاری می‌شود. اگر address از نوع any باشد، source IP مربوط به
-TCP control connection استفاده خواهد شد.
+در UDP `Init` و دوباره پیش از نخستین payload، metadata endpoint باید WID واقعی
+مالک line و handle فعال association را نشان دهد. mismatch مربوط به metadata/WID
+در حالی که worker فعلی درست است، فقط UDP را fail-closed رد می‌کند: remote line یا
+پاسخ تازه نمی‌سازد و TCP control line را نمی‌بندد یا به آن پیام نمی‌دهد. اجرای
+callback روی worker فعلیِ نادرست یک invariant هسته‌ای و fatal است و پیش از خواندن
+line state یا resource محلی worker رد می‌شود.
 
 ## مدل امنیتی UDP
 
 listener مربوط به UDP یک open proxy نیست. datagram تنها در این شرایط پذیرفته می‌شود:
 
-- sender با یک association ثبت‌شده مطابقت داشته باشد
-- association توسط یک TCP control line موفق ساخته شده باشد
-- entry مربوط به association هنوز وجود داشته باشد
+- روی سوکت اختصاصی و داینامیک تخصیص‌یافته به همان association کلاینت رسیده باشد
+- IP/port مبدأ datagram با آدرس peer مورد انتظار یا pin‌شده مطابقت داشته باشد
+- association توسط یک TCP control line معتبر ایجاد شده و روی worker جاری فعال باشد
 
-وقتی TCP control line بسته شود، UDP association همان لحظه unregister می‌شود و datagramهای بعدی رد می‌شوند.
+اگر IP مشخص‌شده در درخواست UDP-associate با IP مربوط به TCP control peer متفاوت
+باشد، درخواست رد می‌شود. IP wildcard از همان control peer استفاده می‌کند و اگر
+source port صفر باشد، نخستین datagram مطابق، port را pin می‌کند. SOCKS5 استاندارد
+برای هر datagram احراز هویت رمزنگاری‌شده ندارد؛ در نتیجه Peer دیگری با همان IP عمومی
+مورد انتظار که port اختصاصی را بداند، می‌تواند هنگام port صفر برای نخستین packet
+مسابقه دهد. مقاومت قوی‌تر به یک encapsulation یا token احراز هویت‌شدهٔ UDP با طراحی
+جداگانه نیاز دارد.
 
-associationها در یک registry با 64 shard داخل tunnel state نگه داشته می‌شوند. entryها فقط metadata کپی‌شده دارند:
+وقتی TCP control line بسته شود، endpoint داینامیک UDP بسته شده و association از جدول worker-local حذف می‌شود و هرگونه پکت بعدی رد خواهد شد.
+
+associationها در جدول‌های hash محلی هر worker روی `socks5server_tstate_t` نگهداری می‌شوند و نیازی به قفل‌های سراسری مشترک بین threadها ندارند. entryها فقط metadata کپی‌شده دارند:
 
 - generation token
 - worker id مالک
-- `user_handle_t` احراز هویت‌شده
+- handle مربوط به endpoint داینامیک
+- `user_handle_t` احراز هویت‌شده، یا handle خالی در حالت no-auth
 - username/password خام کپی‌شده، در حالت authenticated
 
-در registry هیچ `line_t *` قابل استفاده‌ای ذخیره نمی‌شود. generation token
-نمی‌گذارد یک control line قدیمی هنگام بسته شدن، association جدیدی با همان key
-را به اشتباه حذف کند.
+در registry هیچ `line_t *` قابل استفاده‌ای ذخیره نمی‌شود. handle کامل endpoint
+پویا (WID مالک به‌همراه generation) هویت association است و کلید association مبتنی بر
+tuple شبکه وجود ندارد. control line در حال بسته‌شدن فقط entryای را حذف می‌کند که handle
+کامل آن هنوز مطابقت دارد.
 
 ## رفتار UDP payload
 
 وقتی یک datagram SOCKS UDP برسد:
 
-1. association مربوط به sender lookup می‌شود.
+1. با استفاده از generation مربوط به endpoint داینامیک، association محلی worker پیدا می‌شود.
 2. header مربوط به SOCKS5 UDP اعتبارسنجی می‌شود.
 3. اگر `FRAG != 0` باشد، datagram محافظه‌کارانه نادیده گرفته می‌شود.
 4. مقصد remote از هدر خوانده می‌شود.
@@ -206,9 +302,9 @@ associationها در یک registry با 64 shard داخل tunnel state نگه د
 
 1. payload در یک header پاسخ SOCKS5 UDP قرار می‌گیرد.
 2. source address داخل header همان remote destination مربوط به backend UDP line است.
-3. datagram حاصل در جهت downstream به سمت UDP listener و client فرستاده می‌شود.
+3. datagram حاصل در جهت downstream به سمت سوکت پویای UDP فرستاده می‌شود.
 
-backend UDP lineها lineهای معمول واتروال‌اند که پشت سمت UDP مربوط به client
+backend UDP lineها lineهای معمول واتروال‌اند که پشت سمت پویای UDP مربوط به client
 ساخته می‌شوند. این طراحی association رو به client را از مقصدهای outbound جدا
 نگه می‌دارد و lifecycle معمول lineها را حفظ می‌کند.
 
@@ -217,7 +313,7 @@ backend UDP lineها lineهای معمول واتروال‌اند که پشت �
 پیاده‌سازی ترتیب close در Waterwall را حفظ می‌کند:
 
 - line state محلی پیش از فرستادن `Finish` واقعی از بین می‌رود
-- control line قبل از مرگ، association UDP خودش را unregister می‌کند
+- control line قبل از مرگ، endpoint پویای UDP خود را می‌بندد و association خود را unregister می‌کند
 - backend UDP lineهای داخلی قبل از بسته شدن از client line detach می‌شوند
 - اگر قبل از established شدن لازم باشد پاسخ failure SOCKS5 فرستاده شود، این کار از مسیر close محافظت‌شده در برابر
   callbackهای re-entrant انجام می‌شود
@@ -232,8 +328,14 @@ payload را در آن کپی می‌کند.
 - `username`, `password`, `users`, یا `accounts` را تنظیم نکنید؛ این کلیدهای legacy رد می‌شوند.
 - هم‌زمان `auth-client-node-name` و `no-auth: true` نگذارید.
 - UDP را بدون `ipv4` یا `udp-ipv4` فعال نکنید.
+- از `TcpListener -> Socks5Server` همراه `udp: true` استفاده نکنید؛ این ورودی فقط
+  TCP است و provider پویای UDP ندارد.
+- datagramهای SOCKS UDP را به پورت ثابت پیکربندی‌شدهٔ listener نفرستید؛ از
+  `BND.PORT` پویایی استفاده کنید که `UDP ASSOCIATE` برمی‌گرداند.
 - بعد از `Socks5Server` authenticated به‌صورت دستی `UserController` نگذارید.
 - انتظار پشتیبانی از `BIND` یا reassembly برای UDP fragmentation نداشته باشید.
+- در حالت UDP فقط بازبودن port کنترل TCP در firewall/NAT کافی نیست؛ relay port
+  پویای برگشتی نیز باید قابل‌دسترسی باشد.
 
 ## متادیتای نود
 

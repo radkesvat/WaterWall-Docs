@@ -6,15 +6,15 @@ description: "راهنمای نود Router در WaterWall."
 ---
 
 <!--
-Documentation version: 152
+Documentation version: 153
 -->
 
 # Router
 
 `Router` نودی مبتنی بر rule برای تقسیم connectionها میان شاخه‌های مختلف
-واتروال است. این نود در میانه chain قرار می‌گیرد، پس از دیدن نخستین upstream
-payload هر line مسیر را انتخاب می‌کند و تمام آن connection را فقط از همان شاخه
-عبور می‌دهد.
+واتروال است. این نود در میانه chain قرار می‌گیرد و برای هر connection یک شاخه
+انتخاب می‌کند. ruleهایی که فقط به metadata موجود در `Init` نیاز دارند همان‌جا
+انتخاب می‌شوند؛ ruleهای نیازمند sniffing با نخستین upstream payload انتخاب می‌شوند.
 
 زمانی از آن استفاده کنید که یک مسیر inbound باید بر اساس source IP، port ورودی،
 destination IP یا domain، نوع شبکه، protocol تشخیص‌داده‌شده، وجود HTTP Upgrade
@@ -30,15 +30,17 @@ flowchart LR
 
 ## مدل ذهنی
 
-`Router` را یک انتخاب‌گر شاخه در نظر بگیرید که تصمیم خود را کمی به تأخیر می‌اندازد:
+`Router` را انتخاب‌گر شاخه‌ای در نظر بگیرید که هر وقت ممکن باشد زود تصمیم
+می‌گیرد و فقط هنگام نیاز به بررسی bytes تصمیم را به تأخیر می‌اندازد:
 
-- در زمان `Init` شاخه را انتخاب نمی‌کند.
-- منتظر نخستین upstream payload می‌ماند تا در صورت نیاز، بایت‌های قابل مشاهده
-  را برای تشخیص protocol، مقدار HTTP Host/:authority، مقدار TLS/QUIC SNI یا
-  وجود HTTP `Upgrade` بررسی کند.
-- آن بایت‌های ابتدایی را تا زمان تصمیم‌گیری در buffer نگه می‌دارد.
-- پس از match شدن یک rule، شاخه انتخابی را مقداردهی اولیه می‌کند و بایت‌های
-  bufferشده را روی همان شاخه دوباره پخش می‌کند.
+- اگر هیچ rule یا تنظیم اصلی به inspection payload نیاز نداشته باشد، در `Init`
+  بر پایه metadata مبدأ/مقصد، نوع شبکه و credentialها شاخه را انتخاب و همان‌جا
+  مقداردهی اولیه می‌کند.
+- ruleی که به تشخیص protocol، HTTP Host/:authority، TLS/QUIC SNI یا HTTP
+  `Upgrade` نیاز دارد منتظر نخستین upstream payload می‌ماند و آن bytes را تا
+  زمان تصمیم‌گیری در buffer نگه می‌دارد.
+- پس از match شدن یک rule تأخیری، شاخه انتخابی را مقداردهی اولیه می‌کند و
+  bytes bufferشده را روی همان شاخه دوباره پخش می‌کند.
 - برای هر connection فقط یک‌بار تصمیم می‌گیرد و payloadهای بعدی مستقیم از همان
   شاخه عبور می‌کنند.
 - ترافیک downstream شاخه انتخابی از راه `Router` به نود قبلی برمی‌گردد.
@@ -47,8 +49,11 @@ flowchart LR
 مسیر پیش‌فرض است.
 
 :::warning
-`Router` برای انتخاب مسیر باید ابتدا از client داده بگیرد. در protocolهای
-server-first تا پیش از رسیدن نخستین upstream payload هیچ شاخه‌ای انتخاب نمی‌شود.
+ruleهای نیازمند sniffing همچنان باید ابتدا از client داده بگیرند. برای
+protocolهای server-first یا clientهایی که پیش از نخستین write به downstream
+establishment نیاز دارند، فقط از ruleهای metadata-only (برای نمونه `network`،
+port، address یا credential) استفاده کنید و `sniffing`، `protocol` و
+`attributes` را در آن Router نیاورید.
 :::
 
 ## جایگاه رایج
@@ -716,7 +721,7 @@ TcpListener -> Router
 
 | callback | رفتار |
 | --- | --- |
-| upstream `Init` | فقط state داخلی `Router` را مقداردهی اولیه و `dest_ctx.optional_flags` را پاک می‌کند؛ هنوز شاخه‌ای آماده نمی‌شود. |
+| upstream `Init` | state داخلی را مقداردهی اولیه و فقط بیت‌های protocol تشخیص‌داده‌شده را از `dest_ctx.optional_flags` پاک می‌کند؛ metadata کنترل مسیر یک‌بارمصرف حفظ می‌شود. اگر هیچ rule یا تنظیمی به sniffing payload نیاز نداشته باشد، شاخه انتخابی همین‌جا آماده می‌شود. |
 | اولین upstream `Payload` | payload را در buffer نگه می‌دارد، در صورت نیاز محتوای آن را بررسی می‌کند، ruleها را ارزیابی و شاخه انتخابی را مقداردهی اولیه می‌کند و سپس بایت‌های bufferشده را روی همان شاخه بازپخش می‌کند. |
 | payloadهای بعدی upstream | مستقیم به target انتخابی یا default `next` می‌روند. |
 | upstream `Pause` / `Resume` | فقط پس از انتخاب route فرستاده می‌شوند. |
@@ -724,7 +729,7 @@ TcpListener -> Router
 | downstream `Payload` / `Pause` / `Resume` / `Est` | به نود قبلی برمی‌گردند. |
 | downstream `Finish` | state داخلی را از بین می‌برد و سپس `Finish` را به نود قبلی می‌فرستد. |
 
-`Router` عمداً در upstream `Init` مقدار `dest_ctx.optional_flags` را پاک می‌کند تا بیت‌های protocol تشخیص‌داده‌شده در یک `Router` به `Router` بعدی روی همان line منتقل نشوند.
+`Router` عمداً در upstream `Init` فقط زیرمجموعه بیت‌های protocol تشخیص‌داده‌شده در `dest_ctx.optional_flags` را پاک می‌کند تا این بیت‌ها از یک `Router` به `Router` بعدی روی همان line منتقل نشوند. بیت‌های جداگانه کنترل مسیر که tunnelهای protocol برای یک adapter بعدی حمل می‌کنند حفظ می‌شوند و هرگز `protocol` match محسوب نمی‌شوند.
 
 ## دستورالعمل‌ها
 
@@ -877,7 +882,7 @@ Host/:authority یا TLS/QUIC SNI sniff کرده باشد.
 
 ### Routing برای protocolهای server-first
 
-`Router` بر اساس نخستین upstream payload تصمیم می‌گیرد. اگر server باید پیش از فرستادن داده از سوی client صحبت کند، `Router` تا رسیدن داده client نمی‌تواند شاخه را مقداردهی اولیه کند.
+وقتی ruleها فقط metadata موجود روی line را می‌خواهند، `Router` شاخه را در `Init` آماده می‌کند. اگر هر rule یا تنظیم اصلی به sniffing payload نیاز داشته باشد، تصمیم تا نخستین upstream payload عقب می‌افتد؛ چنین پیکربندی‌ای تا رسیدن داده client نمی‌تواند شاخه server-first را مقداردهی اولیه کند.
 
 `Router` header تازه‌ای به ابتدای payload اضافه نمی‌کند و به left padding نیاز ندارد.
 

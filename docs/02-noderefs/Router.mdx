@@ -6,16 +6,17 @@ description: "Reference documentation for the Router node."
 ---
 
 <!--
-Documentation version: 152
+Documentation version: 153
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/Router/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/Router.mdx, and all files must keep the same documentation version.
 -->
 
 # Router
 
 `Router` is WaterWall's rule-based branch selector for connection-oriented
-traffic. It sits in the middle of a chain, waits for the first upstream payload
-of a line, evaluates ordered rules, and sends that whole connection to one
-selected branch.
+traffic. It sits in the middle of a chain, evaluates ordered rules, and sends
+each connection to one selected branch. Metadata-only rules can select a branch
+during `Init`; rules that need sniffing select one from the first upstream
+payload.
 
 Use it when one inbound path should split into several outbound paths by source
 IP, inbound port, destination IP, destination domain, network type, detected
@@ -31,15 +32,17 @@ flowchart LR
 
 ## Mental Model
 
-Think of `Router` as a deferred branch selector:
+Think of `Router` as an early selector when it can be, and a deferred branch
+selector when it must inspect bytes:
 
-- It does not choose a branch during `Init`.
-- It waits for the first upstream payload so it can inspect visible bytes when a
-  rule needs protocol detection, HTTP Host/:authority, TLS/QUIC SNI, or HTTP
-  `Upgrade`.
-- It buffers those first bytes while deciding.
-- After a rule wins, it initializes the selected branch and replays the buffered
-  bytes to that branch.
+- If no rule or root setting needs payload inspection, it evaluates the line's
+  source/destination metadata, network, and credential facts during `Init` and
+  initializes the selected branch immediately.
+- A rule needing protocol detection, HTTP Host/:authority, TLS/QUIC SNI, or HTTP
+  `Upgrade` waits for the first upstream payload and buffers those bytes while
+  deciding.
+- After a deferred rule wins, it initializes the selected branch and replays the
+  buffered bytes to that branch.
 - The decision is made once per connection. Later payloads go directly through
   the same selected branch.
 - Downstream traffic from the selected branch returns through `Router` to the
@@ -48,10 +51,17 @@ Think of `Router` as a deferred branch selector:
 If no rule matches, the connection uses the node's top-level `next`. That `next`
 is the default route.
 
+At `Init`, Router clears stale observed-protocol bits while preserving separate
+one-shot route-control metadata. This lets a protocol tunnel carry an already
+negotiated destination through Router to its designated outbound adapter without
+making that metadata available to `protocol` rules.
+
 :::warning
-`Router` needs the client side to send first. Protocols where the server speaks
-first cannot be classified until upstream payload arrives, because no branch is
-initialized before that first payload.
+Rules that need sniffing still need the client side to send first. For
+server-first or handshake clients that need downstream establishment before
+their first write, use only metadata-only rules (for example `network`, ports,
+addresses, or credentials) and leave root `sniffing`, `protocol`, and
+`attributes` out of that Router.
 :::
 
 ## Typical Placement
@@ -924,9 +934,10 @@ to. Use it for multiport listener routing.
 
 ### Routing server-first protocols
 
-Router classifies on first upstream payload. If the server must speak before the
-client sends anything, Router cannot initialize a branch until client data
-arrives.
+Router initializes a branch during `Init` when its configured rules use only
+metadata already on the line. If any configured rule or root setting needs
+payload sniffing, Router instead waits for the first upstream payload; such a
+configuration cannot initialize a server-first path until client data arrives.
 
 ## Node Metadata
 

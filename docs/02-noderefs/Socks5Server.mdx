@@ -6,7 +6,7 @@ description: "Reference documentation for the Socks5Server node."
 ---
 
 <!--
-Documentation version: 152
+Documentation version: 157
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/Socks5Server/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/Socks5Server.mdx, and all files must keep the same documentation version.
 -->
 
@@ -34,20 +34,88 @@ TCP-only SOCKS5 server:
 TcpListener -> Socks5Server -> TcpConnector
 ```
 
-SOCKS5 server with UDP support:
+SOCKS5 server with combined `CONNECT` and UDP support:
 
 ```text
-TcpListener -> Socks5Server -> TcpConnector
-UdpListener -> Socks5Server -> UdpConnector
+TcpUdpListener -> [optional middle tunnels] -> Socks5Server -> TcpUdpConnector
 ```
 
-The TCP listener accepts the SOCKS5 control connection. The UDP listener receives SOCKS5 UDP datagrams after the client
-has created a valid UDP association over the TCP control connection.
+There is one previous callback path, not separate TCP and UDP chains into one `Socks5Server`. `TcpUdpListener` supplies
+the TCP control ingress and its private dynamic UDP provider on that one path. `udp: true` fails startup when the
+finalized preceding path has no `UdpListener`/`TcpUdpListener` provider.
+
+:::warning Required topology for SOCKS5 UDP
+Use [`TcpUdpListener`](./TcpUdpListener.mdx) for the normal built-in deployment. `TcpListener` alone can carry the
+SOCKS5 TCP control connection and `CONNECT`, but it cannot provide the dynamic UDP endpoint required by
+`UDP ASSOCIATE`. A bare [`UdpListener`](./UdpListener.mdx) exposes the provider capability, but by itself cannot accept
+the required TCP control connection. It is useful only inside a custom fan-in topology that supplies TCP on the same
+callback path.
+
+`Socks5Server` discovers the provider automatically from its finalized preceding path. There is no provider-name or
+provider-API JSON setting.
+:::
 
 Do not manually place `UserController` after an authenticated `Socks5Server`. Authenticated mode creates and inserts an
 internal `UserController` before the configured `next` node.
 
-## Authenticated example
+## Complete TCP/UDP topology example
+
+This minimal configuration shows all three required data-path roles: the combined entry listener, the SOCKS5 protocol
+node, and a connector that follows each requested TCP or UDP destination.
+
+```json
+{
+  "name": "socks5-service",
+  "nodes": [
+    {
+      "name": "socks-entry",
+      "type": "TcpUdpListener",
+      "settings": {
+        "address": "0.0.0.0",
+        "port": 1080,
+        "nodelay": true
+      },
+      "next": "socks-server"
+    },
+    {
+      "name": "socks-server",
+      "type": "Socks5Server",
+      "settings": {
+        "no-auth": true,
+        "connect": true,
+        "udp": true,
+        "ipv4": "203.0.113.10"
+      },
+      "next": "outbound"
+    },
+    {
+      "name": "outbound",
+      "type": "TcpUdpConnector",
+      "settings": {
+        "address": "dest_context->address",
+        "port": "dest_context->port",
+        "nodelay": true,
+        "fastopen": false
+      }
+    }
+  ]
+}
+```
+
+Replace `203.0.113.10` with an IPv4 address that the SOCKS5 clients can actually reach. The example uses `no-auth` only
+to keep the topology visible; an Internet-facing deployment should normally use `auth-client-node-name` and a configured
+`AuthenticationClient`.
+
+The addresses and ports in this topology have different jobs:
+
+| Setting or value | Meaning |
+| --- | --- |
+| `TcpUdpListener.settings.address` | Local address on which the TCP listener and dynamically created UDP sockets bind. |
+| `TcpUdpListener.settings.port` | Public SOCKS5 TCP control port. The internal static UDP child also listens here, but `Socks5Server` does not accept that fixed port as a SOCKS UDP association. |
+| `Socks5Server.settings.ipv4` | IPv4 address advertised to the SOCKS5 client in `BND.ADDR`; it must be reachable by that client. It is not the socket bind setting. |
+| Reply `BND.PORT` | Per-association UDP relay port chosen dynamically by the operating system and returned by `UDP ASSOCIATE`. |
+
+## Authenticated node example
 
 ```json
 {
@@ -57,7 +125,7 @@ internal `UserController` before the configured `next` node.
     "auth-client-node-name": "auth-client",
     "connect": true,
     "udp": true,
-    "ipv4": "0.0.0.0",
+    "ipv4": "203.0.113.10",
     "sweep-interval-ms": 1000,
     "verbose": false
   },
@@ -67,6 +135,8 @@ internal `UserController` before the configured `next` node.
 
 `auth-client` must be an existing node of type `AuthenticationClient` in the same configuration. `Socks5Server` uses
 that node for lookups; it does not create the authentication client.
+
+Replace `203.0.113.10` with the IPv4 address advertised to and reachable by your SOCKS5 clients.
 
 ## No-auth example
 
@@ -92,10 +162,13 @@ Exactly one authentication mode must be selected: either `auth-client-node-name`
 | `settings` | object | Required and must not be empty. |
 | `settings.auth-client-node-name` | string | Required unless `no-auth` is explicitly `true`. Must point to an existing `AuthenticationClient` node and must not point back to the same `Socks5Server`. |
 | `settings.no-auth` | boolean | Required only when no authentication client is configured. Must be `true` to enable no-auth mode. |
-| `settings.ipv4` / `settings.udp-ipv4` | string | Required when `udp` is enabled. IPv4 address returned in the `UDP ASSOCIATE` reply. |
+| `settings.ipv4` / `settings.udp-ipv4` | string | Required when `udp` is enabled. Reachable IPv4 address returned in `BND.ADDR` of the `UDP ASSOCIATE` reply; this is not the listener bind address. |
 | `next` | string | Required. Points to the real outbound path. |
 
 At least one of `connect` or `udp` must be enabled.
+
+When `udp` is enabled, the finalized preceding path must expose a dynamic UDP provider. In a normal built-in topology,
+that means starting the service with `TcpUdpListener` rather than `TcpListener`.
 
 ## Optional fields
 
@@ -157,44 +230,60 @@ If `connect` is disabled, `CONNECT` requests are rejected with `command not supp
 `UDP ASSOCIATE` creates an association that is owned by the TCP control line. It does not open a normal upstream stream
 from the control line.
 
+The provider is discovered automatically by walking the finalized preceding callback path. Optional middle tunnels can
+remain between `TcpUdpListener` and `Socks5Server` as long as that path still reaches the provider. No provider setting
+is added to the `Socks5Server` JSON.
+
 The UDP associate reply uses:
 
 - the configured `settings.ipv4` or `settings.udp-ipv4` as the reply address
-- the local TCP listener port that accepted the control connection as the reply port
+- the dynamically allocated ephemeral UDP port provided by the preceding `UdpListener` (normally through `TcpUdpListener`) dynamic endpoint provider as the reply port
 
-For example, if the TCP control connection was accepted on local port `443` and `ipv4` is `0.0.0.0`, the reply tells the
-client to send SOCKS UDP datagrams to `0.0.0.0:443`.
+When `UDP ASSOCIATE` is requested, `Socks5Server` queries its upstream listener (`UdpListener` or `TcpUdpListener`) to allocate a dynamic, dedicated bound UDP socket endpoint for this client. Once the dynamic endpoint is bound and activated on the current worker, the assigned ephemeral UDP port is returned to the client in the `UDP ASSOCIATE` reply. If binding, activation, or reply allocation fails, only that association receives a general-failure reply; existing associations remain intact. The returned endpoint must be reachable through firewall and NAT policy. Static/fixed-port UDP listener traffic is not accepted as a SOCKS association.
 
-The request's UDP peer hint is used when present. If the hint contains a concrete IP and port, the association is keyed
-to that source. If the hint uses an any-address, the TCP control connection source IP is used.
+At UDP `Init` and again before its first payload, endpoint metadata must name the
+line's actual owner WID and an active association handle. A valid-current-worker
+metadata/WID mismatch is an ordinary fail-closed UDP-only rejection: it creates
+no remote line, sends no reply, and never closes or messages the TCP control
+line. A callback invoked from a different current worker is a fatal core
+invariant and is rejected before line state or worker-local resources are read.
 
 ## UDP security model
 
 The UDP listener is not an open proxy. A UDP datagram is accepted only when:
 
-- the datagram sender matches a registered association
-- the association was created by a successfully negotiated TCP control line
-- the association entry still exists
+- the datagram arrives on the dynamic bound UDP socket assigned to that client association
+- the datagram source IP/port matches the pinned or expected peer address
+- the association was created by a successfully negotiated TCP control line and is active on the current worker
 
-When the TCP control line closes, its UDP association is unregistered immediately. Later UDP datagrams for that
-association are rejected.
+A concrete peer IP in the UDP-associate request that differs from the TCP control
+peer is rejected. A wildcard peer IP uses the control peer IP; when the requested
+source port is zero, the first matching datagram pins the port. Standard SOCKS5
+does not cryptographically authenticate individual UDP datagrams. A peer sharing
+the expected public IP that learns a dedicated relay port can therefore race the
+first packet when the requested port is zero. Stronger protection needs a
+separately designed authenticated UDP encapsulation or token protocol.
 
-Associations are stored in a 64-shard registry on the `Socks5Server` tunnel state. Registry entries store copied
-metadata only:
+When the TCP control line closes, its dynamic UDP endpoint is closed in `UdpListener` and its association is removed immediately from the worker-local registry. Later UDP datagrams arriving on that endpoint or referencing that generation are dropped.
+
+Associations are stored in a worker-local hash map on the `Socks5Server` tunnel state without global locks or cross-worker lock contention. Entries store copied metadata only:
 
 - a generation token
 - the owner worker id
-- the authenticated `user_handle_t`
+- the dynamic endpoint handle
+- the authenticated `user_handle_t`, or an empty handle in no-auth mode
 - copied raw username/password strings, when authenticated mode is used
 
-They do not store a usable `line_t *`. The generation token prevents an older closing control line from deleting a newer
-association that reused the same key.
+They do not store a usable `line_t *`. The complete dynamic endpoint handle
+(owner WID plus generation) is the association identity; there is no
+network-tuple association key. A closing control line removes only the entry
+whose complete handle still matches.
 
 ## UDP payload behavior
 
 When a SOCKS UDP datagram arrives:
 
-1. The server looks up the matching association.
+1. The server looks up the matching worker-local association using the dynamic endpoint generation.
 2. It validates the SOCKS5 UDP header.
 3. If `FRAG != 0`, it ignores the datagram conservatively.
 4. It parses the requested remote destination from the header.
@@ -205,9 +294,9 @@ When a reply comes back from the next node:
 
 1. The payload is wrapped in a SOCKS5 UDP response header.
 2. The response header source address is the remote destination represented by the backend UDP line.
-3. The wrapped datagram is sent downstream toward the UDP listener/client side.
+3. The wrapped datagram is sent downstream toward the dynamic UDP endpoint.
 
-The internal backend UDP lines are normal Waterwall lines created behind the client-facing UDP side. This keeps the
+The internal backend UDP lines are normal Waterwall lines created behind the client-facing dynamic UDP side. This keeps the
 client-facing association line separate from per-remote outbound destinations and preserves normal line lifecycle rules.
 
 ## Finish behavior
@@ -215,7 +304,7 @@ client-facing association line separate from per-remote outbound destinations an
 The implementation follows Waterwall's close ordering:
 
 - local line state is destroyed before real `Finish` propagation
-- the control line unregisters its UDP association before it can die
+- the control line closes its dynamic UDP endpoint and unregisters its UDP association before it can die
 - internal backend UDP lines detach from the client line before closing
 - final SOCKS5 failure replies, when needed before establishment, are sent through a close path that guards against
   re-entrant callbacks
@@ -225,8 +314,13 @@ The implementation follows Waterwall's close ordering:
 - Do not configure `username`, `password`, `users`, or `accounts`; those legacy keys are rejected.
 - Do not configure both `auth-client-node-name` and `no-auth: true`.
 - Do not enable UDP without `ipv4` or `udp-ipv4`.
+- Do not use `TcpListener -> Socks5Server` with `udp: true`; that is a TCP-only entry and has no dynamic UDP provider.
+- Do not send SOCKS UDP datagrams to the configured static listener port; use the dynamic `BND.PORT` returned by
+  `UDP ASSOCIATE`.
 - Do not manually place `UserController` immediately after an authenticated `Socks5Server`; it is inserted internally.
 - Do not expect SOCKS5 `BIND` or UDP fragmentation reassembly.
+- Do not allow only the TCP control port through a firewall/NAT when using UDP;
+  the dynamically returned relay port must also be reachable.
 
 ## Node Metadata
 

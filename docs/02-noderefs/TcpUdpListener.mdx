@@ -6,7 +6,7 @@ description: "Reference documentation for the TcpUdpListener node."
 ---
 
 <!--
-Documentation version: 152
+Documentation version: 155
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/TcpUdpListener/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/TcpUdpListener.mdx, and all files must keep the same documentation version.
 -->
 
@@ -27,10 +27,15 @@ Use `TcpUdpListener` when the same service entry should accept both TCP and UDP:
 TcpUdpListener -> SpeedTestServer
 TcpUdpListener -> SniffRouter -> TcpUdpConnector
 TcpUdpListener -> Router -> ...
+TcpUdpListener -> [optional middle tunnels] -> Socks5Server -> TcpUdpConnector
 ```
 
 The next node must be valid for the traffic you expect. If both TCP and UDP will arrive in production, the next node must
 understand both normal TCP lines and UDP peer lines, or it must route them by protocol.
+
+`TcpUdpListener` is the standard built-in entry node for [`Socks5Server`](./Socks5Server.mdx) with `udp: true`: its TCP
+child accepts the SOCKS5 control connection, while its UDP child supplies the dynamic endpoint provider. A plain
+`TcpListener` supports only SOCKS5 TCP/`CONNECT` and cannot satisfy `UDP ASSOCIATE`.
 
 ## Basic Example
 
@@ -222,10 +227,36 @@ Line ownership stays with the child adapter that created the line:
 - TCP lines are owned by the internal `TcpListener`
 - UDP peer lines are owned by the internal `UdpListener`
 
+## Dynamic UDP Endpoint Delegation
+
+For a compatible protocol tunnel later in the same chain, including `Socks5Server`, `TcpUdpListener` delegates the typed
+dynamic UDP endpoint capability to its internal [`UdpListener`](./UdpListener.mdx). `Socks5Server` discovers this
+provider automatically from its finalized preceding path; no provider node name or JSON API setting is required. The
+child remains the owner of the dynamic socket, its worker-local endpoint registry, and each provider-created normal line;
+the wrapper only preserves the usual callback chain.
+
+```text
+dynamic UDP child endpoint -> UdpListener child -> TcpUdpListener -> next chain
+```
+
+On the return path, the wrapper selects the UDP child from the line source
+protocol, so downstream replies reach the dedicated endpoint. The wrapper must
+not separately close, drain, or run the child's endpoint lifecycle. Dynamic
+allocation uses an ephemeral UDP port from the child, not the wrapper's
+configured static TCP/UDP port.
+
+The child enforces the endpoint's normalized expected peer IP before line
+creation, a configured nonzero source port exactly, and a first-valid-packet pin
+when the configured source port is zero. Mismatches are silent drops and never
+close or message the associated TCP control line. Its `large-*-buffer: false`
+settings likewise leave dynamic child-socket kernel defaults unchanged.
+
 ## Common Mistakes
 
 - Do not use `TcpUdpListener` as a protocol converter. It accepts both protocols, but it does not convert between them.
 - Do not point it at a next node that only works for TCP if UDP traffic can arrive.
+- Do not replace it with `TcpListener` in a `Socks5Server` topology that enables UDP; `TcpListener` has no dynamic UDP
+  provider.
 - Do not configure different TCP and UDP port sets on this wrapper; both child listeners receive the same settings.
 - Do not remove or corrupt source protocol metadata before callbacks return downstream to this node.
 

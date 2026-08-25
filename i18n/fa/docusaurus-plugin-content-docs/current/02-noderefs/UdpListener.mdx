@@ -6,7 +6,7 @@ description: "راهنمای نود UdpListener در WaterWall."
 ---
 
 <!--
-Documentation version: 152
+Documentation version: 155
 Sync note: فایل انگلیسی WaterWall-Docs/docs/02-noderefs/UdpListener.mdx و WaterWall/tunnels/UdpListener/description.md باید نسخه‌ی مستندات یکسانی داشته باشند. هر تغییر قابل‌مشاهده برای کاربر در نسخه‌ی انگلیسی باید در این ترجمه نیز اعمال شود.
 -->
 
@@ -180,7 +180,9 @@ UDP ذاتاً Connectionless است، اما `UdpListener` برای بقیه‌
 | Integer مثبت | همان تعداد Byte را مستقیماً درخواست می‌کند. |
 
 هر دو گزینه برای Listenerهای UDP به‌صورت پیش‌فرض از Socket Buffer بزرگ WaterWall
-استفاده می‌کنند.
+استفاده می‌کنند. همین parser برای Socketهای association پویا هم اعمال می‌شود:
+`false` مقدار پیش‌فرض Kernel را برای آن‌ها نیز دست‌نخورده می‌گذارد و buffer بزرگ
+WaterWall درخواست نمی‌کند.
 
 ### ‏Interface و `fwmark`
 
@@ -294,6 +296,49 @@ Timeoutهای فعلی:
 اگر Line مربوط به Peer منقضی شود، `UdpListener` یک `finish` در upstream می‌فرستد
 و Lineای را که خودش ساخته است نابود می‌کند.
 
+## ارائه‌دهندهٔ endpoint پویا
+
+`UdpListener` یک provider تایپ‌شده و درون‌پردازه‌ای برای ساخت endpoint پویا نیز
+در اختیار tunnel پروتکلی سازگار در همان chain می‌گذارد.
+[`Socks5Server`](./Socks5Server.mdx) یکی از مصرف‌کنندگان این قابلیت است. برای یک
+سرویس عادی SOCKS5 از [`TcpUdpListener`](./TcpUdpListener.mdx) استفاده کنید: child
+داخلی `TcpListener`، ‏control connection الزامی TCP را می‌پذیرد و child داخلی
+`UdpListener` این provider را واگذار می‌کند. یک `UdpListener` مستقل به‌تنهایی
+ورودی کامل SOCKS5 نیست، زیرا نمی‌تواند آن control connection نوع TCP را بپذیرد.
+
+این یک capability از `interface.h` است، نه یک setting در JSON و نه API پیام خارجی
+`instance/api.c`. نود `Socks5Server` آن را به‌صورت خودکار از مسیر قبلی نهایی‌شدهٔ
+خود پیدا می‌کند؛ اپراتور نام نود provider را پیکربندی نمی‌کند.
+
+provider روی Event Worker درخواست‌کننده یک Socket UDP اختصاصی را با Bind انحصاری
+روی `port: 0` می‌سازد و یک handle مقداری و opaque (شامل WID مالک و generation)،
+آدرس محلی تخصیص‌داده‌شده توسط kernel، و port واقعی را برمی‌گرداند. Handle فقط روی
+Worker مالک معتبر است؛ close تکراری یا handle قدیمی بی‌خطر است و endpoint جدیدتر را
+نمی‌بندد.
+
+ورود داده از endpoint پویا مسیر عادی chain را طی می‌کند:
+
+```text
+dynamic UDP socket -> UdpListener -> TcpUdpListener (در صورت وجود) -> next chain
+```
+
+پاسخ‌های downstream از همان endpoint به peer پین‌شده بازمی‌گردند. Socket پویا از
+address، ‏interface، ‏`fwmark`، ‏bufferهای send/receive، ‏whitelist و blacklist
+Listener استفاده می‌کند، اما از `port` ثابت، بازهٔ port، ‏balance group و
+multiport backend استفاده نمی‌کند.
+
+پیش از آن‌که یک Datagram پویا بتواند Line متعلق به provider را بسازد یا استفاده
+کند، IP نرمال‌شدهٔ peer باید دقیقاً با IP مورد انتظار endpoint برابر باشد. Source
+port غیرصفرِ تنظیم‌شده نیز باید دقیقاً برابر باشد؛ source port صفر نخستین sender
+معتبر را pin می‌کند و همهٔ portهای بعدی باید با همان pin برابر باشند. Datagramهای
+نامطابق بی‌صدا drop می‌شوند و TCP control association را نمی‌بندند یا به آن پیام
+نمی‌دهند.
+
+در Quiesce، بازکردن یا فعال‌سازی endpoint تازه رد می‌شود. روی Worker مالک، ابتدا
+callbackهای WIO جدا می‌شوند، سپس endpoint از registry محلی Worker حذف می‌شود و یک
+مسیر close واحد و idempotent، Line عادی متعلق به provider را finish و نابود می‌کند.
+این inventory از جدول عادی peerها در Socket Manager جدا است.
+
 ## نکات و محدودیت‌ها
 
 - `UdpListener` یک Chain Head برای UDP است و به `next` نیاز دارد.
@@ -302,6 +347,11 @@ Timeoutهای فعلی:
 - `whitelist` و `blacklist`، ‏Stringهای CIDR مربوط به IPv4 و IPv6 را می‌پذیرند.
 - `fwmark` و Bindشدن به Device به Platform وابسته‌اند.
 - Lineهای Peer در حالت Pause، ‏Datagramهای ورودی را به‌جای Bufferکردن دور می‌ریزند.
+- endpointهای پویا plumbing داخلی capability هستند، نه port عمومی اضافه که با
+  `port` یا `port-range` تنظیم شود.
+- برای سرویس داخلی SOCKS5 UDP، توپولوژی
+  `TcpUdpListener -> ... -> Socks5Server` را پیکربندی کنید، نه یک ورودی مستقل
+  `UdpListener` یا `TcpListener`.
 - برای رفتار Stateless و در سطح Packet در UDP، شاید `UdpStatelessSocket` انتخاب
   مناسب‌تری از `UdpListener` باشد.
 
