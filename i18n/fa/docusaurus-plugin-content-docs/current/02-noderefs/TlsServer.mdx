@@ -6,7 +6,7 @@ description: "راهنمای نود TlsServer در WaterWall."
 ---
 
 <!--
-Documentation version: 153
+Documentation version: 155
 -->
 
 # TlsServer
@@ -305,6 +305,54 @@ downstream عمداً به تأخیر نمی‌افتند. اگر upstream `Fini
 برای camouflage روی یک پورت عمومی، بهتر است fallback یک سرویس واقعی TLS، معمولاً nginx، با certificate، SNI، ALPN،
 cipher، ticket و نسخه protocol مشابه `TlsServer` باشد. قرار دادن HTTP ساده پشت یک پورت عمومی TLS معمولاً خیلی راحت‌تر
 fingerprint می‌شود.
+
+## مسیریابی بر اساس SNI با Fallback واقعی TLS
+
+وب‌سرور Nginx دو ورودی غیرمنتظره عمومی روی HTTPS listener را از یکدیگر متمایز می‌کند:
+
+1. **درخواست Plaintext HTTP روی پورت HTTPS**: Nginx یک درخواست عادی روی پورت HTTPS را در داخل با وضعیت 497 دسته‌بندی می‌کند. اگر `error_page` سفارشی نشده باشد، پاسخ پیش‌فرض معمولاً همان صفحه HTML قابل‌شناسایی با وضعیت بیرونی 400 است. گزینه `fallback-node-name` در `TlsServer` این حالت را با هدایت byteهای غیر TLS پیش از تعهد به TLS به سمت نود fallback مدیریت می‌کند. بخش [پردازش خطاهای SSL در مستندات Nginx](https://nginx.org/en/docs/http/ngx_http_ssl_module.html#errors) را ببینید.
+2. **پیام TLS ClientHello با SNI ناشناخته یا متفاوت**: اتصال ابتدا در context سرور پیش‌فرض Nginx ساخته می‌شود و اگر SNI منطبق پیدا نشود، handshake معمولاً با certificate و تنظیمات همان context کامل می‌شود. سرور پیش‌فرض می‌تواند با تنظیم صریح [`ssl_reject_handshake on`](https://nginx.org/en/docs/http/ngx_http_ssl_module.html#ssl_reject_handshake) این handshakeها را رد کند. بخش [انتخاب virtual server در Nginx](https://nginx.org/en/docs/http/server_names.html#virtual_server_selection) را ببینید.
+
+تنظیم `TlsServer.sni` مدل رد صریح handshake (`ssl_reject_handshake on`) را پیاده می‌کند، نه مسیریابی default vhost در Nginx. از آنجا که `TlsServer.sni` نمی‌تواند با `fallback-node-name` ترکیب شود، برای سناریوهایی که نیازمند استتار کامل Nginx هستند (که در آن SNI ناشناخته، عدم ارسال SNI و درخواست‌های plaintext همگی به یک Nginx HTTPS listener واقعی برسند)، باید `SniffRouter` **پیش از** `TlsServer` قرار گیرد:
+
+```text
+TcpListener :443 -> SniffRouter
+                      |-- route (expected SNI) -> TlsServer -> protected backend
+                      `-- default (unmatched)  -> TcpConnector -> real nginx HTTPS listener
+```
+
+الگوی پیکربندی مینیمال:
+
+```json
+{
+  "name": "sniff-router",
+  "type": "SniffRouter",
+  "settings": {
+    "routes": [
+      {
+        "domain": "vpn.example.com",
+        "detection": "tls",
+        "next": "protected-tls-server"
+      }
+    ]
+  },
+  "next": "nginx-fallback-connector"
+}
+```
+
+در این معماری:
+- نود `SniffRouter` پیش از پایان TLS، مقدار SNI در ClientHello آشکار را بررسی و دسته‌بندی می‌کند.
+- پیام‌های ClientHello منطبق به `TlsServer` هدایت می‌شوند (که نباید `fallback-node-name` داشته باشد). استفاده از فیلتر `sni` در `TlsServer` اختیاری و به عنوان بررسی redundant fail-closed است، نه مکانیزم اصلی مسیریابی.
+- پیام‌های ClientHello با SNI آشکار نامنطبق، پیام‌های فاقد SNI آشکار و ترافیک plaintext به شاخه پیش‌فرض `next` در `SniffRouter` و به Nginx واقعی بدون رمزگشایی هدایت می‌شوند.
+- ECH مقدار SNI درونی را پنهان می‌کند، اما ClientHello بیرونی آن ممکن است همچنان نام سرور آشکاری داشته باشد. `SniffRouter` بر اساس همان مقدار بیرونی مسیریابی می‌کند: نام بیرونی منطبق به شاخه محافظت‌شده می‌رود و نام بیرونی نامنطبق یا غایب به شاخه پیش‌فرض می‌رود. این نود نمی‌تواند بر اساس نام درونی رمزنگاری‌شده مسیریابی کند.
+- پیام‌های کامل ClientHello پیش از اعمال حد آستانه بافر ارزیابی می‌شوند. ورودی‌های ناقصی که کمتر از سقف ۸۱۹۲ بایت هستند در حالت انتظار می‌مانند و مشمول idle timeout در listener اولیه (مانند `TcpListener`) خواهند بود.
+- برای مشاهده پیکربندی کامل، فایل `tests/examples/vless_tls_sni_camouflage_server.json` را بررسی کنید.
+
+**محدودیت‌ها و مرزهای شناسایی**:
+- **مقدار SNI تنها متادیتای مسیریابی است، نه احراز هویت**: هر کلاینتی که SNI مورد انتظار را بداند به `TlsServer` محافظت‌شده می‌رسد. احراز هویت باید در لایه‌های درونی پروتکل (مانند VLESS یا Trojan) انجام گیرد.
+- **رفتار پروتکل درونی همچنان قابل مشاهده است**: byteهای پاسخ رد یا fallback، شیوه بسته‌شدن اتصال و timing پس از رسیدن probe به SNI محافظت‌شده همچنان می‌توانند پروتکل درونی یا deployment را آشکار کنند.
+- **سلامت و پاسخ‌دهی Fallback**: در صورت در دسترس نبودن سرور Nginx پشتیبان یا تفاوت در رفتارهای certificate/ALPN/cipher/session، سرویس قابل شناسایی خواهد بود.
+- **تایمینگ و Timeoutها**: بافرینگ در `SniffRouter` و اتصال مجدد تأخیر اندکی ایجاد می‌کنند. زمان‌های timeout در `TcpListener` را با سرور پوششی هماهنگ کنید. WaterWall ادعای یکسان‌بودن کامل تایمینگ یا تطابق بایت‌به‌بایت اثر انگشت TLS را ندارد.
 
 ## Handshake Timeout
 
