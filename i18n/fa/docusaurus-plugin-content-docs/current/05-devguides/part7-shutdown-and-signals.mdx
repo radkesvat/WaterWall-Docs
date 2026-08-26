@@ -6,7 +6,7 @@ description: "کنترل‌کننده‌ی خاموش‌سازی، پروتکل 
 ---
 
 <!--
-Documentation version: 157
+Documentation version: 160
 -->
 
 # بخش ۷: خاتمه‌ی برنامه
@@ -217,6 +217,14 @@ retain-on-refusal که نتواند Timer همان Worker را نصب کند، �
 سپس تخصیص Timer روی Worker مقصد شکست بخورد، مالکیت قبلاً منتقل شده است؛ در نتیجه
 پاک‌سازی یک بار با `ResourceFailure` اجرا می‌شود.
 
+Worker Messageهای زمان‌بندی‌شده از مرز داخلی سه‌حالتهٔ `wtimerTryAdd()` استفاده
+می‌کنند. Storage مربوط به Timer آن‌ها با `calloc` واقعاً fallible در CRT ساخته و با
+`free` متناظر در CRT آزاد می‌شود؛ provenance صریح expiry، حذف صریح، cleanup
+quiesced/deferred، آزادسازی رویداد pending و نابودی Loop را به همان خانواده هدایت
+می‌کند. `wtimerAdd()` عمومی و storage نامرتبط Event همچنان fail-fast هستند.
+ردشدن نصب به‌دلیل بسته‌بودن پذیرش Loop، `AdmissionClosed` گزارش می‌کند و هرگز به
+اشتباه `ResourceFailure` نامیده نمی‌شود.
+
 ارسال‌های بررسی‌شده مقدار `worker_message_submit_result_e` برمی‌گردانند:
 پذیرفته‌شده، ردشده با حفظ مالکیت فراخواننده، یا ردشده پس از اجرای پاک‌سازی.
 پاک‌سازی یک `worker_message_cancel_reason_e` دریافت می‌کند که دردسترس‌نبودن مقصد،
@@ -232,7 +240,34 @@ retain-on-refusal که نتواند Timer همان Worker را نصب کند، �
 همسایه‌ها را فراخوانی کند یا صرفاً به‌دلیل لغوشدن کار هنگام آرام‌سازی عمدی، یک
 خاموش‌سازی دیگر درخواست کند.
 
-## ۶. ‏Lifecycle ABI v2
+### Settlement عمومی Line Task
+
+خانوادهٔ `lineSchedule*Task*()` همین قرارداد را به API عمومی Line می‌آورد. Cleanup
+دلیل Worker Message را به `line_task_cancel_reason_e` نگاشت می‌کند و وقتی dispatch
+allocation فیزیکی ولی Line منطقی مرده ببیند `LineDead` می‌دهد. رکورد scheduling پیش
+از user callback آزاد می‌شود؛ Reference Line تا پایان notification، settlement
+Buffer و سپس `lineUnref()` نگه داشته می‌شود.
+
+`RejectedSettled` یعنی notification همگام و cleanup داخلی تمام شده است؛
+`AcceptedAsync` فقط انتقال مالکیت به مسیر async است. پس از admission پیام setup،
+مسیر submitter و owner مستقل از هم پیش می‌روند:
+
+```text
+submitter lane -> setup admission commits result -> return/observe AcceptedAsync
+owner lane     -> accepted setup may run -> allocation fails -> ResourceFailure cancellation
+                 cancellation may precede, race with, or follow submitter observation
+```
+
+بنابراین State و latch معلق caller باید پیش از submission منتشر شوند؛ مشاهدهٔ
+`AcceptedAsync` نقطهٔ synchronization با cancellation نیست.
+
+Setup در صف می‌تواند با `Quiesced`، Timer arm‌شده پیش از expiry و queue جداشده با
+`Teardown` settle شود. این‌ها مجوز rearm، restart retry یا درخواست shutdown تازه
+نیستند. پیشرفت الزامی باید در inventory مالک یا Stop نماینده داشته باشد. Callback
+لغو NULL فقط notification را حذف می‌کند و cleanup رکورد، Buffer و Reference باقی
+می‌ماند.
+
+## ۶. مراحل Lifecycle و ABI نود خارجی
 
 هر تونل یک جدول کامل Callback چرخه‌ی عمر با Context دارد. خاموش‌سازی پردازه مراحل
 دقیق زیر را برای هر تونل اجرا می‌کند. NodeManager درون هر زنجیره از ترتیب
@@ -263,20 +298,21 @@ Traversal مرکزی از قبل مالک آن است.
 
 ### Nodeهای خارجی
 
-Lifecycle v2 عمداً Layout خارجی `tunnel_t` و Signatureهای Callback را تغییر می‌دهد.
-Library یک Node دینامیک باید تابع زیر را Export کند:
+Lifecycle v2 عمداً Layout خارجی `tunnel_t` و Signatureهای Callback را تغییر داد.
+ABI کامل نود خارجی اکنون به‌دلیل تغییر Signatureهای Line Task نسخهٔ 3 است. Library
+یک Node دینامیک باید Symbol تاریخی زیر را Export کند:
 
 ```c
 uint32_t waterwallNodeLifecycleAbiVersion(void)
 {
-    return WW_EXTERNAL_NODE_LIFECYCLE_ABI_VERSION;
+    return WW_EXTERNAL_NODE_ABI_VERSION;
 }
 ```
 
-بارگذار (`Loader`) پیش از Resolve یا فراخوانی Getter مربوط به Node، این Symbol را
-بررسی می‌کند. کتابخانه‌ای با Descriptor گمشده یا ناسازگار رد می‌شود. WaterWall هیچ
-Callback قدیمی تک‌آرگومانی را از طریق Function Pointer دارای Context صدا نمی‌زند و
-Layout قدیمی را نرمال نمی‌کند.
+Loader این Symbol را پیش از Getter بررسی می‌کند و Library گمشده، v2 یا ناسازگار را
+رد می‌کند. `WW_EXTERNAL_NODE_LIFECYCLE_ABI_VERSION` برای سازگاری Source alias مانده
+و Callbackهای lifecycle معنای v2 خود را حفظ می‌کنند. WaterWall prototype قدیمی را
+از مرز جدید فراخوانی یا Layout ناسازگار را normalize نمی‌کند.
 
 ## ۷. توالی مرتب خاموش‌سازی
 
@@ -490,13 +526,19 @@ Mask در SignalManager که بالاتر توضیح داده شد استفاد�
 
 ```bash
 ctest --preset linux-unit-release --output-on-failure \
-  -R 'shutdown|signal|worker.*quies|wloop_(stop|wakeup)|lifecycle_node_abi|quiescence_gate|reader_session|lwip'
+  -R 'line_task_scheduling|worker_context_helpers|shutdown|signal|worker.*quies|wloop_(stop|wakeup)|external_node_abi|quiescence_gate|reader_session|lwip'
 
 # پوشش متمرکز Race روی زنجیره‌ابزارهای پشتیبانی‌شده‌ی Linux
 ctest --preset linux-tsan-unit --output-on-failure
 ```
 
 Fixtureهای مهم موارد زیر را اثبات می‌کنند:
+
+- `line_task_scheduling` شکست one-shot را داخل مرز واقعی و fallible
+  `eventloopTryZalloc()` تزریق می‌کند و settlement مستقیم/خارجی، Bufferدار، Line
+  مرده، quiescence، teardown و cancellation بازدرون‌شونده را می‌سنجد؛
+- `worker_context_helpers` نگاشت نتیجه/دلیل Worker Message و قرارداد مالکیت دقیق
+  callback-or-cleanup را اثبات می‌کند؛
 
 - پذیرش پایدار با Wake ناقص، Handleکردن Wake اشباع‌شده در POSIX، ‏Coalesceشدن
   Requestها، انتخاب Reason اول و Arbitration نهایی Status؛
@@ -515,7 +557,7 @@ Fixtureهای مهم موارد زیر را اثبات می‌کنند:
   نابودی Timeout Index یک Owner Registry خالی می‌خواهند؛ Reverse TCP Bridge همچنان
   Smoke Test است؛
 - Race میان Enter و Close برای Device/Session و میان Join و Reclamation؛
-- پذیرش lifecycle ABI v2 و ردشدن Descriptor گمشده یا ناسازگار پیش از Node Getter؛
+- پذیرش ABI v3 نود خارجی و ردشدن Descriptor گمشده، v2 یا ناسازگار پیش از Node Getter؛
 - هیچ Leaf در کد تولید Phase سراسری Shutdown پردازه را نمی‌خواند.
 
 Preset ‏`linux-tsan-unit`، ‏Unitهای متمرکز هم‌زمانی را همراه Fixtureهای واقعی

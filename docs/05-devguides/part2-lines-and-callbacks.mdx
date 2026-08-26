@@ -5,7 +5,7 @@ sidebar_label: "Part 2: Lines & Lifetime"
 description: "The connection lifecycle, re-entrancy hazards, line references, and the clean-finish patterns that keep WaterWall tunnels free of use-after-free bugs."
 ---
 <!--
-Documentation version: 160
+Documentation version: 163
 -->
 
 # Part 2: Lines, Callbacks & Lifetime Safety
@@ -118,22 +118,139 @@ direct reference-count decrement must preserve this release/acquire protocol.
 Do not rely on worker-message locks or an unrelated readiness flag to publish
 line state to a foreign final releaser.
 
-### Checked Worker Scheduling
+### Scheduled Line Tasks
 
-`lineScheduleTask()`, `lineScheduleTaskWithBuf()`, and both delayed variants
-return whether required work was admitted. A `false` result means cleanup has
-already released the scheduler's line reference and, for a buffer variant, the
-buffer; the callback will never run. Reset any `*_scheduled` latch before
-choosing synchronous reconciliation or a terminal owner path.
+`lineScheduleTask()`, `lineScheduleTaskWithBuf()`, and the two delayed variants
+transfer one task to the immutable event worker recorded by the line. Immediate
+work and a delayed call with `delay_ms == 0` are always queued for a later loop
+iteration; neither executes inline. Timer creation and task execution remain
+owner-worker-affine even when submission originates on another worker, the
+lwIP thread, a device thread, or an unregistered thread.
 
-Delayed line tasks require the current line owner worker. Timer allocation or
-timed-queue insertion failure is a refusal, never permission to invoke the
-callback early: minimum-delay callbacks may reschedule themselves, so inline
-fallback can recurse without bound. Cross-worker required lifecycle work needs
-an explicit owner or Stop registry if target-side timer setup can fail after the
-setup message was admitted. Only deliberately lossy payload or observational
-statistics sites may discard a scheduling result, and those exceptions are
-source-policy registered.
+#### Submission precondition
+
+The caller must hold an independently synchronized **live handle** until the
+scheduler takes its own line reference. That means both:
+
+- a physical reference keeps the allocation present; and
+- a gate, registry lock, or equivalent publication protocol prevents
+  `lineDestroy()` from racing the call.
+
+An unprotected raw pointer is invalid. A physical reference alone is also
+insufficient because it does not keep `alive` true. The scheduler retains the
+line after the call, but it does not retain the supplied `tunnel_t`; the runtime
+or component must keep that tunnel valid until task-or-cancellation settlement.
+
+#### What the result proves
+
+Every scheduling result is `line_task_submit_result_e` and must be inspected:
+
+| Result | Synchronous proof |
+| --- | --- |
+| `kLineTaskSubmitRejectedSettled` | The task will not run. Optional cancellation notification and all scheduler-owned record, line-reference, and buffer settlement have completed before return. |
+| `kLineTaskSubmitAcceptedAsync` | Ownership entered an asynchronous queue or setup path. It does **not** prove that a positive-delay timer is armed, that the task remains pending when observed, or that the task will run. |
+| `kLineTaskSubmitTimerArmed` | A non-zero-delay call made on the line's owner worker installed its timer before return. Later line death or quiescence can still cancel it. |
+
+The immediate APIs never return `TimerArmed`. Delayed zero returns
+`AcceptedAsync`. A positive delay submitted on the owner returns `TimerArmed`
+after successful installation. The same positive delay submitted from any
+other thread returns `AcceptedAsync` once owner-side setup is queued.
+
+Scheduling-record acquisition and timed-resource installation deliberately use
+different allocation policies. The pooled scheduling record is fail-fast:
+master-pool item creation cannot report OOM to the scheduling API. Positive-delay
+worker messages instead install their timer through the internal
+`wtimerTryAdd()` boundary. It allocates only those timers with the genuinely
+fallible `eventloopTryZalloc()` (CRT `calloc`) and records their provenance so
+expiry, explicit deletion, quiesced/deferred deletion, loop destruction, and
+pending-event reclamation all use the matching `eventloopTryFree()` (CRT `free`).
+The public `wtimerAdd()` and unrelated event allocations retain their existing
+fail-fast event-loop/mimalloc behavior.
+
+`wtimerTryAdd()` distinguishes installed, admission-closed, and resource-failure
+outcomes. Only an actual allocation failure becomes `ResourceFailure`; closure
+at the installation boundary becomes `AdmissionClosed`. On an owner-worker
+positive-delay call, resource failure cancels synchronously and returns
+`RejectedSettled`. Once a foreign setup message is accepted, the call is
+committed to return `AcceptedAsync`. Owner-side `ResourceFailure` is asynchronous
+with respect to the submitter and may be delivered before, concurrently with, or
+after that return is observed. The task never runs inline: doing so would violate
+its minimum delay and can make a self-rescheduling task recurse without bound.
+Independent delayed tasks have no equal-deadline FIFO guarantee. Ordered work
+belongs in one explicit queue drained by one scheduled task.
+
+#### Exactly one terminal outcome
+
+A non-null `LineTaskCancelFn` makes the public outcome exactly one of task or
+cancellation. Cancellation may run synchronously and re-entrantly before the
+scheduling call returns, later on the owner worker, on the submitting thread,
+or during detached-queue teardown. The scheduler holds its physical line
+reference during notification, but the line may already be logically dead and
+its tunnel line state may already be destroyed. The callback is notification
+only: it owns neither a transferred buffer nor scheduler cleanup.
+
+Set a pending latch **before** submission so synchronous cancellation can settle
+it. A cancellation handler may touch only state whose lifetime and concurrency
+are independently proved, such as an atomic tunnel-state latch kept alive by the
+component lifecycle. It must not restart normal work during quiescence or
+teardown. Passing `NULL` deliberately declines notification; internal ownership
+still settles exactly once.
+
+Cancellation reasons are precise:
+
+| Reason | Meaning |
+| --- | --- |
+| `kLineTaskCancelTargetUnavailable` | The target WID has no ordinary event-worker queue. |
+| `kLineTaskCancelAdmissionClosed` | The target no longer admits normal work or timer setup. |
+| `kLineTaskCancelEnqueueFailure` | Queue growth or wake publication refused submission. |
+| `kLineTaskCancelResourceFailure` | Owner-side delayed resource installation failed. |
+| `kLineTaskCancelQuiesced` | Worker quiescence settled accepted work before execution. |
+| `kLineTaskCancelTeardown` | Detached queue teardown settled the task. |
+| `kLineTaskCancelLineDead` | Dispatch found the retained allocation logically dead. |
+
+After foreign admission, submitter and owner progress independently:
+
+```text
+submitter lane -> setup admission commits result -> return/observe AcceptedAsync
+owner lane     -> accepted setup may run -> allocation fails -> cancellation(ResourceFailure)
+                 cancellation may precede, race with, or follow submitter observation
+```
+
+Memory and resource safety are unconditional; task progress is not. Required
+work therefore needs a synchronous `RejectedSettled` fallback and an
+authoritative owner/Stop path for cancellation after acceptance. Deliberately
+lossy payload and observational-statistics work may pass `NULL` and explicitly
+discard the typed result:
+
+```c
+const line_task_submit_result_e result =
+    lineScheduleDelayedTask(parent, muxclientLogStatsTask, 5000, t, NULL);
+discard result; /* statistics are intentionally best effort */
+```
+
+A required pending-state design can use an independently safe atomic latch in
+tunnel state. Both terminal callbacks clear the same latch; neither assumes that
+a timer was armed or reaches into possibly destroyed line state:
+
+```c
+static void retryCancelled(tunnel_t *t, line_t *line, line_task_cancel_reason_e reason)
+{
+    retry_tstate_t *ts = tunnelGetState(t);
+    atomicStoreExplicit(&ts->pending[lineGetWID(line)], false, memory_order_release);
+    discard reason; /* owner drain is authoritative after cancellation */
+}
+
+atomicStoreExplicit(&ts->pending[wid], true, memory_order_release);
+const line_task_submit_result_e result =
+    lineScheduleDelayedTask(line, retryTask, delay_ms, t, retryCancelled);
+if (result == kLineTaskSubmitRejectedSettled)
+{
+    /* retryCancelled already cleared pending; perform only safe inline policy. */
+}
+```
+
+Do not let both a cancellation callback and the `RejectedSettled` branch perform
+the same fallback. Notification has already run when that result is returned.
 
 The shared `pipe_tunnel` follows the same rule for ordered cross-worker streams.
 One explicit pair owner holds the borrowed/owned roles and references; any lost

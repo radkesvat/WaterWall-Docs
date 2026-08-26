@@ -5,7 +5,7 @@ sidebar_label: "Part 7: Application Termination"
 description: "The shutdown controller, worker quiescence protocol, lifecycle-v2 component stages, task settlement, signals, devices, and destruction order."
 ---
 <!--
-Documentation version: 157
+Documentation version: 160
 -->
 
 # Part 7: Application Termination
@@ -209,6 +209,14 @@ payload to its caller without invoking cleanup. If a queued setup wrapper was
 accepted and timer allocation later fails on the target worker, ownership had
 already transferred, so cleanup runs once with `ResourceFailure`.
 
+Timed worker messages use the internal three-way `wtimerTryAdd()` boundary.
+Their timer storage comes from fallible CRT `calloc` and is reclaimed by matching
+CRT `free`; explicit provenance routes expiry, explicit deletion,
+quiesced/deferred cleanup, pending-event release, and loop destruction through
+that matching family. Public `wtimerAdd()` and unrelated event storage remain
+fail-fast. Installation refusal caused by closed loop admission reports
+`AdmissionClosed`; it is never mislabeled as `ResourceFailure`.
+
 Checked submissions return `worker_message_submit_result_e`: accepted,
 rejected with caller ownership retained, or rejected after cleanup ran. Cleanup
 receives a `worker_message_cancel_reason_e` that distinguishes unavailable
@@ -225,7 +233,37 @@ Cleanup releases ownership. It must not restart application work, call an
 unbounded neighbor graph, or request another shutdown merely because intentional
 quiescence canceled the task.
 
-## 6. Lifecycle ABI v2
+### Public line-task settlement
+
+The public `lineSchedule*Task*()` family builds on this run-or-cancel machinery.
+Its cleanup maps worker-message reasons to `line_task_cancel_reason_e`, adds
+`LineDead` when dispatch finds a physically retained but logically dead line,
+and releases its scheduling record before invoking re-entrant user code. The
+scheduler keeps the line reference through notification, then settles any
+buffer and finally releases the line.
+
+`RejectedSettled` means synchronous notification and internal cleanup are
+complete. `AcceptedAsync` only transfers ownership to an asynchronous path. In
+particular, foreign delayed submission has two independently progressing lanes
+after setup admission:
+
+```text
+submitter lane -> setup admission commits result -> return/observe AcceptedAsync
+owner lane     -> accepted setup may run -> allocation fails -> ResourceFailure cancellation
+                 cancellation may precede, race with, or follow submitter observation
+```
+
+Caller state and pending latches must therefore be published before submission;
+observing `AcceptedAsync` is not a synchronization point with cancellation.
+
+Pending setup can instead be canceled with `Quiesced`; an armed timer can be
+canceled before expiry; detached queue cleanup reports `Teardown`. These are
+terminal settlement, not permission to rearm, restart a retry loop, or request
+shutdown again. Required progress must remain represented by an authoritative
+owner inventory or Stop path. Passing a null cancellation callback changes only
+notification, never record, buffer, or line-reference cleanup.
+
+## 6. Lifecycle stages and external-node ABI
 
 Every tunnel has a total, context-bearing lifecycle callback table. Process
 shutdown invokes these exact stages for every tunnel. Within a chain,
@@ -256,20 +294,24 @@ the central traversal already owns it.
 
 ### External nodes
 
-Lifecycle v2 intentionally changes the external `tunnel_t` layout and callback
-signatures. A dynamic node library must export:
+Lifecycle v2 intentionally changed the external `tunnel_t` layout and callback
+signatures. The complete external-node ABI is now version 3 because the public
+line-task scheduling signatures also changed. A dynamic node library must
+export the historical descriptor symbol:
 
 ```c
 uint32_t waterwallNodeLifecycleAbiVersion(void)
 {
-    return WW_EXTERNAL_NODE_LIFECYCLE_ABI_VERSION;
+    return WW_EXTERNAL_NODE_ABI_VERSION;
 }
 ```
 
 The loader validates this symbol before resolving or invoking a node getter.
-Libraries with a missing or mismatched descriptor are rejected. WaterWall never
-calls a legacy one-argument callback through a context-bearing function pointer
-and does not normalize an old layout.
+Libraries with a missing, v2, or otherwise mismatched descriptor are rejected.
+`WW_EXTERNAL_NODE_LIFECYCLE_ABI_VERSION` remains an alias for source
+compatibility, while lifecycle callbacks retain their v2 semantics. WaterWall
+never calls an old callback or line-task prototype through a new function
+boundary and does not normalize an incompatible layout.
 
 ## 7. Ordered shutdown sequence
 
@@ -476,13 +518,19 @@ Focused validation should cover the behavior changed:
 
 ```bash
 ctest --preset linux-unit-release --output-on-failure \
-  -R 'shutdown|signal|worker.*quies|wloop_(stop|wakeup)|lifecycle_node_abi|quiescence_gate|reader_session|lwip'
+  -R 'line_task_scheduling|worker_context_helpers|shutdown|signal|worker.*quies|wloop_(stop|wakeup)|external_node_abi|quiescence_gate|reader_session|lwip'
 
 # Focused race coverage on supported Linux toolchains
 ctest --preset linux-tsan-unit --output-on-failure
 ```
 
 Important fixtures prove:
+
+- `line_task_scheduling` injects one-shot failure inside the real fallible
+  `eventloopTryZalloc()` boundary and proves direct/foreign, buffered, line-dead,
+  quiescence, teardown, and re-entrant settlement;
+- `worker_context_helpers` proves the underlying worker-message result/reason
+  mapping and callback-or-cleanup ownership contract;
 
 - durable degraded-wake acceptance, saturated POSIX wake handling, request
   coalescing, first-reason selection, and final status arbitration;
@@ -501,8 +549,8 @@ Important fixtures prove:
   before destroying the timeout index; the reverse TCP bridge remains the smoke
   test;
 - device/session enter-versus-close and join-versus-reclamation races;
-- lifecycle ABI v2 acceptance and pre-getter rejection of missing or mismatched
-  descriptors;
+- external-node ABI v3 acceptance and pre-getter rejection of missing, v2, or
+  otherwise mismatched descriptors;
 - no production leaf reads a process-wide shutdown phase.
 
 The `linux-tsan-unit` preset builds the focused concurrency units plus the real

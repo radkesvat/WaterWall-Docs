@@ -6,7 +6,7 @@ description: "چرخه‌ی عمر اتصال، خطرهای Re-entrancy، نگ�
 ---
 
 <!--
-Documentation version: 160
+Documentation version: 163
 -->
 
 # بخش ۲: Lineها، Callbackها و ایمنی طول عمر
@@ -124,21 +124,106 @@ credentials آن release sequence را acquire می‌کند. هر کدی که �
 count را کم می‌کند باید همین قرارداد را حفظ کند؛ lock صف پیام یا readiness flag
 نامرتبط جای این publication را نمی‌گیرد.
 
-### زمان‌بندی بررسی‌شده روی Worker
+### زمان‌بندی Task وابسته به Line
 
-توابع `lineScheduleTask()`، ‏`lineScheduleTaskWithBuf()` و هر دو گونهٔ delayed
-اعلام می‌کنند که کار الزامی پذیرفته شده است یا نه. نتیجهٔ `false` یعنی reference
-متعلق به scheduler و، در گونهٔ دارای buffer، خود buffer آزاد شده‌اند و callback
-هرگز اجرا نمی‌شود. پیش از انتخاب reconciliation هم‌زمان یا مسیر terminal owner،
-latchهایی مانند `*_scheduled` را بازنشانی کنید.
+`lineScheduleTask()`، ‏`lineScheduleTaskWithBuf()` و دو گونهٔ delayed، کار را به
+Event Worker تغییرناپذیر Line منتقل می‌کنند. کار فوری و `delay_ms == 0` همیشه برای
+iteration بعد queue می‌شود و inline اجرا نمی‌شود؛ ساخت Timer و اجرای task حتی برای
+submitter خارجی روی owner worker باقی می‌ماند.
 
-Delayed taskهای line باید روی worker مالک همان line ساخته شوند. شکست تخصیص timer
-یا درج در timed queue یک refusal است، نه اجازهٔ اجرای زودهنگام callback؛ callback
-با حداقل delay ممکن است خودش را دوباره schedule کند و fallback هم‌زمان به recursion
-بی‌کران برسد. کار lifecycle الزامی و cross-worker، اگر setup timer در سمت مقصد
-پس از admission پیام ممکن است شکست بخورد، به owner صریح یا registry قابل drain در
-Stop نیاز دارد. فقط payload عمداً lossy یا statistics مشاهده‌ای می‌توانند نتیجهٔ
-schedule را نادیده بگیرند و این استثناها در policy منبع ثبت می‌شوند.
+فراخواننده باید تا گرفتن Reference داخلی scheduler یک **live handle** همگام‌شده
+داشته باشد: Reference برای ماندن allocation و gate/lock رجیستری برای جلوگیری از
+race با `lineDestroy()`. Reference فیزیکی به‌تنهایی `alive` را حفظ نمی‌کند. Scheduler
+خود Line را نگه می‌دارد اما `tunnel_t` را جداگانه retain نمی‌کند؛ lifecycle مؤلفه
+باید `t` را تا پایان task یا cancellation زنده نگه دارد.
+
+نتیجهٔ `line_task_submit_result_e` باید صریح بررسی شود:
+
+| نتیجه | چیزی که هنگام return ثابت شده است |
+| --- | --- |
+| `kLineTaskSubmitRejectedSettled` | Task اجرا نمی‌شود؛ notification اختیاری و cleanup رکورد، Reference و Buffer تمام شده است. |
+| `kLineTaskSubmitAcceptedAsync` | مالکیت وارد queue/setup async شده؛ armشدن Timer، pendingبودن فعلی یا اجرای task را تضمین نمی‌کند. |
+| `kLineTaskSubmitTimerArmed` | فراخوانی delay مثبت روی owner worker، Timer را پیش از return نصب کرده است؛ مرگ Line یا quiescence هنوز می‌تواند آن را لغو کند. |
+
+API فوری هرگز `TimerArmed` نمی‌دهد؛ delay صفر `AcceptedAsync` است. Delay مثبت روی
+owner پس از نصب موفق `TimerArmed` و از Thread دیگر پس از queueشدن setup مقدار
+`AcceptedAsync` می‌دهد.
+
+گرفتن رکورد scheduling و نصب منبع زمان‌بندی عمداً policy تخصیص متفاوتی دارند.
+رکورد pooled به‌صورت fail-fast گرفته می‌شود، زیرا ساخت item در master pool نمی‌تواند
+OOM را به API زمان‌بندی گزارش کند. در مقابل، Worker Message با delay مثبت Timer خود
+را از مرز داخلی `wtimerTryAdd()` نصب می‌کند. فقط Timerهای این مسیر با
+`eventloopTryZalloc()` واقعاً fallible (یعنی `calloc` مربوط به CRT) ساخته می‌شوند و
+provenance آن‌ها ثبت می‌شود تا expiry، حذف صریح، حذف quiesced/deferred، نابودی Loop و
+reclamation رویداد pending همگی از `eventloopTryFree()` متناظر (یعنی `free` مربوط به
+CRT) استفاده کنند. `wtimerAdd()` عمومی و allocationهای نامرتبط Event Loop همان
+رفتار fail-fast قبلی با event-loop allocator/mimalloc را حفظ می‌کنند.
+
+`wtimerTryAdd()` نتیجه‌های installed، admission-closed و resource-failure را جدا
+می‌کند. فقط شکست واقعی allocation به `ResourceFailure` تبدیل می‌شود؛ بسته‌شدن
+پذیرش در مرز نصب، `AdmissionClosed` است. روی owner worker، شکست منبع برای delay مثبت
+همگام cancellation را اجرا می‌کند و `RejectedSettled` می‌دهد. پس از پذیرش پیام setup
+خارجی، فراخوانی متعهد است `AcceptedAsync` برگرداند؛ اما `ResourceFailure` سمت owner
+نسبت به submitter ناهمگام است و ممکن است پیش از مشاهدهٔ return، هم‌زمان با آن یا پس
+از آن تحویل شود. Task هرگز inline اجرا نمی‌شود، چون این کار minimum delay را نقض
+می‌کند و می‌تواند task خودزمان‌بند را به recursion نامحدود ببرد. Taskهای delayed
+مستقل حتی با delay برابر ترتیب FIFO تضمین‌شده ندارند؛ کار مرتب باید در یک queue صریح
+با یک drain task باشد.
+
+با `LineTaskCancelFn` غیرNULL دقیقاً یکی از task یا cancellation اجرا می‌شود.
+Cancellation ممکن است همگام و re-entrant پیش از return، بعداً روی owner/submitting
+thread یا در teardown اجرا شود. Scheduler هنگام notification Reference فیزیکی را
+دارد، اما Line ممکن است logically dead و lstate آن نابود شده باشد. Callback فقط
+notification است؛ مالک Buffer یا cleanup داخلی نیست و بدون اثبات مستقل نباید State
+مختص owner را لمس کند. `NULL` فقط notification را حذف می‌کند، نه settlement را.
+
+دلیل‌ها دقیق‌اند: `TargetUnavailable`، ‏`AdmissionClosed`، ‏`EnqueueFailure`،
+`ResourceFailure`، ‏`Quiesced`، ‏`Teardown` و `LineDead`. Latch را پیش از submission
+تنظیم کنید تا cancellation همگام بتواند آن را settle کند. Callback لغو هنگام
+quiescence/teardown نباید کار عادی را restart کند و branch مربوط به
+`RejectedSettled` نباید fallbackای را دوباره اجرا کند که cancellation انجام داده است.
+
+پس از admission خارجی، مسیر submitter و owner مستقل از هم پیش می‌روند:
+
+```text
+submitter lane -> setup admission commits result -> return/observe AcceptedAsync
+owner lane     -> accepted setup may run -> allocation fails -> cancellation(ResourceFailure)
+                 cancellation may precede, race with, or follow submitter observation
+```
+
+ایمنی حافظه و منابع همیشگی است، اما پیشرفت task تضمین نیست. کار الزامی به fallback
+همگام برای `RejectedSettled` و inventory/Stop مالک برای cancellation پس از پذیرش
+نیاز دارد. Payload عمداً lossy یا statistics مشاهده‌ای می‌تواند `NULL` بدهد و نتیجهٔ
+typed را صریح discard کند.
+
+نمونهٔ source-oriented برای کار آماری عمداً lossy و بدون notification لغو:
+
+```c
+const line_task_submit_result_e result =
+    lineScheduleDelayedTask(parent, muxclientLogStatsTask, 5000, t, NULL);
+discard result; /* statistics are intentionally best effort */
+```
+
+برای کار الزامی، latch مستقل را پیش از submission منتشر کنید و همان latch را در
+هر دو outcome پایانی reconcile کنید؛ cancellation به lstate احتمالاً نابودشده
+دسترسی ندارد:
+
+```c
+static void retryCancelled(tunnel_t *t, line_t *line, line_task_cancel_reason_e reason)
+{
+    retry_tstate_t *ts = tunnelGetState(t);
+    atomicStoreExplicit(&ts->pending[lineGetWID(line)], false, memory_order_release);
+    discard reason; /* owner drain is authoritative after cancellation */
+}
+
+atomicStoreExplicit(&ts->pending[wid], true, memory_order_release);
+const line_task_submit_result_e result =
+    lineScheduleDelayedTask(line, retryTask, delay_ms, t, retryCancelled);
+if (result == kLineTaskSubmitRejectedSettled)
+{
+    /* retryCancelled already cleared pending; run only the safe inline policy. */
+}
+```
 
 `pipe_tunnel` مشترک نیز همین قاعده را برای streamهای مرتب cross-worker رعایت
 می‌کند. یک pair owner صریح نقش‌های borrowed/owned و referenceها را نگه می‌دارد؛
