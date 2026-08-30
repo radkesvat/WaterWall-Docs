@@ -6,12 +6,12 @@ description: "راهنمای نود UdpConnector در WaterWall."
 ---
 
 <!--
-Documentation version: 154
+Documentation version: 159
 -->
 
 # UdpConnector
 
-`UdpConnector` adapter خروجی UDP است. یک UDP socket محلی می‌سازد، address و port مقصد را انتخاب می‌کند و datagramها را میان نود قبلی و peer راه دور جابه‌جا می‌سازد.
+`UdpConnector` adapter خروجی UDP است. socketهای UDP محلی worker را مدیریت می‌کند، address و port مقصد را انتخاب می‌کند و datagramها را میان نود قبلی و peer راه دور جابه‌جا می‌سازد.
 
 جایگاه رایج:
 
@@ -21,14 +21,20 @@ UdpListener -> ... -> UdpConnector -> سرویس UDP راه دور
 
 این نود معمولاً انتهای یک UDP stream-style chain است.
 
+`UdpConnector` فقط normal lineهای لایه ۴ را می‌پذیرد. worker packet line لایه ۳
+باید پیش از رسیدن به این نود از bridge صریح `PacketsToStream` عبور کند. اگر payload
+در سمت دریافت باید دوباره وارد packet chain شود، از `StreamToPackets` استفاده
+کنید. برای endpoint مستقیم UDP روی packet line، adapter سازگار با packet مانند
+`UdpStatelessSocket` مناسب‌تر است.
+
 ## قابلیت‌ها
 
-- ساخت یک UDP socket که به port موقت محلی bind شده است.
+- مدیریت socketهای UDP خروجی در state محلی هر worker.
 - انتخاب address و port مقصد از تنظیمات ثابت، مقصدهای وزن‌دار یا routing context.
 - resolve کردن نام domain از طریق یک `DomainResolver` داخلی و async.
 - ارسال payloadهای upstream از نود قبلی به remote UDP peer.
 - ارسال datagramهای UDP دریافت‌شده به‌صورت downstream به نود قبلی.
-- دور ریختن datagramهای peer ناشناس در balance mode برابر `"connection"`.
+- هدایت datagramهای دریافتی به line مبدأ و رد کردن peerهای ثبت‌نشده.
 - ردیابی UDP lineها با idle timeout.
 - اعمال socket option‌های اختیاری مثل socket bufferها، `SO_MARK`، device binding و source-IP binding در صورت پشتیبانی.
 
@@ -184,7 +190,8 @@ parser برای سازگاری کلید قدیمی و غلط‌نویسی‌شد
 
 `balance-mode` اختیاری است و پیش‌فرض `"connection"` است.
 
-در mode برابر `"packet"` همچنان برای هر WaterWall line فقط یک UDP socket ساخته می‌شود، پس تمام مقصدها باید با خانواده آدرس همان socket سازگار باشند. برای نمونه، مقصدهای فقط IPv4 و فقط IPv6 را در یک فهرست packet-balanced مخلوط نکنید، مگر اینکه socket انتخاب‌شده بتواند به همه آن‌ها بفرستد.
+normal lineها در mode برابر `"packet"` می‌توانند از مقصدهای IPv4 و IPv6 استفاده
+کنند. انتخاب socket و source port محلی به‌صورت داخلی مدیریت می‌شود.
 
 ## تنظیمات اختیاری
 
@@ -333,14 +340,13 @@ metadata داخلی chain است، نه یک setting در JSON؛ برای نمو
 1. آدرس و پورت مقصد را برای line انتخاب می‌کند.
 2. `domain-strategy` را روی destination context line تنظیم می‌کند.
 3. در صورت نیاز از طریق `DomainResolver` داخلی domain را resolve می‌کند.
-4. بعد از اینکه مقصد یک آدرس IP شد یک socket UDP می‌سازد.
-5. اندازه bufferهای send و receive را اعمال می‌کند.
-6. تنظیمات اختیاری `interface`، `fwmark` و egress pin را اعمال می‌کند.
-7. به `source-ip:0` وقتی `source-ip` تنظیم شده bind می‌کند، در غیر این صورت به آدرس wildcard برای خانواده آدرس انتخاب‌شده.
-8. مقصد انتخاب‌شده را به‌عنوان peer address مربوط به socket ذخیره می‌کند.
-9. خواندن از socket را آغاز می‌کند و downstream `Est` را به نود قبلی می‌فرستد.
+4. resourceهای UDP محلی worker را برای مقصد resolveشده آماده می‌کند.
+5. bufferهای send/receive و تنظیمات `interface`، `fwmark`، source IP و egress pin
+   را روی هر socket تازه‌ای که لازم باشد اعمال می‌کند.
+6. پردازش receive را در صورت نیاز پیش از ارسال downstream `Est` آغاز می‌کند.
 
-UDP در اینجا handshake اتصال ندارد. `Est` فقط آماده بودن UDP socket محلی را نشان می‌دهد، نه پاسخ دادن peer راه دور را.
+UDP در اینجا handshake اتصال ندارد. `Est` آماده بودن binding محلی line را نشان
+می‌دهد، نه پاسخ دادن peer راه دور.
 
 ## domain resolution
 
@@ -350,8 +356,20 @@ DNS resolution هنگام init و به‌شکل async انجام می‌شود. 
 
 - نخستین packetی که یک domain حل‌نشده را انتخاب کند، یک DNS request از نوع async برای همان object آغاز می‌کند
 - packetهای مربوط به آن مقصد در یک صف محدود منتظر می‌مانند
-- پس از موفقیت resolution، packetهای بعدی همان line از آدرس به‌دست‌آمده استفاده می‌کنند
+- پس از موفقیت resolution، پیش از تخلیه صف resource مقصد آماده می‌شود؛ شکست آن
+  فقط صف همان مقصد را حذف می‌کند
+- context مقصد ثابت برای packetهای بعدی همان line cache می‌شود؛ مقصدی که از
+  line context متغیر می‌آید پیش از استفاده دوباره ساخته می‌شود
+- اگر line context متغیر هنگام pending بودن DNS request قبلی برای همان slot مقصد
+  تغییر کند، packet جدید به‌جای پیوستن به request منسوخ drop می‌شود
 - cache زمان‌دار DNS یا DNS request جدا برای هر packet وجود ندارد
+
+## مدیریت socket محلی Worker
+
+state مربوط به socket محلی worker و وابسته به خانواده آدرس است. پاسخ فقط از
+endpointهای مورد انتظار پذیرفته می‌شود و source ناشناس دور ریخته می‌شود. رفتار
+socket و source port محلی توسط connector مدیریت می‌شود و نباید به‌عنوان شناسه
+line استفاده شود. pause و idle deadline به ازای line مستقل‌اند.
 
 ## جریان داده
 
@@ -367,9 +385,8 @@ payload upstream -> UdpConnector -> ارسال UDP
 دریافت UDP -> UdpConnector -> payload downstream
 ```
 
-در mode برابر `"connection"` فقط datagramهای peer راه دور انتخاب‌شده پذیرفته می‌شوند و داده peerهای دیگر نادیده گرفته خواهد شد.
-
-در mode برابر `"packet"`، socket پاسخ هر مقصد packet-balanced را می‌پذیرد، حتی اگر datagramها خارج از ترتیب برگردند.
+در هر دو balance mode، datagram دریافتی فقط از peer ثبت‌شده پذیرفته و به line مبدأ
+هدایت می‌شود.
 
 ## کنترل جریان و buffering
 
@@ -387,16 +404,9 @@ payload upstream -> UdpConnector -> ارسال UDP
 
 ## idle timeout
 
-هر UDP line در یک جدول idle ردیابی می‌شود.
-
-timeout‌های فعلی:
-
-| وضعیت | timeout |
-| --- | --- |
-| بعد از مقداردهی اولیه | حدود `30 ثانیه` |
-| بعد از ادامه ترافیک | حدود `300 ثانیه` |
-
-اگر UDP line منقضی شود، socket بسته می‌شود و downstream `finish` به نود قبلی فرستاده می‌شود.
+UDP lineهای idle به‌صورت خودکار منقضی می‌شوند و ادامه ترافیک deadline را تمدید
+می‌کند. هنگام expiry، state مربوط به connector آزاد و downstream `finish` به نود
+قبلی فرستاده می‌شود.
 
 ## نکات و هشدارها
 
@@ -406,6 +416,12 @@ timeout‌های فعلی:
 - `fwmark` و device binding به platform وابسته هستند.
 - `fwmark` روی Windows در دسترس نیست.
 - وقتی read در حالت pause است، datagram ورودی به‌جای قرار گرفتن در buffer دور ریخته می‌شود.
+- source port محلی توسط connector مدیریت می‌شود و نباید به‌عنوان شناسه line
+  استفاده شود.
+- `PacketsToStream` در حال حاضر فقط packetهای IPv4 خودسازگار را bridge می‌کند و
+  routing context متغیر هر packet را روی normal line خروجی کپی نمی‌کند. برای تبدیل
+  IPv4 TCP/UDP به ازای flow از `PacketsToConnection` و برای semantics مستقیم
+  packet-line routing از adapter UDP سازگار با packet استفاده کنید.
 - برای رفتار UDP stateless در سطح packet، `UdpStatelessSocket` ممکن است مناسب‌تر از `UdpConnector` باشد.
 
 ## متادیتای نود
@@ -417,7 +433,7 @@ timeout‌های فعلی:
 | node flags | `kNodeFlagChainEnd` |
 | `can_have_prev` | `true` |
 | `can_have_next` | `false` |
-| `layer_group` | `kNodeLayerAnything` |
-| `layer_group_prev_node` | `kNodeLayerAnything` |
+| `layer_group` | `kNodeLayer4` |
+| `layer_group_prev_node` | `kNodeLayer4` |
 | `layer_group_next_node` | `kNodeLayerNone` |
 | `required_padding_left` | `0` bytes |

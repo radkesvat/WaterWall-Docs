@@ -5,7 +5,7 @@ sidebar_label: "Part 4: Packet Tunnels"
 description: "Packet-line semantics, pure packet tunnels, packet/stream bridges, packet-line initialization, and paired-tunnel direction rules for layer-3 work."
 ---
 <!--
-Documentation version: 153
+Documentation version: 155
 -->
 
 # Part 4: Packet Lines & Packet Tunnels
@@ -153,24 +153,29 @@ but an implemented payload handler may still enforce a stricter packet-line role
 
 ### Category 3 — intentional terminal absorber: handle locally and document
 
-A packet line is still a `line_t`, and a chain may legally terminate one at an
-ordinary stream adapter. That adapter borrows the packet line exactly as it would
-borrow a connection line, and it closes its own side for its own reasons.
+A packet line is still a `line_t`, and a chain may legally terminate one at a
+packet-capable terminal adapter. That adapter borrows the packet line without
+owning it and may close its own side for a documented reason.
 
-The shipped example is `PacketSender -> UdpConnector`, which
-`tests/cases/udp_connector_listener_packet_loss_multiworker` exercises:
+One shipped example is an active `BlackHole` behind `PacketSender`:
 
 ```text
-PacketSender ──(worker packet line)──> UdpConnector ──> network
+PacketSender ──(worker packet line)──> BlackHole(mode=active)
 ```
 
-`UdpConnector` opens a UDP socket per line and expires it when the flow goes idle.
-Expiry sends `tunnelPrevDownStreamFinish()` **down the worker packet line**, and it
-lands on `packetsenderTunnelDownStreamFinish()`. That is not a violation and must
-not abort. `PacketSender` owns no per-line state and has no prev, so it absorbs
-the close without propagating it or destroying the packet line. It must still
-stop that worker's timer and send loop because receiving `Finish` permanently
-closes the upstream destination.
+During upstream `Init`, an active `BlackHole` sends
+`tunnelPrevDownStreamFinish()` **down the worker packet line**, and it lands on
+`packetsenderTunnelDownStreamFinish()`. That is not a violation and must not
+abort. `PacketSender` owns no per-line state and has no prev, so it absorbs the
+close without propagating it or destroying the packet line. It must still stop
+that worker's timer and send loop because receiving `Finish` permanently closes
+the upstream destination.
+
+An adapter that requires normal connection lines is not a packet-line terminal.
+`UdpConnector` is layer-4-only: a packet path must use
+`PacketSender -> PacketsToStream -> UdpConnector`, with `StreamToPackets` on the
+receiving side when the payload returns to layer 3. The bridge owns the normal
+line and handles its recreation without closing the persistent packet line.
 
 This classification is directional. `PacketSender` downstream is an absorber,
 while its upstream handler remains fatal because the chain head has no `prev`
@@ -465,9 +470,9 @@ handler belongs in it:
   an anchor rejects an impossible close with `LOGF` + `abortProgramNow(1)`; a
   transparent middle transform forwards it in the same direction; an intentional
   terminal absorber documents why there is nothing to forward or release.
-- `PacketSender` is direction-specific: downstream absorbs the legitimate close
-  from `UdpConnector`, while upstream remains fatal. `PacketReceiver` is also an
-  intentional terminal absorber.
+- `PacketSender` is direction-specific: downstream absorbs a legitimate close
+  from a packet-line terminal such as an active `BlackHole`, while upstream
+  remains fatal. `PacketReceiver` is also an intentional terminal absorber.
 - A handler that can receive both a packet line and a normal line must branch on
   the exact role (`tunnelchainIsWorkerPacketLine()`) before any cleanup.
 - `packettunnelCreate()` only means `lstate_size == 0`; several such nodes are

@@ -6,7 +6,7 @@ description: "راهنمای نود Socks5Server در WaterWall."
 ---
 
 <!--
-Documentation version: 158
+Documentation version: 159
 -->
 
 # Socks5Server
@@ -22,7 +22,7 @@ Documentation version: 158
 - username/password authentication از طریق `AuthenticationClient`
 - دستور `CONNECT`
 - دستور `UDP ASSOCIATE` با تخصیص پورت پویا از طریق `UdpListener` یا `TcpUdpListener`
-- UDP relay association وابسته به احراز هویت
+- UDP relay association وابسته به یک TCP control connection پذیرفته‌شده
 
 دستور `BIND` پشتیبانی نمی‌شود و رد می‌شود.
 
@@ -75,7 +75,7 @@ callback فراهم کند.
       "name": "socks-entry",
       "type": "TcpUdpListener",
       "settings": {
-        "address": "0.0.0.0",
+        "address": "127.0.0.1",
         "port": 1080,
         "nodelay": true
       },
@@ -88,7 +88,7 @@ callback فراهم کند.
         "no-auth": true,
         "connect": true,
         "udp": true,
-        "ipv4": "203.0.113.10"
+        "ipv4": "127.0.0.1"
       },
       "next": "outbound"
     },
@@ -106,10 +106,9 @@ callback فراهم کند.
 }
 ```
 
-`203.0.113.10` را با آدرس IPv4ای جایگزین کنید که کلاینت‌های SOCKS5 واقعاً بتوانند
-به آن دسترسی داشته باشند. در این نمونه فقط برای واضح ماندن توپولوژی از `no-auth`
-استفاده شده است؛ یک سرویس در دسترس از اینترنت معمولاً باید
-`auth-client-node-name` و یک `AuthenticationClient` پیکربندی‌شده داشته باشد.
+این نمونه no-auth عمداً فقط روی loopback در دسترس است. برای clientهای راه دور،
+`auth-client-node-name` را همراه یک `AuthenticationClient` تنظیم کنید و سپس آدرس
+listener و آدرس اعلام‌شده را متناسب با deployment تغییر دهید.
 
 آدرس‌ها و پورت‌های این توپولوژی نقش‌های متفاوتی دارند:
 
@@ -206,15 +205,11 @@ username:password
 `username:password` داخل فیلد `password` قرار دهید. فیلد `name` کاربر برای username روی پروتکل SOCKS5 استفاده نمی‌شود و
 می‌تواند صرفا metadata مدیریتی باشد.
 
-بعد از auth موفق:
-
-- `user_handle_t` برگشتی داخل line state ذخیره می‌شود
-- handle با `lineAddUser()` به line اضافه می‌شود
-- username/password خام هم به‌عنوان marker credential روی line کپی می‌شود تا ruleهای downstream بتوانند روی
-  username/password route کنند
-- `UserController` داخلی پیش از رسیدن line به `next`، محدودیت‌های user از جمله تعداد connection زنده، IP، ترافیک، تاریخ انقضا و وضعیت enabled را اعمال می‌کند
-
-در حالت `no-auth` یک marker handle خالی anonymous روی line ثبت می‌شود.
+بعد از auth موفق، هویت user و metadata سازگار مربوط به credential به Waterwall
+line اضافه می‌شود. `UserController` داخلی پیش از رسیدن line به `next`، policy
+پیکربندی‌شده user را اعمال می‌کند. در حالت `no-auth` هویت authenticated برای
+policy مختص user وجود ندارد؛ بنابراین access control در سطح deployment همچنان
+مهم است.
 
 username و password در حالت احرازشده باید غیرخالی باشند. NUL داخلی رد می‌شود، چون lookup نهایی به‌صورت C string
 انجام می‌شود.
@@ -251,8 +246,8 @@ tunnelهای میانی اختیاری می‌توانند بین `TcpUdpListene
 
 در UDP `Init` و دوباره پیش از نخستین payload، metadata endpoint باید WID واقعی
 مالک line و handle فعال association را نشان دهد. mismatch مربوط به metadata/WID
-در حالی که worker فعلی درست است، فقط UDP را fail-closed رد می‌کند: remote line یا
-پاسخ تازه نمی‌سازد و TCP control line را نمی‌بندد یا به آن پیام نمی‌دهد. اجرای
+در حالی که worker فعلی درست است، فقط UDP را fail-closed رد می‌کند: datagram را
+drop می‌کند، پاسخی نمی‌فرستد و TCP control line را بدون تغییر باقی می‌گذارد. اجرای
 callback روی worker فعلیِ نادرست یک invariant هسته‌ای و fatal است و پیش از خواندن
 line state یا resource محلی worker رد می‌شود.
 
@@ -274,40 +269,31 @@ source port صفر باشد، نخستین datagram مطابق، port را pin �
 
 وقتی TCP control line بسته شود، endpoint داینامیک UDP بسته شده و association از جدول worker-local حذف می‌شود و هرگونه پکت بعدی رد خواهد شد.
 
-associationها در جدول‌های hash محلی هر worker روی `socks5server_tstate_t` نگهداری می‌شوند و نیازی به قفل‌های سراسری مشترک بین threadها ندارند. entryها فقط metadata کپی‌شده دارند:
-
-- generation token
-- worker id مالک
-- handle مربوط به endpoint داینامیک
-- `user_handle_t` احراز هویت‌شده، یا handle خالی در حالت no-auth
-- username/password خام کپی‌شده، در حالت authenticated
-
-در registry هیچ `line_t *` قابل استفاده‌ای ذخیره نمی‌شود و lookup مربوط به UDP هرگز
-`lineRef()` یا `lineUnref()` را روی TCP control line فراخوانی نمی‌کند. handle کامل
-endpoint پویا (WID مالک به‌همراه generation) هویت association است و کلید association
-مبتنی بر tuple شبکه وجود ندارد. control line در حال بسته‌شدن فقط entryای را حذف
-می‌کند که handle کامل آن هنوز مطابقت دارد.
+state مربوط به association محلی worker است و از یک هویت opaque برای dynamic
+endpoint استفاده می‌کند. این state به‌جای pointer قابل استفاده به TCP control line،
+metadata کپی‌شده نگه می‌دارد و هنگام بسته شدن control line فقط association فعلی و
+مطابق همان line حذف می‌شود.
 
 ## رفتار UDP payload
 
 وقتی یک datagram SOCKS UDP برسد:
 
-1. با استفاده از generation مربوط به endpoint داینامیک، association محلی worker پیدا می‌شود.
+1. association فعال با استفاده از هویت opaque مربوط به dynamic endpoint پیدا می‌شود.
 2. header مربوط به SOCKS5 UDP اعتبارسنجی می‌شود.
 3. اگر `FRAG != 0` باشد، datagram محافظه‌کارانه نادیده گرفته می‌شود.
 4. مقصد remote از هدر خوانده می‌شود.
-5. برای آن مقصد یک backend UDP line داخلی ساخته یا reuse می‌شود.
-6. هدر SOCKS5 UDP حذف می‌شود و فقط payload از backend line به سمت بالا ارسال می‌شود.
+5. هدر SOCKS5 UDP حذف و payload با destination context درخواستی به سمت upstream
+   ارسال می‌شود.
 
 وقتی پاسخ از نود بعدی برگردد:
 
 1. payload در یک header پاسخ SOCKS5 UDP قرار می‌گیرد.
-2. source address داخل header همان remote destination مربوط به backend UDP line است.
+2. source address داخل header، endpoint راه دور مرتبط با همان پاسخ را مشخص می‌کند.
 3. datagram حاصل در جهت downstream به سمت سوکت پویای UDP فرستاده می‌شود.
 
-backend UDP lineها lineهای معمول واتروال‌اند که پشت سمت پویای UDP مربوط به client
-ساخته می‌شوند. این طراحی association رو به client را از مقصدهای outbound جدا
-نگه می‌دارد و lifecycle معمول lineها را حفظ می‌کند.
+association سمت client از پردازش outbound جدا می‌ماند و از قرارداد callback عادی
+لایه ۴ استفاده می‌کند. state مربوط به outbound همان association هنگام بسته شدن
+control line آزاد می‌شود.
 
 ## رفتار Finish
 
@@ -315,7 +301,7 @@ backend UDP lineها lineهای معمول واتروال‌اند که پشت �
 
 - line state محلی پیش از فرستادن `Finish` واقعی از بین می‌رود
 - control line قبل از مرگ، endpoint پویای UDP خود را می‌بندد و association خود را unregister می‌کند
-- backend UDP lineهای داخلی قبل از بسته شدن از client line detach می‌شوند
+- state مربوط به outbound همان association پیش از close آزاد می‌شود
 - اگر قبل از established شدن لازم باشد پاسخ failure SOCKS5 فرستاده شود، این کار از مسیر close محافظت‌شده در برابر
   callbackهای re-entrant انجام می‌شود
 
