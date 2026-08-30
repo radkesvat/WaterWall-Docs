@@ -475,7 +475,8 @@ message-owned until safe settlement.
 
 ### Random Generation Contracts
 
-WaterWall provides two random generation facilities in `ww/libc/wfrand.h`:
+WaterWall provides three related random-generation and selection facilities in
+`ww/libc/wfrand.h` and `ww/libc/wpercentgate.h`:
 
 1. **Operating-System Secure Random (`secureRandomBytes`)**:
    - Backed directly by OS entropy sources (`getrandom()` syscall on Linux, `arc4random_buf()` on BSD/Darwin, `BCryptGenRandom` on Windows, `/dev/urandom` fallback on Unix).
@@ -495,6 +496,15 @@ WaterWall provides two random generation facilities in `ww/libc/wfrand.h`:
    - Stream renewal: if a thread consumes $2^{32}$ blocks (counter exhaustion), it atomically requests a new stream identifier and initializes a new nonce without making an OS syscall.
    - Fork safety: the POSIX `pthread_atfork` child handler uses only lock-free state invalidation. The child treats the inherited process key and surviving TLS stream as unusable, then reseeds from OS entropy on its next random request.
    - Lifecycle: `frandGlobalInit()` is called during startup immediately after secure random initialization; `frandInit()` initializes worker TLS state; `frandThreadCleanup()` erases thread state on exit; `frandGlobalCleanup()` clears process state in `destroyGlobalState()` and startup rollback paths. Calling random functions before global initialization or after global cleanup is fatal.
+
+3. **Non-Cryptographic Percentage Gates (`noncrypto_percent_gate_t`, `nonCryptoPercentGateInit`, `nonCryptoPercentGateStep`)**:
+   - This is a purpose-specific, caller-owned PCG32 stream for hot decisions that need random-like percentage behavior but do not need unpredictability or cryptographic security. It does not expose general-purpose random integers or bytes.
+   - Initialize each gate once with its fixed percentage and a seed. Initialization precomputes the comparison cutoff; an ordinary step performs only the PCG state update, output permutation, and cutoff comparison. It makes no syscall, allocation, lock, or atomic operation.
+   - Keep one independently seeded gate for every logical decision stream and ownership domain. Unrelated decisions, directions, node instances, or workers must not share a gate: shared state couples their observed rates. A gate has one owner and must not be accessed concurrently.
+   - The sequence deliberately permits runs of selected and rejected events and approaches the configured percentage over time. It is not an exact-frequency scheduler, an exact-uniform cryptographic sampler, or a source of security.
+   - A seed may be drawn once from `fastRand64()` to keep gates from starting in lockstep, but that does not make PCG output secure. State disclosure or sufficient observation may reveal future decisions.
+   - Use this facility only when predictability cannot affect authentication, association, abuse resistance, wire camouflage, classifier resistance, protocol identifiers, nonces, secrets, hash-flood defenses, or another adversarial boundary. Those purposes remain on the fast CSPRNG family.
+   - Zero and one hundred percent are exact and do not advance gate state. Percentages from one through ninety-nine consume one PCG output per decision.
 
 The lwIP port uses this same fast CSPRNG on every host. `LWIP_RAND()` delegates
 to `fastRand32()` and therefore requires initialized fast-RNG TLS, but it does
