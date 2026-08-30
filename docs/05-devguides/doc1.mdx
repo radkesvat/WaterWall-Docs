@@ -473,6 +473,29 @@ reads the item afterward. Their physical reclamation differs: local removal
 normally frees immediately, while a shared item can remain heap- or
 message-owned until safe settlement.
 
+### Random Generation Contracts
+
+WaterWall provides two random generation facilities in `ww/libc/wfrand.h`:
+
+1. **Operating-System Secure Random (`secureRandomBytes`)**:
+   - Backed directly by OS entropy sources (`getrandom()` syscall on Linux, `arc4random_buf()` on BSD/Darwin, `BCryptGenRandom` on Windows, `/dev/urandom` fallback on Unix).
+   - Initialized and probed by `createGlobalState()` before workers start.
+   - Returns a recoverable failure without providing a fallback if the OS provider cannot fill the complete request.
+   - Use it when a value intentionally needs an independent OS draw, including the process fast-random master key, bearer credentials, and private or rotating secret material kept outside the process fast stream.
+
+2. **Fast Random Stream Family (`fastRand`, `fastRand32`, `fastRand64`, `getRandomBytes`, `fastRandRange32`, `fastRandJittered32`, `roll100`)**:
+   - This is a cryptographically secure pseudorandom generator backed by per-thread RFC 8439 ChaCha20 streams and a 256-bit OS-generated process master key.
+   - It is the normal runtime choice for nonces, IVs, salts, unpredictable identifiers, local hash seeds, randomized protocol fields, and padding.
+   - `fastRand()`, `fastRand32()`, and `fastRand64()` provide 15, 32, and 64 random bits. Use `getRandomBytes()` or multiple words when a value needs more; two `fastRand64()` calls provide 128 bits.
+   - All raw integer and byte calls consume the same continuous per-thread stream. Range, jitter, and percentage helpers apply modulo mapping and are convenience samplers rather than exact-uniform cryptographic range samplers.
+   - The process master key is generated once during startup by `frandGlobalInit()`.
+   - Each thread derives an independent, contiguous ChaCha20 stream using a 96-bit nonce containing domain tag `"WWFR"` and an atomically allocated 64-bit stream identifier.
+   - Outputs are buffered in a thread-local 64-byte block cache; after thread initialization, ordinary calls use only TLS state and perform no syscall, lock, allocation, or atomic operation.
+   - Requests larger than the cache drain its remainder and generate whole 64-byte ChaCha20 blocks directly into caller memory.
+   - Stream renewal: if a thread consumes $2^{32}$ blocks (counter exhaustion), it atomically requests a new stream identifier and initializes a new nonce without making an OS syscall.
+   - Fork safety: the POSIX `pthread_atfork` child handler uses only lock-free state invalidation. The child treats the inherited process key and surviving TLS stream as unusable, then reseeds from OS entropy on its next random request.
+   - Lifecycle: `frandGlobalInit()` is called during startup immediately after secure random initialization; `frandInit()` initializes worker TLS state; `frandThreadCleanup()` erases thread state on exit; `frandGlobalCleanup()` clears process state in `destroyGlobalState()` and startup rollback paths. Calling random functions before global initialization or after global cleanup is fatal.
+
 ## Glossary
 
 | Term | Meaning |
