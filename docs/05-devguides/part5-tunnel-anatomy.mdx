@@ -17,21 +17,21 @@ keep the lifecycle intact.
 
 ## Directory Layout
 
-Most tunnels follow this shape (this is the real layout of `TcpListener`,
-`TlsClient`, `MuxClient`, and the `template`):
+Tunnel files use the following layout. Callback files and their directories
+exist only where the node implements behavior beyond its constructor defaults:
 
 ```text
 tunnels/MyTunnel/
   CMakeLists.txt
   description.md
   include/MyTunnel/
-    interface.h          # public WW_EXPORT API + all callback prototypes
+    interface.h          # public WW_EXPORT API + custom callback prototypes
     structure.h          # tstate / lstate structs, size enums, helpers
   instance/
     create.c             # tunnelCreate(), assign callbacks, parse + validate settings
     node.c               # node metadata: type, flags, layer group, padding, createHandle
-    chain.c              # onChain hook (usually delegates to the default)
-    index.c              # onIndex hook (usually delegates to the default)
+    chain.c              # custom onChain hook, when needed
+    index.c              # custom onIndex hook, when needed
     prepair.c            # onPrepare hook
     start.c              # onStart hook
     stop.c               # lifecycle-v2 quiesce, drain, and stop hooks
@@ -48,11 +48,23 @@ tunnels/MyTunnel/
 
 :::note Real layout vs. the old summary
 Two details matter in practice: every tunnel has an `instance/api.c`, and the
-prepare hook file is spelled **`prepair.c`** (the function is `...OnPrepair`). The
+prepare hook file, when present, is spelled **`prepair.c`** (the function is
+`...OnPrepair`). The
 upstream/downstream finish files are `fin.c`, not `finish.c`.
 :::
 
-The split into one file per `{direction}/{event}` keeps each callback small.
+Keep inherited callbacks at their defaults; do not add forwarding wrappers or
+empty lifecycle files for them. Compare against the actual constructor: packet
+payload defaults and disabled adapter directions intentionally abort, whereas
+ordinary flow defaults forward. State changes, event absorption, cleanup, and
+error handling require custom callbacks even when their bodies are short.
+
+Remove obsolete callback implementations when they have no registrations or
+runtime callers, together with their declarations and build-source references.
+Check public entrypoints and dynamic loading conventions before declaring a
+function unused; retain callbacks and APIs that remain reachable.
+
+The split into one file per custom `{direction}/{event}` keeps each callback small.
 Shared protocol logic and the state machine live in `common/helpers.c` so the
 callback files stay readable. Follow that convention; reviewers expect it.
 
@@ -61,16 +73,16 @@ callback files stay readable. Follow that convention; reviewers expect it.
 | File | Responsibility |
 | --- | --- |
 | `instance/node.c` | Returns the `node_t` describing this tunnel type: `type`, `version`, `createHandle`, `flags`, `required_padding_left`, `layer_group`, and neighbor layer constraints. |
-| `instance/create.c` | `tunnelCreate(node, sizeof(tstate), sizeof(lstate))`, assign the twelve flow callbacks and the lifecycle hooks, parse and validate JSON settings, allocate per-worker resources, clean up on any failure. |
+| `instance/create.c` | `tunnelCreate(node, sizeof(tstate), sizeof(lstate))`, assign only the flow callbacks and lifecycle hooks that differ from the constructor defaults, parse and validate JSON settings, allocate per-worker resources, clean up on any failure. |
 | `instance/chain.c` / `index.c` | The `onChain` / `onIndex` hooks. Most tunnels keep the framework defaults. Static internal topology known before solving belongs in `onChain`. A tunnel whose private topology depends on solved adjacent layers may also set optional `onSolvedTopology` from `create.c`. It receives the current solved snapshot, which is not necessarily final. The hook may be called repeatedly and returns `true` if and only if it changed topology; the snapshot then becomes stale and the manager solves again before invoking another hook. Once a complete pass reports no changes, `onIndex` runs once over immutable topology and may consume the final solved layers. |
 | `instance/prepair.c` / `start.c` / `stop.c` | `onPrepare` / `onStart` and the lifecycle-v2 shutdown hooks. Bootstrap in `onStart`; close admission in `onQuiesceRequest`; detach worker-affine work in `onWorkerQuiesce`; wait for external producers in `onQuiesceWait`; drain owned lines in `onWorkerStop`; release remaining shared resources in `onStop`. |
 | `instance/destroy.c` | `onDestroy`: free settings, SSL contexts, pools, thread-local arrays, then call `tunnelDestroy(t)`. |
 | `instance/api.c` | The `tunnelApi` runtime entry. It receives an `sbuf_t` message, must recycle it, and returns an `api_result_t`. |
 | `common/line_state.c` | `LinestateInitialize` (called from `Init`) and `LinestateDestroy` (zeroes the aligned line-state region). |
 | `common/helpers.c` | Shared protocol parsing, framing, and the close/finish helpers used by the callback files. |
-| `upstream/*.c`, `downstream/*.c` | One flow callback each. Keep them thin; delegate to `helpers.c`. |
+| `upstream/*.c`, `downstream/*.c` | One custom flow callback each. Omit files for inherited callbacks. Keep them thin; delegate to `helpers.c`. |
 | `include/MyTunnel/structure.h` | `mytunnel_tstate_t`, `mytunnel_lstate_t`, size enums, and small inline helpers. |
-| `include/MyTunnel/interface.h` | `WW_EXPORT` create/destroy/api prototypes plus every callback prototype. |
+| `include/MyTunnel/interface.h` | `WW_EXPORT` create/api and custom destroy prototypes, plus prototypes for implemented callbacks. |
 
 ### Typed internal capabilities versus runtime messages
 
@@ -200,7 +212,7 @@ against the v3 headers.
 
 1. `tunnel_t *t = tunnelCreate(node, sizeof(tstate), sizeof(lstate));`
 2. Check `t` immediately and return `NULL` if creation failed.
-3. Assign all twelve flow callbacks and the lifecycle hooks.
+3. Assign only callbacks whose behavior differs from the chosen constructor defaults.
 4. Read settings from `node->node_settings_json`, validating each one.
 5. Allocate per-worker resources (e.g. one SSL context per worker).
 6. **On any later failure, clean up and bail out** — destroy partial state and the
