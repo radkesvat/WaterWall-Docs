@@ -42,7 +42,7 @@ verification flow.
 
 `ww/vendor/xz-embedded/README.waterwall.md` records the pinned upstream revision
 and source mapping. The root build always builds `xz_embedded` as a static
-library and links `Waterwall` directly to `XZEmbedded::XZEmbedded`, on every
+library and links `Waterwall` through `WaterWall::XZDecoder` to `XZEmbedded::XZEmbedded`, on every
 platform, without fetching XZ sources or requiring system liblzma. Other targets
 link `XZEmbedded::XZEmbedded` directly to obtain `<xz.h>`; `ww` does not re-export
 this dependency. Unused code remains subject to normal static linker elimination.
@@ -71,6 +71,93 @@ requires complete input consumption and the trusted expected output length;
 output must be discarded on failure. The wrapper accepts only CRC32 checks.
 This boundary has no Linux loading or startup dependencies. Tests round-trip a
 compiled module and exercise malformed inputs and capacity/length failures.
+
+### Optional Linux packed executable
+
+`WW_PACK_RUNTIME` defaults to `OFF`. Native Linux x86-64 builds may use a separate
+production tree with identical enabled features and Release LTO:
+
+```bash
+cmake --preset linux-packed
+cmake --build --preset linux-packed -j8
+ctest --preset linux-packed --output-on-failure
+```
+
+The public `Waterwall` target builds the final executable in both ordinary and
+packed configurations, including explicit `--target Waterwall` builds. Packed
+builds use the private `WaterwallApplication` target for the ordinary application.
+The final artifact is `build/linux-packed/Release/Waterwall`. Deploy it with user
+configuration, existing system libraries, and any intentionally supplied external
+node libraries. The private `waterwall_application` comparison executable is a
+normal executable built with the ordinary dependency graph and optimization,
+allocator, CPU, and linking policies. Packing adds no global PIC or shared-runtime
+requirements. Cross-compiling and non-Linux/non-x86-64 packed targets fail
+configuration. Ordinary builds do not invoke the host encoder or payload generator.
+
+Core-file open failures include the program version on stderr before the error.
+The ordinary application and packed launcher use the same startup input-error
+reporting, so a missing core file still identifies the executable version without
+runtime initialization or decompression.
+
+A serialized independent native build checks the encoder's dependencies in
+`build/xz-encoder-host` without inheriting target compiler environment flags.
+Generation strips a private executable copy, checks its ELF identity, compresses
+it, and atomically publishes one source containing bytes and exact size/target
+metadata under `packed/<configuration>`. The executable, encoder, generator, and
+strip tool are declared dependencies. Failure stops the build without changing the
+input executable or publishing partial output. The launcher links the existing
+`WaterWall::XZDecoder` target, basic JSON and plain-C input support, without `ww`,
+full settings, C++ runtime, networking, or crypto dependencies.
+The final launcher is also stripped during linking in every configuration,
+including Debug: static symbols and debug information are omitted while symbols
+needed for dynamic linking remain. The ordinary application and private comparison
+executable retain their normal configuration's debugging information.
+
+The Linux backend requires Linux 3.19 or newer with `memfd_create`, sealing,
+`execveat`, and permission to execute anonymous files. `/proc/self/exe` must be
+readable to capture the effective outer executable location, including PATH and
+symlink invocation. The backend restores directly into a shared writable mapping,
+unmaps it, seals the executable, and calls `execveat` with `AT_EMPTY_PATH`. The
+kernel/interpreter handles ordinary ELF execution. New executable-memfd flags are
+retried only on unsupported-flag errors, never on policy denial. All failures are
+nonzero; there is no disk extraction, cache, shell, or supervisor fallback. The
+conservative CPU guard runs before both launcher and application startup.
+
+The startup-only handoff uses four reserved arguments:
+`--ww-internal-fd=`, `--ww-internal-len=`, `--ww-internal-src=`, and
+`--ww-internal-exe=`. The outer launcher rejects these from users. The ordinary
+application accepts a complete, nonduplicate set as untrusted configuration input,
+strips it before normal CLI validation, reads the declared regular-file snapshot
+from offset zero, and closes the descriptor on success or failure. Only the input
+descriptor deliberately survives exec; launcher descriptors are above the standard
+streams even when those streams were closed. Input remains byte-for-byte intact,
+including bytes after a NUL. CLI arguments, environment, CWD, PID, and standard
+streams retain their normal meanings. The captured executable path supplies the
+existing executable-relative external-library search; it does not change the
+kernel's `/proc/self/exe` identity. Restricted mode still prohibits external nodes
+and user scripts. Set-ID/file-capability deployment is not a supported packing
+contract; this backend adds no credential transfer or privilege workaround.
+
+Native no-LTO unit trees own full-settings cleanup coverage and launcher failure
+fixtures. The snapshot unit also crosses a real exec and checks exact large-input
+receipt, offset, PID, restricted selection, and descriptor closure. Production
+tests select the final launcher explicitly and exercise real restoration,
+constructors, TLS, workers, networking, and shutdown. Fixture tests alone cannot
+establish full runtime equivalence; unavailable platform, namespace, or privileged
+checks must be reported as unverified.
+
+The public-target regression check operates on generated artifacts in an idle,
+configured packed tree. Run it separately from other builds/tests of that tree:
+
+```bash
+python3 tests/packed_build_target_test.py --build-dir build/linux-packed --config Release
+python3 tests/packed_build_target_test.py --build-dir build/linux-packed --config Debug
+```
+
+It uses `readelf` (override with `--readelf PATH`) to verify the final launcher has
+no static symbol table or debug sections, recreates a missing final executable,
+checks regeneration after an application update, and verifies that an unchanged
+build leaves the payload stable.
 
 ### Build Rules
 
@@ -134,11 +221,11 @@ workspace paths; nesting root inside a mapped user namespace would lose that
 host-filesystem permission authority.
 
 - `support`: production policy and test-harness tests (13 tests), run strictly serially.
-- `functional`: deterministic integration tests (152 tests) run in parallel (`min(32, max(4, 4 * CPUs))` jobs).
+- `functional`: deterministic integration tests (153 tests) run in parallel (`min(32, max(4, 4 * CPUs))` jobs).
 - `external`: integration tests requiring live host internet access (e.g. Reality against Google), run strictly serially.
 - `speed`: multi-stream throughput benchmarks (16 tests), run strictly serially (`RUN_SERIAL TRUE`) to avoid contention.
 - `privileged`: root/TUN probe tests (6 tests) run under `sudo -E`.
-- `all`: runs support, functional, external, and speed lanes in sequence (182 tests total).
+- `all`: runs support, functional, external, and speed lanes in sequence (183 tests total).
 
 The production tree contains integration, smoke, and source-policy tests. Native
 unit tests live in the separate no-LTO tree below. `ctest --preset linux` is
