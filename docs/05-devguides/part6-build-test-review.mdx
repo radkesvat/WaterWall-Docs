@@ -38,6 +38,57 @@ configuration, e.g. `build/linux/Release/Waterwall` (also `Debug/` and
 `linux-clang-x64`, `linux-tsan-unit`, and more); do not mix them within a single
 verification flow.
 
+Linux runtime code uses the `waterwall_runtime_options` interface, exported
+publicly by `ww`: C/C++ compilation receives `-fno-pic -fno-pie`, and executable
+links receive `-no-pie`. This covers `ww`, the application, tunnels, their reused
+PCH, and runtime-linked tests. The lwIP, UUID, freeres, KCP/FEC, and Brotli wrapper helper targets attach
+the same interface directly without inheriting ww's headers or PCH. Application
+targets also use `POSITION_INDEPENDENT_CODE OFF` with `CheckPIESupported`.
+The policy applies to ordinary and packed builds across Linux CPU variants;
+Android, Apple, and other non-Windows operating systems retain their existing policy.
+ThreadSanitizer builds retain PIE because the sanitizer requires it. The selected
+static runtime dependencies also use this policy: mimalloc, MaxMindDB, c-ares,
+libsodium, nghttp2, BoringSSL, and Brotli. Komihash is header-only and inherits the
+including runtime source's flags. `waterwall_configure_runtime_dependency()`
+applies the interface's compile options, disables an upstream PIC property when
+non-PIC compilation is active, and exports the matching executable link options.
+This avoids changing vendored sources or mixing upstream CMake link signatures.
+Preprocessed assembly receives the same non-PIC options as C/C++; NASM keeps its
+own instruction/relocation implementation. The packed launcher, host encoder,
+and XZ Embedded retain their own relocation settings.
+The startup guard and decoder wrapper are compiled separately for the
+application and launcher so their object code follows the respective policy. Do not link the non-PIC runtime
+archives into a shared library. This removes ASLR for the application's executable
+image but does not eliminate dynamic-library PLT/GOT calls; throughput gains must
+be measured. Results from changing only the executable link policy do not measure
+this runtime-wide code-generation policy.
+
+The in-tree OpenSSL static build receives `no-pic no-pie` through its own
+Configure options on Linux (excluding Android and ThreadSanitizer) and Windows
+x86/x64. GCC/Clang builds also receive `-fno-pic -fno-pie` to override default-PIE
+toolchains; MSVC does not receive those Unix compiler flags. Other platforms and
+Windows ARM retain their existing settings. Imported OpenSSL targets supplied
+externally retain their provider's build policy. OpenSSL's `no-pic` also disables
+building loadable modules: the default provider remains built in, and the enabled
+legacy provider is linked into libcrypto instead of built as a separate module.
+This is not a FIPS-module build. The wrapper detects changed Configure options and
+recreates its generated OpenSSL build directory before rebuilding the archives.
+
+Windows x86/x64 runtime consumers use the same interface for fixed-base executable
+linking. MSVC uses `/DYNAMICBASE:NO /FIXED /INCREMENTAL:NO` and, on x64,
+`/HIGHENTROPYVA:NO`. MinGW uses `-fno-pic -fno-pie` for C/C++ runtime compilation
+and `--disable-dynamicbase --disable-reloc-section` for executable linking, plus
+`--disable-high-entropy-va` on x64. These apply in every configuration, including
+Debug; MSVC incremental linking is disabled to permit fixed-base output.
+Dependency DLLs retain their own relocation policy. Windows ARM targets retain
+ASLR because the platform requires it. Removing the executable's base relocations
+requires its preferred address to be available; OS policies that require
+relocatable images may reject it. This is an executable-image policy, not a
+system-wide override of DLL, heap, stack, or OS-enforced randomization.
+See Microsoft's [DYNAMICBASE](https://learn.microsoft.com/en-us/cpp/build/reference/dynamicbase)
+and [FIXED](https://learn.microsoft.com/en-us/cpp/build/reference/fixed-fixed-base-address)
+references, and the [GNU PE linker options](https://sourceware.org/binutils/docs/ld/Options.html).
+
 ### Vendored XZ Embedded
 
 `ww/vendor/xz-embedded/README.waterwall.md` records the pinned upstream revision
