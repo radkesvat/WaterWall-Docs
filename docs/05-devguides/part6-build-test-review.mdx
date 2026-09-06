@@ -149,8 +149,9 @@ configuration, existing system libraries, and any intentionally supplied externa
 node libraries. The private `waterwall_application` comparison executable is a
 normal executable built with the ordinary dependency graph and optimization,
 allocator, CPU, and linking policies. Packing adds no global PIC or shared-runtime
-requirements. Cross-compiling and non-Linux/non-x86-64 packed targets fail
-configuration. Ordinary builds do not invoke the host encoder or payload generator.
+requirements. Linux packing remains native x86-64 only. Windows packing accepts x86/x64
+targets, including MinGW cross-compilation; Windows ARM and other packed targets
+fail configuration. Ordinary builds do not invoke the host encoder or payload generator.
 
 Core-file open failures include the program version on stderr before the error.
 The ordinary application and packed launcher use the same startup input-error
@@ -158,8 +159,16 @@ reporting, so a missing core file still identifies the executable version withou
 runtime initialization or decompression.
 
 A serialized independent native build checks the encoder's dependencies in
-`build/xz-encoder-host` without inheriting target compiler environment flags.
-Generation strips a private executable copy, checks its ELF identity, compresses
+`build/xz-encoder-host-<compiler/generator identity>` without inheriting target
+compiler environment flags. `WW_HOST_C_COMPILER` selects a native host compiler;
+`WW_HOST_ENCODER_GENERATOR` selects its generator. Windows host builds retain
+the MSVC environment and use the host `.exe` suffix. The independent manual
+encoder presets continue using `build/xz-encoder-host`.
+On a Windows Visual Studio build, the native encoder generator selects its own
+MSVC compiler without searching for GCC or Clang. Explicitly setting
+`CMAKE_SYSTEM_NAME` in a native Windows preset still makes CMake report
+`CMAKE_CROSSCOMPILING`; that flag alone does not determine host executability.
+Generation finalizes a private executable copy, checks its target identity, compresses
 it, and atomically publishes one source containing bytes and exact size/target
 metadata under `packed/<configuration>`. The executable, encoder, generator, and
 strip tool are declared dependencies. Failure stops the build without changing the
@@ -216,6 +225,134 @@ It uses `readelf` (override with `--readelf PATH`) to verify the final launcher 
 no static symbol table or debug sections, recreates a missing final executable,
 checks regeneration after an application update, and verifies that an unchanged
 build leaves the payload stable.
+
+### Windows packed executable bootstrap
+
+Windows x86/x64 builds can opt in with `-DWW_PACK_RUNTIME=ON`; development and
+Windows download jobs keep their ordinary defaults. Native release acceptance is
+required before enabling packed downloads. Public target `Waterwall` produces
+`<configuration>/Waterwall.exe`; `WaterwallApplication` remains the ordinary
+private `waterwall_application.exe`. Windows ARM packing is unsupported.
+
+The launcher is a C executable using CRT allocation, shared startup/basic JSON,
+XZ Embedded, and Windows system APIs. It does not link runtime libraries. The
+inner application keeps the ordinary fixed-base options. The launcher explicitly
+retains ASLR, base relocations, and DEP. Both executables retain the existing
+`requireAdministrator` manifest. GNU-compatible stripping applies only to staged
+payload copies and the final launcher. MSVC preserves the application's separate
+PDB policy; launcher links disable incremental linking and debug generation.
+No PE loader sections are removed manually. Payload generation identifies PE32
+and PE32+, rejects DLLs, wrong machines, invalid entry points and section ranges,
+and validates again after finalization. The XZ format is unchanged.
+
+After basic validation, the Windows launcher copies the exact input into an
+unnamed pagefile mapping, drops writable access, and inherits only a read-only
+snapshot handle and duplicated intended standard handles. The startup boundary
+uses `--ww-internal-map=` in place of Linux's descriptor argument, validates a
+bounded transport header and committed read-only pages across the complete view,
+copies the snapshot into owned CRT memory, and closes the handle. A successful
+mapping alone does not establish that reserved pages can be read. All internal
+arguments are removed before normal CLI parsing.
+Restricted validation remains mandatory. Ordinary Windows stdin retains its CRT
+text semantics; restricted stdin retains binary semantics, with no second text
+conversion at receipt.
+
+The executable is decoded into non-executable storage and written into a new
+private temporary directory. Its protected ACL admits the current user and
+SYSTEM and carries the token's integrity label. Extraction requires a local
+ACL-capable volume; network/FAT-style temporary roots have no weaker fallback.
+Reparse-point roots are refused, the resolved root and every canonical ancestor
+are pinned against replacement, and the owned directory and executable stay
+protected while in use. Directory pins request traverse access and deny write
+and delete sharing; attribute-only opens do not enforce these
+[sharing restrictions](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/8c0e3f4f-0729-49f4-a14d-7f7add593819).
+Only completely decoded and identified PE bytes are started. New filesystem and
+process operations use wide APIs; conversion to the existing active-code-page
+startup boundary rejects unrepresentable paths.
+
+`CreateProcessW` loads the child normally with the original CWD, environment and
+standard streams. Correct CRT quoting preserves argument boundaries. Captured
+outer executable location supplies the runtime's existing resource/node path
+override. DLL files directly beside the launcher are copied into the private
+extraction directory with its restrictive ACL and held read-only until child
+exit. This preserves executable-directory precedence for implicit imports and
+bare-name DLL loads while keeping the native CWD/system/PATH search policy and
+inherited DLL-directory settings intact. No `SetDllDirectoryW`, PATH expansion,
+recursive deployment copy, or stream proxy is added. CWD-only companions remain
+in CWD and use the ordinary loader fallback. DLL copies are startup snapshots;
+their Windows module paths point into the extraction directory. Resources needed
+by a companion through its own module-relative paths are not copied. Such
+deployments must use an ordinary build unless those resources are located
+explicitly. See Microsoft's
+[DLL search order](https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-search-order).
+
+The child has its own PID and temporary Windows image path; the launcher waits
+without handling traffic. A suspended child is admitted into an owned
+kill-on-close job before resuming. Admission failure terminates and reaps the
+child. No breakaway or resource-limit policy is requested. The existing Vista
+API target is retained; enclosing-job combinations that cannot admit the child
+fail explicitly (nested jobs require newer Windows). Native deployment testing
+must establish supported OS/service-wrapper combinations. This does not claim
+crash-proof admission: forced termination between creation and job assignment
+can leave a suspended child, and forced termination or machine failure can leave
+extraction files.
+
+After child exit, cleanup closes owned handles, retries deletion a bounded number
+of times for both the executable and directory, and reports exact owned residue
+as UTF-8 on byte-oriented stderr without recursive deletion. `ExitProcess`
+relays the full child DWORD status; cleanup warnings do not replace it. The
+console behavior is described in [Part 7](./part7-shutdown-and-signals.mdx).
+A Windows Firewall rule for the outer path does not identify the temporary child.
+Stable-path firewall/service supervision deployments must use an ordinary build
+unless their concrete deployment policy supports this process model. Packing
+does not add firewall rules, bypass UAC, or guarantee memory-only storage.
+
+The independent `core/tools/windows_launcher` project compiles the actual launcher
+and startup sources with a small PE fixture and companion DLL. From that directory:
+
+```bash
+cmake --preset mingw-x64
+cmake --build --preset mingw-release -j8
+ctest --preset mingw-release --output-on-failure
+cmake --build --preset mingw-debug -j8
+ctest --preset mingw-debug --output-on-failure
+```
+
+For a build-only PE32 cross-check, use `mingw-x86`, `mingw-x86-release`, and
+`mingw-x86-debug` with an i686 MinGW compiler. It does not assume Wine32 is installed.
+On Windows, use `native`, `native-release`, and `native-debug` from a compiler
+environment. The fixture covers exact snapshots, large input, text/binary modes,
+source deletion after capture, original location, companion imports from an
+unrelated CWD, TLS initialization, child status, malformed handoffs, handle
+closure, and concurrent cleanup. Native platform unit trees also register
+`waterwall.windows_packed_startup_unit` and
+`waterwall.windows_launcher_arguments_unit` outside the Linux-only test subtree.
+Native packed application builds register `waterwall.windows_packed_application`,
+which compares startup/settings behavior, requires a size reduction against the
+finalized payload, and runs the existing four-worker in-process TLS workload on
+both ordinary and packed executables. Registration uses the Windows host and
+runnable target architecture, so the native x86/x64 presets register it even
+when their explicit system settings make `CMAKE_CROSSCOMPILING` true.
+Native bootstrap CI runs MSVC x86/x64 and the existing MSYS toolchains. The
+application CI jobs additionally build a separate packed acceptance tree and
+run the application comparison; their downloads continue using ordinary trees.
+These tests do not replace manual deployment acceptance.
+
+`windows-cross-mingw-x64` is a full application cross-check preset. It requires
+the target MinGW compiler/SDK and native dependency build tools; successful
+fixture builds do not prove that every full application dependency cross-builds.
+Use the same public-target regression on an idle Windows packed tree:
+
+```bash
+python tests/packed_build_target_test.py --build-dir build/windows-launcher-native --config Release --windows
+```
+
+On Linux/Wine append `--runner wine`. The check verifies PE identity, launcher
+ASLR/DEP/relocations and omitted debug data, application non-ASLR flags, recreation,
+regeneration, and stable unchanged output. Header checks and Wine cannot establish
+native UAC, console control, ACL/locking, antivirus, firewall or service-wrapper
+behavior, nor full runtime workers/TCP/TLS equivalence. Full native application
+and manual checks remain mandatory before Windows packed release enablement.
 
 ### Build Rules
 
