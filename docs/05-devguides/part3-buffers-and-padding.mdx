@@ -207,21 +207,45 @@ do not set the flag on pooled buffers.
 
 ### BufferStream chunk and exact-read contracts
 
-`bufferstreamPush()` takes ownership of its input and preserves that input as a
-separate queued chunk. This matters to `bufferstreamIdealRead()` callers, which
-can observe the queued boundaries. `bufferstreamPushCoalescing()` is an opt-in
-alternative for consumers that treat the queue as a byte stream: it also takes
-ownership on every path, but may copy a complete input of at most 4 KiB into
-unused space at the current queue tail and recycle the source before returning.
-Callers of the coalescing operation must not retain the source pointer or depend
-on input-chunk identity.
+Use `buffer_queue_t` when individual buffer entries or chunk boundaries matter.
+Use `buffer_stream_t` for an ordered byte sequence, such as protocol parsing,
+byte inspection, or exact-length extraction. Internal stream boundaries are not
+message boundaries and need not match input chunks.
 
-Coalescing never grows a tail, copies only part of an input, searches older
-entries, or consumes left padding. Temporary buffers and buffers carrying
-`sbuf_lifetime_t` metadata remain separate, as do inputs that do not completely
-fit. The operation reduces allocation and queue-entry amplification; it does not
-bound the stream's logical byte count or replace protocol size limits and
-backpressure.
+`bufferstreamPush()` takes ownership on every path and may copy an input into
+the current tail and recycle the input before returning. Callers must not access
+the transferred buffer or pointers into it, depend on its allocation identity,
+or require one retained chunk per push. Payload contents and FIFO byte order
+are preserved; coalescing is permitted, not guaranteed.
+
+`bufferstreamReadExact()` returns exactly the requested positive number of
+available bytes, combining or splitting storage as needed. `ReadAtLeast()` may
+return more according to internal chunking. `IdealRead()` transfers an internal
+storage chunk efficiently, with no correspondence promised to pushes or wire
+records; it requires positive buffered length but can return a retained empty
+entry. `FullRead()` returns the complete buffered byte sequence, or `NULL` for
+zero logical bytes. Byte views and delimiter searches observe the same ordered
+bytes regardless of internal partitioning. Consumers needing a protocol boundary
+must parse it and request the appropriate length.
+
+The current push policy copies only a complete, positive input of at most 4 KiB
+that fits into the current tail's unused writable space. The resulting chunk
+can exceed 4 KiB. It never grows the tail, searches older entries, partially
+copies an input, or consumes left padding. Temporary buffers and buffers with
+lifetime metadata are excluded from push coalescing. These are push-policy
+constraints, not guarantees that subsequent stream reads preserve identity or
+metadata.
+
+Logical emptiness and buffered length measure bytes, not retained entries.
+Zero-length input is enqueued, and an eligible empty tail can absorb later bytes;
+it is not a message marker. Retained empty entries still require cleanup.
+Coalescing can reduce retained allocations and queue entries but does not replace
+protocol byte limits, retained-allocation limits where applicable, or
+backpressure. Pool recycling does not guarantee an immediate RSS reduction.
+
+Buffer queues preserve entries, but Debug insertion may replace the allocation
+to expose stale aliases. Observe the queue API's returned retained pointer and
+ownership/failure contract; do not assume the original input address survives.
 
 For a split `bufferstreamReadExact()`, `use_left_padding` is the exact prefix
 budget `U` that the stream may temporarily consume and count toward writable
