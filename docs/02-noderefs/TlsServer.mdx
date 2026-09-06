@@ -115,7 +115,7 @@ Both files must be valid for OpenSSL context creation.
 
 | Field | Default | Description |
 | --- | --- | --- |
-| `sni` | not set | Exact-match SNI gate. Rejects clients that do not send this SNI. |
+| `sni` | not set | Case-insensitive exact SNI match. Mismatch or absent SNI routes to fallback when configured; otherwise rejects the handshake. |
 | `select-alpns` | `["http/1.1"]` | Preferred ALPN selection list. |
 | `alpns` | not set | Deprecated alias for ALPN selection. Prefer `select-alpns`. |
 | `min-version` | `"TLSv1.2"` | Minimum TLS version. |
@@ -127,14 +127,13 @@ Both files must be valid for OpenSSL context creation.
 | `session-cache` | `"none"` | Session cache mode. |
 | `session-cache-size` | `20480` | Builtin OpenSSL session cache size. |
 | `session-tickets` | `true` | Enables TLS session tickets. |
-| `fallback-node-name` | not set | Fallback branch for clearly non-TLS input before TLS commit. Aliases: `fallback-node`, `fallback`. |
+| `fallback-node-name` | not set | Fallback branch for clearly non-TLS input or mismatched/absent configured SNI before TLS commit. Aliases: `fallback-node`, `fallback`. |
 | `fallback-intentional-delay-ms` | `7` | Delay for upstream payloads sent to fallback. Nonzero delay uses configured jitter. At `0`, an active unpaused fallback with no older FIFO batch or scheduled drain forwards inline; paused or older bytes remain FIFO and Resume drains them before later payload can overtake. |
 | `fallback-intentional-delay-jitter-ms` | `1` | Random jitter around delayed fallback payload scheduling. Ignored when delay is `0`. |
 | `tls13-record-shaping` | absent | Experimental sender-side TLS 1.3 padding and delay configuration. |
 | `verbose` | `false` | Enables detailed TLS lifecycle logging. |
 
-`sni` cannot be combined with fallback. A mismatched but otherwise valid ClientHello could otherwise be handed to fallback
-as plaintext, which is highly fingerprintable.
+`sni` can be combined with fallback to route mismatched or absent SNI to a real TLS listener before local TLS output.
 
 ## Experimental TLS 1.3 Record Shaping
 
@@ -289,7 +288,7 @@ Fallback is selected only before `TlsServer` has committed to TLS.
 The classifier looks at the initial upstream bytes:
 
 - bytes that are clearly not TLS go to fallback
-- bytes that start like TLS handshake records, such as `16 03`, stay on the TLS path
+- bytes that start like TLS handshake records, such as `16 03`, are parsed by OpenSSL; when `sni` and fallback are configured, the early ClientHello callback routes mismatched or absent SNI to fallback
 - once OpenSSL produces a ServerHello, the line is committed to the protected TLS branch
 
 When fallback starts, `TlsServer` releases TLS resources for that line and initializes the fallback branch. During normal
@@ -298,8 +297,10 @@ delay zero, an active unpaused fallback with no older FIFO batch or scheduled dr
 remain FIFO and Resume schedules their drain before later payload can overtake them. From then on, payloads pass through
 fallback without TLS encryption or decryption. The delayed upstream fallback FIFO is bounded to 1 MiB per line.
 
-TLS-looking but malformed, oversized, incomplete, or slow handshakes are closed on the TLS path. They are not routed to
-fallback after TLS classification.
+Malformed ClientHello/SNI input rejected before routing stays on the TLS error path. Incomplete or slow input waits for the handshake deadline; the fallback server handles TLS negotiation and errors after an SNI fallback selection.
+
+With SNI routing enabled, original input is retained in compact, coalescing buffers up to 1 MiB of input per line until TLS commitment or fallback selection. Socket fragmentation and ClientHello fragmentation across TLS records are supported, and any coalesced trailing bytes are replayed in order. The existing `handshake-timeout-ms` deadline covers incomplete input; `0` disables that deadline. Exceeding the buffer limit closes the connection without selecting a branch. A ServerHello (including HelloRetryRequest) commits the TLS branch; later errors never switch it to fallback.
+
 
 Fallback delay is applied only to normal live upstream payloads. Downstream responses from fallback are not intentionally
 delayed. On upstream `Finish`, queued bytes synchronously flush in FIFO order before fallback `Finish` when fallback can
@@ -317,7 +318,33 @@ Nginx distinguishes two kinds of unexpected public inputs on an HTTPS listener:
 1. **Plaintext HTTP on the HTTPS port**: Nginx classifies a regular request sent to an HTTPS port with internal status 497. Without `error_page` customization, its stock response is normally the recognizable outward 400 HTML page. `TlsServer`'s `fallback-node-name` handles this by forwarding non-TLS bytes to a fallback connector before TLS commitment. See nginx's [SSL error processing](https://nginx.org/en/docs/http/ngx_http_ssl_module.html#errors).
 2. **TLS ClientHello with unknown or mismatched SNI**: A connection begins in nginx's default-server context and, without an SNI match, ordinarily completes the TLS handshake using that context's certificate and settings. A default server can instead reject these handshakes explicitly with [`ssl_reject_handshake on`](https://nginx.org/en/docs/http/ngx_http_ssl_module.html#ssl_reject_handshake). See nginx's [virtual-server selection](https://nginx.org/en/docs/http/server_names.html#virtual_server_selection).
 
-The `TlsServer.sni` setting models strict handshake rejection (`ssl_reject_handshake on`), not nginx default-vhost routing. Because `TlsServer.sni` cannot be combined with `fallback-node-name`, deployments requiring full nginx camouflage—where unknown SNI, absent SNI, and plaintext HTTP all reach a real nginx HTTPS listener—should place `SniffRouter` **before** `TlsServer`:
+With both `sni` and `fallback-node-name`, `TlsServer` routes mismatched or absent visible SNI directly to the fallback before emitting TLS output. Matching SNI continues through the protected `next` branch. No `SniffRouter` is required for this single-name route. Without fallback, `sni` remains a strict handshake rejection filter.
+
+```text
+TcpListener :443 -> TlsServer (sni: protected.example.com)
+                      |-- next -> protected backend
+                      `-- fallback-node-name -> TcpConnector -> real nginx HTTPS listener
+```
+
+Configure the TLS node with:
+
+```json
+{
+  "name": "tls-server",
+  "type": "TlsServer",
+  "settings": {
+    "cert-file": "server.crt",
+    "key-file": "server.key",
+    "sni": "protected.example.com",
+    "fallback-node-name": "nginx-fallback-connector"
+  },
+  "next": "protected-backend"
+}
+```
+
+The connector must point to a real TLS listener: fallback receives the original TLS wire bytes, not decrypted HTTP. Visible outer SNI is used with ECH; encrypted inner SNI is unavailable. SNI is routing metadata, not authentication.
+
+`SniffRouter` remains an alternative for multiple domain routes or mixed-protocol routing:
 
 ```text
 TcpListener :443 -> SniffRouter
@@ -405,7 +432,7 @@ If your goal is wire-level similarity to default nginx, keep defaults unless you
 ## Common Mistakes
 
 - Do not expect `TlsServer` to parse HTTP; put `HttpServer` after it when you need HTTP behavior.
-- Do not combine `sni` with fallback.
+- When combining `sni` with fallback, point fallback to a TLS listener that can handle the original ClientHello.
 - Do not use ALPN as an authentication or rejection gate; no-overlap ALPN offers continue without negotiated ALPN.
 - Do not advertise `h2` unless the protected and fallback behavior can plausibly answer HTTP/2.
 - Do not use `shared` session cache; it is not implemented.

@@ -711,6 +711,31 @@ directional finish/close state, or — if the tunnel genuinely lacks one and thi
 the final-bytes case — add an explicit directional close flag. As stressed above,
 this is the **only** place such a flag belongs.
 
+### TlsServer SNI fallback admission
+
+`TlsServer` borrows the normal line created by its upstream owner. With both `sni`
+and fallback configured, its OpenSSL early ClientHello callback compares the visible
+SNI before TLS output. A mismatch or absent SNI suspends OpenSSL; the payload driver
+must replay the retained original wire bytes to fallback before later payloads.
+Matching SNI continues to the protected branch. Without fallback, the SNI gate
+still rejects mismatches. Malformed ClientHello/SNI input rejected before routing
+stays on the TLS error path.
+
+The original transcript is bounded to 1 MiB, including record headers and coalesced
+trailing bytes, and the existing handshake deadline covers incomplete input.
+Retained snapshots use compact byte copies and coalescing; never retain a full
+receive allocation for each tiny fragment merely because the logical byte count
+is below the limit. Copies carry the line pool's left padding for later replay.
+ServerHello, including HelloRetryRequest, commits the protected TLS branch: never
+switch to fallback afterward. Starting fallback releases TLS state and disarms its
+deadline before branch Init. Queue the entire initial input before invoking Init,
+including the triggering plaintext buffer when applicable. While Init is on the
+stack, later re-entrant input may enqueue behind it, but neither inline payload
+nor scheduled drains may run, including through Resume. After Init survives,
+release this admission barrier and drain in FIFO order subject to backpressure.
+A close during Init discards queued input instead of sending payload into an
+unfinished Init callback. Preserve the borrowed line's reference/owner rules.
+
 ### Delayed Fallback Batches Before Closing
 
 A scheduled line task holds a physical line reference only. It does **not** keep
