@@ -107,8 +107,9 @@ library and links `Waterwall` through `WaterWall::XZDecoder` to `XZEmbedded::XZE
 platform, without fetching XZ sources or requiring system liblzma. Other targets
 link `XZEmbedded::XZEmbedded` directly to obtain `<xz.h>`; `ww` does not re-export
 this dependency. Unused code remains subject to normal static linker elimination.
-The compiled decoder supports XZ + LZMA2 + x86 BCJ with CRC32 integrity checks
-and only `XZ_SINGLE` decoding. CRC64, SHA-256, other BCJ filters, multi-call
+The compiled decoder uses the XZ container layout with Waterwall-specific
+identifiers, LZMA2 + x86 BCJ, CRC32 integrity checks, and only `XZ_SINGLE` decoding.
+CRC64, SHA-256, other BCJ filters, multi-call
 allocation modes, and concatenated-stream support are disabled. Initialize the
 CRC32 table once before concurrent use, as documented in the vendored header.
 XZ Embedded provides decompression only.
@@ -133,13 +134,27 @@ compressed bytes and metadata as C source; `waterwall_xz_encoder` owns compressi
 Python remains in test runners, including the Windows launcher fixture. Production
 builds with tests disabled do not require Python for these packing steps.
 
-The fixed encoder format is one CRC32 XZ stream using x86 BCJ at offset zero,
-then LZMA2 (8 MiB dictionary, lc/lp/pb 3/0/2, normal mode, BT4, nice length 64,
+The fixed encoder format is one CRC32 stream with the XZ layout and Waterwall
+identifiers, using x86 BCJ at offset zero, then LZMA2 (8 MiB dictionary,
+lc/lp/pb 3/0/2, normal mode, BT4, nice length 64,
 search depth 64). The separate `WaterWall::XZDecoder` target exposes
 `<ww_xz_decoder.h>` and uses XZ Embedded single-call decoding into a bounded
 caller-owned buffer. Call `wwXzDecoderInit()` once before concurrent use. Success
 requires complete input consumption and the trusted expected output length;
 output must be discarded on failure. The wrapper accepts only CRC32 checks.
+The shared `ww/vendor/xz-embedded/include/ww_xz_format.h` defines a six-byte
+`MUFASA` header magic, a two-byte `gg` footer magic (no terminating NULs), and
+`FF` as the private CRC32 selector. The encoder replaces those identifiers in
+liblzma output. Both copies of the stream flags become `00 FF`: the selector
+is at offset 7 and three bytes before the stream end. Their stored CRCs remain
+calculated over the original `00 01` flags. The decoder requires the private
+CRC32 marker and normalizes only its own copied header/footer buffers before
+CRC validation; caller input stays unchanged. Header, footer, index and block
+data checksum validation remain enabled. Compression algorithms, sizes, filters,
+indexes and checksum values stay intact. Both native launchers use this format.
+Ordinary XZ tools cannot decode it until the magic and both selectors are
+restored. The internal `.xz` suffix does not denote a standard XZ file.
+
 This boundary has no Linux loading or startup dependencies. Tests round-trip a
 compiled module and exercise malformed inputs and capacity/length failures.
 Encoder and payload-source output are created exclusively; existing output and an input/output path
@@ -276,7 +291,8 @@ DLL-characteristics records can carry CET policy and must not be removed merely
 to empty the directory. See the [PE debug types](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#debug-type).
 No PE loader sections are removed manually. Payload generation identifies PE32
 and PE32+, rejects DLLs, wrong machines, invalid entry points and section ranges,
-and validates again after finalization. The XZ format is unchanged.
+and validates again after finalization. Both platforms use the same private
+compression stream format described above.
 
 After basic validation, the Windows launcher copies the exact input into an
 unnamed pagefile mapping, drops writable access, and inherits only a read-only
