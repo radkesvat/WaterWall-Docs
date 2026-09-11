@@ -5,7 +5,7 @@ sidebar_label: "Part 4: Packet Tunnels"
 description: "Packet-line semantics, pure packet tunnels, packet/stream bridges, packet-line initialization, and paired-tunnel direction rules for layer-3 work."
 ---
 <!--
-Documentation version: 155
+Documentation version: 156
 -->
 
 # Part 4: Packet Lines & Packet Tunnels
@@ -249,6 +249,60 @@ sense as one of:
 If you need real per-flow or per-connection lifecycle behind packet traffic,
 **create normal lines behind the packet side** — do not try to make the packet
 line behave like a connection.
+
+## ProtoSwap checksum representation
+
+ProtoSwap normalizes the TCP/UDP checksum's source and destination address
+contributions to zero before mapping, then restores the current addresses'
+contributions when decoding. The actual IP addresses stay intact. The mapped
+checksum still uses the native TCP (`6`) or UDP (`17`) pseudo-header protocol,
+not the mapped number. Address rewrites between endpoints therefore preserve
+valid checksums after decoding, without payload scans, packet expansion, or
+per-flow state. Both endpoints must use this checksum convention.
+
+Without an existing recalculation request, the incremental adjustment preserves
+invalid checksum residuals and detection of payload corruption. Disabled IPv4
+UDP checksum zero stays zero; enabled UDP arithmetic zero is transmitted as
+`0xffff`. TCP zero is an ordinary checksum value.
+
+Every fragment receives the protocol mapping. Only the fragment containing both
+transport checksum bytes receives the address adjustment, including a later TCP
+fragment after an 8- or 16-byte first fragment. Fragmentation may occur before
+encoding or between endpoints; no reassembly or ordering state is needed.
+Fragments of one datagram must receive consistent final addresses. Malformed
+IPv4/transport lengths, partial checksum fields and invalid local fragment
+geometry pass through unchanged, with their pending request preserved. Trailing
+buffer bytes are excluded from the transform; final writers still validate the
+packet length.
+
+Native shaping and port ghost run before upstream normalization. An existing
+checksum request is completed under the native protocol and actual addresses
+before encoding, in either callback direction; a failed request prevents mapping.
+For fragments, that request repairs only the IPv4 header. Decoding restores the
+address contribution and native protocol before downstream port restoration or
+TCP/TLS parsing. Existing downstream checksum requests are handed onward;
+upstream decoding can complete them immediately. ProtoSwap creates no new
+recalculation request. Arbitrary payload edits while mapped require a transform
+that understands this checksum convention.
+
+The shared `updateIpv4TransportChecksumAddresses()` helper takes an effective
+TCP/UDP protocol separately from the visible IP protocol and explicit old/new
+address contributions in network byte order. It must never manage a line's
+checksum request. It applies RFC 1624 equation 3 with 16-bit complements and
+end-around carry, and changes at most the two transport checksum bytes.
+For whole packets, validate TCP minimum header/data offset or UDP declared length
+against IPv4 total length using the effective protocol. For fragments, compute
+`fragment_start = fragment_offset * 8` and locate TCP offset 16 or UDP offset 6
+relative to the original IP payload. Never form a later-fragment TCP-header
+pointer or require every fragment to contain a full transport header.
+
+Preflight the complete transition before any mutation or request consumption.
+A no-match or rejected transition must leave bytes and the request unchanged.
+A successful encoder must not hand a normalized packet with an unsettled request
+to a generic writer: mapped protocol `1`, for example, would select ICMP checksum
+logic. Preserve the post-transition request per duplicate or delayed packet;
+never restore a consumed request from an earlier cached boolean. An already
+mapped upstream packet is decoded exactly once at this node and forwarded native.
 
 ## Two Kinds of Packet Tunnels
 
