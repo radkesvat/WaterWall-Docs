@@ -341,19 +341,87 @@ with the ordinary executable. Bootstrap uses inherited signal dispositions; afte
 execution the ordinary signal setup, startup rollback, and shutdown sequence apply.
 On Linux there is no resident launcher or loadable WaterWall runtime module.
 
-The Windows packed launcher owns bootstrap resources and waits for a separate
-ordinary child process. It does not participate in runtime shutdown or forward
-console events: the attached child receives Ctrl+C/Ctrl+Break directly. A real
-launcher-local handler records cancellation during bootstrap, survives these
-events while the child runs, and uses only process-lifetime atomic state. Console
-close/logoff/shutdown waits at most four seconds for the main owner; the OS may
-terminate it at its own deadline. The inherited Ctrl+C-ignore shortcut is not used.
-The main owner admits a suspended child to a kill-on-close job, resumes it, waits,
-cleans up owned extraction state, and exits with the child's full DWORD status.
-An incompatible enclosing job fails admission without running the child. Forced
-termination can leave extraction files (and, during the create-to-job interval,
-a suspended child); normal cleanup is not a crash-cleanup guarantee. The ordinary
-SignalManager and application shutdown controller remain unchanged.
+The Windows packed public process owns a private kill-on-close Job and joins it
+before creating any descendant. Children inherit membership at creation; there is
+no suspended-child create-to-assignment gap. Neither breakaway flag is set and no
+Job handle reaches the runtime. An incompatible enclosing Job fails startup; this
+works without nested Jobs on Windows 7 when the public process starts outside an
+enclosing Job. The sole ordinary Job handle is intentionally retained through
+process exit because closing it would terminate the public process itself.
+
+Independent `--stop-event`, `--ready-event`, and `--controller-process` capabilities
+replace hosted mode. The launcher validates object type/access and uses explicit
+handle inheritance. A process-lifetime observer is armed before configuration
+reading, translates stop/controller death to a private event, and enforces one
+60-second startup budget followed by at most 15 seconds of stop/cleanup. The
+runtime observes the exact controller at startup checkpoints and publishes
+readiness only after commit. Deadline termination skips runtime/CRT cleanup;
+termination initiation does not establish completion.
+
+`--console:hidden` detaches the console; `--console:visible` allocates one when
+needed and routes diagnostics there while preserving config stdin. Console
+requests use the same stop path. The observer never blocks on logs or config I/O.
+Ordinary clients without a controller capability remain independent of parent exit.
+
+`--session-file:PATH` creates a private, non-reusable record before runtime creation.
+`--recover:PATH` uses its bound Job/process identity, requests stop and verifies
+active-process accounting. A missing Job name is not proof of termination. If the
+Job cannot be opened, recovery requires a final one-member barrier receipt plus
+proof that the exact public process exited. Runtime adapter creation publishes intent before the
+OS call and its actual GUID before returning to callers. Recovery checks only
+those GUIDs; unresolved creation identity remains unverified. Built-in Windows
+TUN IP, route, and DNS operations target the owned adapter. Loop prevention uses
+the physical-interface egress pin on participating sockets and adds no
+physical-interface host routes. Shared WinDivert support still serves raw and
+capture devices.
+Recovery holds a read-only mapping of the journal across settlement and refreshes
+that view afterward; `ReadFile` must not be used to observe mapped effect writes,
+because Windows does not guarantee coherence between those access methods.
+An orderly-return event and launcher receipt distinguish cleanup from an arbitrary
+exit code. Full DWORD runtime status is retained independently of cleanup outcome.
+The public result marks runtime status known only when it was actually obtained
+from a terminated runtime. Failed creation, or cancellation of a never-resumed
+child followed by a confirmed wait, can settle without a runtime receipt. Admission
+intent remains published until the creation owner proves that boundary. Recovery
+reports the first unmet completion condition through `cleanup_detail`, separately
+from the causal end reason and any file residue.
+An abrupt runtime exit can settle without an orderly receipt when recovery
+authenticates the record, independently establishes process inactivity, and
+observes every recorded adapter GUID absent from `GetIfTable2`. Retained driver
+files and possible residue after abrupt exit are reported through `file_residue`;
+they do not veto verified process/interface settlement. Runtime status and
+`termination` still describe the actual exit, including an unknown status when
+the launcher could not finalize it.
+Missing process evidence, unresolved adapter creation identity, failed interface
+queries, or a still-present adapter remain unverified. This includes a disconnected
+adapter and does not itself prove active network effects. A missing launcher
+receipt can therefore still prevent process certification after the Job's name
+has disappeared. Recovery never treats name absence as inactive Job accounting.
+For built-in configurations, a settled result permits replacement and retirement
+of client-owned session inputs even with file residue. Applications should use
+`--restricted-config` when relying on this boundary; scripts and external nodes
+can create untracked effects. Unverified results permit bounded observation retries,
+not conflicting replacement or arbitrary network repair. Client-owned firewall
+policy remains a separate decision. Recovery does not persist its observations
+as a replacement launcher receipt; clients retain a successful result until
+session retirement. Forced-exit recovery observes recorded device state and does
+not repair arbitrary device state. The full
+argument, result, permission, deadline and recovery contract is in
+[`core/tools/windows_launcher/LIFECYCLE.md`](https://github.com/radkesvat/WaterWall/blob/main/core/tools/windows_launcher/LIFECYCLE.md).
+
+Completed Windows process termination closes that process's handles and ends its
+threads and process-local state, including socket egress bindings. Wintun's driver
+handles owner-process exit and handle closure by unregistering packet buffers and
+reporting disconnection, independently of WaterWall's graceful handlers. This
+packet-session boundary must not be equated with adapter removal: modern Windows
+software-device removal is asynchronous, and Windows 7 uses a separate adapter
+and orphan-cleanup path. Inactive device properties, interface configuration,
+driver installations, extracted files, logs, and the recovery record can remain.
+Client-owned firewall policy has its own lifetime. User scripts and external nodes
+fall outside the built-in TUN effect inventory. The interface contract's
+[forced-termination table](https://github.com/radkesvat/WaterWall/blob/main/core/tools/windows_launcher/LIFECYCLE.md#what-remains-after-forced-termination)
+documents the precise boundaries and primary Windows/Wintun sources; these
+mechanisms do not replace native qualification of the shipped driver and OS.
 
 Logging remains available through late cleanup diagnostics. SignalManager's exit
 observer registry is not a general ownership stack: observers may emit final
