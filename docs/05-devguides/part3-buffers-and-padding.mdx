@@ -31,13 +31,14 @@ struct sbuf_s
     uint32_t len;          // current payload length, in bytes
     uint32_t capacity;     // total allocation of buf[] (constant for the buffer's life)
     uint16_t l_pad;        // reserved left padding (constant once created)
-    bool     is_temporary; // stack/view buffer: never freed or pooled
-    uint8_t  _padding1;
+    uint16_t flags;
     uint8_t  buf[];        // 32-byte aligned data
 };
 ```
 
-The mental model is a cursor inside a fixed allocation:
+For ordinary buffers, the cursor moves inside a fixed allocation. The flag
+`kSbufFlagSplice` gives the payload a different representation, described below.
+The storage diagram and accessor descriptions here apply to ordinary buffers:
 
 ```text
    |<-- left capacity -->|<------- payload (len) ------->|<-- writeable tail -->|
@@ -80,6 +81,49 @@ sbufWrite(b, src, n);              // raw copy of n bytes at the cursor
 sbufConsume(b, n);                 // drop n bytes from the payload tail count
 sbufShiftRight(b, n);              // advance cursor: consume n bytes from the front
 ```
+
+### Pipe-backed payloads: `kSbufFlagSplice`
+
+`kSbufFlagSplice` marks a small `sbuf_t` wrapper for payload held in a pipe.
+The representation uses a separate splice-buffer pool and typically needs
+64 bytes or less of actual `buf` storage. The first four bytes at the original
+payload start, `buf + l_pad`, hold the pipe file descriptor; the body bytes
+remain in the pipe. The descriptor is control data, not four bytes of payload.
+The preceding `l_pad` bytes are real reserved headroom.
+
+For this representation, length and capacity describe the logical payload
+available through the pipe. They do not describe the wrapper's physical
+allocation or authorize reading or writing that many bytes through a buffer
+pointer. A tunnel may trust these sizes for accounting and forwarding while
+treating the pipe-backed body as opaque.
+
+When the line's splice context has no blockers and its splice path is active,
+Payload callbacks may receive these wrappers. The event loop and adapters that
+support splice interpret the descriptor and manage pipe I/O; the initial
+adapters are `TcpListener` and `TcpConnector`. Forwarding tunnels that already
+pass buffers opaquely and use size-based accounting can usually keep their
+Payload code unchanged after agreeing to splice mode. They need no special
+flag branch just to pass the wrapper onward. Code that handles the splice
+representation directly must understand the flag.
+
+Agreement to splice means leaving the pipe-backed body and its descriptor
+uninspected and unmodified by ordinary payload processing. The normal left
+padding path remains available: a tunnel may call `sbufShiftLeft()` and write
+its own prefix within physically reserved headroom and its advertised padding
+budget. The descriptor stays at `buf + l_pad` as `curpos` moves left. Those real
+prefix bytes precede the pipe-backed body in the logical payload. The permission
+to prepend does not permit overwriting the descriptor or accessing body bytes
+through `buf`.
+
+Accessors such as `sbufGetMutablePtr()` deliberately add no splice-specific
+checks or runtime assertions. Their callers uphold the representation
+contract. Corrupting the descriptor can break I/O or crash the process, but
+there is no guarantee of an immediate crash that would reliably detect misuse.
+
+This section defines the representation contract. Micro-buffer pooling provides
+the wrapper allocations; event-loop emission and splice-specific BufferStream
+handling are not implemented yet. Current BufferStream copying, splitting, and coalescing
+operate on ordinary buffers with resident payload bytes.
 
 ## Prepending a Header: `sbufShiftLeft`
 
@@ -153,6 +197,7 @@ buffer_pool_t *pool = lineGetBufferPool(line);     // this line's worker pool
 
 sbuf_t *big   = bufferpoolGetLargeBuffer(pool);    // large working buffer
 sbuf_t *small = bufferpoolGetSmallBuffer(pool);    // small working buffer
+sbuf_t *micro = bufferpoolGetMicroBuffer(pool);    // exactly 32 payload bytes plus micro padding
 
 // ... use the buffer ...
 
@@ -165,9 +210,39 @@ always use that line's pool — never a different worker's. Buffers from a pool
 already carry the chain's reserved left padding, so a pooled buffer is the correct
 place to build a payload you intend to prepend onto.
 
+Each buffer pool has large, small, and micro caches backed by separate shared
+master pools. `bufferpoolCreate()` takes all three master pools; micro payload
+capacity is fixed at `MICRO_BUFFER_SIZE` (32 bytes). Micro allocation is explicit:
+`bufferpoolGetBestFit()` continues to select only the large/small tiers.
+
+Each tier refills at most four buffers at a time, further bounded by half the
+local cache capacity and its available slots. Pools whose previous refill batch
+was smaller than four retain that smaller batch. Cache capacities and shrink
+thresholds are independent of this refill limit.
+
+`bufferpoolGetMicroBufferSize()` and `bufferpoolGetMicroBufferPadding()` expose
+the micro geometry. `bufferpoolUpdateAllocationPaddings()` accepts separate
+large, small, and micro padding arguments. Global chain-padding updates cover
+all three tiers, and device pools inherit all three padding values from their
+worker pool. Set padding before populating the local caches.
+
+The existing `lineGetBufferPool()`, `getWorkerBufferPool()`, and
+`getCurrentEventWorkerBufferPool()` accessors all expose the micro tier through
+`bufferpoolGetMicroBuffer()`. `lineReuseBuffer()` and `reuseBuffer()` use the same
+recycling path as `bufferpoolReuseBuffer()`, subject to their existing worker
+ownership requirements. Recycling clears flags and length; for a splice wrapper,
+it first restores physical capacity from the 32-byte micro payload and its
+reserved padding. Pooling manages buffer storage, not pipe I/O.
+
 If you need a buffer bigger than the current one for an append, use
 `sbufReserveSpace()` (it reallocates and copies only when necessary) rather than
 hand-rolling growth.
+
+`sbufCreateMicro(pad_left)` directly allocates an empty buffer with exactly
+32 bytes of payload capacity, plus left padding rounded up to a 32-byte
+boundary. Its payload capacity stays at 32 bytes regardless of the CPU cache
+line size. The buffer starts with zero length and flags, and no lifetime
+metadata; `sbufDestroy()` releases the allocation.
 
 ### Sizing Destination Buffers for Untrusted or Variable Payloads
 
@@ -201,10 +276,6 @@ Buffer lifetime bugs are as common as line lifetime bugs. The rules:
   `lineCallWithRef()` / `lineCallWithRefWithBuf()`), only recycle buffers you still hold; do not touch the dead
   line's state to do it.
 
-The `is_temporary` flag marks stack/view buffers that must never be freed or
-pooled. Do not pass a temporary buffer to anything that may try to recycle it, and
-do not set the flag on pooled buffers.
-
 ### BufferStream chunk and exact-read contracts
 
 Use `buffer_queue_t` when individual buffer entries or chunk boundaries matter.
@@ -231,8 +302,8 @@ must parse it and request the appropriate length.
 The current push policy copies only a complete, positive input of at most 4 KiB
 that fits into the current tail's unused writable space. The resulting chunk
 can exceed 4 KiB. It never grows the tail, searches older entries, partially
-copies an input, or consumes left padding. Temporary buffers and buffers with
-lifetime metadata are excluded from push coalescing. These are push-policy
+copies an input, or consumes left padding. Buffers with lifetime metadata are
+excluded from push coalescing. These are push-policy
 constraints, not guarantees that subsequent stream reads preserve identity or
 metadata.
 
