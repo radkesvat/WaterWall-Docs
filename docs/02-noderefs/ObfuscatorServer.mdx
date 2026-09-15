@@ -19,10 +19,8 @@ key, and header options.
 In the current implementation, the only supported method is XOR. This node is a
 traffic-shaping and obfuscation layer, not an encryption layer.
 
-`ObfuscatorServer` is created with WaterWall's packet-tunnel API and has no
-per-line tunnel state. Payload bytes are transformed in place, except when the
-optional TLS-like header mode needs to clone a buffer to get enough left
-padding.
+The option-off path remains stateless. TLS-like framing uses normal-line receive
+state for stream reassembly, while exact packet lines remain stateless.
 
 ## Typical Placement
 
@@ -59,7 +57,7 @@ Use the same `skip` and `tls_record_header` settings as the client side.
   node.
 - Can leave the IPv4 header, or IPv4 plus TCP/UDP header, unobfuscated.
 - Marks packet-line payloads for checksum recalculation after changing bytes.
-- Does not buffer payloads and does not keep per-line state.
+- Keeps bounded receive state only for ordinary streams with TLS-like framing enabled.
 
 The server implementation mirrors the client implementation. The client/server
 names describe deployment role; the transform itself is symmetric.
@@ -162,14 +160,17 @@ encryption, and no authentication. It only imitates the shape of a post-handshak
 TLS application-data record.
 :::
 
-Important limits:
+Stream framing behavior:
 
-- payloads larger than `65535` bytes are dropped when wrapping
-- truncated headers are dropped when stripping
-- records whose declared length does not exactly match the current payload
-  buffer length are dropped
-- there is no record reassembly buffer, so receive-side payload callbacks should
-  contain exactly one complete TLS-like record
+- Split large deliveries into records of at most 65,535 body bytes and apply XOR/skip per record.
+- Reassemble fragmented headers/bodies and parse coalesced records, retaining partial tails.
+- Send one encoded or decoded aggregate per batch; paused decoding resumes FIFO.
+- Bound retained input by `65540 + max(65536, 2 * L)` bytes, with `L` from the line pool.
+- Close malformed or overflowing ordinary streams and release state on Finish.
+
+Exact packet lines still require one complete record per packet. Truncated,
+mismatched, malformed, or oversized datagrams retain the existing drop policy;
+this mode adds no datagram fragmentation or cross-packet reassembly.
 
 ## Direction Behavior
 

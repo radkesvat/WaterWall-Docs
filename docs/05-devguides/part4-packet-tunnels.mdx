@@ -30,6 +30,13 @@ A packet line is a real `line_t`, but unlike a connection line it is:
 - **not** closed during normal runtime,
 - destroyed only when the **chain itself** is destroyed.
 
+"Worker-owned" here means persistent, worker-local packet-pipeline state. It
+does not make a node on the left or right its connection owner. Normal lines
+created inside a packet chain, including WireGuardDevice's companion transport
+lines and UdpStatelessSocket's incoming peer lines, still belong to their exact
+creators and close normally. Classify the actual `line_t`, not just its worker
+ID or whether the chain contains packet nodes.
+
 The source is explicit. In `tunnelchainFinalize()` (`ww/net/chain.c`), when the
 chain contains a packet node, one packet line is created per worker (abridged here
 without the surrounding pool cleanup):
@@ -70,9 +77,9 @@ Reach a worker's packet line with `tunnelchainGetWorkerPacketLine(chain, wid)`.
 
 :::danger Never destroy a packet line at runtime
 Do not call `lineDestroy()` on a packet line during normal operation, and never
-design logic that expects packet lines to be recreated on `Finish`. Some packet
-adapters (`TunDevice`, `UdpStatelessSocket`) assert in debug builds that the
-packet line is still alive after forwarding a packet. If your change can let a
+design logic that expects packet lines to be recreated on `Finish`. Packet
+adapters such as `TunDevice` assert in debug builds that the packet line is still
+alive after forwarding a packet. If your change can let a
 packet line die at runtime, that is almost certainly a bug.
 :::
 
@@ -388,6 +395,23 @@ Examples and what they anchor:
 State stored here is worker-local bridge state — still not per-connection state.
 If you need closable per-connection behavior behind packet traffic, create or
 manage normal lines behind the packet line instead of closing the packet line.
+
+### Obfuscator stream and packet roles
+
+With `tls_record_header` enabled, ObfuscatorClient and ObfuscatorServer reserve
+normal-line receive state through `tunnelCreate()`. Both supported Init directions
+initialize that state before forwarding; upstream Est remains pass-through.
+Exact worker packet lines bypass this state and preserve one-packet/one-record
+validation, checksum requests, and oversized-datagram drops. Packet Finish remains
+same-direction forwarding and never destroys the packet line.
+
+Ordinary stream deliveries split into records with at most 65,535 body bytes.
+XOR and skip operate per record. One encoded aggregate is sent per delivery;
+complete received records become one decoded aggregate, with partial tails kept
+for later input. Receive retention is bounded by one maximum wire record plus
+`max(65536, 2 * L)`, using the current line pool's large payload capacity `L`.
+Paused decoders retain bounded input until Resume; malformed records and overflow
+close the borrowed normal line through its owner. Finish releases all receive state.
 
 ## Packet-Line Initialization
 

@@ -134,7 +134,7 @@ and reads; TcpConnector selects it after adopting its socket and before reads.
 TcpListener owns its normal line; TcpConnector borrows it.
 
 For NIO TCP splice reads, positive `FIONREAD` availability determines the requested
-transfer size, capped by the loop's large-buffer size and the 32 KiB
+transfer size, capped by the loop's large-buffer size and the 512 KiB
 `LARGE_BUFFER_SIZE_RAM_HIGH` limit. The read loop checks out a splice wrapper,
 lazily initializes its private pipe, and performs the nonblocking socket-to-pipe
 splice **before invoking the Payload callback**.
@@ -364,7 +364,8 @@ line:
 ```c
 buffer_pool_t *pool = lineGetBufferPool(line);     // this line's worker pool
 
-sbuf_t *big   = bufferpoolGetLargeBuffer(pool);    // large working buffer
+sbuf_t *big   = bufferpoolGetLargeBuffer(pool);    // ordinary read/working buffer
+sbuf_t *medium = bufferpoolGetMediumBuffer(pool); // fixed 64 KiB helper buffer
 sbuf_t *small = bufferpoolGetSmallBuffer(pool);    // small working buffer
 sbuf_t *splice_buf = bufferpoolGetSpliceBuffer(pool); // 32 control-storage bytes plus splice padding
 
@@ -379,11 +380,29 @@ always use that line's pool — never a different worker's. Buffers from a pool
 already carry the chain's reserved left padding, so a pooled buffer is the correct
 place to build a payload you intend to prepend onto.
 
-Each buffer pool has large, small, and splice caches backed by separate shared
-master pools. `bufferpoolCreate()` takes all three master pools; physical splice
-control storage is fixed at `SPLICE_BUFFER_STORAGE_SIZE` (32 bytes), excluding
-left padding. Splice allocation is explicit:
-`bufferpoolGetBestFit()` continues to select only the large/small tiers.
+Each buffer pool has large, medium, small, and splice caches backed by separate
+shared master pools. `bufferpoolCreate()` takes those four master pools in that
+order. Their payload capacities, excluding reserved left padding, are:
+
+| Tier | Capacity | Use |
+| --- | --- | --- |
+| Small | 4 KiB | Small ordinary payloads and control messages |
+| Medium | 64 KiB in every memory profile | Helper storage for framing and retained queues, including paused Mux children |
+| Large | 4 KiB in S1/S2; 512 KiB in M1/M2/L1/L2 | Ordinary event-loop read buffers and larger working payloads |
+| Splice | 32 bytes of control storage | Explicit splice wrappers; logical body size is independent of allocation size |
+
+Medium capacity is fixed; its local and master cache counts follow the memory
+profile, just like the other tiers. Ordinary event-loop reads explicitly request
+large buffers and do not select medium buffers. A node may use medium buffers for
+its own work or retention. The tier name does not imply size ordering in low-memory
+profiles, where a medium buffer is larger than a large buffer.
+
+`bufferpoolGetBestFit()` selects the smallest ordinary tier that satisfies both
+payload and padding requirements, comparing actual sizes across small, medium,
+and large. If no tier fits, it creates a dedicated padded buffer that is destroyed
+on return. `bufferpoolTryGetBestFit()` accepts a 64-bit computed length and returns
+`NULL` for unrepresentable geometry before using the same allocation path. Neither
+helper shrinks an existing buffer. Splice allocation stays explicit.
 
 Each tier refills at most four buffers at a time, further bounded by half the
 local cache capacity and its available slots. Pools whose previous refill batch
@@ -392,13 +411,13 @@ thresholds are independent of this refill limit.
 
 `bufferpoolGetSpliceBufferStorageSize()` and `bufferpoolGetSpliceBufferPadding()` expose
 the splice geometry. `bufferpoolUpdateAllocationPaddings()` accepts separate
-large, small, and splice padding arguments. Global chain-padding updates cover
-all three tiers, and device pools inherit all three padding values from their
+large, medium, small, and splice padding arguments. Global chain-padding updates cover
+all four tiers, and device pools inherit each tier's padding value from their
 worker pool. Set padding before populating the local caches.
 
 The existing `lineGetBufferPool()`, `getWorkerBufferPool()`, and
-`getCurrentEventWorkerBufferPool()` accessors all expose the splice tier through
-`bufferpoolGetSpliceBuffer()`. `lineReuseBuffer()` and `reuseBuffer()` use the same
+`getCurrentEventWorkerBufferPool()` accessors expose every tier through the same pool, including
+`bufferpoolGetMediumBuffer()` and `bufferpoolGetSpliceBuffer()`. `lineReuseBuffer()` and `reuseBuffer()` use the same
 recycling path as `bufferpoolReuseBuffer()`, subject to their existing worker
 ownership requirements. Recycling clears flags and length; for a splice wrapper,
 it first restores physical capacity from the 32-byte control storage and its
@@ -422,7 +441,7 @@ When sizing a destination buffer from an untrusted or variable payload length:
 
 - Use `bufferpoolGetBestFit()` (or another checked growth operation) rather than
   assuming a fixed buffer tier fits the input. Supply the left padding required
-  by the onward buffer contract as well as the payload capacity: when neither
+  by the onward buffer contract as well as the payload capacity: when no
   pool tier fits, best-fit creates a dedicated buffer with exactly the requested
   padding. Request zero only for a locally consumed buffer or a proven
   zero-padding destination.
@@ -491,20 +510,48 @@ allocation to expose stale aliases. Splice wrappers retain their allocation and
 private pipe. Observe the queue API's returned retained pointer and
 ownership/failure contract.
 
-For a split `bufferstreamReadExact()`, `use_left_padding` is the exact prefix
-budget `U` that the stream may temporarily consume and count toward writable
-capacity. A small pooled buffer is eligible only when it provides both the
-remaining payload capacity, `max(requested_bytes - U, 0)`, and all `U` configured
-padding bytes. Allocator-alignment slack and chain padding owned by other tunnels
-are never credited. If the large tier must grow for an oversized result, the
-existing reserve fallback preserves that tier's complete chain-wide padding.
+Exact reads transfer a whole matching chunk directly, even when its allocation
+is larger than its current length. BufferStream does not copy an entire chunk
+into smaller storage to save retained memory. Splitting uses ordinary best-fit
+pooled storage, including the medium tier. Merging keeps its existing append/grow
+path. There is no proportional-capacity allocator or automatic compaction step.
+
+`use_left_padding` is the exact prefix budget `U` that an exact read may consume.
+Only `max(requested_bytes - U, 0)` is credited as the payload requirement; padding
+owned by onward consumers remains reserved. Small-tier results use that tier's
+padding; other new allocations request at least the large tier's reserved padding. Splits clone ordinary lifetime metadata; whole
+chunks keep their association. Existing byte-stream merge semantics still apply.
+`IdealRead()` retains its internal-chunk transfer contract.
+
+`bufferstreamMoveExactBytesTo(stream, destination, bytes)` appends exactly the
+requested bytes into caller-owned ordinary storage. It validates source length
+and destination append space before consumption; insufficient bytes or space
+terminate the program. Zero bytes is a no-op. The destination must not belong
+to the stream. Its allocation, cursor, and reserved padding stay unchanged, and
+this helper does not apply `use_left_padding` to it. Callers prepare any permitted
+prefix space themselves.
+
+The move walks queued sources directly with `memoryCopyLarge()`, recycling fully
+consumed entries and advancing a partial source in place. It does not allocate
+or grow destination storage, merge source chunks, or copy an unrelated remainder.
+Both source and destination must contain ordinary resident data.
+
+Existing destination lifetime metadata is preserved. An empty destination with
+no metadata inherits the first contributing source's association: a full source
+transfers it, while a partial source clones it. Empty source entries are recycled
+without supplying the association. Further sources follow ordinary byte-stream
+merge semantics: their independent associations are not aggregated into the
+result and settle as those sources are recycled. Appending to an existing payload
+does not replace its association, including when that association is NULL.
 
 ### MUX parent streams and decoded child queues
 
 MuxClient and MuxServer accumulate encoded parent bytes in `buffer_stream_t`.
-They must extract each complete frame with `muxReadCompleteFrame()`, which uses
-the eight-byte header and declared payload length. Never replace that extraction
-with arbitrary `IdealRead()`/`FullRead()` chunks. Parent coalescing changes storage
+They must use the shared Mux frame helpers, which validate the complete eight-byte
+header and declared payload length before consumption. `muxPeekCompleteFrame()`
+allows child lookup before choosing ordinary extraction or `muxReadFrameForQueue()`
+for a paused child. `muxReadCompleteFrame()` remains the combined peek/read helper.
+Never replace frame extraction with arbitrary `IdealRead()`/`FullRead()` chunks. Parent coalescing changes storage
 boundaries, not MUX wire-frame boundaries.
 
 Decoded `Data` waiting for a paused child belongs in `pending_child_data`, a
@@ -514,11 +561,50 @@ count. An empty Data body still has a wire header and is not an empty carrier
 input or a close signal. Keep the existing logical flow-control and actual
 allocation-charge accounting separate.
 
+Mux owns its paused-child retention policy. After peeking a complete Data header
+and looking up the child, it chooses small or 64 KiB medium storage before
+extracting a paused frame. `bufferstreamMoveExactBytesTo()` copies only that frame
+into the final destination, avoiding an intermediate merge and later retention
+copy. The wire header temporarily uses Mux's eight-byte prepend budget; removing
+it restores the destination's full pool headroom. A suitable whole source chunk
+is transferred directly. Unpaused delivery keeps its existing exact-read path.
+
+Queue admission still checks whether a supplied payload needs smaller pooled
+storage, so other queue callers keep the same bounded retention behavior.
+BufferStream itself makes no retention or pool-tier decision in the new helper.
+
+All Mux wire frames (at most 65,527 payload bytes plus an eight-byte header) fit
+in medium payload capacity. Copying a paused frame therefore does not need a
+separate variable-sized allocation in normal pool geometry. The child, parent,
+and detached hard limits still charge the actual retained allocation, including
+padding, header, and alignment overhead. Logical Pause/Resume thresholds and FIFO
+frame boundaries are unchanged.
+
 MUX framing is not general UDP boundary preservation. Both encoders split child
 payloads larger than 65,527 bytes, and decoding does not recover the original
 callback boundary. Child-side transforms can also split or combine payloads.
 Use the UdpOverTcp pair around a UDP flow's byte-stream portion rather than
 depending on direct UDP/MUX adjacency; observe that pair's own payload limits.
+
+### Stream delivery headroom and datagram framing
+
+ConnectionToPackets retains at most `P + L` pending TCP payload bytes per flow,
+where `P` is its configured `max-pending-bytes` and `L` is the line pool's large
+payload capacity. The extra `L` bounds already-delivered input before Pause can
+take effect. Its 1,024-entry cap remains independent, and overflow is rejected
+before queue insertion. PacketsToConnection applies the same `P + L` bound on
+the return path; its acknowledgement records charge their original payload
+length until fully acknowledged and keeps production paused while that charge
+exceeds `P`, including when only ACK records remain. Both retain their independent
+entry caps. UDP
+has no such pending stream queue.
+
+UdpOverTcp's negotiated TCP mode splits a large payload into wire frames of at
+most 65,505 bytes each, with the existing two-byte lengths. The encoded frames
+are emitted together in one callback, so an onward Pause cannot leave a local
+fragment sequence unfinished. Ordinary lifetime metadata follows the aggregate.
+UDP mode still treats each callback as one datagram and drops oversized input;
+it must never split a datagram to accommodate the larger ordinary read tier.
 
 ### Payload length versus retained allocation charge
 

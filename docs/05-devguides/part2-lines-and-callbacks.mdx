@@ -346,7 +346,7 @@ such as "Client", "Server", "Listener", or "Connector":
 - `TcpListener` calls `lineCreate()` for every accepted connection and is that
   line's owner.
 - `TcpConnector` owns a **socket**, not a line. It calls neither `lineCreate()`
-  nor `lineDestroy()`; it consumes a line created further up the chain. Owning an
+  nor `lineDestroy()`; it consumes a line created toward the `prev` side. Owning an
   OS resource is not owning a `line_t`.
 - A tunnel routinely **mixes roles**: `MuxClient` owns its parent/carrier line
   while borrowing every child line; `HttpClient` owns the upload/download
@@ -356,6 +356,59 @@ such as "Client", "Server", "Listener", or "Connector":
 
 `tests/line_ownership_policy_test.py` records the classification of every
 production creation site and fails when a new one appears unclassified.
+
+### Ownership and topology
+
+For ordinary connection streams, the usual layout is:
+
+```text
+creator/owner -> middle tunnels -> borrowing socket adapter
+     left              upstream toward next ->       right
+```
+
+Normal lines are almost always **left-owned** in this layout. The creator sends
+upstream `Init`; middle tunnels and the right-side adapter borrow that same line.
+The owner may itself be a middle node creating a separate parent, child, or
+transport line. "Left-owned" describes the path back to that exact line's
+creator, not the first node in the configuration file or its chain-array index.
+`TcpListener`, `UdpListener`, and the head-only `UdpStatelessSocket` follow this
+pattern for accepted connections or incoming peers. Closing their OS resource
+at a borrowing node does not transfer ownership of the line.
+
+An ordinary middle stream tunnel may use the upstream-then-downstream local
+Finish sequence below under this topology contract. The downstream Finish
+travels back to the owner and may destroy the line; it must be the last use of
+that line in the close path. This is distinct from handling a received Finish,
+which is forwarded only away from its sender.
+
+Keep these special cases separate:
+
+| Line/path | Ownership and lifetime |
+| --- | --- |
+| Worker packet line | Shared worker-local packet state, allocated and released by the chain. It stays logically alive throughout runtime; a node must never destroy it on Finish. Worker affinity is not per-connection ownership. |
+| Reverse nodes and Bridge | Bridge forwards the same line while reversing callback direction; it does not become the owner. Follow the exact reverse-node ownership contract at the direction-changing boundary. |
+| Internal companion transport line | A node that creates one owns that normal line, even inside a packet chain. For example, WireGuardDevice creates normal companion transport lines; when transport faces `prev`, their Init travels downstream. These are not persistent worker packet lines or ordinary left-owned stream ingress. |
+
+The reverse topology has two mandatory direct connections:
+
+```text
+Bridge -> ReverseClient
+ReverseServer -> Bridge
+```
+
+**No node may sit between either pair**, including a transparent transform,
+logger, or limiter. Put extra processing outside these gaps. In particular,
+ReverseClient's downstream Init must reach Bridge directly; Bridge turns it
+into upstream Init on the paired branch. An intervening ordinary stream tunnel
+cannot rely on the usual left-owner model at that boundary. These rules define
+supported configurations even though startup does not currently enforce the
+adjacencies automatically; see [Part 5](./part5-tunnel-anatomy.mdx#bridge-and-reverse-node-adjacency).
+
+Do not infer that every normal line in every topology is left-owned, or that an
+explicit downstream Init handler changes ownership. Trace special/internal
+creation paths before applying the ordinary stream close sequence. A physical
+reference keeps allocation memory available; it does not keep a destroyed line
+logically alive.
 
 ### Shutdown-complete owners and adapters
 
@@ -565,13 +618,15 @@ read any field of `ls` after `LinestateDestroy(ls)` — assume it is zeroed.
 
 ### Closing Both Directions From the Middle
 
-When a middle tunnel itself decides to tear down the connection (a protocol error,
-a limit hit), it is responsible for closing **both** sides. The safe ordering is:
+When a middle tunnel itself decides to tear down an ordinary borrowed,
+left-owned connection (a protocol error, a limit hit), it is responsible for
+closing **both** sides. Under the ownership/topology contract above, the ordering is:
 
 1. Destroy this tunnel's own line state.
-2. Send the **upstream** `Finish` first. (`Finish` is non-re-entrant, so the line
-   is still alive after this.)
-3. Send the **downstream** `Finish` second. (This one can lead to the line dying.)
+2. Send the **upstream** `Finish` first. The right side borrows this line and
+   must neither destroy it nor reflect callbacks toward the sender.
+3. Send the **downstream** `Finish` second. This reaches the left-side owner and
+   can destroy the line.
 4. Return immediately.
 
 ```c
@@ -582,6 +637,12 @@ tunnelNextUpStreamFinish(t, l);  // 2. close forward (line still alive)
 tunnelPrevDownStreamFinish(t, l); // 3. close backward (line may die now)
 return;                          // 4. do not touch l or ls again
 ```
+
+The line surviving the first Finish follows from its owner being on the other
+side, together with the no-reflection rule. Non-re-entrancy alone does not prove
+that an arbitrary recipient cannot own and destroy a line. Apply the specific
+ownership contract at reverse/Bridge boundaries and for internal companion
+lines; do not apply this normal-line teardown recipe to a worker packet line.
 
 Adapters are simpler: sitting at one end of the chain, they only ever send
 `Finish` once, toward the opposite direction.

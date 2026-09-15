@@ -186,14 +186,26 @@ The reverse topology requires both direct adjacencies:
 - `ReverseServer -> Bridge`: Bridge must be ReverseServer's immediate next node.
 - `Bridge -> ReverseClient`: Bridge must be ReverseClient's immediate previous node.
 
-No node may intervene in either pair; for example,
-`Bridge -> SpeedLimit -> ReverseClient` is forbidden. ReverseClient creates a
+**No node may intervene in either pair**, including a transparent transform,
+logger, or limiter. Both `Bridge -> SpeedLimit -> ReverseClient` and
+`ReverseServer -> SpeedLimit -> Bridge` are forbidden. ReverseClient creates a
 line toward its previous side using downstream `Init`, and Bridge translates
 that callback into upstream `Init` on its paired branch. These are chain-design
 requirements that users must follow. The code does not automatically enforce
-either adjacency rule.
+either adjacency rule. The direct connection keeps the exceptional direction
+change at the reverse/Bridge boundary; ordinary stream nodes outside it retain
+their usual left-owner topology assumptions. See
+[Part 2](./part2-lines-and-callbacks.mdx#ownership-and-topology) for the scope of
+those assumptions and the corresponding Finish order.
 
 ### Node Flags
+
+`UdpStatelessSocket` is a chain-head adapter by design. It requires `next`,
+forbids `prev`, and creates normal peer lines using upstream `Init` only.
+Outgoing datagrams and callbacks from the chain arrive downstream from `next`.
+Tail placement and downstream peer initialization are intentionally disabled;
+this is the supported topology contract, not a temporary workaround. WireGuard
+layouts using this socket place its transport side toward `prev`.
 
 | Flag | Meaning |
 | --- | --- |
@@ -415,9 +427,35 @@ inherited identities and avoid appending repeated markers to the borrowed
 client or reused child. Current TCP read EOF closes the full transport,
 including on IOCP; proxy persistence does not introduce half-close semantics.
 
+HttpProxyServer treats `max-pending-bytes` (`P`) as its working pending-data
+budget. Four working buffers retain at most `4 * P` allocation bytes. Each
+direction may additionally hold one already-delivered remainder of at most
+`D = max(65536, 2 * L)` logical bytes, where `L` comes from the finalized line
+pool. Total retained logical bytes are bounded by `P + 2 * D`. A single delivery
+is limited to `P + D`; only its immediately drainable prefix may exceed the
+per-direction remainder allowance. Each remainder's
+payload capacity is at most `max(small_capacity, 2 * D)` plus cache-line rounding;
+its full padding, sbuf header, and aligned-allocation overhead are additional.
+Remainder admission copies into ordinary best-fit pooled storage when needed
+to satisfy this bound. Working slice room excludes deferred
+bytes so moving bytes into working storage never double-counts them. Remainders
+participate in pressure, FIFO pumping, and every error/timeout/close cleanup path.
+Blocked pipelined requests leave response progress available.
+
+ReverseServer, HalfDuplexServer, and HttpServer split derive waiting budgets from
+`scale = max(1, ceil(L / 32768))`. ReverseServer closes above `65535 * scale`;
+HalfDuplexServer closes at or above `131070 * scale`, including initial upload
+publication; HttpServer split closes above `131070 * scale` unless its explicit
+buffering-limit bypass is enabled. Handshake/header validation and available-peer
+pairing precede waiting checks. The 32 KiB divisor is a fixed budget reference. Wire and HTTP framing limits remain independent.
+
 If you work on `HttpClient` or `HttpServer`, these source-backed constraints
 apply:
 
+- HTTP/1.x header limits count bytes through the first complete `CRLF CRLF`,
+  including the terminator. Body bytes received in the same buffer do not count
+  against that limit. Without a terminator, the buffered header prefix remains
+  subject to the limit. This applies to request, response, and split headers.
 - WaterWall targets HTTP/1.x and **single-stream** HTTP/2 only. Do not add HTTP/3.
   Do not support more than one logical HTTP/2 stream. If a peer opens extra
   streams, reject or ignore them conservatively per the existing design.
