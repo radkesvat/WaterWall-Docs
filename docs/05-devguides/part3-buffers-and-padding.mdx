@@ -180,7 +180,8 @@ the dedicated pipe helpers and preserve exclusive buffer ownership.
 Converting B first reads BBB and leaves AAA intact, including when A is queued.
 Final stream delivery must still preserve A-before-B order. Pool access remains
 worker-affine; an explicitly transferred wrapper may use its receiving worker's
-pool. Generic BufferQueue and BufferStream restrictions still apply.
+pool. BufferQueue preserves these owned entries; BufferStream still requires
+ordinary resident payload.
 
 #### Conversion and partial reads
 
@@ -194,8 +195,8 @@ must not access afterward.
 `wioPartialReadSpliceBuffer(buf, dest, bytes)` appends exactly the requested
 prefix/body bytes. It validates source length, cursor, and destination append
 space, without growing storage or consuming destination headroom. Zero bytes
-is a validated no-op. The caller retains
-both buffers and must recycle the wrapper when fully consumed.
+is a validated no-op. The caller retains both buffers and returns the wrapper
+through `bufferpoolReuseBuffer()` when finished, discarding any unconsumed remainder.
 
 Both read helpers require `kSbufFlagSplice | kSbufFlagSplicePiped` and read only
 from the wrapper's private pipe. A nonempty body requires an initialized pair.
@@ -210,15 +211,22 @@ Unsupported conversion and partial reads abort.
 
 #### Recycling, discard, and physical destruction
 
-`wioRecycleSpliceBuffer(buf, pool)` requires zero logical length
-and an empty private pipe. The pool-return guard enforces these conditions
-in Release and with pooling bypassed. Kernel emptiness is verified using
-`FIONREAD`; resetting sbuf fields never empties a pipe. Normal reuse restores
-physical capacity and clears transient state while preserving healthy empty
-pipes. Unused empty wrappers can also be recycled directly.
+`bufferpoolReuseBuffer(pool, buf)` takes exclusive ownership and discards any
+remaining payload for ordinary and splice buffers. For a splice wrapper it calls
+`sbufSpliceDiscard()` before resetting the header or entering the pool-bypass
+branch, then verifies that the private pipe is empty. WIO cleanup, BufferQueue
+destruction, `lineReuseBuffer()`, and `reuseBuffer()` share this behavior without
+caller-side splice cleanup.
 
-WIO cancellation through `wioReleaseBuffer()` requires exclusive ownership.
-It drops the real prefix and drains its private pipe with bounded scratch storage
+A wrapper claiming zero length must already have an empty pipe; the pool
+verifies kernel emptiness with `FIONREAD` in Release and
+with pooling bypassed. Resetting sbuf fields never empties a pipe. Normal reuse
+restores physical capacity and clears transient state while preserving healthy
+empty pipes. Unused empty wrappers can also be recycled directly.
+
+`sbufSpliceDiscard()` requires exclusive ownership and leaves an empty wrapper
+for recycling without freeing it. For nonempty payloads it drops the real prefix
+and drains the private pipe with bounded scratch storage
 and nonblocking reads, retrying `EINTR` and accepting positive short reads.
 `EAGAIN` confirms emptiness. EOF or unexpected error closes both owned ends and
 marks the pair uninitialized; teardown never creates a replacement. A later
@@ -251,9 +259,34 @@ Graceful close drains the queue normally. Unsupported NIO builds and non-TCP
 destinations reject splice writes fatally. Callback admission and reentrancy
 follow the normal WIO contracts.
 
-Generic BufferQueue insertion still rejects splice wrappers, including adapter
-pause queues. BufferStream copying, splitting, and coalescing support ordinary
-resident payload only. NIO's internal WIO FIFO stores the owned wrappers directly.
+#### BufferQueue splice ownership
+
+BufferQueue accepts ordinary and splice buffers through its existing push, pop,
+peek, reserve, and destroy API. It preserves entries, including empty entries,
+and FIFO order. Logical byte accounting includes each splice buffer's real prefix
+and remaining private-pipe body; it does not count control-storage capacity.
+
+Splice insertion retains the original wrapper and private pipe in every build.
+It neither copies metadata as payload nor converts or consumes the body.
+Nonempty splice entries require `kSbufFlagSplicePiped`; empty unused wrappers
+are valid. Splice lifetime metadata must remain null. Ordinary Debug insertion
+continues to replace allocations to detect stale aliases.
+
+Successful insertion transfers ownership to the queue. Failed try-insertion
+leaves the pointer, buffer, private-pipe contents, queue entries, and byte count
+unchanged. Pop transfers ownership back to the caller. Peek is borrowed: do not
+consume or modify a queued buffer through an alias. Pop first, consume through
+the splice helpers, and reinsert any remainder so queue accounting stays correct.
+
+Destroying a nonempty queue discards remaining private bodies and recycles the
+wrappers on the owning event worker, preserving healthy empty pipes. Drain errors
+close the affected pair before recycling; teardown never creates a replacement.
+Empty queue destruction requires no worker context. TCP adapter pause queues
+use these same ownership rules; final stream delivery order remains the caller's
+responsibility.
+
+BufferStream copying, splitting, and coalescing still support ordinary resident
+payload only. NIO's internal WIO FIFO stores the owned wrappers directly.
 
 ## Prepending a Header: `sbufShiftLeft`
 
@@ -447,9 +480,10 @@ Coalescing can reduce retained allocations and queue entries but does not replac
 protocol byte limits, retained-allocation limits where applicable, or
 backpressure. Pool recycling does not guarantee an immediate RSS reduction.
 
-Buffer queues preserve entries, but Debug insertion may replace the allocation
-to expose stale aliases. Observe the queue API's returned retained pointer and
-ownership/failure contract; do not assume the original input address survives.
+Buffer queues preserve entries, but Debug insertion may replace an ordinary
+allocation to expose stale aliases. Splice wrappers retain their allocation and
+private pipe. Observe the queue API's returned retained pointer and
+ownership/failure contract.
 
 For a split `bufferstreamReadExact()`, `use_left_padding` is the exact prefix
 budget `U` that the stream may temporarily consume and count toward writable
