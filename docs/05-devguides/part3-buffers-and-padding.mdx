@@ -99,7 +99,7 @@ the small/large buffer APIs. Ordinary buffer duplication does not select the
 splice pool.
 
 Splice buffers must not carry `sbuf_lifetime_t` metadata: their `lifetime` must
-remain `NULL`. Both WIO splice helpers check this with ordinary debug `assert()`
+remain `NULL`. The WIO splice helpers check this with ordinary debug `assert()`
 calls.
 
 Two additional flags describe the location of the represented body. Both are
@@ -142,19 +142,54 @@ has `supports_splice` set, before forwarding `Init` or starting reads.
 `TcpConnector` applies the same chain check to its destination WIO immediately
 after successful socket adoption, before connecting or starting reads. Both
 adapters close the affected connection if pipe initialization fails.
-Read/send dispatch does not consult the flag yet.
 
-**Splice buffers must not be deferred.** A buffer carrying
-`kSbufFlagSplice` may be forwarded synchronously through the current callback
-chain, but must not be retained in a queue or saved for later processing. This
-includes `PipeTunnel` handoffs to another worker, posting to the main thread,
-timers, and deferred callbacks on the same thread.
+On builds with `WW_HAVE_SPLICE`, NIO TCP read dispatch uses `FIONREAD` when
+this flag is enabled. A positive count produces a buffer from the loop's
+splice tier, capped by both its configured large-buffer size and the 32 KiB
+`LARGE_BUFFER_SIZE_RAM_HIGH` limit. The wrapper starts at its reserved left
+padding with `kSbufFlagSplice | kSbufFlagSpliceFD`, a descriptor pointer at
+`buf + l_pad`, length equal to the reserved socket byte count, and logical
+capacity equal to that count plus left padding. Its lifetime metadata is null.
+No socket bytes are read into userspace for this delivery.
 
-Before deferring work, use the dedicated splice helpers to consume all bytes
-represented by the wrapper through `read()` or `splice()`. Tunnel code must
-use the helpers rather than issue raw reads or splices that bypass their
-accounting, and must not queue the unconsumed wrapper. A partial transfer
-leaves the same restriction on the unconsumed splice payload.
+Immediately before delivery, `handle->reserved` is set to the wrapper length.
+It must be zero both before a new splice read and after the callback returns;
+otherwise `LOGF()` and `abortProgramNow(1)` report the outstanding reservation.
+The dispatcher retains the descriptor across the callback so this check remains
+valid even if the callback closes or frees the WIO. It does not inspect the
+transferred buffer afterward. Once the check succeeds, it releases that
+temporary descriptor reference.
+
+When `FIONREAD` reports zero, dispatch uses the ordinary nonblocking read path
+to distinguish EOF, transient readiness, and readable data not covered by that
+count. Splice-disabled WIOs, non-TCP descriptors, and unsupported builds retain
+ordinary reads. A transient availability-query error returns to the loop; other
+query failures close the connection through its existing read-error path.
+Admission closure before delivery returns the still-local wrapper to its pool
+without reserving or consuming socket bytes.
+
+**Socket-backed splice payloads must not be deferred.** Before returning from
+the read callback or posting work to another worker, the main thread, a timer,
+or a later callback, consume every reserved socket byte with the dedicated
+helpers. Convert the payload to ordinary storage or call
+`wioMoveSpliceBuferToPipe()` to move the body into its pipe. A partial read leaves
+the same obligation for the remaining socket bytes. Raw reads that bypass
+helper accounting do not satisfy the reservation check; dropping the wrapper
+without consuming its socket bytes does not satisfy it either.
+
+A pipe-backed wrapper can be retained by splice-aware code once the socket
+reservation is cleared. Its bytes remain in the descriptor's pipe, not in the
+wrapper's control storage. The pointer is borrowed: a holder that may outlive
+the source WIO must retain the descriptor with `wiofdRef()` and later release
+it with `wiofdUnref()`. Recycling the wrapper does not release such a reference.
+This ownership is separate from `sbuf_lifetime_t`, which splice buffers cannot
+carry.
+
+NIO `wioWrite()` and BufferQueue insertion currently reject splice wrappers
+with `LOGF()` and `abortProgramNow(1)`. These temporary guards prevent ordinary
+send and Debug queue-copy code from treating descriptor storage as payload.
+Convert to an ordinary buffer before using those paths until their splice
+handling is implemented.
 
 Ordinary payload processing leaves the kernel-backed body and its descriptor pointer
 uninspected and unmodified. The normal left
@@ -237,15 +272,52 @@ A positive short source-FD read updates `reserved` before aborting. The helper
 makes one read attempt for a nonempty body; an empty body requires no syscall.
 Unsupported builds also log with `LOGF()` and abort.
 
+#### Reading part of a splice payload into ordinary storage
+
+`wioPartialReadSpliceBuffer(buf, dest, bytes)` appends exactly `bytes` from the
+front of the splice payload to the ordinary destination's existing payload and
+returns `dest`. The count includes any prepended bytes: those bytes come first,
+followed by the requested portion of the socket- or pipe-backed body. A request
+entirely within the real prefix makes no read syscall. Zero is permitted and
+leaves both buffers unchanged after validating their flags and bounds.
+
+The source must have `kSbufFlagSplice` and exactly one location flag, with no
+lifetime metadata (checked by a debug assertion). Runtime checks require valid
+cursor/length bounds, `bytes <= sbufGetLength(buf)`, and enough destination
+append space. The destination check accounts for its existing length as well
+as `sbufGetMaximumWriteableSize(dest)`; it never grows the allocation or uses
+reserved left padding to make the request fit.
+
+For body bytes, the helper reads from `handle->fd` or `handle->pipefd[0]` based
+on the location flag. Callers must serialize descriptor access. A selected pipe
+must already be initialized; an FD-backed read requires sufficient `reserved`
+bytes. Only actual bytes read from the source FD reduce `reserved`. A short
+read or any read error, including `EINTR`, logs with `LOGF()` and calls
+`abortProgramNow(1)`. Bounds, flag, pipe-initialization, and reservation failures
+use the same fatal path. Unsupported builds also abort.
+
+On success, the destination length grows by `bytes` and the splice length
+shrinks by `bytes`. Consuming a prefix advances the splice cursor only across
+the real prefix bytes. Consuming the kernel body reduces the splice buffer's
+logical capacity by that body count instead of advancing its cursor into the
+descriptor storage. The pointer stays at `buf + l_pad`, and the location flags
+continue to describe the remaining body. Destination padding, cursor, flags,
+and lifetime metadata are preserved.
+
+The caller retains both buffers. This helper does not recycle the splice
+wrapper, even when it becomes empty; the caller must return it to the owning
+worker's buffer pool. Any remaining socket-backed payload is still subject to
+the restriction on deferred use.
+
 Accessors such as `sbufGetMutablePtr()` deliberately add no splice-specific
 checks or runtime assertions. Their callers uphold the representation
 contract. Corrupting the descriptor pointer can break I/O or crash the process, but
 there is no guarantee of an immediate crash that would reliably detect misuse.
 
-This section defines the representation contract. Splice-buffer pooling provides
-the wrapper allocations; event-loop emission and splice-specific BufferStream
-handling are not implemented yet. Current BufferStream copying, splitting, and coalescing
-operate on ordinary buffers with resident payload bytes.
+Splice-buffer pooling provides the wrappers used by TCP read dispatch.
+Splice sending and splice-specific BufferStream handling are not implemented
+yet. Current BufferStream copying, splitting, and coalescing operate on ordinary
+buffers with resident payload bytes.
 
 ## Prepending a Header: `sbufShiftLeft`
 

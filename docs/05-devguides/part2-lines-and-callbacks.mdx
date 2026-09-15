@@ -147,6 +147,32 @@ object to its pool. For a closed WIO that remains allocated,
 The WIO retains only its array-slot index for
 bookkeeping; I/O always uses the descriptor object.
 
+NIO splice read dispatch holds a temporary descriptor reference across the
+payload callback and checks that its socket-byte reservation is zero before
+releasing that reference. The callback may close the WIO; the check uses the
+retained descriptor rather than dereferencing the WIO or transferred buffer.
+An emitted splice wrapper stores a borrowed descriptor pointer and does not
+own a reference itself. Splice-aware code retaining a pipe-backed wrapper past
+the source WIO's lifetime must acquire and release its own descriptor reference.
+
+Freeing a pending NIO detaches its descriptor-table slot immediately but defers
+recycling the WIO allocation until the pending dispatcher releases it. Shutdown
+also settles these detached pending allocations before destroying the WIO pool.
+
+`pending` also prevents reuse of the allocation for a new descriptor. If the OS
+reuses an fd whose closed NIO is still pending, `wioGet()` retires that old object
+on its original loop and creates a fresh WIO for the new connection. The old
+pending entry never follows an accepted socket to another worker. A closed NIO
+whose pending dispatch has finished can still be reused in place.
+
+`wioDetach()` runs on the original owner thread and `wioAttach()` on the
+destination owner thread. Both require stopped read/write interest and no
+pending dispatch; a pending WIO triggers `LOGF()` and `abortProgramNow(1)`.
+Stopping interest alone does not release pending-list ownership. Defer a
+handoff until the original loop has finished dispatch. SocketManager hands off
+newly accepted, non-pending WIOs, including when an fd number was reused.
+The dispatcher retains its `cur->loop == loop` ownership check as well.
+
 `wioInitPipe(io)` or `wiofdInitPipe(handle)` creates a nonblocking,
 close-on-exec pipe on a build with `WW_HAVE_SPLICE`. Both slots start at zero;
 the pair `{0, 0}` means uninitialized, while a successfully created pipe may
