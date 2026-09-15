@@ -130,7 +130,7 @@ a zero or maximum reference count is a fatal invariant violation.
 ### Shared WIO Descriptors
 
 A `wio_t` retains a pointer to `wio_fd_t`, defined in `ww/event/wevent.h`.
-The descriptor object holds the primary `fd`, a lazily created `pipefd[2]`,
+The descriptor object holds the primary `fd`
 and an atomic reference count with exactly 32-bit storage on every platform.
 A newly adopted descriptor starts with one reference owned by the WIO.
 `wioGetFDHandle()` returns a borrowed pointer; call `wiofdRef()` before keeping
@@ -140,20 +140,25 @@ it beyond that WIO's lifetime and match each retained reference with
 WIO close removes watcher interest and settles its queued writes, invokes the
 close callback while its descriptor is still available, and then releases its
 reference. Deferred graceful close retains the reference until draining ends.
-Other holders can keep the descriptor and pipe alive after the WIO closes or
-is recycled. The last release closes all owned descriptors and returns the
+Other holders can keep the descriptor alive after the WIO closes or
+is recycled. The last release closes the primary descriptor and returns the
 object to its pool. For a closed WIO that remains allocated,
 `wioGetFDHandle()` returns `NULL` and `wioGetFD()` returns `-1`.
 The WIO retains only its array-slot index for
 bookkeeping; I/O always uses the descriptor object.
 
-NIO splice read dispatch holds a temporary descriptor reference across the
-payload callback and checks that its socket-byte reservation is zero before
-releasing that reference. The callback may close the WIO; the check uses the
-retained descriptor rather than dereferencing the WIO or transferred buffer.
-An emitted splice wrapper stores a borrowed descriptor pointer and does not
-own a reference itself. Splice-aware code retaining a pipe-backed wrapper past
-the source WIO's lifetime must acquire and release its own descriptor reference.
+NIO splice reads move socket bytes into a wrapper's private pipe before invoking
+the callback. The wrapper contains neither a source pointer nor a source reference;
+its length reflects the actual transfer. After delivery the read path does not
+inspect the source or buffer, so callbacks may close/free the source immediately.
+No socket reservation or post-callback source guard is needed for this read path.
+
+Each splice allocation exclusively owns its private pipe. Buffers can be retained
+or partially consumed and deferred immediately, and source WIO/handle reclamation
+cannot affect them. Queued writes preserve their private pairs until completion
+or discard. Graceful close drains them; cancellation drains or closes each private
+pair before recycling. See the
+[private-body rules and AAA/BBB example](./part3-buffers-and-padding.mdx#independent-private-bodies).
 
 Freeing a pending NIO detaches its descriptor-table slot immediately but defers
 recycling the WIO allocation until the pending dispatcher releases it. Shutdown
@@ -173,20 +178,10 @@ handoff until the original loop has finished dispatch. SocketManager hands off
 newly accepted, non-pending WIOs, including when an fd number was reused.
 The dispatcher retains its `cur->loop == loop` ownership check as well.
 
-`wioInitPipe(io)` or `wiofdInitPipe(handle)` creates a nonblocking,
-close-on-exec pipe on a build with `WW_HAVE_SPLICE`. Both slots start at zero;
-the pair `{0, 0}` means uninitialized, while a successfully created pipe may
-use descriptor zero for one end. Repeated initialization preserves the same
-pipe. Failure returns `-1`, sets `errno`, and leaves the slots uninitialized;
-unsupported builds report `ENOSYS`. Initialize while exclusively owning the
-WIO or descriptor object. Atomic references protect lifetime, not concurrent
-pipe initialization or descriptor operations.
-
 `wioReleaseNoClose()` preserves descriptors owned by another subsystem, such
 as c-ares. It relinquishes the primary descriptor by setting the object's
 `fd` to `-1`, then releases the WIO reference; it does not close that external
-descriptor. The external owner remains responsible for closing it. Any pipe
-still belongs to the descriptor object and closes on its final release.
+descriptor. The external owner remains responsible for closing it.
 Coordinate this ownership transfer with other holders before calling it.
 
 Descriptor objects use ordinary worker-local generic pools backed by a

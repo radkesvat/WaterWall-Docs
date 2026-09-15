@@ -84,240 +84,176 @@ sbufShiftRight(b, n);              // advance cursor: consume n bytes from the f
 
 ### Splice payloads: `kSbufFlagSplice`
 
-`kSbufFlagSplice` identifies a dedicated `sbuf_t` wrapper for payload held in
-the kernel. Its physical control storage is 32 bytes plus reserved left padding.
-A `wio_fd_t *` is stored at the original payload start, `buf + l_pad`; the
-object itself remains separately allocated. This pointer identifies the source
-socket and its lazily initialized pipe. It is control data and does not count
-as payload bytes. The preceding `l_pad` bytes are real reserved headroom.
+A splice allocation keeps the common 32-byte `sbuf_t` header and exactly
+32 bytes of control storage plus reserved left padding. Named metadata at the
+fixed address `buf + l_pad` contains an exclusively owned `int pipefd[2]`.
+There is no source socket pointer or source-handle reference in the wrapper. Access it through `splice_buffer.h` helpers,
+which copy bytes safely. Ordinary buffers never contain this metadata.
 
-`sbufCreateSplice(pad_left)` and `bufferpoolGetSpliceBuffer(pool)` return empty
-wrappers with only `kSbufFlagSplice` set. Before use, the caller initializes the
-descriptor pointer, the FD/Piped location flags, and the logical payload size.
-These allocations are dedicated to splice metadata; ordinary payload bytes use
-the small/large buffer APIs. Ordinary buffer duplication does not select the
-splice pool.
+Creation initializes `{-1, -1}` pipe descriptors without a
+pipe syscall. Descriptor zero is valid. `sbufSpliceInitPipe()` lazily creates a
+nonblocking, close-on-exec private pair with `pipe2`, publishing both ends only
+on success. Repeated initialization retains the pair. Failure returns `-1`
+with `errno`, leaving the pair uninitialized; unsupported builds use `ENOSYS`.
+The wrapper has one owner and serialized access. Copying metadata does not
+duplicate ownership. Splice wrappers must never carry `sbuf_lifetime_t` metadata.
 
-Splice buffers must not carry `sbuf_lifetime_t` metadata: their `lifetime` must
-remain `NULL`. The WIO splice helpers check this with ordinary debug `assert()`
-calls.
+Checkout sets only `kSbufFlagSplice`. Delivered splice payloads also have
+`kSbufFlagSplicePiped`: their bodies are already in their private pipes. An empty
+consumed wrapper may retain this flag. Empty-body helpers need no pipe creation. The real prefix occupies reserved headroom:
 
-Two additional flags describe the location of the represented body. Both are
-meaningful only when `kSbufFlagSplice` is set:
-
-- `kSbufFlagSplicePiped`: the body has been spliced into the descriptor's pipe.
-- `kSbufFlagSpliceFD`: the body remains in the source file descriptor.
-
-For this representation, length and capacity describe the logical payload,
-whose body may still be in the socket or have been moved into its pipe.
-They do not describe the wrapper's physical
-allocation or authorize reading or writing that many bytes through a buffer
-pointer. A tunnel may trust these sizes for accounting and forwarding while
-treating the kernel-backed body as opaque.
-
-When splice I/O is active, Payload callbacks may receive these wrappers. The event loop and adapters that
-support splice interpret the descriptor and manage pipe I/O; the initial
-adapters are `TcpListener` and `TcpConnector`. Forwarding tunnels that already
-pass buffers synchronously and opaquely and use size-based accounting can
-usually keep their Payload code unchanged. They need no special
-flag branch just to pass the wrapper onward. Code that handles the splice
-representation directly must understand the flag.
-
-Each `wio_t` records its selected I/O mode in the one-bit `splice_enabled`
-field. `wioEnableSplice(io)` initializes the descriptor's nonblocking,
-close-on-exec pipe before setting this field. It returns `0` on success or
-`-1` with `errno` set on failure, leaving the mode unchanged on failure.
-An existing pipe is reused. `wioDisableSplice(io)` clears the flag without
-closing the pipe; `wioIsSpliceEnabled(io)` reads it. Use these helpers on the WIO owner thread.
-The flag starts disabled whenever WIO adopts a new descriptor, including
-reuse of a cached or pooled WIO. `wioEnableSplice()` asserts that the WIO is
-open and has never registered read interest. A sticky `read_started` bit
-records successful `WW_READ` registration through `wioAdd()` (including
-`wioRead()`); stopping reads does not clear it. The bit resets only when WIO
-adopts a new descriptor. This checks WIO read activation, not peer arrival
-of bytes in the kernel socket queue or raw OS reads outside WIO.
-
-`TcpListener` enables the flag on an accepted socket when its finalized chain
-has `supports_splice` set, before forwarding `Init` or starting reads.
-`TcpConnector` applies the same chain check to its destination WIO immediately
-after successful socket adoption, before connecting or starting reads. Both
-adapters close the affected connection if pipe initialization fails.
-
-On builds with `WW_HAVE_SPLICE`, NIO TCP read dispatch uses `FIONREAD` when
-this flag is enabled. A positive count produces a buffer from the loop's
-splice tier, capped by both its configured large-buffer size and the 32 KiB
-`LARGE_BUFFER_SIZE_RAM_HIGH` limit. The wrapper starts at its reserved left
-padding with `kSbufFlagSplice | kSbufFlagSpliceFD`, a descriptor pointer at
-`buf + l_pad`, length equal to the reserved socket byte count, and logical
-capacity equal to that count plus left padding. Its lifetime metadata is null.
-No socket bytes are read into userspace for this delivery.
-
-Immediately before delivery, `handle->reserved` is set to the wrapper length.
-It must be zero both before a new splice read and after the callback returns;
-otherwise `LOGF()` and `abortProgramNow(1)` report the outstanding reservation.
-The dispatcher retains the descriptor across the callback so this check remains
-valid even if the callback closes or frees the WIO. It does not inspect the
-transferred buffer afterward. Once the check succeeds, it releases that
-temporary descriptor reference.
-
-When `FIONREAD` reports zero, dispatch uses the ordinary nonblocking read path
-to distinguish EOF, transient readiness, and readable data not covered by that
-count. Splice-disabled WIOs, non-TCP descriptors, and unsupported builds retain
-ordinary reads. A transient availability-query error returns to the loop; other
-query failures close the connection through its existing read-error path.
-Admission closure before delivery returns the still-local wrapper to its pool
-without reserving or consuming socket bytes.
-
-**Socket-backed splice payloads must not be deferred.** Before returning from
-the read callback or posting work to another worker, the main thread, a timer,
-or a later callback, consume every reserved socket byte with the dedicated
-helpers. Convert the payload to ordinary storage or call
-`wioMoveSpliceBuferToPipe()` to move the body into its pipe. A partial read leaves
-the same obligation for the remaining socket bytes. Raw reads that bypass
-helper accounting do not satisfy the reservation check; dropping the wrapper
-without consuming its socket bytes does not satisfy it either.
-
-A pipe-backed wrapper can be retained by splice-aware code once the socket
-reservation is cleared. Its bytes remain in the descriptor's pipe, not in the
-wrapper's control storage. The pointer is borrowed: a holder that may outlive
-the source WIO must retain the descriptor with `wiofdRef()` and later release
-it with `wiofdUnref()`. Recycling the wrapper does not release such a reference.
-This ownership is separate from `sbuf_lifetime_t`, which splice buffers cannot
-carry.
-
-NIO `wioWrite()` and BufferQueue insertion currently reject splice wrappers
-with `LOGF()` and `abortProgramNow(1)`. These temporary guards prevent ordinary
-send and Debug queue-copy code from treating descriptor storage as payload.
-Convert to an ordinary buffer before using those paths until their splice
-handling is implemented.
-
-Ordinary payload processing leaves the kernel-backed body and its descriptor pointer
-uninspected and unmodified. The normal left
-padding path remains available: a tunnel may call `sbufShiftLeft()` and write
-its own prefix within physically reserved headroom and its advertised padding
-budget. The pointer stays at `buf + l_pad` as `curpos` moves left. Those real
-prefix bytes precede the kernel-backed body in the logical payload. The permission
-to prepend does not permit overwriting the pointer or accessing body bytes
-through `buf`.
-
-#### Consuming the socket body into the pipe
-
-`wioMoveSpliceBuferToPipe(buf)`, declared in `ww/event/wloop.h`, reads the stored
-pointer from `buf + l_pad` and moves socket bytes from `handle->fd` into
-`handle->pipefd[1]`. The pipe must already be initialized, normally by
-`wioEnableSplice()`. This helper never creates it: an uninitialized pipe causes
-`LOGF()` followed by `abortProgramNow(1)` in every build. The source socket
-must be nonblocking. Callers must serialize access to the descriptor and hold a
-reservation covering the requested socket bytes.
-
-The helper checks at runtime, including in release builds, that
-`kSbufFlagSplice` and `kSbufFlagSpliceFD` are set and `kSbufFlagSplicePiped`
-is clear. A violation calls `LOGF()` and `abortProgramNow(1)`.
-The splice representation contract requires a
-splice allocation. Logical `capacity` cannot independently prove the physical
-allocation size. `curpos` must be at or left of `l_pad`; any prepended bytes
-are excluded from the splice request:
-
-```c
-prefix_bytes = buf->l_pad - buf->curpos;
-socket_bytes = buf->len - prefix_bytes;
+```text
+prefix_bytes = l_pad - curpos
+body_bytes   = len - prefix_bytes
 ```
 
-It makes a nonblocking splice attempt, retrying `EINTR`, and returns the actual
-number of bytes moved. Only a positive result reduces `handle->reserved`, by
-that exact amount. A zero-length body returns zero without a splice syscall.
-Unsupported builds return `-1` with `errno` set to `ENOSYS`.
+Length and capacity describe logical payload, not resident bytes. Prefix
+consumption advances the cursor; body consumption reduces length and logical
+capacity without advancing into metadata. Prepending within advertised padding
+is permitted. Inspecting or overwriting the kernel-backed body or control storage
+through generic byte accessors is not permitted; those accessors do not add
+splice checks. Opaque synchronous forwarding and size accounting remain valid.
 
-On full completion, the helper clears `kSbufFlagSpliceFD` and sets
-`kSbufFlagSplicePiped`, preserving the other flags. An empty body also completes.
-Short transfers, EOF before completion, and splice errors leave the flags
-unchanged and currently call `LOGF()` followed by `abortProgramNow(1)`.
-The diagnostic includes the requested count, syscall result, and error number.
-This is temporary handling: short splices remain valid syscall outcomes.
-Reservation accounting always uses the actual transferred count, including
-before this abort. Length, capacity, cursor, prefix bytes, and references
-remain unchanged.
+#### Mode selection and pipe-backed reads
 
-#### Converting a splice payload into ordinary storage
+`wioEnableSplice()` selects the mode on the owner thread before any successful
+read registration. Its debug assertions require an open WIO and a clear sticky
+`read_started` bit; stopping reads does not clear that bit. Supported builds
+return zero without creating a pipe. Unsupported builds return `-1` with
+`ENOSYS`. New descriptor adoption resets the mode. Disable and query helpers
+only change or read the mode.
 
-`wioTransformSpliceBufferToRealBuffer(buf, dest, pool)`, declared in
-`ww/event/wloop.h`, consumes the splice wrapper and returns `dest`, an ordinary
-buffer supplied by the caller. Pass the owning worker's `buffer_pool_t`; its
-splice tier receives the consumed wrapper through `bufferpoolReuseBuffer()`.
-The call must run on that pool's owning thread. After success, the caller owns
-only `dest` and must not access or recycle `buf` again.
+TcpListener selects the mode for a finalized splice-capable chain before Init
+and reads; TcpConnector selects it after adopting its socket and before reads.
+TcpListener owns its normal line; TcpConnector borrows it.
 
-The source must have `kSbufFlagSplice` and exactly one of `kSbufFlagSpliceFD`
-or `kSbufFlagSplicePiped`. The helper reads the pointer at `buf + l_pad`, copies
-the real prefix (`l_pad - curpos` bytes), and reads the remaining body from
-`handle->fd` or `handle->pipefd[0]`, according to the location flag. A selected
-pipe must already be initialized. Callers must serialize descriptor access and
-hold a reservation covering an FD-backed body. Source-FD reads reduce
-`handle->reserved` by the actual count read; pipe reads do not reduce it again.
+For NIO TCP splice reads, positive `FIONREAD` availability determines the requested
+transfer size, capped by the loop's large-buffer size and the 32 KiB
+`LARGE_BUFFER_SIZE_RAM_HIGH` limit. The read loop checks out a splice wrapper,
+lazily initializes its private pipe, and performs the nonblocking socket-to-pipe
+splice **before invoking the Payload callback**.
 
-The destination's previous contents are replaced. Its cursor becomes the source
-cursor, preserving the remaining left headroom, and its length becomes the
-source's complete length, including the prepended bytes. Its allocation
-`capacity` and original `l_pad` remain unchanged. Before copying or reading,
-the helper requires enough physical storage for that cursor and the full
-payload. It clears all splice flags on the result. The source must have no
-lifetime metadata, as checked by a debug assertion. The helper neither transfers
-nor releases lifetime metadata; the destination's metadata stays unchanged and
-remains the caller's responsibility.
+Only the actual positive splice result is published as the body length. Logical
+capacity becomes left padding plus that count, and `kSbufFlagSplicePiped` is set.
+A positive short splice produces a smaller valid buffer; remaining socket bytes
+are handled by later reads. The availability query is a request bound, not a
+promise that the requested number of bytes will be delivered.
 
-Invalid flags, a splice destination, insufficient destination storage, an
-uninitialized selected pipe, short reads, and every read error (including
-`EINTR`) call `LOGF()` followed by `abortProgramNow(1)` in every build.
-A positive short source-FD read updates `reserved` before aborting. The helper
-makes one read attempt for a nonempty body; an empty body requires no syscall.
-Unsupported builds also log with `LOGF()` and abort.
+`EINTR` retries the transfer. `EAGAIN` recycles the empty wrapper and waits for
+another readiness event. Zero indicates EOF and closes the stream; other splice
+errors recycle the empty wrapper and follow normal read-error closure. If private
+pipe creation fails, the read loop recycles the unused wrapper and falls back to
+an ordinary read for that delivery. No socket bytes have been consumed at that
+point. Splice mode stays enabled, so later reads may create or reuse a pipe.
 
-#### Reading part of a splice payload into ordinary storage
+When `FIONREAD` is zero, the ordinary nonblocking read path distinguishes EOF
+from transient readiness and data not represented by that count. Availability
+query `EAGAIN`/`EINTR` returns to the loop; other query errors close the stream.
+Consequently a splice-enabled WIO may still deliver an ordinary buffer through
+that fallback. Disabled, non-TCP, and unsupported reads retain ordinary behavior.
 
-`wioPartialReadSpliceBuffer(buf, dest, bytes)` appends exactly `bytes` from the
-front of the splice payload to the ordinary destination's existing payload and
-returns `dest`. The count includes any prepended bytes: those bytes come first,
-followed by the requested portion of the socket- or pipe-backed body. A request
-entirely within the real prefix makes no read syscall. Zero is permitted and
-leaves both buffers unchanged after validating their flags and bounds.
+Admission is checked before consuming data and again before delivery. If shutdown
+suppresses delivery after a successful splice, WIO drains and recycles the
+still-local wrapper. A missing read callback also releases the undelivered buffer.
+After invoking the callback, the read path accesses neither the buffer nor the
+source WIO. The callback may close/free the source immediately.
 
-The source must have `kSbufFlagSplice` and exactly one location flag, with no
-lifetime metadata (checked by a debug assertion). Runtime checks require valid
-cursor/length bounds, `bytes <= sbufGetLength(buf)`, and enough destination
-append space. The destination check accounts for its existing length as well
-as `sbufGetMaximumWriteableSize(dest)`; it never grows the allocation or uses
-reserved left padding to make the request fit.
+There is no FD-backed wrapper state, socket reservation, or post-callback source
+reference check. Source descriptor ownership remains with WIO and its other
+explicit holders; emitted buffers have no dependency on that ownership.
 
-For body bytes, the helper reads from `handle->fd` or `handle->pipefd[0]` based
-on the location flag. Callers must serialize descriptor access. A selected pipe
-must already be initialized; an FD-backed read requires sufficient `reserved`
-bytes. Only actual bytes read from the source FD reduce `reserved`. A short
-read or any read error, including `EINTR`, logs with `LOGF()` and calls
-`abortProgramNow(1)`. Bounds, flag, pipe-initialization, and reservation failures
-use the same fatal path. Unsupported builds also abort.
+#### Independent private bodies
 
-On success, the destination length grows by `bytes` and the splice length
-shrinks by `bytes`. Consuming a prefix advances the splice cursor only across
-the real prefix bytes. Consuming the kernel body reduces the splice buffer's
-logical capacity by that body count instead of advancing its cursor into the
-descriptor storage. The pointer stays at `buf + l_pad`, and the location flags
-continue to describe the remaining body. Destination padding, cursor, flags,
-and lifetime metadata are preserved.
+```text
+Socket -> this buffer's private pipe -> Payload callback
 
-The caller retains both buffers. This helper does not recycle the splice
-wrapper, even when it becomes empty; the caller must return it to the owning
-worker's buffer pool. Any remaining socket-backed payload is still subject to
-the restriction on deferred use.
+Buffer A -> private pipe A: [AAA]
+Buffer B -> private pipe B: [BBB]
+```
 
-Accessors such as `sbufGetMutablePtr()` deliberately add no splice-specific
-checks or runtime assertions. Their callers uphold the representation
-contract. Corrupting the descriptor pointer can break I/O or crash the process, but
-there is no guarantee of an immediate crash that would reliably detect misuse.
+Every emitted splice body is independent as soon as the callback receives it.
+Splice-aware code may retain the whole buffer or a partially consumed remainder
+for later use, including after source WIO/handle reclamation. No preparation call
+or source reference is needed before deferral. Consume the private body through
+the dedicated pipe helpers and preserve exclusive buffer ownership.
 
-Splice-buffer pooling provides the wrappers used by TCP read dispatch.
-Splice sending and splice-specific BufferStream handling are not implemented
-yet. Current BufferStream copying, splitting, and coalescing operate on ordinary
-buffers with resident payload bytes.
+Converting B first reads BBB and leaves AAA intact, including when A is queued.
+Final stream delivery must still preserve A-before-B order. Pool access remains
+worker-affine; an explicitly transferred wrapper may use its receiving worker's
+pool. Generic BufferQueue and BufferStream restrictions still apply.
+
+#### Conversion and partial reads
+
+`wioTransformSpliceBufferToRealBuffer(buf, dest, pool)` replaces an ordinary
+destination payload with the real prefix and body, preserving the source cursor
+and total length. It checks destination capacity through sbuf accessors; the
+destination's allocation geometry, left padding, and lifetime remain unchanged.
+It recycles the consumed wrapper, which callers
+must not access afterward.
+
+`wioPartialReadSpliceBuffer(buf, dest, bytes)` appends exactly the requested
+prefix/body bytes. It validates source length, cursor, and destination append
+space, without growing storage or consuming destination headroom. Zero bytes
+is a validated no-op. The caller retains
+both buffers and must recycle the wrapper when fully consumed.
+
+Both read helpers require `kSbufFlagSplice | kSbufFlagSplicePiped` and read only
+from the wrapper's private pipe. A nonempty body requires an initialized pair.
+Positive short reads accumulate until the required byte count is reached, and
+`EINTR` retries without losing progress. Invalid flags/bounds, EOF, or any other
+read error before completion use `LOGF()` and `abortProgramNow(1)`. This includes
+`EAGAIN`: the private pipe must already hold all claimed bytes, so an incomplete
+body cannot be deferred until more bytes arrive. These exact-size helper reads
+are distinct from the read loop's socket-to-pipe transfer, whose actual positive
+result determines delivery length.
+Unsupported conversion and partial reads abort.
+
+#### Recycling, discard, and physical destruction
+
+`wioRecycleSpliceBuffer(buf, pool)` requires zero logical length
+and an empty private pipe. The pool-return guard enforces these conditions
+in Release and with pooling bypassed. Kernel emptiness is verified using
+`FIONREAD`; resetting sbuf fields never empties a pipe. Normal reuse restores
+physical capacity and clears transient state while preserving healthy empty
+pipes. Unused empty wrappers can also be recycled directly.
+
+WIO cancellation through `wioReleaseBuffer()` requires exclusive ownership.
+It drops the real prefix and drains its private pipe with bounded scratch storage
+and nonblocking reads, retrying `EINTR` and accepting positive short reads.
+`EAGAIN` confirms emptiness. EOF or unexpected error closes both owned ends and
+marks the pair uninitialized; teardown never creates a replacement. A later
+transfer can recreate it.
+
+The splice-specific destructor closes both ends exactly once and frees the
+allocation without accessing the source. Cached entries have reset flags, so
+local/master teardown, overflow, and geometry replacement use the known splice
+tier's destructor. Incompatible-pool returns and bypass returns also close the
+pair. Ordinary payload bytes must never be interpreted as descriptors.
+
+Existing bounded local caches, bounded splice master, and four-item recharge
+policy remain in force. Local shrink transfers reusable allocations to the
+master; master overflow destroys them. Maximum idle pipe descriptors are bounded
+by twice the sum of local splice-cache capacities and splice master capacity;
+live wrappers add their own pairs.
+
+#### Writing splice payloads
+
+Supported NIO TCP writes require Piped inputs whose bytes are already in their
+private pipes. Writing or queueing never reads the source socket. Real prefixes use send before bodies
+use nonblocking splice to the destination. Actual combined progress drives
+logical queue accounting. Short sends, `EAGAIN`, and `EINTR` retain the remainder
+in the existing WIO FIFO, shared with ordinary writes. Queued buffers require no
+source handle and remain valid after source reclamation.
+
+Completion recycles empty wrappers. Rejection, output error, overflow, timeout,
+forced close, and teardown discard private bodies through the same cleanup path.
+Graceful close drains the queue normally. Unsupported NIO builds and non-TCP
+destinations reject splice writes fatally. Callback admission and reentrancy
+follow the normal WIO contracts.
+
+Generic BufferQueue insertion still rejects splice wrappers, including adapter
+pause queues. BufferStream copying, splitting, and coalescing support ordinary
+resident payload only. NIO's internal WIO FIFO stores the owned wrappers directly.
 
 ## Prepending a Header: `sbufShiftLeft`
 
@@ -428,7 +364,7 @@ recycling path as `bufferpoolReuseBuffer()`, subject to their existing worker
 ownership requirements. Recycling clears flags and length; for a splice wrapper,
 it first restores physical capacity from the 32-byte control storage and its
 reserved padding. Checkout restores `kSbufFlagSplice` with both location flags
-clear. Pooling manages buffer storage, not pipe I/O.
+clear. Empty private pipe pairs survive pool reuse and close on physical destruction.
 
 If you need a buffer bigger than the current one for an append, use
 `sbufReserveSpace()` (it reallocates and copies only when necessary) rather than
@@ -438,7 +374,8 @@ hand-rolling growth.
 32 bytes of payload capacity, plus left padding rounded up to a 32-byte
 boundary. Its payload capacity stays at 32 bytes regardless of the CPU cache
 line size. The buffer starts with zero length, only `kSbufFlagSplice` set, and no lifetime
-metadata; `sbufDestroy()` releases the allocation.
+metadata; `sbufDestroy()` releases a live splice allocation and its private pipe.
+Cached splice-tier entries use `sbufDestroySplice()` even with reset flags.
 
 ### Sizing Destination Buffers for Untrusted or Variable Payloads
 
