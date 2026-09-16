@@ -88,11 +88,14 @@ A splice allocation keeps the common 32-byte `sbuf_t` header and exactly
 32 bytes of control storage plus reserved left padding. Named metadata at the
 fixed address `buf + l_pad` contains an exclusively owned `int pipefd[2]`, its
 last known kernel capacity, and a monotonic capacity-retry deadline.
-There is no source socket pointer or source-handle reference in the wrapper. Access it through `splice_buffer.h` helpers,
-which copy bytes safely. Ordinary buffers never contain this metadata.
+There is no source socket pointer or source-handle reference in the wrapper.
+Access metadata through `splice_buffer.h` helpers, which copy bytes safely.
+Public splice lifecycle helpers are declared in `shiftbuffer.h`. Ordinary buffers
+never contain this metadata.
 
-Creation initializes `{-1, -1}` pipe descriptors without a
-pipe syscall. Descriptor zero is valid. `sbufSpliceInitPipe(buf, preferred_capacity)` lazily creates a
+`sbufCreateSplice(pad_left)` initializes `{-1, -1}` pipe descriptors without a
+pipe syscall, including when pool refill allocates spare wrappers. Descriptor zero
+is valid. `sbufSpliceInitPipe(buf, preferred_capacity)` lazily creates a
 nonblocking, close-on-exec private pair with `pipe2`, publishing both ends only
 on success. For an empty buffer, a positive preferred capacity (at most
 `INT_MAX`) queries `F_GETPIPE_SZ` and requests `F_SETPIPE_SZ` if the known
@@ -161,9 +164,10 @@ TcpListener owns its normal line; TcpConnector borrows it.
 
 For NIO TCP splice reads, positive `FIONREAD` availability determines the requested
 transfer size, capped by the loop's large-buffer size and the 1 MiB
-`LARGE_BUFFER_SIZE_RAM_HIGH` limit. The read loop checks out a splice wrapper,
-lazily initializes its private pipe, and performs the nonblocking socket-to-pipe
-splice **before invoking the Payload callback**.
+`LARGE_BUFFER_SIZE_RAM_HIGH` limit. The read loop checks out a splice wrapper with
+its private pipe already initialized by the pool, then performs the socket-to-pipe
+splice in nonblocking mode
+**before invoking the Payload callback**.
 
 The preferred pipe capacity is that same read limit, independent of the bytes
 currently ready: 1 MiB in higher memory profiles and 64 KiB in low-memory
@@ -182,9 +186,10 @@ promise that the requested number of bytes will be delivered.
 `EINTR` retries the transfer. `EAGAIN` recycles the empty wrapper and waits for
 another readiness event. Zero indicates EOF and closes the stream; other splice
 errors recycle the empty wrapper and follow normal read-error closure. If private
-pipe creation fails, the read loop recycles the unused wrapper and falls back to
-an ordinary read for that delivery. No socket bytes have been consumed at that
-point. Splice mode stays enabled, so later reads may create or reuse a pipe.
+pipe creation fails, checkout recycles the unused wrapper internally and returns
+`NULL` with `errno`; the read loop falls back to an ordinary read for that delivery.
+No socket bytes have been consumed at that point. Splice mode stays enabled, so
+later reads may create or reuse a pipe.
 
 When `FIONREAD` is zero, the ordinary nonblocking read path distinguishes EOF
 from transient readiness and data not represented by that count. Availability
@@ -407,7 +412,7 @@ buffer_pool_t *pool = lineGetBufferPool(line);     // this line's worker pool
 sbuf_t *big   = bufferpoolGetLargeBuffer(pool);    // ordinary read/working buffer
 sbuf_t *medium = bufferpoolGetMediumBuffer(pool); // 32 KiB in S1/S2, 64 KiB in higher profiles
 sbuf_t *small = bufferpoolGetSmallBuffer(pool);    // small working buffer
-sbuf_t *splice_buf = bufferpoolGetSpliceBuffer(pool); // 32 control-storage bytes plus splice padding
+sbuf_t *splice_buf = bufferpoolGetSpliceBuffer(pool); // ready private pipe, or NULL on pipe failure
 
 // ... use the buffer ...
 
@@ -429,15 +434,15 @@ their worker pool. Payload capacities, excluding reserved left padding, are:
 | Tier | Capacity | Use |
 | --- | --- | --- |
 | Small | 4 KiB | Small ordinary payloads and control messages |
-| Medium | 32 KiB in S1/S2; 64 KiB in M1/M2/L1/L2 | Helper storage for framing and retained queues, including paused Mux children |
+| Medium | 32 KiB in S1/S2; 64 KiB in M1/M2/L1/L2 | Framing, retained queues including paused Mux children, and best-fit reads |
 | Large | 64 KiB in S1/S2; 1 MiB in M1/M2/L1/L2 | Ordinary event-loop read buffers and larger working payloads |
 | Splice | 32 bytes of control storage | Explicit splice wrappers; logical body size is independent of allocation size |
 
 S1 and S2 share buffer sizes but retain different profile-based local and master
 cache capacities; S1 caches fewer allocations. Higher profiles retain 64 KiB
-medium and 1 MiB large buffers. Ordinary event-loop reads explicitly request
-large buffers. Medium buffers remain helper storage for nodes and retained
-queues. Mux uses the large tier when a paused frame exceeds medium capacity,
+medium and 1 MiB large buffers. Linux NIO ordinary TCP/UDP reads select an
+ordinary tier through best-fit allocation when a positive size hint is available.
+Medium buffers also serve nodes and retained queues. Mux uses the large tier when a paused frame exceeds medium capacity,
 so even a full-size frame fits pooled storage in S1/S2.
 
 `bufferpoolGetBestFit()` selects the smallest ordinary tier that satisfies both
@@ -465,6 +470,17 @@ recycling path as `bufferpoolReuseBuffer()`, subject to their existing worker
 ownership requirements. Recycling clears flags and length; for a splice wrapper,
 it first restores physical capacity from the 32-byte control storage and its
 reserved padding. Checkout restores `kSbufFlagSplice`.
+
+`bufferpoolGetSpliceBuffer(pool)` initializes the selected wrapper's nonblocking,
+close-on-exec private pipe before returning it. It requests the pool's large
+payload capacity capped at `LARGE_BUFFER_SIZE_RAM_HIGH`, preserving the capacity
+retry policy above. Pipe creation failure returns `NULL` with the original
+`errno`, after internally recycling the unused wrapper; unsupported builds return
+`NULL` with `ENOSYS`. Callers must handle this result before accessing the buffer.
+A failed capacity query or increase still returns a usable buffer. This also
+applies when pooling is bypassed, where failure destroys the unused wrapper.
+
+Refill only allocates control storage; it never creates pipes for spare wrappers.
 Empty private pipe pairs survive pool reuse and close on physical destruction.
 
 If you need a buffer bigger than the current one for an append, use
@@ -477,6 +493,31 @@ boundary. Its payload capacity stays at 32 bytes regardless of the CPU cache
 line size. The buffer starts with zero length, only `kSbufFlagSplice` set, and no lifetime
 metadata; `sbufDestroy()` releases a live splice allocation and its private pipe.
 Cached splice-tier entries use `sbufDestroySplice()` even with reset flags.
+
+### Ordinary TCP and UDP receive sizing
+
+On Linux, NIO uses `FIONREAD` as an allocation hint for ordinary TCP and UDP
+reads. A positive TCP count is capped at the pool's large payload size before
+calling `bufferpoolGetBestFit()`. The receive can fill the chosen buffer; any
+remaining stream bytes stay queued for later reads. A TCP splice fallback reuses
+its existing availability result without querying again.
+
+For UDP, the hint is the full size of the next datagram, not the sum of queued
+packets. Best-fit requests that complete size without the TCP cap. It can select
+a larger tier or dedicated storage if the datagram exceeds a custom pool's large
+tier. Each receive still delivers one datagram. The socket has one serialized
+reader between the query and receive.
+
+Both paths request at least the large tier's reserved left padding, so a smaller
+tier with insufficient padding is ineligible. A failed or zero ordinary size query
+falls back to the original large-buffer receive. Zero never skips the receive:
+it may represent an empty UDP datagram, TCP EOF, or transient readiness. The
+actual receive result determines the published length, and Linux UDP truncation
+detection still drops incomplete datagrams. Small/medium/large allocation is not
+an application message-boundary guarantee for TCP.
+
+Other NIO socket types and non-Linux/IOCP receive paths keep their existing
+allocation policy. The splice representation and its separate pool are unchanged.
 
 ### Sizing Destination Buffers for Untrusted or Variable Payloads
 
