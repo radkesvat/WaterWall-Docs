@@ -677,6 +677,34 @@ callback boundary. Child-side transforms can also split or combine payloads.
 Use the UdpOverTcp pair around a UDP flow's byte-stream portion rather than
 depending on direct UDP/MUX adjacency; observe that pair's own payload limits.
 
+### MUX outgoing parent queues
+
+Outgoing encoded Open, Data, Close, and flow-control frames share one lazy
+`buffer_queue_t` per parent, separate from incoming `pending_child_data` queues.
+Parent Pause stops parent-bound Payload immediately; retained output outlives its
+originating child. FIFO admission and Open/flow-state publication precede any
+forwarding or child notification that can re-enter Mux.
+
+`parent-write-buffer-pause-threshold` defaults to 8 MiB of retained allocation
+charge, and `parent-write-buffer-limit` defaults to 16 MiB. Both accept positive
+integers up to `INT_MAX`; the final threshold must be below the limit. Omitted
+settings independently use their defaults. Each parent gets its own budget.
+Admission rejects a projected charge strictly greater than the hard limit before
+queue ownership transfers; equality is allowed. Reservation refusal and overflow
+close that parent locally. Small controls use fitting ordinary pooled buffers
+with onward padding. A writable, empty, inactive FIFO permits direct delivery
+without queue allocation, including buffers larger than the retention budget.
+
+The running charge accounts for the exact retained pointer returned by insertion;
+Debug replacement preserves ordinary allocation geometry. Pop subtracts the
+charge before transferring ownership. Parent Resume does not reset accounting.
+Child-wide callbacks occur only on a real local gate transition, using referenced,
+attachment-checked snapshots. Release waits for empty plus writable and preserves
+peer-flow pressure. Parent loss and owner Stop discard outgoing backlog; incoming
+detached-drain accounting and `parent-buffer-limit` retain their existing meanings.
+These outgoing thresholds measure allocation charge; incoming child FlowPause and
+FlowResume thresholds still measure logical payload bytes.
+
 ### Stream delivery headroom and datagram framing
 
 ConnectionToPackets retains at most `P + L` pending TCP payload bytes per flow,
@@ -708,10 +736,23 @@ Do not treat that content length as a memory charge when a security or resource
 limit specifically promises to bound allocations retained by a live queue. An
 empty or one-byte `sbuf_t` can still retain its full capacity, left padding,
 header, and allocator alignment overhead. Memory-sensitive code that needs such
-a hard bound—currently the Mux child, parent, and detached queue limits—must keep
+a hard bound—currently the Mux incoming child/parent/detached limits and outgoing parent FIFO—must keep
 a separate actual-allocation charge. This stricter accounting is specialized;
 it must not replace logical length in ordinary buffer queues or in Mux's
-payload-based pause and resume thresholds.
+incoming-child payload-based pause and resume thresholds.
+
+`sbufGetAllocationCharge(const sbuf_t *buf)` is the canonical O(1) charge for an
+allocated buffer's own userspace storage. For ordinary buffers it returns
+`sizeof(sbuf_t) + sbufGetTotalCapacity(buf) + kSbufAllocationAlignment`; capacity
+already includes left padding. For splice wrappers it returns the header plus
+original left padding, `SPLICE_BUFFER_STORAGE_SIZE`, and alignment overhead.
+Splice capacity and length are logical, so they cannot measure wrapper storage.
+The helper works before pipe initialization, makes no allocation or syscall, and
+reads no payload bytes. Cursor movement, consumption, and prepending leave the
+charge unchanged unless storage is replaced. It excludes kernel pipe memory,
+referenced lifetime-object allocations, allocator bookkeeping beyond explicit
+alignment overhead, and pool/queue storage. Making accounting splice-aware does
+not make Mux splice-capable.
 
 ### Buffers transferred to scheduled line tasks
 

@@ -58,7 +58,7 @@ server side: TcpListener -> TlsServer -> HttpServer -> MuxServer -> TcpConnector
 - فریم‌های برگشتی `MuxServer` را به child مناسب هدایت می‌کند.
 - اگر سمت نوشتن child محلی pause باشد، داده رسیده از parent را در صف نگه می‌دارد.
 - backpressure per-child را با `FlowPause` و `FlowResume` frame بازتاب می‌دهد.
-- parent lineهای exhausted و بی‌کار را پس از بسته شدن آخرین child می‌بندد.
+- parent lineهای exhausted و بی‌کار را پس از بسته شدن آخرین child و تحویل خروجی صف‌شده می‌بندد.
 
 `MuxClient` objectهای parent از نوع `line_t` را داخل خود می‌سازد و مسئول آزاد کردن آن‌هاست. Child lineهایی را که نود قبلی ساخته، آزاد نمی‌کند.
 
@@ -169,7 +169,7 @@ payload را می‌شمارند. charge تخصیص فقط برای سه سقف 
 
 هر child یک `cid` می‌گیرد. مقدار `cid` در محدوده همان parent line محلی است و در فریم‌های MUX به کار می‌رود تا `MuxServer` بتواند payload و رویدادهای کنترلی را به stream منطقی درست نسبت دهد.
 
-در حالت timer و counter، هر worker یک parent فعال و قابل استفاده دارد. Childهای جدید تا exhausted شدن parent به آن متصل می‌شوند. اگر با رسیدن child بعدی count به `max-children` رسیده باشد، parent از selection بازنشسته می‌شود، برای childهای فعلی زنده می‌ماند و در صفر بسته می‌شود؛ child جدید parent دیگری می‌گیرد.
+در حالت timer و counter، هر worker یک parent فعال و قابل استفاده دارد. Childهای جدید تا exhausted شدن parent به آن متصل می‌شوند. اگر با رسیدن child بعدی count به `max-children` رسیده باشد، parent از selection بازنشسته می‌شود، برای childهای فعلی زنده می‌ماند و پس از صفر شدن تعداد child و تحویل خروجی صف بسته می‌شود؛ child جدید parent دیگری می‌گیرد.
 
 در حالت pool ثابت parentها، نخستین child روی یک worker باعث می‌شود `MuxClient` به تعداد `per-worker-connections-count` برای همان worker parent line بسازد. Childهای تازه به کم‌بارترین parent غیر-finishing با count کمتر از `max-children` می‌روند و تساوی با round-robin شکسته می‌شود. اگر همه full باشند child قرضی جدید فوراً Finish می‌گیرد؛ parent اضافه یا صف انتظار نامحدود ساخته نمی‌شود. با افت count، parent دوباره قابل استفاده است.
 
@@ -181,7 +181,7 @@ payload را می‌شمارند. charge تخصیص فقط برای سه سقف 
 | `counter` | وقتی `cid` به `connection-capacity` برسد | cap ساده روی streamهای منطقی به‌ازای هر parent. |
 | `fixed-connections-count` | با زمان یا counter تجمعی exhausted نمی‌شود؛ `max-children` همچنان اعمال می‌شود | تعداد ثابت اتصال بیرونی per-worker. |
 
-Parentِ exhausted بی‌درنگ بسته نمی‌شود؛ فقط child تازه نمی‌پذیرد و childهای موجود تا پایان ادامه می‌دهند. اگر چنین parentی child نداشته باشد، `MuxClient` آن را می‌بندد و آزاد می‌کند.
+Parentِ exhausted بی‌درنگ بسته نمی‌شود؛ فقط child تازه نمی‌پذیرد و childهای موجود تا پایان ادامه می‌دهند. اگر چنین parentی child نداشته باشد، تا تحویل آخرین خروجی و پایان ارسال فعال در فهرست مالکیت می‌ماند، ولی دیگر برای child تازه انتخاب نمی‌شود. در حالت fixed، parent طبق سیاست قبلی قابل استفاده مجدد است. Worker Stop همه parentهای تحت مالکیت، حتی parent بازنشسته بدون child، را بدون انتظار برای Resume می‌بندد و خروجی باقی‌مانده را آزاد می‌کند.
 
 همچنین یک hard limit مطلق برای cid وجود دارد: وقتی parent به `4294967295` برسد، exhausted می‌شود.
 
@@ -242,12 +242,59 @@ forward نخواهد شد.
 | upstream `Pause` / `Resume` child | `FlowPause` می‌فرستد / داده queue شده را flush می‌کند و در صورت نیاز `FlowResume` می‌فرستد. |
 | upstream `Finish` child | `Close` می‌فرستد، یا `Open + Close` اگر هنوز payload stream را باز نکرده؛ در صورت نیاز parent exhausted بیکار را می‌بندد. |
 | downstream `Payload` والد | فریم‌های MUX از `MuxServer` را تجزیه می‌کند و `Data`، `Close`، `FlowPause` و `FlowResume` را به child مناسب می‌فرستد. |
-| downstream `Pause` / `Resume` والد | write pressure والد را به child نویسنده اخیر یا همه childها (اگر نویسنده اخیر نامشخص باشد) بازتاب می‌دهد. |
+| downstream `Pause` / `Resume` والد | خروجی parent را بی‌درنگ متوقف می‌کند / FIFO را تخلیه می‌کند؛ محدودیت childها فقط در threshold صف اعمال می‌شود. |
 | downstream `Finish` والد | state و line تحت مالکیت parent را بی‌درنگ از بین می‌برد، صف‌های پذیرفته‌شده childها را به drainهای مستقل از parent منتقل می‌کند و هر child را پس از خالی و قابل‌نوشتن شدن صف آن finish می‌کند. |
 | upstream `Est` | غیرفعال؛ رسیدن به این callback fatal است. |
 | downstream `Init` | غیرفعال؛ رسیدن به این callback fatal است. |
 
 فریم‌های ناشناخته، فریم‌های مربوط به cid ناموجود و فریم `Open` ناخواسته از سمت سرور دور ریخته می‌شوند.
+
+### صف خروجی parent
+
+هر parent یک FIFO مستقل و با تخصیص تنبل برای خروجی رمزگذاری‌شده دارد. تنظیم‌های
+اختیاری زیر برحسب بایتِ charge تخصیص `sbuf_t` هستند: ظرفیت کامل با padding،
+هدر بافر و سربار alignment را حساب می‌کنند، نه طول منطقی payload یا RSS فرایند.
+
+| تنظیم | پیش‌فرض | معنی |
+| --- | --- | --- |
+| `parent-write-buffer-pause-threshold` | `8388608` (8 MiB) | با رسیدن charge صف به این مقدار، تولیدکننده‌های child متصل Pause می‌شوند. |
+| `parent-write-buffer-limit` | `16777216` (16 MiB) | سقف سخت charge صف هر parent؛ برابری با سقف مجاز است. |
+
+هر دو مقدار باید عدد صحیح مثبت در بازه `[1, INT_MAX]` باشند و threshold باید
+اکیداً کمتر از limit باشد. صفر، مقدار منفی، اعشاری، نوع JSON نامعتبر و مقدار خارج
+از بازه باعث رد تنظیمات در startup می‌شوند. هر فیلد حذف‌شده مستقلاً مقدار پیش‌فرض
+خود را می‌گیرد؛ هیچ مقدار دیگری خودکار تغییر نمی‌کند. پس limit کمتر از 8 MiB
+به override کردن threshold هم نیاز دارد. نمونه داخل `settings`:
+
+```json
+{
+  "parent-write-buffer-pause-threshold": 2097152,
+  "parent-write-buffer-limit": 4194304
+}
+```
+
+این بودجه برای هر parent جداگانه اعمال می‌شود. `parent-buffer-limit` همچنان
+صف داده ورودیِ decodeشده برای childها را محدود می‌کند و معنی آن تغییر نکرده است.
+
+با دریافت Pause از transport والد، هیچ Payload تازه‌ای به آن سمت فرستاده نمی‌شود؛
+این قاعده شامل فریم‌های کنترلی و Close هم هست. خروجی تازه در FIFO می‌ماند و عمر
+آن به زنده ماندن child وابسته نیست. توقف کوتاه زیر threshold هیچ پیمایشی روی
+childها ایجاد نمی‌کند. رسیدن به threshold یک‌بار تولیدکننده‌ها را Pause می‌کند؛
+child تازه پس از پایان Callback مربوط به Init/Est، همین محدودیت را می‌گیرد.
+
+Resume صف را به ترتیب FIFO تا خالی شدن یا Pause بعدی تخلیه می‌کند. محدودیت محلی
+تولیدکننده‌ها فقط وقتی صف خالی و transport قابل‌نوشتن باشد برداشته می‌شود؛
+FlowPause دریافتی از peer و حالت بسته شدن child مستقل باقی می‌مانند. خروجی
+بازگشتی از Callback پشت خروجی قدیمی‌تر قرار می‌گیرد. خواندن ورودی parent و
+parentهای دیگر مسدود نمی‌شوند.
+
+اگر charge بافر تازه از سقف عبور کند یا رزرو صف شکست بخورد، فقط همان parent از
+مسیر معمول teardown بسته می‌شود؛ بافرها آزاد می‌شوند و فرایند متوقف نمی‌شود.
+مسیر مستقیمِ قابل‌نوشتن با صف خالی، تخصیص صف ندارد و مشمول سقف نگه‌داری نیست.
+فریم‌های کنترلی کوچک از رده مناسب pool با padding زنجیره استفاده می‌کنند.
+با از دست رفتن parent، خروجی غیرقابل‌ارسال بی‌درنگ آزاد می‌شود؛ drain مستقل
+صف‌های ورودی child طبق قرارداد قبلی ادامه دارد. Open و وضعیت flow-control پیش
+از Callback بازگشتی، پس از پذیرش در مسیر خروجی مرتب، منتشر می‌شوند.
 
 ## Backpressure و صف‌ها
 
