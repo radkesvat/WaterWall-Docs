@@ -162,12 +162,12 @@ TcpListener selects the mode for a finalized splice-capable chain before Init
 and reads; TcpConnector selects it after adopting its socket and before reads.
 TcpListener owns its normal line; TcpConnector borrows it.
 
-For NIO TCP splice reads, positive `FIONREAD` availability determines the requested
-transfer size, capped by the loop's large-buffer size and the 1 MiB
-`LARGE_BUFFER_SIZE_RAM_HIGH` limit. The read loop checks out a splice wrapper with
-its private pipe already initialized by the pool, then performs the socket-to-pipe
-splice in nonblocking mode
-**before invoking the Payload callback**.
+For NIO TCP splice reads, the read loop checks out a splice wrapper with its
+private pipe already initialized by the pool and calls `splice()` directly. Each
+request is capped by the loop's large-buffer size and the 1 MiB
+`LARGE_BUFFER_SIZE_RAM_HIGH` limit. There is no socket `FIONREAD` query before a
+successful splice delivery. The socket and pipe are nonblocking, and the transfer
+happens **before invoking the Payload callback**.
 
 The preferred pipe capacity is that same read limit, independent of the bytes
 currently ready: 1 MiB in higher memory profiles and 64 KiB in low-memory
@@ -180,25 +180,32 @@ allowance faster, including while their pairs remain cached.
 Only the actual positive splice result is published as the body length. Logical
 capacity becomes left padding plus that count; `kSbufFlagSplice` stays set.
 A positive short splice produces a smaller valid buffer; remaining socket bytes
-are handled by later reads. The availability query is a request bound, not a
-promise that the requested number of bytes will be delivered.
+are handled by later reads. The requested count is an upper bound, not a promise
+of a full-size transfer; a pipe smaller than the requested count remains usable.
 
-`EINTR` retries the transfer. `EAGAIN` recycles the empty wrapper and waits for
-another readiness event. Zero indicates EOF and closes the stream; other splice
-errors recycle the empty wrapper and follow normal read-error closure. If private
-pipe creation fails, checkout recycles the unused wrapper internally and returns
-`NULL` with `errno`; the read loop falls back to an ordinary read for that delivery.
-No socket bytes have been consumed at that point. Splice mode stays enabled, so
-later reads may create or reuse a pipe.
+`EINTR` retries the transfer. On `EAGAIN` or a zero result, the empty wrapper is
+recycled and the loop attempts one ordinary nonblocking receive through the
+best-fit path. TCP urgent data can stop splice at the urgent boundary while
+`recv()` can advance and deliver subsequent ordinary bytes. With a peer FIN
+already received, splice can even return zero at that boundary before those bytes
+are drained. The ordinary receive confirms EOF rather than treating a zero splice
+result alone as proof that the stream has no remaining data.
 
-When `FIONREAD` is zero, the ordinary nonblocking read path distinguishes EOF
-from transient readiness and data not represented by that count. Availability
-query `EAGAIN`/`EINTR` returns to the loop; other query errors close the stream.
-Consequently a splice-enabled WIO may still deliver an ordinary buffer through
-that fallback. Disabled, non-TCP, and unsupported reads retain ordinary behavior.
+A successful fallback delivers ordinary bytes with the actual received length.
+Ordinary `EAGAIN`/`EINTR` returns to the event loop; ordinary zero closes the stream.
+Other splice errors recycle the wrapper and follow normal read-error closure.
+If private pipe creation fails, checkout recycles the unused wrapper internally
+and returns `NULL` with `errno`; the read loop also falls back to an ordinary
+receive. None of these fallbacks has consumed socket bytes in the splice attempt.
+Splice mode stays enabled for later reads.
 
-Admission is checked before consuming data and again before delivery. If shutdown
-suppresses delivery after a successful splice, WIO drains and recycles the
+`FIONREAD` remains an allocation hint in the ordinary receive path, including
+these fallbacks. A failed or zero hint still attempts the ordinary receive.
+Disabled, non-TCP, and unsupported splice paths retain ordinary behavior.
+
+The common NIO event handler checks admission before entering the read path;
+the read path checks again before delivery. If shutdown suppresses delivery
+after a successful splice, WIO drains and recycles the
 still-local wrapper. A missing read callback also releases the undelivered buffer.
 After invoking the callback, the read path accesses neither the buffer nor the
 source WIO. The callback may close/free the source immediately.
@@ -499,8 +506,8 @@ Cached splice-tier entries use `sbufDestroySplice()` even with reset flags.
 On Linux, NIO uses `FIONREAD` as an allocation hint for ordinary TCP and UDP
 reads. A positive TCP count is capped at the pool's large payload size before
 calling `bufferpoolGetBestFit()`. The receive can fill the chosen buffer; any
-remaining stream bytes stay queued for later reads. A TCP splice fallback reuses
-its existing availability result without querying again.
+remaining stream bytes stay queued for later reads. A TCP splice fallback obtains
+this hint only after pipe creation fails or splice makes no progress.
 
 For UDP, the hint is the full size of the next datagram, not the sum of queued
 packets. Best-fit requests that complete size without the TCP cap. It can select
