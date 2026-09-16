@@ -259,17 +259,21 @@ line behave like a connection.
 
 ## Linux capture conntrack policy
 
-Linux capture automatically pairs each source-range NFQUEUE rule in `filter
-INPUT` with a `CT --notrack` rule in `raw PREROUTING`. NOTRACK additionally matches
-`addrtype --dst-type LOCAL`, so ordinary transit traffic, broadcast, and multicast
+`RawSocket` uses one `bypass-conntrack` setting for capture and raw output,
+defaulting to true. When enabled, Linux capture pairs each source-range NFQUEUE
+rule in `filter INPUT` with a `CT --notrack` rule in `raw PREROUTING`. NOTRACK
+additionally matches `addrtype --dst-type LOCAL`, so ordinary transit traffic, broadcast, and multicast
 are not exempted. The INPUT source-only capture match remains unchanged.
 Matching occurs before DNAT; selected local-unicast traffic must not depend on
-host conntrack-based NAT or connection-state filtering. Output is not exempted.
+host conntrack-based NAT or connection-state filtering. Setting the option to
+false installs neither capture nor output NOTRACK rules; NFQUEUE capture and
+its drop-and-dispatch behavior remain active.
 Keep normal raw priority: NOTRACK must not move fragment reassembly or change the
 capture payload limit. PMTU/ICMP delivery remains a separate responsibility.
 
 The reader must be ready before rule installation. Install all INPUT rules
-before any NOTRACK rules and activate capture only after both sets succeed.
+before any enabled NOTRACK rules and activate capture only after all selected
+rules succeed.
 The lifecycle owner removes NOTRACK before NFQUEUE, including startup rollback,
 normal stop, and cleanup following reader failure. Attempt queue cleanup even if
 NOTRACK cleanup fails. Account for each rule kind independently, including
@@ -283,6 +287,39 @@ untracked. `--queue-bypass` cannot undo NOTRACK; abrupt process death or final
 cleanup failure can leave `WWCAP_NOTRACK_...` rules in `raw PREROUTING` requiring
 administrator removal. This implementation does not reclaim another process's
 rules. `skip-sysctl` suppresses optional tuning only, never either rule kind.
+
+## Linux raw output conntrack policy
+
+`RawSocket` defaults `bypass-conntrack` to true. A configured `mark` field is
+rejected while it is enabled, including zero or null. Disabling the option
+preserves explicit output marks and installs neither capture nor output
+NOTRACK exemptions. The Windows backend accepts the setting without changing
+WinDivert behavior.
+
+The Linux raw device selects a random mark from values at least `0x00010000`,
+preferring the high half of the 32-bit space. Selection checks `iptables-save`
+mark comparisons/literal assignments and IPv4 `ip rule` fwmark selectors. It
+preserves their match results for an unmarked packet, including masked and
+inverted comparisons: the socket mark affects routing before `raw OUTPUT`.
+These snapshots provide best-effort avoidance, not a global reservation of
+marks on other sockets, native nftables/tc/eBPF rules, or future/concurrent
+policy changes. Do not claim that a high range is reserved for WaterWall.
+
+Set `SO_MARK` and install the exact-mark `CT --notrack` rule in `raw OUTPUT`
+before publishing the writer. Inspection, selection, socket-option, or rule
+installation failure must fail startup and roll back. Keep the ordinary raw
+hook priority and packet-size policy. No per-packet firewall commands are
+needed; normal routing/firewall, MTU, and ICMP-delivery responsibilities remain.
+Host conntrack-based NAT cannot be relied upon for the exempted output.
+
+Only the lifecycle owner runs firewall commands. Stop requests remain
+nonblocking. Join the writer before removing its exemption; a failed join must
+retain both writer resources and the rule. Record a rule as pending before
+insertion because a failed or timed-out command may have committed. Remove by
+exact mark and per-installation `WWRAW_NOTRACK_...` comment, reconciling failed
+deletion against `raw OUTPUT`. Retain pending cleanup for retry during teardown
+and report the mark/comment when it remains unresolved. Abrupt process death
+can leave a rule that an administrator must remove; never flush foreign rules.
 
 ## Linux capture packet validation
 

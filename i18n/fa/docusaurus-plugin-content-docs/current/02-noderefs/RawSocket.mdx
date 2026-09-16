@@ -71,7 +71,7 @@ upstream وارد `PingServer` می‌کند. `PingServer` آن‌ها را به
       "192.0.2.10",
       "198.51.100.0/24"
     ],
-    "mark": 10
+    "bypass-conntrack": true
   },
   "next": "next-node-name"
 }
@@ -85,7 +85,7 @@ upstream وارد `PingServer` می‌کند. `PingServer` آن‌ها را به
   "type": "RawSocket",
   "settings": {
     "raw-device-name": "raw-out",
-    "mark": 10
+    "bypass-conntrack": true
   }
 }
 ```
@@ -127,7 +127,8 @@ upstream وارد `PingServer` می‌کند. `PingServer` آن‌ها را به
 | --- | --- | --- | --- |
 | `capture-device-name` | string | `unnamed-capture-device` | نامی که به capture-device backend داده می‌شود. |
 | `raw-device-name` | string | `unnamed-raw-device` | نامی که به raw-output backend داده می‌شود. |
-| `mark` | integer | `0` | firewall mark برای raw output device، در platform یا backendهایی که آن را پشتیبانی می‌کنند. |
+| `bypass-conntrack` | boolean | `true` | در Linux، NOTRACK را برای هر دو مسیر capture و raw output کنترل می‌کند: ruleهای source-range در `raw PREROUTING` و rule دقیق با mark خودکار در `raw OUTPUT`. مقدار `false` نصب هر دو را غیرفعال می‌کند؛ NFQUEUE و رفتار drop-and-dispatch همچنان فعال می‌مانند. در حالت write-only فقط rule خروجی لازم است. روی WinDivert ویندوز اثری ندارد. |
+| `mark` | integer | `0` در حالت غیرفعال بودن bypass | mark صریح برای raw output؛ فقط با `bypass-conntrack=false` مجاز است. وقتی bypass فعال باشد، حتی `mark: 0` یا `mark: null` رد می‌شود. |
 | `skip-sysctl` | boolean | `false` | در Linux، batch مربوط به تنظیمات performance با `sysctl` را اجرا نمی‌کند. تنظیم NFQUEUE و ruleهای ضروری iptables همچنان اجرا می‌شوند. |
 
 Aliasهای سازگاری:
@@ -168,6 +169,37 @@ Aliasهای سازگاری:
 
 هر دو callback upstream و downstream payload از همین write path استفاده می‌کنند.
 
+در Linux، این قابلیت به `iptables`، `iptables-save` و `ip` از iproute2 و مجوز
+مدیریت firewall (`CAP_NET_ADMIN`) نیاز دارد.
+پیش از فعال شدن writer، WaterWall وضعیت ruleهای IPv4 را می‌خواند، mark تصادفی
+انتخاب می‌کند، `SO_MARK` را تنظیم و rule اختصاصی NOTRACK را نصب می‌کند. شکست در
+خواندن policy، انتخاب mark، تنظیم socket یا نصب rule باعث شکست startup و تلاش
+برای rollback می‌شود.
+
+انتخاب mark بازهٔ `0x80000000..0xffffffff` را ترجیح می‌دهد و در صورت نیاز به
+مقادیر پایین‌تر مراجعه می‌کند؛ مقادیر کمتر از `0x00010000` انتخاب نمی‌شوند.
+مقایسه‌ها و انتساب‌های ثابت mark در `iptables-save` و selectorهای fwmark در
+`ip -4 rule show`، از جمله maskها و نتیجهٔ تطبیق packet بدون mark، بررسی
+می‌شوند. مقدار انتخاب‌شده در log ثبت می‌شود. این کار فقط احتمال تداخل را کم
+می‌کند و رزرو سراسری نیست: policy بومی nftables، tc/eBPF، mark دیگر socketها،
+تغییرات هم‌زمان و برنامه‌هایی که بعداً اجرا می‌شوند ممکن است دیده نشوند.
+
+این معافیت فقط conntrack را کنار می‌گذارد؛ routing و firewall همچنان اعمال
+می‌شوند و خروجی معاف نباید به NAT یا stateful filtering مبتنی بر conntrack
+میزبان متکی باشد. اولویت معمول raw، پردازش fragment و محدودیت MTU تغییر نمی‌کند.
+برای mark صریح از تنظیم زیر استفاده کنید:
+
+```json
+"settings": { "bypass-conntrack": false, "mark": 10 }
+```
+
+این گزینه معافیت conntrack هر دو مسیر capture و output همین نود را غیرفعال
+می‌کند؛ ruleهای سایر مدیران مستقل می‌مانند. writer پیش از حذف rule با comment
+`WWRAW_NOTRACK_...` متوقف و join می‌شود. rollback و destroy حذف ruleهای معلق یا
+دارای نتیجهٔ نامشخص را دوباره امتحان می‌کنند. مرگ ناگهانی process یا شکست
+مداوم cleanup ممکن است rule را در `raw OUTPUT` باقی بگذارد؛ در این حالت rule
+با comment ثبت‌شده در log را دستی حذف کنید.
+
 ## رفتار Checksum
 
 `RawSocket` metadata مربوط به checksum را که نودهای قبلی روی packet-line گذاشته‌اند رعایت می‌کند.
@@ -196,21 +228,24 @@ dest-ip
 - `source-ip` پذیرفته می‌شود (بسته‌های منطبق از پشته شبکه کرنل حذف/drop می‌شوند و تنها WaterWall آن‌ها را دریافت و پردازش می‌کند)
 - `dest-ip` باعث شکست ساخت tunnel می‌شود و پیام خطا، استفاده از `TunDevice` را برای capture ترافیک خروجی پیشنهاد می‌کند
 
-در Linux، برای هر source range مربوط به capture، به‌صورت خودکار یک rule از نوع
+در Linux، وقتی `bypass-conntrack` فعال باشد (پیش‌فرض)، برای هر source range
+مربوط به capture یک rule از نوع
 `CT --notrack` در `raw PREROUTING` نیز نصب می‌شود. شرط اضافهٔ
 `--dst-type LOCAL` این معافیت را به مقصدهای unicast محلی محدود می‌کند؛ ترافیک
 عبوری معمول، broadcast و multicast از conntrack معاف نمی‌شوند. فیلتر capture در
 `INPUT` همچنان فقط source را بررسی می‌کند. این تطبیق پیش از DNAT انجام می‌شود؛
 ترافیک معاف‌شده نباید به NAT یا ruleهای stateful وابسته به conntrack همین میزبان
-متکی باشد. هیچ معافیتی در `OUTPUT` نصب نمی‌شود.
+متکی باشد. مقدار `bypass-conntrack=false` معافیت هر دو مسیر را غیرفعال می‌کند؛
+NFQUEUE capture و رفتار drop-and-dispatch آن همچنان فعال می‌مانند.
 
 اولویت معمول raw حفظ می‌شود؛ reassembly مربوط به fragmentها و محدودیت capture
 برابر با ۱٬۵۰۰ بایت تغییر نمی‌کنند. این ruleها MTU را تغییر نمی‌دهند و جایگزین
 PMTU discovery نیستند؛ پیام‌های ICMP لازم باید همچنان به stack مسئول برسند.
 گزینهٔ `skip-sysctl` نصب NOTRACK را غیرفعال نمی‌کند.
 
-ابتدا reader آماده و همهٔ ruleهای INPUT نصب می‌شوند، سپس ruleهای NOTRACK اضافه
-می‌شوند. شکست نصب هرکدام باعث شکست startup و rollback هر دو دسته می‌شود.
+ابتدا reader آماده و همهٔ ruleهای INPUT نصب می‌شوند، سپس در صورت فعال بودن
+این گزینه ruleهای NOTRACK اضافه می‌شوند. capture پس از نصب همهٔ ruleهای
+انتخاب‌شده فعال می‌شود. شکست نصب باعث شکست startup و rollback ruleهای نصب‌شده می‌شود.
 cleanup ابتدا حذف NOTRACK و سپس حذف NFQUEUE را امتحان می‌کند؛ شکست در حذف
 NOTRACK مانع تلاش برای حذف NFQUEUE نمی‌شود. وضعیت هر rule، از جمله نتیجهٔ
 نامعلوم پس از timeout، جداگانه در جدول مربوط به خودش پیگیری می‌شود. شکست reader
