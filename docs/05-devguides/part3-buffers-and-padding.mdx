@@ -199,8 +199,8 @@ After invoking the callback, the read path accesses neither the buffer nor the
 source WIO. The callback may close/free the source immediately.
 
 There is no FD-backed wrapper state, socket reservation, or post-callback source
-reference check. Source descriptor ownership remains with WIO and its other
-explicit holders; emitted buffers have no dependency on that ownership.
+reference check. WIO owns its primary descriptor directly; emitted buffers
+have no dependency on that descriptor's lifetime.
 
 #### Independent private bodies
 
@@ -213,7 +213,7 @@ Buffer B -> private pipe B: [BBB]
 
 Every emitted splice body is independent as soon as the callback receives it.
 Splice-aware code may retain the whole buffer or a partially consumed remainder
-for later use, including after source WIO/handle reclamation. No preparation call
+for later use, including after source WIO reclamation. No preparation call
 or source reference is needed before deferral. Consume the private body through
 the dedicated pipe helpers and preserve exclusive buffer ownership.
 
@@ -254,13 +254,17 @@ Unsupported conversion and partial reads abort.
 `bufferpoolReuseBuffer(pool, buf)` takes exclusive ownership and discards any
 remaining payload for ordinary and splice buffers. For a splice wrapper it calls
 `sbufSpliceDiscard()` before resetting the header or entering the pool-bypass
-branch, then verifies that the private pipe is empty. WIO cleanup, BufferQueue
-destruction, `lineReuseBuffer()`, and `reuseBuffer()` share this behavior without
+branch in every build. When `BUFFER_POOL_DEBUG == 1`, it then verifies that the
+private pipe is empty, using `LOGF()` and `abortProgramNow(1)` on failure.
+WIO cleanup, BufferQueue destruction, `lineReuseBuffer()`, and `reuseBuffer()` share this behavior without
 caller-side splice cleanup.
 
-A wrapper claiming zero length must already have an empty pipe; the pool
-verifies kernel emptiness with `FIONREAD` in Release and
-with pooling bypassed. Resetting sbuf fields never empties a pipe. Normal reuse
+A wrapper claiming zero length must already have an empty pipe. The pool uses
+`sbufSpliceIsReusable(buf)` to check kernel emptiness with `FIONREAD` only when
+`BUFFER_POOL_DEBUG == 1`, including when pooling is bypassed. This check is
+independent of `NDEBUG`. With pool debugging disabled, the verification and its
+syscall disappear; discard remains active and recycling trusts the consumption
+helpers' byte accounting. Resetting sbuf fields never empties a pipe. Normal reuse
 restores physical capacity and clears transient state while preserving healthy
 empty pipes. Unused empty wrappers can also be recycled directly.
 

@@ -121,31 +121,31 @@ direct reference-count decrement must preserve this release/acquire protocol.
 Do not rely on worker-message locks or an unrelated readiness flag to publish
 line state to a foreign final releaser.
 
-Line and WIO descriptor reference counters use `atomic_u32_t` from
+Line reference counters use `atomic_u32_t` from
 `ww/libc/watomic.h`. Access published counters through its `atomic*U32*`
 helpers, including in tests. The generic atomic API uses pointer-sized storage
 on the Windows fallback and cannot operate on these 32-bit fields. Incrementing
 a zero or maximum reference count is a fatal invariant violation.
 
-### Shared WIO Descriptors
+### WIO Descriptor Ownership
 
-A `wio_t` retains a pointer to `wio_fd_t`, defined in `ww/event/wevent.h`.
-The descriptor object holds the primary `fd`
-and an atomic reference count with exactly 32-bit storage on every platform.
-A newly adopted descriptor starts with one reference owned by the WIO.
-`wioGetFDHandle()` returns a borrowed pointer; call `wiofdRef()` before keeping
-it beyond that WIO's lifetime and match each retained reference with
-`wiofdUnref()`.
+A `wio_t` stores its owned primary descriptor directly as `int fd`, defined in
+`ww/event/wevent.h`. `wioGetFD()` returns that descriptor, or `-1` after it has
+been closed or released. Descriptor zero is valid. The descriptor has no separate
+allocation, reference count, or pool; only the WIO allocation has deferred
+lifetime protection.
 
 WIO close removes watcher interest and settles its queued writes, invokes the
-close callback while its descriptor is still available, and then releases its
-reference. Deferred graceful close retains the reference until draining ends.
-Other holders can keep the descriptor alive after the WIO closes or
-is recycled. The last release closes the primary descriptor and returns the
-object to its pool. For a closed WIO that remains allocated,
-`wioGetFDHandle()` returns `NULL` and `wioGetFD()` returns `-1`.
-The WIO retains only its array-slot index for
-bookkeeping; I/O always uses the descriptor object.
+close callback while the descriptor is still available, then invalidates and
+closes the descriptor exactly once. Deferred graceful close keeps it open until
+draining ends. Reentrant freeing in the close callback preserves the WIO
+allocation until that close frame returns. On Windows, the native close kind is
+captured at descriptor adoption, so sockets use `closesocket()` and CRT file
+descriptors use `_close()` even if the logical I/O type changes later.
+
+The separate `io_slot` field preserves descriptor-table bookkeeping after `fd`
+becomes `-1`. It is never used for I/O. Pending and native IOCP operation roots
+protect the WIO allocation after close; they do not keep its socket open.
 
 NIO splice reads move socket bytes into a wrapper's private pipe before invoking
 the callback. The wrapper contains neither a source pointer nor a source reference;
@@ -154,7 +154,7 @@ inspect the source or buffer, so callbacks may close/free the source immediately
 No socket reservation or post-callback source guard is needed for this read path.
 
 Each splice allocation exclusively owns its private pipe. Buffers can be retained
-or partially consumed and deferred immediately, and source WIO/handle reclamation
+or partially consumed and deferred immediately, and source WIO reclamation
 cannot affect them. Queued writes preserve their private pairs until completion
 or discard. Graceful close drains them; cancellation drains or closes each private
 pair before recycling. See the
@@ -179,18 +179,10 @@ newly accepted, non-pending WIOs, including when an fd number was reused.
 The dispatcher retains its `cur->loop == loop` ownership check as well.
 
 `wioReleaseNoClose()` preserves descriptors owned by another subsystem, such
-as c-ares. It relinquishes the primary descriptor by setting the object's
-`fd` to `-1`, then releases the WIO reference; it does not close that external
-descriptor. The external owner remains responsible for closing it.
-Coordinate this ownership transfer with other holders before calling it.
-
-Descriptor objects use ordinary worker-local generic pools backed by a
-separate shared master pool. Non-event threads acquire and return objects
-through the master without touching a worker's local cache. Allocation and
-final release look up the shared master in global state; individual objects
-do not store a pool pointer. The global master remains available after a
-worker's local pool is destroyed. Every descriptor reference must settle
-before global master-pool teardown.
+as c-ares. It removes watcher interest, detaches the WIO's array slot, and sets
+`fd` to `-1` without closing the external descriptor. The external owner remains
+responsible for closing it. Pending/native operations and callback frames still
+settle before the WIO allocation can return to its existing pool.
 
 ### Scheduled Line Tasks
 
