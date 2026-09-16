@@ -150,7 +150,7 @@ Aliasهای سازگاری:
 
 1. `RawSocket` بررسی می‌کند که packet از نوع IPv4 باشد.
 2. packetهای غیر IPv4 به pool برگردانده می‌شوند و به chain راه پیدا نمی‌کنند.
-3. بسته‌های منطبق با فیلتر capture از پشته شبکه کرنل میزبان حذف/drop می‌شوند (توسط drop-and-dispatch در لینوکس یا packet diversion در ویندوز)؛ بنابراین هسته سیستم‌عامل آن‌ها را پردازش نکرده و تنها WaterWall به آن‌ها دسترسی انحصاری دارد.
+3. بسته‌های منطبق با فیلتر capture از پشته شبکه کرنل میزبان حذف/drop می‌شوند (توسط drop-and-dispatch در لینوکس یا packet diversion در ویندوز)؛ هنگام فعال بودن capture، تحویل معمول آن‌ها به لایهٔ transport محلی متوقف می‌شود و WaterWall کپی دریافت‌شده را پردازش می‌کند.
 4. worker packet line متناظر از chain گرفته می‌شود.
 5. packet IPv4 captureشده به سمت نود مجاور انتخاب‌شده فرستاده می‌شود.
 
@@ -196,6 +196,30 @@ dest-ip
 - `source-ip` پذیرفته می‌شود (بسته‌های منطبق از پشته شبکه کرنل حذف/drop می‌شوند و تنها WaterWall آن‌ها را دریافت و پردازش می‌کند)
 - `dest-ip` باعث شکست ساخت tunnel می‌شود و پیام خطا، استفاده از `TunDevice` را برای capture ترافیک خروجی پیشنهاد می‌کند
 
+در Linux، برای هر source range مربوط به capture، به‌صورت خودکار یک rule از نوع
+`CT --notrack` در `raw PREROUTING` نیز نصب می‌شود. شرط اضافهٔ
+`--dst-type LOCAL` این معافیت را به مقصدهای unicast محلی محدود می‌کند؛ ترافیک
+عبوری معمول، broadcast و multicast از conntrack معاف نمی‌شوند. فیلتر capture در
+`INPUT` همچنان فقط source را بررسی می‌کند. این تطبیق پیش از DNAT انجام می‌شود؛
+ترافیک معاف‌شده نباید به NAT یا ruleهای stateful وابسته به conntrack همین میزبان
+متکی باشد. هیچ معافیتی در `OUTPUT` نصب نمی‌شود.
+
+اولویت معمول raw حفظ می‌شود؛ reassembly مربوط به fragmentها و محدودیت capture
+برابر با ۱٬۵۰۰ بایت تغییر نمی‌کنند. این ruleها MTU را تغییر نمی‌دهند و جایگزین
+PMTU discovery نیستند؛ پیام‌های ICMP لازم باید همچنان به stack مسئول برسند.
+گزینهٔ `skip-sysctl` نصب NOTRACK را غیرفعال نمی‌کند.
+
+ابتدا reader آماده و همهٔ ruleهای INPUT نصب می‌شوند، سپس ruleهای NOTRACK اضافه
+می‌شوند. شکست نصب هرکدام باعث شکست startup و rollback هر دو دسته می‌شود.
+cleanup ابتدا حذف NOTRACK و سپس حذف NFQUEUE را امتحان می‌کند؛ شکست در حذف
+NOTRACK مانع تلاش برای حذف NFQUEUE نمی‌شود. وضعیت هر rule، از جمله نتیجهٔ
+نامعلوم پس از timeout، جداگانه در جدول مربوط به خودش پیگیری می‌شود. شکست reader
+باعث درخواست shutdown منظم می‌شود و مالک lifecycle پاک‌سازی ruleها را انجام
+می‌دهد. حذف NOTRACK رهگیری packetهای بعدی را برمی‌گرداند، نه packetهایی که قبلاً
+untracked شده‌اند. `--queue-bypass` فقط روی NFQUEUE اثر دارد؛ مرگ ناگهانی process
+یا شکست نهایی cleanup ممکن است ruleهای `WWCAP_NOTRACK_...` را باقی بگذارد که
+برای بازگشت conntrack باید توسط مدیر سیستم از `raw PREROUTING` حذف شوند.
+
 در Linux، ‏ruleهای NFQUEUE از `--queue-bypass` استفاده می‌کنند. اگر WaterWall
 روی queue گوش نکند، packetهای matching به‌جای drop شدن به‌علت نبود queue، از
 firewall میزبان عبور می‌کنند. این یک سیاست availability از نوع fail-open است:
@@ -204,7 +228,7 @@ firewall میزبان عبور می‌کنند. این یک سیاست availabil
 نمی‌کند. WaterWall از شماره queueهایی که از قبل در ruleهای INPUT استفاده
 شده‌اند دوری می‌کند. شکست نهایی در startup مربوط به capture یا cleanup کردن
 rule، ‏queue را سریع می‌بندد و آن capture-device object را غیرقابل restart
-می‌کند؛ در نتیجه `--queue-bypass` برای هر ruleای که حذف نشده باشد فعال می‌شود.
+می‌کند؛ در نتیجه `--queue-bypass` برای هر rule مربوط به NFQUEUE که حذف نشده باشد فعال می‌شود.
 queue reader باید پیش از نصب اولین rule آماده بودن خود را گزارش کند و در تمام
 مدت نصب ruleها، rollback و cleanup هنگام bring-down در حال اجرا بماند. تا زمانی
 که همه ruleها نصب نشده‌اند و raw output device آماده نیست، packetها
