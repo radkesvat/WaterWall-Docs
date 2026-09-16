@@ -86,21 +86,36 @@ sbufShiftRight(b, n);              // advance cursor: consume n bytes from the f
 
 A splice allocation keeps the common 32-byte `sbuf_t` header and exactly
 32 bytes of control storage plus reserved left padding. Named metadata at the
-fixed address `buf + l_pad` contains an exclusively owned `int pipefd[2]`.
+fixed address `buf + l_pad` contains an exclusively owned `int pipefd[2]`, its
+last known kernel capacity, and a monotonic capacity-retry deadline.
 There is no source socket pointer or source-handle reference in the wrapper. Access it through `splice_buffer.h` helpers,
 which copy bytes safely. Ordinary buffers never contain this metadata.
 
 Creation initializes `{-1, -1}` pipe descriptors without a
-pipe syscall. Descriptor zero is valid. `sbufSpliceInitPipe()` lazily creates a
+pipe syscall. Descriptor zero is valid. `sbufSpliceInitPipe(buf, preferred_capacity)` lazily creates a
 nonblocking, close-on-exec private pair with `pipe2`, publishing both ends only
-on success. Repeated initialization retains the pair. Failure returns `-1`
-with `errno`, leaving the pair uninitialized; unsupported builds use `ENOSYS`.
+on success. For an empty buffer, a positive preferred capacity (at most
+`INT_MAX`) queries `F_GETPIPE_SZ` and requests `F_SETPIPE_SZ` if the known
+capacity is smaller. Zero skips capacity negotiation. Neither a failed query
+nor a rejected increase fails initialization or closes the pipe.
+
+Undersized or unknown-capacity pairs retry during a later empty initialization,
+at most once per second per pair. The capacity and retry deadline survive local
+and master pool reuse and exclusive transfers between workers. Expiry does not
+schedule background work: only a subsequent initialization can retry. A buffer
+holding payload is never resized. Once the recorded capacity satisfies the
+request, initialization skips both the clock check and capacity syscalls; larger
+pipes are never shrunk. Pipe close clears the capacity and retry state so a new
+pair starts fresh. Pipe creation failure returns `-1` with `errno`, leaving the
+pair uninitialized; unsupported builds use `ENOSYS`.
 The wrapper has one owner and serialized access. Copying metadata does not
 duplicate ownership. Splice wrappers must never carry `sbuf_lifetime_t` metadata.
 
-Checkout sets only `kSbufFlagSplice`. Delivered splice payloads also have
-`kSbufFlagSplicePiped`: their bodies are already in their private pipes. An empty
-consumed wrapper may retain this flag. Empty-body helpers need no pipe creation. The real prefix occupies reserved headroom:
+Checkout sets `kSbufFlagSplice`, which identifies the splice representation.
+Any claimed body bytes must already be in the wrapper's private pipe. There is
+no separate body-location flag. An empty body may have an uninitialized pipe
+or an existing empty pair; empty-body helpers need no pipe creation.
+The real prefix occupies reserved headroom:
 
 ```text
 prefix_bytes = l_pad - curpos
@@ -122,6 +137,17 @@ policy after topology expansion, alongside platform support, absence of packet
 nodes, and splice support from every node. Enabling the option does not override
 those eligibility checks or change node capability flags.
 
+When splice is enabled on a supported Linux build, core startup also tries to
+raise `fs.pipe-user-pages-soft`. A finite `fs.pipe-user-pages-hard` supplies the
+target; an unlimited hard limit (`0`) uses 512 MiB converted to pages with the
+system's page size, rounding up if needed. These live system-wide settings govern
+each user's aggregate pipe-page allowance; they are not per-process resource
+limits. An unlimited soft limit (`0`), or a soft value already at or above the
+target, causes no change. Read/parse/write and page-size-query failures are
+nonfatal. The hard limit and `fs.pipe-max-size` are never changed, and no
+persistent sysctl configuration is written. A successful increase remains in
+effect after WaterWall exits. Disabled splice skips this startup operation.
+
 `wioEnableSplice()` selects the mode on the owner thread before any successful
 read registration. Its debug assertions require an open WIO and a clear sticky
 `read_started` bit; stopping reads does not clear that bit. Supported builds
@@ -134,13 +160,21 @@ and reads; TcpConnector selects it after adopting its socket and before reads.
 TcpListener owns its normal line; TcpConnector borrows it.
 
 For NIO TCP splice reads, positive `FIONREAD` availability determines the requested
-transfer size, capped by the loop's large-buffer size and the 512 KiB
+transfer size, capped by the loop's large-buffer size and the 1 MiB
 `LARGE_BUFFER_SIZE_RAM_HIGH` limit. The read loop checks out a splice wrapper,
 lazily initializes its private pipe, and performs the nonblocking socket-to-pipe
 splice **before invoking the Payload callback**.
 
+The preferred pipe capacity is that same read limit, independent of the bytes
+currently ready: 1 MiB in higher memory profiles and 64 KiB in low-memory
+profiles. Existing larger capacities are never reduced. A successful growth
+request is not a promise of a full-size splice: pipe layout and available input
+can still produce a shorter result. Rejected growth keeps the splice path active
+with the pipe's existing capacity. Larger pipes consume the per-user pipe-page
+allowance faster, including while their pairs remain cached.
+
 Only the actual positive splice result is published as the body length. Logical
-capacity becomes left padding plus that count, and `kSbufFlagSplicePiped` is set.
+capacity becomes left padding plus that count; `kSbufFlagSplice` stays set.
 A positive short splice produces a smaller valid buffer; remaining socket bytes
 are handled by later reads. The availability query is a request bound, not a
 promise that the requested number of bytes will be delivered.
@@ -204,7 +238,7 @@ space, without growing storage or consuming destination headroom. Zero bytes
 is a validated no-op. The caller retains both buffers and returns the wrapper
 through `bufferpoolReuseBuffer()` when finished, discarding any unconsumed remainder.
 
-Both read helpers require `kSbufFlagSplice | kSbufFlagSplicePiped` and read only
+Both read helpers require `kSbufFlagSplice` and read only
 from the wrapper's private pipe. A nonempty body requires an initialized pair.
 Positive short reads accumulate until the required byte count is reached, and
 `EINTR` retries without losing progress. Invalid flags/bounds, EOF, or any other
@@ -252,8 +286,9 @@ live wrappers add their own pairs.
 
 #### Writing splice payloads
 
-Supported NIO TCP writes require Piped inputs whose bytes are already in their
-private pipes. Writing or queueing never reads the source socket. Real prefixes use send before bodies
+Supported NIO TCP writes accept splice buffers whose body bytes are already in
+their private pipes. Empty and prefix-only wrappers need no initialized pipe.
+Writing or queueing never reads the source socket. Real prefixes use send before bodies
 use nonblocking splice to the destination. Actual combined progress drives
 logical queue accounting. Short sends, `EAGAIN`, and `EINTR` retain the remainder
 in the existing WIO FIFO, shared with ordinary writes. Queued buffers require no
@@ -274,8 +309,9 @@ and remaining private-pipe body; it does not count control-storage capacity.
 
 Splice insertion retains the original wrapper and private pipe in every build.
 It neither copies metadata as payload nor converts or consumes the body.
-Nonempty splice entries require `kSbufFlagSplicePiped`; empty unused wrappers
-are valid. Splice lifetime metadata must remain null. Ordinary Debug insertion
+Splice entries must already own any claimed body bytes in their private pipes;
+empty and prefix-only wrappers need no initialized pipe.
+Splice lifetime metadata must remain null. Ordinary Debug insertion
 continues to replace allocations to detect stale aliases.
 
 Successful insertion transfers ownership to the queue. Failed try-insertion
@@ -365,7 +401,7 @@ line:
 buffer_pool_t *pool = lineGetBufferPool(line);     // this line's worker pool
 
 sbuf_t *big   = bufferpoolGetLargeBuffer(pool);    // ordinary read/working buffer
-sbuf_t *medium = bufferpoolGetMediumBuffer(pool); // fixed 64 KiB helper buffer
+sbuf_t *medium = bufferpoolGetMediumBuffer(pool); // 32 KiB in S1/S2, 64 KiB in higher profiles
 sbuf_t *small = bufferpoolGetSmallBuffer(pool);    // small working buffer
 sbuf_t *splice_buf = bufferpoolGetSpliceBuffer(pool); // 32 control-storage bytes plus splice padding
 
@@ -382,20 +418,23 @@ place to build a payload you intend to prepend onto.
 
 Each buffer pool has large, medium, small, and splice caches backed by separate
 shared master pools. `bufferpoolCreate()` takes those four master pools in that
-order. Their payload capacities, excluding reserved left padding, are:
+order, followed by the cache width and explicit large, medium, and small payload
+capacities. Each pool stores its own sizes; device pools inherit all three from
+their worker pool. Payload capacities, excluding reserved left padding, are:
 
 | Tier | Capacity | Use |
 | --- | --- | --- |
 | Small | 4 KiB | Small ordinary payloads and control messages |
-| Medium | 64 KiB in every memory profile | Helper storage for framing and retained queues, including paused Mux children |
-| Large | 4 KiB in S1/S2; 512 KiB in M1/M2/L1/L2 | Ordinary event-loop read buffers and larger working payloads |
+| Medium | 32 KiB in S1/S2; 64 KiB in M1/M2/L1/L2 | Helper storage for framing and retained queues, including paused Mux children |
+| Large | 64 KiB in S1/S2; 1 MiB in M1/M2/L1/L2 | Ordinary event-loop read buffers and larger working payloads |
 | Splice | 32 bytes of control storage | Explicit splice wrappers; logical body size is independent of allocation size |
 
-Medium capacity is fixed; its local and master cache counts follow the memory
-profile, just like the other tiers. Ordinary event-loop reads explicitly request
-large buffers and do not select medium buffers. A node may use medium buffers for
-its own work or retention. The tier name does not imply size ordering in low-memory
-profiles, where a medium buffer is larger than a large buffer.
+S1 and S2 share buffer sizes but retain different profile-based local and master
+cache capacities; S1 caches fewer allocations. Higher profiles retain 64 KiB
+medium and 1 MiB large buffers. Ordinary event-loop reads explicitly request
+large buffers. Medium buffers remain helper storage for nodes and retained
+queues. Mux uses the large tier when a paused frame exceeds medium capacity,
+so even a full-size frame fits pooled storage in S1/S2.
 
 `bufferpoolGetBestFit()` selects the smallest ordinary tier that satisfies both
 payload and padding requirements, comparing actual sizes across small, medium,
@@ -421,8 +460,8 @@ The existing `lineGetBufferPool()`, `getWorkerBufferPool()`, and
 recycling path as `bufferpoolReuseBuffer()`, subject to their existing worker
 ownership requirements. Recycling clears flags and length; for a splice wrapper,
 it first restores physical capacity from the 32-byte control storage and its
-reserved padding. Checkout restores `kSbufFlagSplice` with both location flags
-clear. Empty private pipe pairs survive pool reuse and close on physical destruction.
+reserved padding. Checkout restores `kSbufFlagSplice`.
+Empty private pipe pairs survive pool reuse and close on physical destruction.
 
 If you need a buffer bigger than the current one for an append, use
 `sbufReserveSpace()` (it reallocates and copies only when necessary) rather than
