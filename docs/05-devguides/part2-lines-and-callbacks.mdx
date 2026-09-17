@@ -226,10 +226,20 @@ Scheduling-record acquisition and timed-resource installation deliberately use
 different allocation policies. The pooled scheduling record is fail-fast:
 master-pool item creation cannot report OOM to the scheduling API. Positive-delay
 worker messages instead install their timer through the internal
-`wtimerTryAdd()` boundary. It allocates only those timers with the genuinely
-fallible `eventloopTryZalloc()` (CRT `calloc`) and records their provenance so
-expiry, explicit deletion, quiesced/deferred deletion, loop destruction, and
-pending-event reclamation all use the matching `eventloopTryFree()` (CRT `free`).
+`wtimerTryAdd()` boundary. On worker loops these timeout records use a
+worker-local generic pool backed by `GSTATE.masterpool_timers`. Local width is
+`RAM_PROFILE`; master width is `2 * RAM_PROFILE`. Pool constructors double those
+widths for cache capacity, and local refills request `RAM_PROFILE` records.
+`genericpoolTryGetItem()` preserves recoverable failure: a partial refill keeps
+its acquired records, and an empty refill returns null without a checkout.
+Fresh records use `eventloopTryZalloc()`, which delegates to WaterWall's
+recoverable `memoryTryAllocateZero()` helper. Physical release uses the ordinary
+`eventloopFree()` path and the same allocator backend. Every checkout resets the record.
+Expiry, explicit deletion, quiesced/deferred deletion, loop destruction, and
+pending-event reclamation return records only at final release; an executing
+callback's pending timer cannot be reused by a nested submission. Worker pools
+outlive loop cleanup and the shared master outlives all workers. Standalone loops
+without a timer pool use the same recoverable allocation and ordinary release.
 The public `wtimerAdd()` and unrelated event allocations retain their existing
 fail-fast event-loop/mimalloc behavior.
 
