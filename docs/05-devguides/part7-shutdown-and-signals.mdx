@@ -216,27 +216,25 @@ Posting APIs distinguish the two ownership styles used by the runtime:
   cleanup settles them.
 
 Delayed submission makes the same distinction during timer setup. A
-retain-on-refusal call that cannot install a same-worker timer returns the
-payload to its caller without invoking cleanup. If a queued setup wrapper was
-accepted and timer allocation later fails on the target worker, ownership had
-already transferred, so cleanup runs once with `ResourceFailure`.
+retain-on-refusal call rejected by closed timer admission returns its payload
+to the caller without invoking cleanup. An already accepted setup wrapper
+instead settles through cleanup if admission closes before it can arm.
 
-Timed worker messages use the internal three-way `wtimerTryAdd()` boundary.
-Their timeout records use an owner-worker generic pool backed by the shared
-timer master pool, sized from `RAM_PROFILE` as described in
-[Part 2](./part2-lines-and-callbacks.mdx#what-the-result-proves). Refill allocation
-remains fallible. Explicit provenance routes expiry, explicit deletion,
-quiesced/deferred cleanup, pending-event release, and loop destruction back to
-the pool only when no pending callback retains the allocation. Loop cleanup
-finishes before local timer pools are destroyed, and the master remains alive
-until all workers are destroyed. Public `wtimerAdd()` and unrelated event storage
-remain fail-fast. Installation refusal caused by closed loop admission reports
-`AdmissionClosed`; it is never mislabeled as `ResourceFailure`.
+Timed worker messages use `wtimerAdd()` and normal fail-fast allocation. Owner
+workers acquire timeout records from their existing generic pools backed by
+`GSTATE.masterpool_timers`, sized from `RAM_PROFILE` as described in
+[Part 2](./part2-lines-and-callbacks.mdx#what-the-result-proves). No recoverable
+allocator or pool interface is involved. Explicit pool ownership routes expiry,
+explicit deletion, quiesced/deferred cleanup, pending-event release, and loop
+destruction back to the pool only when no pending callback retains the
+allocation. Loop cleanup finishes before local timer pools are destroyed, and
+the master remains alive until all workers are destroyed. Timer allocation
+failure terminates the process; closed admission still reports `AdmissionClosed`.
 
 Checked submissions return `worker_message_submit_result_e`: accepted,
 rejected with caller ownership retained, or rejected after cleanup ran. Cleanup
 receives a `worker_message_cancel_reason_e` that distinguishes unavailable
-targets, closed admission, enqueue/resource failure, quiescence, and teardown.
+targets, closed admission, enqueue failure, quiescence, and teardown.
 Intentional quiescence and teardown cancellation are normal ownership settlement,
 not new process failures.
 
@@ -265,7 +263,7 @@ after setup admission:
 
 ```text
 submitter lane -> setup admission commits result -> return/observe AcceptedAsync
-owner lane     -> accepted setup may run -> allocation fails -> ResourceFailure cancellation
+owner lane     -> accepted setup may be canceled -> Quiesced cancellation
                  cancellation may precede, race with, or follow submitter observation
 ```
 
@@ -689,14 +687,10 @@ ctest --preset linux-tsan-unit --output-on-failure
 
 Important fixtures prove:
 
-- `memory_allocation` exercises the real recoverable backend failure, zeroed
-  storage, common release, and ordinary fail-fast allocation policy;
-- `timer_pool` proves allocation-free warm reuse across every memory profile,
-  shared-master reuse, actual refill allocation failure, partial refills, and
-  pending/deferred timer reclamation;
-- `line_task_scheduling` injects one-shot failure at recoverable timer acquisition
-  (including warmed caches) and proves direct/foreign, buffered, line-dead,
-  quiescence, teardown, and re-entrant settlement;
+- `timer_pool` proves warm reuse across every memory profile, shared-master
+  reuse, fatal allocation failure, and pending/deferred timer reclamation;
+- `line_task_scheduling` proves direct/foreign, buffered, line-dead, admission
+  closure, quiescence, teardown, and re-entrant settlement;
 - `worker_context_helpers` proves the underlying worker-message result/reason
   mapping and callback-or-cleanup ownership contract;
 

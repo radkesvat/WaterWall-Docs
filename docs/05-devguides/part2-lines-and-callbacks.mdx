@@ -222,36 +222,30 @@ The immediate APIs never return `TimerArmed`. Delayed zero returns
 after successful installation. The same positive delay submitted from any
 other thread returns `AcceptedAsync` once owner-side setup is queued.
 
-Scheduling-record acquisition and timed-resource installation deliberately use
-different allocation policies. The pooled scheduling record is fail-fast:
-master-pool item creation cannot report OOM to the scheduling API. Positive-delay
-worker messages instead install their timer through the internal
-`wtimerTryAdd()` boundary. On worker loops these timeout records use a
-worker-local generic pool backed by `GSTATE.masterpool_timers`. Local width is
-`RAM_PROFILE`; master width is `2 * RAM_PROFILE`. Pool constructors double those
-widths for cache capacity, and local refills request `RAM_PROFILE` records.
-`genericpoolTryGetItem()` preserves recoverable failure: a partial refill keeps
-its acquired records, and an empty refill returns null without a checkout.
-Fresh records use `eventloopTryZalloc()`, which delegates to WaterWall's
-recoverable `memoryTryAllocateZero()` helper. Physical release uses the ordinary
-`eventloopFree()` path and the same allocator backend. Every checkout resets the record.
-Expiry, explicit deletion, quiesced/deferred deletion, loop destruction, and
-pending-event reclamation return records only at final release; an executing
-callback's pending timer cannot be reused by a nested submission. Worker pools
-outlive loop cleanup and the shared master outlives all workers. Standalone loops
-without a timer pool use the same recoverable allocation and ordinary release.
-The public `wtimerAdd()` and unrelated event allocations retain their existing
-fail-fast event-loop/mimalloc behavior.
+Scheduling records and timers use normal fail-fast allocation. Positive-delay
+worker messages install their timer with `wtimerAdd()`. On the loop's owner
+worker, timeout records use `genericpoolGetItem()` from a worker-local pool
+backed by `GSTATE.masterpool_timers`. Local width is `RAM_PROFILE`; master width
+is `2 * RAM_PROFILE`. Pool constructors double those widths for cache capacity,
+and local refills request `RAM_PROFILE` records. Allocation either supplies
+storage or terminates the process; timer allocation does not report
+`ResourceFailure` or invoke cancellation cleanup.
 
-`wtimerTryAdd()` distinguishes installed, admission-closed, and resource-failure
-outcomes. Only an actual allocation failure becomes `ResourceFailure`; closure
-at the installation boundary becomes `AdmissionClosed`. On an owner-worker
-positive-delay call, resource failure cancels synchronously and returns
-`RejectedSettled`. Once a foreign setup message is accepted, the call is
-committed to return `AcceptedAsync`. Owner-side `ResourceFailure` is asynchronous
-with respect to the submitter and may be delivered before, concurrently with, or
-after that return is observed. The task never runs inline: doing so would violate
-its minimum delay and can make a self-rescheduling task recurse without bound.
+Every pooled checkout resets the record. Expiry, explicit deletion,
+quiesced/deferred deletion, loop destruction, and pending-event reclamation
+return records only at final release; an executing callback's pending timer
+cannot be reused by a nested submission. Worker pools outlive loop cleanup and
+the shared master outlives all workers. Foreign startup callers and standalone
+loops without a pool use normal event allocation without borrowing an owner's
+local pool. Period timers also retain normal event allocation.
+
+Shutdown admission can still refuse timer installation. On the owner worker,
+that refusal reports `AdmissionClosed` and returns `RejectedSettled`. A foreign
+submission returns `AcceptedAsync` once setup is queued, and may subsequently
+be canceled before arming. Cancellation may be delivered before, concurrently
+with, or after the submitter observes acceptance. The task never runs inline:
+doing so would violate its minimum delay and can make a self-rescheduling task
+recurse without bound.
 Independent delayed tasks have no equal-deadline FIFO guarantee. Ordered work
 belongs in one explicit queue drained by one scheduled task.
 
@@ -279,7 +273,7 @@ Cancellation reasons are precise:
 | `kLineTaskCancelTargetUnavailable` | The target WID has no ordinary event-worker queue. |
 | `kLineTaskCancelAdmissionClosed` | The target no longer admits normal work or timer setup. |
 | `kLineTaskCancelEnqueueFailure` | Queue growth or wake publication refused submission. |
-| `kLineTaskCancelResourceFailure` | Owner-side delayed resource installation failed. |
+| `kLineTaskCancelResourceFailure` | Not emitted for timer allocation, which is fail-fast. |
 | `kLineTaskCancelQuiesced` | Worker quiescence settled accepted work before execution. |
 | `kLineTaskCancelTeardown` | Detached queue teardown settled the task. |
 | `kLineTaskCancelLineDead` | Dispatch found the retained allocation logically dead. |
@@ -288,7 +282,7 @@ After foreign admission, submitter and owner progress independently:
 
 ```text
 submitter lane -> setup admission commits result -> return/observe AcceptedAsync
-owner lane     -> accepted setup may run -> allocation fails -> cancellation(ResourceFailure)
+owner lane     -> accepted setup may be canceled -> cancellation(Quiesced)
                  cancellation may precede, race with, or follow submitter observation
 ```
 
