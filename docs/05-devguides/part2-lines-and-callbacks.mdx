@@ -159,6 +159,9 @@ cannot affect them. Queued writes preserve their private pairs until completion
 or discard. Graceful close drains them; cancellation drains or closes each private
 pair before recycling. See the
 [private-body rules and AAA/BBB example](./part3-buffers-and-padding.mdx#independent-private-bodies).
+This source-independent lifetime does not make pipe bytes ordinary pointer data:
+parsers and retaining transforms follow the [BufferStream representation contract
+in Part 3](./part3-buffers-and-padding.mdx#bufferstream-representation-inspection-and-extraction-contracts).
 
 Freeing a pending NIO detaches its descriptor-table slot immediately but defers
 recycling the WIO allocation until the pending dispatcher releases it. Shutdown
@@ -956,12 +959,24 @@ remain safe if emitting `Pause` re-enters and destroys the line.
 MuxClient and MuxServer are examples of explicit local buffering: parent transport
 Pause immediately forbids all parent-bound Payload, including protocol controls.
 They retain encoded output in a bounded per-parent FIFO and pause child producers
-only at its allocation-charge threshold. Short transport stalls do not scan the
-child list. Resume drains in order; the local producer gate releases only at
-empty plus writable, preserving peer-flow and terminal-close reasons. This does
-not relax the strict permission boundary at the paused neighbor. TcpListener also
-preserves a Pause received during accepted-line Init: it enables initial reads
-only if Init returns alive and the source is still unpaused.
+only at its queue-capacity threshold. Complete queued frames retain valid private
+bodies under local queue limits. Incoming assembly and attached child queues share
+the existing parent receive limit, with beneficial pressure compaction followed by
+largest-child shedding or parent close. There is no worker-wide pipe quota. Pause
+still forbids Payload, not retention; see the [Part 3 contract](./part3-buffers-and-padding.mdx#queue-capacity-budgets).
+Short transport stalls do not scan the child list. Resume drains in order; the
+local producer gate releases only at empty plus writable, preserving peer-flow
+and terminal-close reasons. This does not relax the strict permission boundary
+at the paused neighbor. TcpListener also preserves a Pause received during
+accepted-line Init: it enables initial reads only if Init returns alive and the
+source is still unpaused.
+
+Mux's fixed header cache owns consumed header bytes until the exact body is
+extracted. No callback observes detached stream ownership. Large splice encoding
+publishes the complete frame batch and Open state before any callback. A Pause
+during its first delivery leaves all later frames in the parent FIFO; nested Data
+or child Close follows that remainder. Parent death discards it, while child death
+alone does not release its cost. Ordinary large encoding keeps one aggregate.
 
 Submitting a Mux control frame can close its child during queue-pressure
 callbacks while leaving the parent alive. Parser-facing queue helpers distinguish

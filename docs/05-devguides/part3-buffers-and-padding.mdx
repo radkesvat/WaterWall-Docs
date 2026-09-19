@@ -29,9 +29,10 @@ struct sbuf_s
 {
     uint32_t curpos;       // offset of the current payload start within buf[]
     uint32_t len;          // current payload length, in bytes
-    uint32_t capacity;     // total allocation of buf[] (constant for the buffer's life)
+    uint32_t capacity;     // ordinary: storage capacity; splice: logical geometry
     uint16_t l_pad;        // reserved left padding (constant once created)
     uint16_t flags;
+    sbuf_lifetime_t *lifetime; // optional ordinary-buffer ownership association
     uint8_t  buf[];        // 32-byte aligned data
 };
 ```
@@ -89,9 +90,10 @@ A splice allocation keeps the common 32-byte `sbuf_t` header and exactly
 fixed address `buf + l_pad` contains an exclusively owned `int pipefd[2]`, its
 last known kernel capacity, and a monotonic capacity-retry deadline.
 There is no source socket pointer or source-handle reference in the wrapper.
-Access metadata through `splice_buffer.h` helpers, which copy bytes safely.
-Public splice lifecycle helpers are declared in `shiftbuffer.h`. Ordinary buffers
-never contain this metadata.
+Access metadata and representation-level materialization through
+`splice_buffer.h`; allocation/recycling lifecycle remains declared in
+`shiftbuffer.h` and `buffer_pool.h`. Ordinary buffers never contain this
+metadata.
 
 `sbufCreateSplice(pad_left)` initializes `{-1, -1}` pipe descriptors without a
 pipe syscall, including when pool refill allocates spare wrappers. Descriptor zero
@@ -115,6 +117,8 @@ The wrapper has one owner and serialized access. Copying metadata does not
 duplicate ownership. Splice wrappers must never carry `sbuf_lifetime_t` metadata.
 
 Checkout sets `kSbufFlagSplice`, which identifies the splice representation.
+Use the inline `sbufIsSplice(buf)` helper to query it on a valid buffer; it does
+not inspect payload bytes or require a pipe syscall.
 Any claimed body bytes must already be in the wrapper's private pipe. There is
 no separate body-location flag. An empty body may have an uninitialized pipe
 or an existing empty pair; empty-body helpers need no pipe creation.
@@ -131,6 +135,12 @@ capacity without advancing into metadata. Prepending within advertised padding
 is permitted. Inspecting or overwriting the kernel-backed body or control storage
 through generic byte accessors is not permitted; those accessors do not add
 splice checks. Opaque synchronous forwarding and size accounting remain valid.
+
+`sbufGetResidentPrefixLength()` returns the addressable prefix of a splice
+buffer, or the full length of an ordinary buffer. After successful pipe I/O,
+`sbufSpliceConsumeBody(buf, bytes)` updates length and logical capacity together
+without moving the cursor. This accounting helper does not read or discard pipe
+bytes itself; use it only for bytes already removed from the private pipe.
 
 #### Mode selection and pipe-backed reads
 
@@ -232,19 +242,19 @@ the dedicated pipe helpers and preserve exclusive buffer ownership.
 Converting B first reads BBB and leaves AAA intact, including when A is queued.
 Final stream delivery must still preserve A-before-B order. Pool access remains
 worker-affine; an explicitly transferred wrapper may use its receiving worker's
-pool. BufferQueue preserves these owned entries; BufferStream still requires
-ordinary resident payload.
+pool. BufferQueue preserves these owned entries. The fixed-header splice stream accepts ordinary and splice entries together;
+BufferStream is ordinary-only. Callers must not scan private-pipe metadata as payload.
 
 #### Conversion and partial reads
 
-`wioTransformSpliceBufferToRealBuffer(buf, dest, pool)` replaces an ordinary
+`sbufSpliceMaterializeToBuffer(buf, dest, pool)` replaces an ordinary
 destination payload with the real prefix and body, preserving the source cursor
 and total length. It checks destination capacity through sbuf accessors; the
 destination's allocation geometry, left padding, and lifetime remain unchanged.
 It recycles the consumed wrapper, which callers
 must not access afterward.
 
-`wioPartialReadSpliceBuffer(buf, dest, bytes)` appends exactly the requested
+`sbufSpliceReadToBuffer(buf, dest, bytes)` appends exactly the requested
 prefix/body bytes. It validates source length, cursor, and destination append
 space, without growing storage or consuming destination headroom. Zero bytes
 is a validated no-op. The caller retains both buffers and returns the wrapper
@@ -343,8 +353,8 @@ Empty queue destruction requires no worker context. TCP adapter pause queues
 use these same ownership rules; final stream delivery order remains the caller's
 responsibility.
 
-BufferStream copying, splitting, and coalescing still support ordinary resident
-payload only. NIO's internal WIO FIFO stores the owned wrappers directly.
+BufferStream accepts ordinary entries only. The fixed-header splice stream owns
+mixed representations for Mux; NIO's internal WIO FIFO stores owned wrappers directly.
 
 ## Prepending a Header: `sbufShiftLeft`
 
@@ -558,152 +568,362 @@ Buffer lifetime bugs are as common as line lifetime bugs. The rules:
   `lineCallWithRef()` / `lineCallWithRefWithBuf()`), only recycle buffers you still hold; do not touch the dead
   line's state to do it.
 
-### BufferStream chunk and exact-read contracts
+### BufferStream representation, inspection, and extraction contracts
 
-Use `buffer_queue_t` when individual buffer entries or chunk boundaries matter.
-Use `buffer_stream_t` for an ordered byte sequence, such as protocol parsing,
-byte inspection, or exact-length extraction. Internal stream boundaries are not
-message boundaries and need not match input chunks.
+`buffer_stream_t` accepts **ordinary resident buffers only**. Use its views,
+CRLF searches, exact/at-least/full reads, and `IdealRead()` only on ordinary
+input. Logical stream entries are storage boundaries, not protocol records.
+Push owns its input and preserves bounded ordinary coalescing: a positive input
+of at most 4 KiB may append to a tail with sufficient spare space. Exact reads
+preserve checked lengths and the explicit `use_left_padding` budget. Both stream
+implementations operate on bytes and owned buffers; they do not interpret or
+propagate `sbuf_lifetime_t` associations.
 
-`bufferstreamPush()` takes ownership on every path and may copy an input into
-the current tail and recycle the input before returning. Callers must not access
-the transferred buffer or pointers into it, depend on its allocation identity,
-or require one retained chunk per push. Payload contents and FIFO byte order
-are preserved; coalescing is permitted, not guaranteed.
+`bufferstreamMoveExactBytesTo()` validates the source range and destination append
+space before consumption. It appends into sufficient caller-owned ordinary
+storage without growing/replacing it or spending additional headroom.
 
-`bufferstreamReadExact()` returns exactly the requested positive number of
-available bytes, combining or splitting storage as needed. `ReadAtLeast()` may
-return more according to internal chunking. `IdealRead()` transfers an internal
-storage chunk efficiently, with no correspondence promised to pushes or wire
-records; it requires positive buffered length but can return a retained empty
-entry. `FullRead()` returns the complete buffered byte sequence, or `NULL` for
-zero logical bytes. Byte views and delimiter searches observe the same ordered
-bytes regardless of internal partitioning. Consumers needing a protocol boundary
-must parse it and request the appropriate length.
+Views and searches consume no bytes. Bounded searches examine only
+`[0, min(buffered, bound))`: a delimiter ending exactly at the bound matches;
+a delimiter crossing it does not. `FindCRLF` returns the CR offset and
+`FindDoubleCRLF` returns the offset after the delimiter. No-match leaves the
+output offset unchanged. `FindDoubleCRLFWithin` requires ordinary bytes.
+HTTP nodes remain ordinary-only and do not advertise splice support.
 
-The current push policy copies only a complete, positive input of at most 4 KiB
-that fits into the current tail's unused writable space. The resulting chunk
-can exceed 4 KiB. It never grows the tail, searches older entries, partially
-copies an input, or consumes left padding. Buffers with lifetime metadata are
-excluded from push coalescing. These are push-policy
-constraints, not guarantees that subsequent stream reads preserve identity or
-metadata.
+### Fixed-header splice stream
 
-Logical emptiness and buffered length measure bytes, not retained entries.
-Zero-length input is enqueued, and an eligible empty tail can absorb later bytes;
-it is not a message marker. Retained empty entries still require cleanup.
-Coalescing can reduce retained allocations and queue entries but does not replace
-protocol byte limits, retained-allocation limits where applicable, or
-backpressure. Pool recycling does not guarantee an immediate RSS reduction.
+`splice_stream_t` in `ww/bufio/splice_stream.{h,c}` owns a FIFO, an explicit active
+head, an immutable header size and a trailing resident header cache. It borrows
+its owner-worker pool. Construction checks object
+allocation arithmetic. Only Mux parents allocate the eight-byte-header object;
+children have no receive stream.
 
-Buffer queues preserve entries, but Debug insertion may replace an ordinary
-allocation to expose stale aliases. Splice wrappers retain their allocation and
-private pipe. Observe the queue API's returned retained pointer and
-ownership/failure contract.
+`splicestreamPush()` takes ownership on every result. It reserves fallible FIFO
+metadata before consuming any new header bytes; refusal recycles the submitted
+input while preserving existing bytes and costs. Empty inputs recycle immediately.
+Ordinary bytes, real resident splice prefixes and private pipe bodies maintain
+FIFO order. Push physically removes only missing header bytes from sources and
+recycles exhausted sources. The header cache owns only bytes.
 
-Exact reads transfer a whole matching chunk directly, even when its allocation
-is larger than its current length. BufferStream does not copy an entire chunk
-into smaller storage to save retained memory. Splitting uses ordinary best-fit
-pooled storage, including the medium tier. Merging keeps its existing append/grow
-path. There is no proportional-capacity allocator or automatic compaction step.
+`splicestreamPeekHeader()` returns a borrowed cache pointer only when complete;
+the pointer expires on mutation. Repeated peeks perform no I/O or allocation.
+`splicestreamLength()` includes cached header bytes; `splicestreamBodyBytes()`
+returns zero until the header is complete, then counts all following bytes.
+Neither peeking nor waiting for a body refills a second header.
 
-`use_left_padding` is the exact prefix budget `U` that an exact read may consume.
-Only `max(requested_bytes - U, 0)` is credited as the payload requirement; padding
-owned by onward consumers remains reserved. Small-tier results use that tier's
-padding; other new allocations request at least the large tier's reserved padding. Splits clone ordinary lifetime metadata; whole
-chunks keep their association. Existing byte-stream merge semantics still apply.
-`IdealRead()` retains its internal-chunk transfer contract.
+`splicestreamMoveFrame(stream, destination, N)` consumes the current cached header
+**and exactly N body bytes**. Header readiness and complete body availability are
+caller preconditions, together with an empty destination; Debug asserts these
+without repeating the decoder's availability checks in Release. The supplied
+destination transfers ownership; always use the
+returned pointer because fallback may recycle/replace the supplied allocation.
+A NULL destination selects ordinary output, including after failed pipe checkout.
+The result preserves full onward pool padding. Ordinary-only ranges remain
+ordinary. `splicestreamMoveFrameToOrdinary()` has the same caller preconditions
+and retains fatal checks for ordinary destination type and sufficient storage
+before consuming; it never grows or replaces the destination.
+After the body completes, the stream clears its cache and gathers only the next
+header. N=0 consumes one zero-body frame. With header size zero, extraction is an
+exact body move with no header discard or look-ahead.
 
-`bufferstreamMoveExactBytesTo(stream, destination, bytes)` appends exactly the
-requested bytes into caller-owned ordinary storage. It validates source length
-and destination append space before consumption; insufficient bytes or space
-terminate the program. Zero bytes is a no-op. The destination must not belong
-to the stream. Its allocation, cursor, and reserved padding stay unchanged, and
-this helper does not apply `use_left_padding` to it. Callers prepare any permitted
-prefix space themselves.
+Pipe-backed extraction can split one source pipe or combine several independently
+owned sources into a new private pipe. Whole suitable wrappers transfer directly.
+Ordinary ranges and real prefixes copy/write in order; pipe bodies use nonblocking
+pipe-to-pipe `splice()`. Positive short progress accumulates and EINTR retries.
+Only successful transfers advance lengths; body consumption never moves the cursor
+into metadata at `buf + l_pad`. No descriptors have two owning wrappers.
 
-The move walks queued sources directly with `memoryCopyLarge()`, recycling fully
-consumed entries and advancing a partial source in place. It does not allocate
-or grow destination storage, merge source chunks, or copy an unrelated remainder.
-Both source and destination must contain ordinary resident data.
-
-Existing destination lifetime metadata is preserved. An empty destination with
-no metadata inherits the first contributing source's association: a full source
-transfers it, while a partial source clones it. Empty source entries are recycled
-without supplying the association. Further sources follow ordinary byte-stream
-merge semantics: their independent associations are not aggregated into the
-result and settle as those sources are recycled. Appending to an existing payload
-does not replace its association, including when that association is NULL.
+Pipe destination capacity is fallible: nominal `F_GETPIPE_SZ` does not prove slot
+availability. Creation/growth failure, unsupported destinations and destination
+pressure select complete ordinary fallback, not process termination. Allocate the
+final best-fit result first, drain only the actual assembled destination bytes,
+then append the still-unmoved source range. Return exactly N ordered bytes once,
+leaving unrequested suffixes intact. Missing claimed source bytes or invalid owned
+descriptors remain fatal invariants. Exact transfer primitives live in
+`splice_buffer`, independently of Mux and the event loop.
 
 ### MUX parent streams and decoded child queues
 
-MuxClient and MuxServer accumulate encoded parent bytes in `buffer_stream_t`.
-They must use the shared Mux frame helpers, which validate the complete eight-byte
-header and declared payload length before consumption. `muxPeekCompleteFrame()`
-allows child lookup before choosing ordinary extraction or `muxReadFrameForQueue()`
-for a paused child. `muxReadCompleteFrame()` remains the combined peek/read helper.
-Never replace frame extraction with arbitrary `IdealRead()`/`FullRead()` chunks. Parent coalescing changes storage
-boundaries, not MUX wire-frame boundaries.
+Mux uses this exact eight-byte wire header, separate from decoded host fields:
 
-Decoded `Data` waiting for a paused child belongs in `pending_child_data`, a
-`buffer_queue_t`. Preserve one entry and one onward payload callback per decoded
-frame, including zero-length `Data`; drain based on entry count, not logical byte
-count. An empty Data body still has a wire header and is not an empty carrier
-input or a close signal. Keep the existing logical flow-control and actual
-allocation-charge accounting separate.
+| Offset | Size | Meaning |
+| --- | --- | --- |
+| 0 | 3 bytes | Unsigned payload length, big-endian. |
+| 3 | 1 byte | Frame type/flags. |
+| 4 | 4 bytes | Unsigned connection ID, big-endian. |
 
-Mux owns its paused-child retention policy. After peeking a complete Data header
-and looking up the child, it chooses small or 64 KiB medium storage before
-extracting a paused frame. `bufferstreamMoveExactBytesTo()` copies only that frame
-into the final destination, avoiding an intermediate merge and later retention
-copy. The wire header temporarily uses Mux's eight-byte prepend budget; removing
-it restores the destination's full pool headroom. A suitable whole source chunk
-is transferred directly. Unpaused delivery keeps its existing exact-read path.
+The inclusive payload maximum is **1 MiB (1,048,576 bytes)** for every frame
+type, independent of RAM profile, buffer sizes and requested or granted pipe
+capacity. A maximum frame occupies 1,048,584 wire bytes; a preceding Open adds
+another eight bytes (1,048,592 total). Decoding rejects a larger declaration as
+soon as all eight header bytes arrive, even for unknown CIDs or types, and closes
+only that parent through normal parent-loss cleanup. Permitted frames wait for
+the complete body; unknown frames consume their declared body and empty Data
+still produces one delivery. Complete frames drain before the incomplete
+remainder is checked against **1,048,584 bytes**, including its cached header.
 
-Queue admission still checks whether a supplied payload needs smaller pooled
-storage, so other queue callers keep the same bounded retention behavior.
-BufferStream itself makes no retention or pool-tier decision in the new helper.
+Open=0, Close=1, FlowPause=2, FlowResume=3 and Data=4 retain their meanings; CID
+uses the full 32-bit range. The serializer uses `mux_wire_header_t`; decoded
+`mux_frame_t` has a 32-bit length and must never be copied as wire bytes.
+Both Mux decoders wait for the complete permitted body. Extraction
+returns only the body: do not shift away another eight bytes. Control/unknown-CID
+frames consume their declared bodies too. Data delivers once per wire frame,
+including empty Data. Paused children retain one queue entry per frame. After
+callbacks, physical references protect allocation life and logical life/state
+checks decide whether sibling parsing may continue.
 
-All Mux wire frames (at most 65,527 payload bytes plus an eight-byte header) fit
-in medium payload capacity. Copying a paused frame therefore does not need a
-separate variable-sized allocation in normal pool geometry. The child, parent,
-and detached hard limits still charge the actual retained allocation, including
-padding, header, and alignment overhead. Logical Pause/Resume thresholds and FIFO
-frame boundaries are unchanged.
+MuxClient owns normal parent lines and borrows children. MuxServer borrows parents
+and owns children created on Open. Splice support changes neither direction nor
+Finish/lifetime rules. Complete frames in a large delivery drain before checking
+the logical incomplete-carrier overflow limit.
 
-MUX framing is not general UDP boundary preservation. Both encoders split child
-payloads larger than 65,527 bytes, and decoding does not recover the original
-callback boundary. Child-side transforms can also split or combine payloads.
-Use the UdpOverTcp pair around a UDP flow's byte-stream portion rather than
-depending on direct UDP/MUX adjacency; observe that pair's own payload limits.
+#### Queue-capacity budgets
+
+Mux uses one **queue-capacity charge** for every owned buffer:
+
+```text
+sizeof(sbuf_t) + sbufGetTotalCapacity(buf) + kSbufAllocationAlignment
+```
+
+Capacity includes reserved left padding. Ordinary entries therefore retain their
+allocation-based charge; splice entries charge logical sbuf capacity, without
+adding wrapper control storage or kernel pipe capacity. Unknown cached pipe
+capacity does not force a valid retained source into ordinary storage.
+
+The sbuf header and alignment overhead are each 32 bytes. For example, after a
+read delivers 100 body bytes into a splice wrapper with 64 bytes of left padding:
+
+| Value | Bytes |
+| --- | ---: |
+| `sbuf->len`, before any prepend | 100 |
+| `sbuf->capacity`, including padding | 164 |
+| Queue-capacity charge: `32 + 164 + 32` | **228** |
+
+The charge stays 228 bytes even if the private pipe supports 1 MiB. This formula
+does not add kernel capacity or the wrapper's control storage. Use
+`sbufGetAllocationCharge()` when the question is the wrapper's actual userspace
+allocation instead. An ordinary buffer holding 100 bytes still charges its full
+allocated capacity, which can be larger than its length.
+
+The boundaries below have different scopes and units. A **parent** is one Mux
+carrier connection; its **children** are the streams multiplexed through it.
+
+| Boundary | Default | Scope and behavior at the boundary |
+| --- | --- | --- |
+| Splice socket read request | **1 MiB**; **64 KiB in S1/S2** | Upper bound per read attempt. A positive short transfer produces a shorter valid buffer; remaining bytes wait for a later read. |
+| Payload in one Mux frame | **1 MiB** | Independent protocol maximum. A larger declaration closes that parent as soon as its complete eight-byte header is decoded. |
+| Incomplete incoming frame | **1 MiB + 8 bytes** | Logical bytes, including the cached header. Complete frames drain first; an oversized incomplete remainder closes the parent. |
+| `child-buffer-limit` | **24 MiB charge** | One child's queued decoded data. Reaching the limit closes that child. |
+| `parent-buffer-limit` | **48 MiB charge** | Incoming stream plus all attached child queues on one parent. At the limit, try beneficial incoming compaction, then shed largest queued children. Unrelieved pressure closes the parent. |
+| `parent-write-buffer-pause-threshold` | **8 MiB charge** | One outgoing parent FIFO. Reaching it pauses child producers while the FIFO drains. |
+| `parent-write-buffer-limit` | **16 MiB charge** | One outgoing parent FIFO, including admitted frame batches. Equality is allowed; exceeding it refuses the new output and closes that parent. |
+| `detached-buffer-limit` | **32–256 MiB charge**, by RAM profile | Per Mux instance/worker, for blocked child queues retained after parent loss. Reaching it closes the newly detached blocked child. L2 defaults to **256 MiB**. |
+| `detached-child-limit` | **4,096–12,000 children**, by RAM profile | Count of those detached blocked children on one Mux instance/worker. Reaching it closes the newly detached blocked child. L2 defaults to **12,000**. |
+
+The named queue settings are JSON-overridable. `parent-buffer-limit: 0` disables
+the combined receive limit; it leaves individual-child and protocol limits in
+force. The two detached limits also support `0` independently. Outgoing limits
+stay positive, with pause threshold below hard limit. The read size follows the
+pool/RAM profile, while the Mux frame maximum remains independent of it.
+See the [MuxClient](../02-noderefs/MuxClient.mdx) and
+[MuxServer](../02-noderefs/MuxServer.mdx) references for complete settings and
+profile tables. Connection-count, idle-timeout, and server admission settings
+remain separate from these buffer boundaries.
+
+`parent-buffer-limit` (48 MiB by default) covers incoming frame assembly plus
+all attached child queues. The stream counter remains separate from the child
+aggregate, and their sum is checked at stable return boundaries. Complete frames
+in a coalesced delivery drain first, even if its temporary charge exceeds the
+limit. Cached header bytes count toward the independent 1,048,584-byte incomplete
+frame bound, but the header cache and stream/queue metadata carry no sbuf charge.
+Active splice-head body consumption reduces logical capacity and its charge;
+prefix consumption and ordinary cursor movement do not reduce capacity.
+
+```text
+parent_receive_charge = incoming_stream_charge
+                      + sum(attached_child_queue_charges)
+```
+
+Reaching a finite receive limit first attempts to combine incoming fragments
+into one ordinary best-fit buffer, only if its predicted total charge is strictly
+lower. Compaction preserves the cached header and exact byte order. It does not
+run on every Push or rewrite child/output queues. Remaining pressure sheds the
+largest queued child, preferring the oldest on ties, and rechecks after every
+callback. Several victims may be needed. No victim or no progress closes only
+that parent through normal parent-loss cleanup. A zero parent limit disables
+this combined finite bound; it introduces no other aggregate cap.
+
+`child-buffer-limit` remains 24 MiB by default and rejects equality. Outgoing
+parent queues remain separate: their pause threshold is 8 MiB, hard limit is
+16 MiB, and hard-limit equality is permitted. Detached queues retain their
+per-worker settings and zero/unlimited meanings. FlowPause/FlowResume continue
+to count logical payload bytes. Ordinary child candidates may still compact to
+a cheaper pooled tier; valid splice candidates are not individually materialized
+for queue pressure.
+
+There is no worker-wide pipe-count or pipe-capacity quota. Other parents cannot
+force fallback through shared pipe reservations. These charges are not physical
+memory, FD, kernel page-reference, socket-queue or RSS bounds, nor a strict
+instantaneous memory ceiling. More retained splice data can use more descriptors
+and nominal kernel capacity under the same logical budget. Pools may cache empty
+pipes after recycling; lower charge does not prove those resources were closed.
+
+`sbufTryGetQueueCharge()` checks the scalar formula, including 32-bit overflow;
+`sbufGetQueueCharge()` is the internal representable-result helper.
+`splicestreamCharge()` exposes source ownership, while `splicestreamCompact()`
+performs the explicit beneficial pressure operation. Queue entries are immutable;
+the mutable active head reconciles its charge after every consumption. Extraction
+settles source charge before a result is forwarded or charged to a child queue.
+Parser depth defers combined enforcement across nested complete-frame delivery;
+pressure cleanup prevents recursive enforcement and requires progress after Close.
+
+### Mux allocation and data flow
+
+For a Data frame addressed to a live child, the receive direction from the
+carrier socket follows this path:
+
+```mermaid
+flowchart TD
+    A["Mux TCP socket"] --> B["Ordinary buffer or splice wrapper with private pipe"]
+    B --> C["Incoming stream: gather eight-byte header"]
+    C --> D{"Complete frame body available?"}
+    D -- No --> W["Wait for more socket data"]
+    W -. Next delivery .-> B
+    D -- Yes --> E["Extract one complete frame body"]
+    E --> F{"Child writable?"}
+    F -- Yes --> G["Forward to child and its write path"]
+    F -- No --> H["Retain in child queue"]
+    H -- Resume --> G
+```
+
+Incoming-stream sbufs and all attached child queues share the parent's receive
+budget. A forwarded result leaves Mux ownership; socket-adapter write queues
+have their own ownership and are outside this Mux budget.
+
+| Object or storage | When allocated or obtained | How it is released |
+| --- | --- | --- |
+| Worker buffer pools and caches | Runtime/worker setup; ordinary tiers and splice wrappers refill through their pools. | Worker/runtime teardown after their users have drained. |
+| Parent-only Mux state | Parent initialization. Includes the child map, outgoing queue, and incoming stream. | Normal parent-loss/Finish cleanup. |
+| `splice_stream_t` and its eight-byte header cache | One allocation per parent, with the cache trailing the stream object. | Parent stream destruction; the cache is not a separate sbuf. |
+| Child state and pending queue | Child initialization. The queue requests initial room for eight entries and can grow. | Child cleanup, or completion of its detached drain. |
+| Ordinary sbuf or splice wrapper | Checked out from the owning worker's pool when data or framing needs it. | Forwarded to its next owner, recycled when consumed/discarded, or physically destroyed by pool policy. |
+| Private pipe pair | Created lazily when a checked-out splice wrapper needs it; an existing cached pair is reused. | Healthy empty pairs can remain pooled; physical wrapper destruction closes them. |
+
+Opening a child does not allocate a pipe for it. Queue-entry storage grows as
+needed; the initial eight-entry reservation is not a maximum number of buffered
+frames. Each splice wrapper still owns its own pipe exclusively.
+
+1. **Read into an owned buffer.** The event loop checks out a wrapper containing
+   the normal 32-byte sbuf header, left padding, and 32 bytes of control storage.
+   It moves socket bytes into the private pipe before handing the buffer to a
+   callback. Only actual positive progress becomes its logical length/capacity.
+   Ordinary fallback instead obtains resident storage from the buffer pool.
+
+2. **Gather the Mux header.** The incoming stream takes ownership and physically
+   consumes only the missing header bytes into its eight-byte cache. Three bytes
+   arriving first, then five bytes plus part of the body, complete the header
+   without requiring the body to become resident. An exhausted source is
+   recycled; any remaining body stays in its buffer or pipe while waiting.
+
+3. **Extract a complete body.** A suitable whole source buffer can transfer
+   directly. A body spanning several inputs, or using only part of one input,
+   gets an independent result assembled in order. Pipe bodies can move
+   pipe-to-pipe; resident prefixes and ordinary sources are copied or written
+   as needed. The caller must use the returned buffer because ordinary fallback
+   can replace its proposed destination.
+
+4. **Deliver or retain for the child.** Writable children receive the result
+   immediately. Paused children retain one entry per decoded frame. Source
+   charges settle before the result is forwarded or added to a child queue.
+   A split source remainder and a retained output each contribute their own
+   charge; a whole-buffer handoff is not charged twice.
+
+5. **Enforce receive retention after complete frames drain.** Mux adds incoming
+   stream charge to attached child queue charge. Under pressure, only a strictly
+   cheaper ordinary representation justifies combining incoming fragments.
+   After any compaction, remaining pressure follows the largest-child/oldest-tie
+   and parent-close policy in the limits table. Compaction preserves the cached
+   header. It does not run on every Push or rewrite existing child/output queues.
+   Ordinary child candidates
+   retain their separate smaller-pool compaction behavior; a large kernel pipe
+   alone does not cause a splice child buffer to be materialized.
+
+6. **Encode the opposite direction toward the parent.** A fitting child payload
+   receives its frame header in reserved left padding and can go directly to a
+   writable parent when ordering permits. Paused parent output is queued inside
+   Mux. At the outgoing pause threshold, child producers are paused. They resume
+   when the FIFO is empty and the parent is writable, still respecting other
+   pause reasons. Large splice inputs are staged as complete ordered batches;
+   admission precedes callbacks and Open precedes the first Data frame. A failed
+   batch cannot publish just its first frames.
+
+7. **Consume, recycle, or finish.** Once forwarded to an adapter, a buffer leaves
+   Mux's queue accounting. Socket writes may send only part of its real prefix or
+   pipe body; the write queue owns the remainder. Recycling discards unread body
+   bytes and may cache a healthy empty pair. A wrapper has no source-socket
+   reference, so closing its original reader cannot invalidate its private body.
+   Parent loss discards its incoming stream and outgoing FIFO; eligible already
+   decoded child queues can finish under the detached-child budgets.
+
+### Mux buffer edge cases
+
+| Situation | Result |
+| --- | --- |
+| Pipe creation fails at socket read | Checkout recycles the unused wrapper and ordinary socket reading takes over for that delivery. Splice mode remains available for later reads. |
+| Pipe capacity query/growth fails | An initialized pipe remains usable at its existing capacity. A shorter successful read is valid. |
+| Socket-to-pipe splice returns `EAGAIN` or zero | Recycle the empty wrapper and try an ordinary nonblocking receive. That receive distinguishes no-data-yet from EOF and handles TCP urgent-data boundaries. |
+| Destination pipe fills during frame assembly | Return a complete ordinary fallback, preserving bytes already moved and appending the remaining source bytes exactly once. |
+| A read of claimed private-pipe bytes is short or interrupted | Accumulate positive progress and retry `EINTR`. EOF, `EAGAIN`, or another failure before the claimed range is complete remains a fatal invariant. This is different from a short socket read. |
+| One small splice buffer would become a larger pooled ordinary buffer | Skip pressure compaction when it would not strictly reduce total incoming charge. Kernel pipe capacity alone does not justify conversion. |
+| One delivery contains many complete frames | Drain complete frames before checking combined retained receive charge. The limit is not an instantaneous ceiling on the current delivery. |
+| A configured parent budget cannot fit the incomplete frame | After beneficial compaction and available child shedding, close only that parent; do not loop indefinitely or abort the process for ordinary limit pressure. |
+| A child dies while its encoded data is queued to the parent | The parent still owns the admitted output and preserves its ordering until sent or discarded by parent cleanup. |
+| Parent loss leaves decoded data for blocked children | Eligible queues detach and can drain independently, subject to their existing per-worker charge/count limits. The parent's unparsed input and outgoing data are discarded. |
+| A callback closes a child or parent during delivery or pressure recovery | Hold the required temporary line reference and recheck logical life/state before continuing. A reference protects allocation life, not permission to use destroyed state. |
+| Empty input or a zero-length Data frame | Empty incoming sbufs recycle without creating a frame. An actual zero-length Data frame remains valid and produces one delivery; an allocated empty result can still carry queue charge. |
+
+The queue-capacity formula and ownership transitions do not promise that physical
+RAM, descriptors, or cached pipe capacity fall when a charge is released. Runtime
+I/O failures and the fatal claimed-byte invariants remain separate from configured
+queue overflow and its connection-level cleanup.
 
 ### MUX outgoing parent queues
 
-Outgoing encoded Open, Data, Close, and flow-control frames share one lazy
-`buffer_queue_t` per parent, separate from incoming `pending_child_data` queues.
-Parent Pause stops parent-bound Payload immediately; retained output outlives its
-originating child. FIFO admission and Open/flow-state publication precede any
-forwarding or child notification that can re-enter Mux.
+Inputs from zero through 1 MiB inclusive keep the in-place single-buffer path;
+zero emits one Data header. The frame cap limits payload, not a local callback.
+Large ordinary inputs keep
+the ordinary aggregate encoder. A large splice input, including a real resident
+prefix, splits into independently owned Data bodies of at most 1,048,576 bytes.
+A real 1 MiB pipe body plus a resident prefix can exceed this cap and still requires splitting.
+The encoder stages **the complete batch before any callback**, with Open before
+first Data for a new client CID. It uses the shared exact range-transfer fallback;
+no temporary stream is allocated around one encoder input.
 
-`parent-write-buffer-pause-threshold` defaults to 8 MiB of retained allocation
-charge, and `parent-write-buffer-limit` defaults to 16 MiB. Both accept positive
-integers up to `INT_MAX`; the final threshold must be below the limit. Omitted
-settings independently use their defaults. Each parent gets its own budget.
-Admission rejects a projected charge strictly greater than the hard limit before
-queue ownership transfers; equality is allowed. Reservation refusal and overflow
-close that parent locally. Small controls use fitting ordinary pooled buffers
-with onward padding. A writable, empty, inactive FIFO permits direct delivery
-without queue allocation, including buffers larger than the retention budget.
+Batch preflight includes checked wire/frame counts, existing parent backlog,
+staged queue-capacity charges. Pipe estimates use completed logical sbuf capacity,
+not the empty wrapper or nominal kernel capacity. Reserve the remaining
+frames' ordinary allocation costs before selecting expensive pipes, so greedy
+pipe choices cannot refuse a batch that fits as ordinary. Reserve all parent FIFO
+entries before publication. Failure recycles the whole local batch and remainder,
+publishes no Open state or output charge, and closes only the affected parent.
 
-The running charge accounts for the exact retained pointer returned by insertion;
-Debug replacement preserves ordinary allocation geometry. Pop subtracts the
-charge before transferring ownership. Parent Resume does not reset accounting.
-Child-wide callbacks occur only on a real local gate transition, using referenced,
-attachment-checked snapshots. Release waits for empty plus writable and preserves
-peer-flow pressure. Parent loss and owner Stop discard outgoing backlog; incoming
-detached-drain accounting and `parent-buffer-limit` retain their existing meanings.
-These outgoing thresholds measure allocation charge; incoming child FlowPause and
-FlowResume thresholds still measure logical payload bytes.
+After admission, all frames belong to the parent. Publish wire state before gate
+notifications or payload callbacks. The guarded pump preserves FIFO and stops
+immediately on Pause. Resume continues the admitted remainder; nested payload or
+reentrant child Close queues after it. Parent death discards undelivered frames.
+Quiescence admits no new stream work, child, batch or protocol output.
+
+`parent-write-buffer-pause-threshold` still defaults to **8 MiB** and
+`parent-write-buffer-limit` to **16 MiB** of queue-capacity charge. Positive
+JSON integers through `INT_MAX` are accepted with threshold below limit. Every
+split splice batch must fit the hard limit even when the transport is writable;
+unusually small limits can therefore reject a large splice delivery before any
+frame is sent. The existing fitting single-buffer direct path remains eligible
+for immediate delivery without FIFO admission. Gate release still waits for
+empty plus writable and preserves peer-flow/terminal-close reasons.
+
+MUX boundaries are wire-frame boundaries, not original callback or general UDP
+datagram boundaries. Use explicit UdpOverTcp framing for UDP byte-stream transport.
 
 ### Stream delivery headroom and datagram framing
 
@@ -736,10 +956,10 @@ Do not treat that content length as a memory charge when a security or resource
 limit specifically promises to bound allocations retained by a live queue. An
 empty or one-byte `sbuf_t` can still retain its full capacity, left padding,
 header, and allocator alignment overhead. Memory-sensitive code that needs such
-a hard bound—currently the Mux incoming child/parent/detached limits and outgoing parent FIFO—must keep
-a separate actual-allocation charge. This stricter accounting is specialized;
-it must not replace logical length in ordinary buffer queues or in Mux's
-incoming-child payload-based pause and resume thresholds.
+a hard bound must keep a separate storage/resource charge. Mux's child, parent,
+detached and outgoing queues use the queue-capacity policy above; it deliberately
+does not bound physical kernel resources. It must not replace logical length in
+BufferQueue or in incoming-child FlowPause/FlowResume thresholds.
 
 `sbufGetAllocationCharge(const sbuf_t *buf)` is the canonical O(1) charge for an
 allocated buffer's own userspace storage. For ordinary buffers it returns
@@ -751,8 +971,16 @@ The helper works before pipe initialization, makes no allocation or syscall, and
 reads no payload bytes. Cursor movement, consumption, and prepending leave the
 charge unchanged unless storage is replaced. It excludes kernel pipe memory,
 referenced lifetime-object allocations, allocator bookkeeping beyond explicit
-alignment overhead, and pool/queue storage. Making accounting splice-aware does
-not make Mux splice-capable.
+alignment overhead, and pool/queue storage. The separate queue-charge helpers use sbuf capacity for both representations. This does not change `sbufGetAllocationCharge()` or
+BufferQueue's logical-byte accounting.
+
+`bufferpoolQueryBestFit()` predicts ordinary storage without allocating, consuming
+a cache entry, or making a reservation. It shares tier selection with
+`bufferpoolGetBestFit()` and reports aligned payload capacity, left padding,
+allocation charge, and whether a configured pool tier fits. Unrepresentable
+geometry returns false without changing the output. Predictions remain valid
+while pool geometry is unchanged. Mux uses this query for ordinary compaction
+and batch fallback reservations; compaction still requires a smaller pooled tier.
 
 ### Buffers transferred to scheduled line tasks
 
