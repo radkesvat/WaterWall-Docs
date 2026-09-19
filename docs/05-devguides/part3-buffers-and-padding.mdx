@@ -32,7 +32,6 @@ struct sbuf_s
     uint32_t capacity;     // ordinary: storage capacity; splice: logical geometry
     uint16_t l_pad;        // reserved left padding (constant once created)
     uint16_t flags;
-    sbuf_lifetime_t *lifetime; // optional ordinary-buffer ownership association
     uint8_t  buf[];        // 32-byte aligned data
 };
 ```
@@ -114,7 +113,7 @@ pipes are never shrunk. Pipe close clears the capacity and retry state so a new
 pair starts fresh. Pipe creation failure returns `-1` with `errno`, leaving the
 pair uninitialized; unsupported builds use `ENOSYS`.
 The wrapper has one owner and serialized access. Copying metadata does not
-duplicate ownership. Splice wrappers must never carry `sbuf_lifetime_t` metadata.
+duplicate ownership. Ordinary and splice buffers carry no generic ownership callbacks.
 
 Checkout sets `kSbufFlagSplice`, which identifies the splice representation.
 Use the inline `sbufIsSplice(buf)` helper to query it on a valid buffer; it does
@@ -250,7 +249,7 @@ BufferStream is ordinary-only. Callers must not scan private-pipe metadata as pa
 `sbufSpliceMaterializeToBuffer(buf, dest, pool)` replaces an ordinary
 destination payload with the real prefix and body, preserving the source cursor
 and total length. It checks destination capacity through sbuf accessors; the
-destination's allocation geometry, left padding, and lifetime remain unchanged.
+destination's allocation geometry and left padding remain unchanged.
 It recycles the consumed wrapper, which callers
 must not access afterward.
 
@@ -337,7 +336,7 @@ Splice insertion retains the original wrapper and private pipe in every build.
 It neither copies metadata as payload nor converts or consumes the body.
 Splice entries must already own any claimed body bytes in their private pipes;
 empty and prefix-only wrappers need no initialized pipe.
-Splice lifetime metadata must remain null. Ordinary Debug insertion
+Ordinary Debug insertion
 continues to replace allocations to detect stale aliases.
 
 Successful insertion transfers ownership to the queue. Failed try-insertion
@@ -507,8 +506,7 @@ hand-rolling growth.
 `sbufCreateSplice(pad_left)` directly allocates an empty buffer with exactly
 32 bytes of payload capacity, plus left padding rounded up to a 32-byte
 boundary. Its payload capacity stays at 32 bytes regardless of the CPU cache
-line size. The buffer starts with zero length, only `kSbufFlagSplice` set, and no lifetime
-metadata; `sbufDestroy()` releases a live splice allocation and its private pipe.
+line size. The buffer starts with zero length, only `kSbufFlagSplice` set; `sbufDestroy()` releases a live splice allocation and its private pipe.
 Cached splice-tier entries use `sbufDestroySplice()` even with reset flags.
 
 ### Ordinary TCP and UDP receive sizing
@@ -576,8 +574,9 @@ input. Logical stream entries are storage boundaries, not protocol records.
 Push owns its input and preserves bounded ordinary coalescing: a positive input
 of at most 4 KiB may append to a tail with sufficient spare space. Exact reads
 preserve checked lengths and the explicit `use_left_padding` budget. Both stream
-implementations operate on bytes and owned buffers; they do not interpret or
-propagate `sbuf_lifetime_t` associations.
+implementations operate exclusively on bytes and owned buffers. Fragment
+assembly belongs to the device reader session; no claim, callback, sidecar token,
+or hidden padding metadata follows a packet through buffer transforms.
 
 `bufferstreamMoveExactBytesTo()` validates the source range and destination append
 space before consumption. It appends into sufficient caller-owned ordinary
@@ -941,7 +940,7 @@ has no such pending stream queue.
 UdpOverTcp's negotiated TCP mode splits a large payload into wire frames of at
 most 65,505 bytes each, with the existing two-byte lengths. The encoded frames
 are emitted together in one callback, so an onward Pause cannot leave a local
-fragment sequence unfinished. Ordinary lifetime metadata follows the aggregate.
+fragment sequence unfinished.
 UDP mode still treats each callback as one datagram and drops oversized input;
 it must never split a datagram to accommodate the larger ordinary read tier.
 
@@ -970,7 +969,7 @@ Splice capacity and length are logical, so they cannot measure wrapper storage.
 The helper works before pipe initialization, makes no allocation or syscall, and
 reads no payload bytes. Cursor movement, consumption, and prepending leave the
 charge unchanged unless storage is replaced. It excludes kernel pipe memory,
-referenced lifetime-object allocations, allocator bookkeeping beyond explicit
+allocator bookkeeping beyond explicit
 alignment overhead, and pool/queue storage. The separate queue-charge helpers use sbuf capacity for both representations. This does not change `sbufGetAllocationCharge()` or
 BufferQueue's logical-byte accounting.
 

@@ -257,6 +257,76 @@ If you need real per-flow or per-connection lifecycle behind packet traffic,
 **create normal lines behind the packet side** — do not try to make the packet
 line behave like a connection.
 
+## Device ingress fragment policy
+
+TunDevice and RawSocket require `fragment-policy`, either `reassemble` or
+`preserve-fragments`. Omission or an invalid value rejects startup. The policy
+is immutable for the reader session and is passed explicitly on all TUN and
+capture backends. RawSocket requires the setting even when capture is disabled;
+path validation applies only to active sources.
+
+Validation follows the source's actual publication direction through the final
+expanded topology. The supported path matrix is deliberately finite:
+
+| Policy | Supported ingress path |
+| --- | --- |
+| `reassemble` upstream | Source, optional Disturber nodes, PacketsToConnection |
+| `reassemble` downstream | Source, optional Disturber nodes, ConnectionToPackets |
+| `preserve-fragments` either direction | Source, audited same-direction packet transforms, external TunDevice/RawSocket egress or BlackHole/PacketReceiver sink |
+
+The audited raw transforms are Disturber, PingClient, PingServer, IpOverrider,
+and IpManipulator (including its ProtoSwap trick). BlackHole is an upstream-only
+sink. Packet/stream bridges, routing branches, direction
+changes, unknown transforms and other mixed paths reject startup with an explicit
+unsupported-path diagnostic. A stream buffer does not establish an external I/O
+boundary. Local-stack consumers cannot be reached through raw mode. Normalization
+is not selected from chain membership or the presence of a stack node elsewhere.
+
+Reassembly accepts the existing 20-byte IPv4-header subset, exact total length,
+valid header checksum, nonempty payload, aligned nonfinal fragments, and payload
+ends at most 65,515. Ordinary unfragmented/non-IPv4 input bypasses assembly.
+One session owns all incomplete bytes; no incomplete datagram is published.
+Completion requires fragment zero, consistent final end and gap-free coverage.
+Fragment zero supplies the header including TOS, TTL, reserved and DF bits; MF
+and offset are cleared, total length and IPv4 checksum are rebuilt. Transport
+bytes and checksums are unchanged. Downstream transport validation remains active.
+Overlaps are dropped without overwriting accepted bytes; conflicting ends and
+range exhaustion poison the identity. Raw overlapping zero with staged tails
+also poisons, preserving the former local rejection rule.
+
+Each session has at most 256 entries, 16 disjoint ranges per entry, and 8,192
+accepted fragments per datagram (enough for a maximum IPv4 datagram composed of
+minimum-size fragments). Normalized storage is bounded to 4 MiB of actual sbuf
+allocation charge, including capacity, padding, header and explicit alignment
+overhead. This accommodates dozens of full datagrams while bounding sparse-tail
+attacks. Growth reserves old plus new allocations simultaneously and copies only
+accepted ranges. Raw mode retains at most 16 pre-zero tails per entry and 256
+in total, under a separate 32 MiB actual allocation-charge limit, allowing the full
+16-tail staging window even with 1 MiB device receive buffers plus overhead. Fixed entry and
+range arrays bound metadata separately. These limits exclude pool caches and RSS.
+
+Entries expire after 15 seconds without deadline refresh. Refusal/expiry keeps
+one fixed 15-second local poison interval; retries do not extend it. Opportunistic
+sweeping can retain bounded expired storage while idle. Retirement releases all
+storage after reader join and pool-owner reset; poison survives restart until its
+local deadline. No downstream timer epoch or residue receipt controls this owner.
+IPv4 identification reuse still has the protocol's inherent delayed-fragment
+ambiguity.
+
+Completed packets retain onward padding and select workers using the ordinary
+whole-packet flow hash. Queued session messages still reject stale generations.
+Once delivered, complete packets follow ordinary buffer ownership, including
+delays, duplication and drops; there is no late device-generation receipt. Raw
+mode preserves fragment bytes and boundaries and stages tails until fragment
+zero supplies port-based worker affinity, but makes no downstream residue or
+post-publication generation guarantee.
+
+Only the audited local-stack paths accept complete datagrams up to 65,535 bytes.
+Global 1,500-byte packet/stream and raw-egress limits and device-MTU checks remain.
+Fragment-sensitive transforms are excluded from normalized paths. Fake DNS sees
+a complete normalized UDP query; non-device fragmented queries retain its existing
+fragment rejection behavior.
+
 ## Linux capture conntrack policy
 
 `RawSocket` uses one `bypass-conntrack` setting for capture and raw output,
@@ -356,8 +426,8 @@ For an unfragmented packet, capture attempts to finish this pending kernel work
 when its headers can be interpreted safely. If completion cannot be performed,
 the bytes remain unchanged and capture still admits the packet. Without that
 metadata, capture neither validates nor rewrites checksums. Fragments are not
-normalized here: the existing shared fragment-affinity checks, staging, and
-settlement rules still apply and can reject them. Windows capture retains its
+normalized here: the selected shared fragment policy validates them and may stage, reassemble, or
+reject them. Windows capture retains its
 checksum-provenance validation policy.
 
 ## ProtoSwap checksum representation
