@@ -154,7 +154,7 @@ The fields you will set most often (all defined in `ww/objects/node.h`):
 | --- | --- |
 | `type` / `hash_type` | The string used in JSON `"type"`, plus its precomputed hash. |
 | `createHandle` | The `TunnelCreateHandle` that builds the instance. |
-| `flags` | One or more `node_flags`: `kNodeFlagChainHead`, `kNodeFlagChainEnd`, `kNodeFlagNoChain`, `kNodeFlagSingleton`, `kNodeFlagSupportsSplice`. |
+| `flags` | One or more `node_flags`: `kNodeFlagChainHead`, `kNodeFlagChainEnd`, `kNodeFlagNoChain`, `kNodeFlagSingleton`, `kNodeFlagSupportsSplice`, `kNodeFlagBlocksSplice`. |
 | `required_padding_left` | Left-padding budget this tunnel may prepend into (see [Part 3](./part3-buffers-and-padding.mdx)). |
 | `layer_group` | The layer category this node operates on: `kNodeLayer3` (packet), `kNodeLayer4` (stream), `kNodeLayerAnything` (supports both), or `kNodeLayerNone`. (Note: `kNodeLayerSameAsNext`, `kNodeLayerSameAsPrev`, `kNodeLayerOppositeNext`, and `kNodeLayerOppositePrev` are forbidden for `layer_group` and only allowed in `layer_group_next_node` / `layer_group_prev_node`). |
 | `layer_group_next_node` / `layer_group_prev_node` | Required layer group for next/previous neighbor (`kNodeLayer3`, `kNodeLayer4`, `kNodeLayerAnything`, `kNodeLayerSameAsNext`, `kNodeLayerSameAsPrev`, `kNodeLayerOppositeNext`, `kNodeLayerOppositePrev`, or `kNodeLayerNone`). Note: Opposite flags must be combined with a base layer group (e.g. `kNodeLayerAnything | kNodeLayerOppositePrev`) and cannot appear alone. |
@@ -214,38 +214,72 @@ layouts using this socket place its transport side toward `prev`.
 | `kNodeFlagNoChain` | Works without being in a chain (e.g. a database/user-auth node). |
 | `kNodeFlagSingleton` | Only one instance allowed in the whole config. |
 | `kNodeFlagSupportsSplice` | Advertises support for splice payloads. |
+| `kNodeFlagBlocksSplice` | Explicitly disables splice for the entire chain; takes precedence over `kNodeFlagSupportsSplice`. |
 
 `tunnel_chain_t.supports_splice` is false during assembly. At
 `tunnelchainFinalize()`, it becomes true only when `WW_HAVE_SPLICE == 1`,
 `misc.splice` is not disabled, the solved chain has no packet nodes
 (`contains_packet_node == false`), and the chain is nonempty with **every**
-tunnel's node advertising `kNodeFlagSupportsSplice`. Packet chains and builds
-without splice support always leave the chain flag false, regardless of node
+tunnel's node advertising `kNodeFlagSupportsSplice` and none advertising
+`kNodeFlagBlocksSplice`. Packet chains and builds without splice support always
+leave the chain flag false, regardless of node
 flags. The node check includes internal helpers and tunnels brought in by
 chain merges. Finalization follows the
 complete `onChain` phase and the solve/`onSolvedTopology` expansion loop;
 `onChain` alone is too early because topology-dependent helpers can still join.
 
-The node flag is a two-direction safety promise, not a per-callback converter:
+`kNodeFlagSupportsSplice` is a two-direction safety promise, not a per-callback converter:
 every reachable payload, retention, error, and close path must accept splice
 input safely, and the node must also accept ordinary fallback input. Advertising
 the flag does not promise that every path remains zero-copy.
 
+`kNodeFlagBlocksSplice` records an explicit node-level exclusion. It wins even if
+both splice flags are set on a node. A node with neither flag still prevents
+splice because support must be explicitly advertised. The blocker applies to the
+final expanded/merged topology, including internal helpers, and does not depend
+on which runtime mode or branch a particular connection uses.
+
+`TlsClient`, `TlsServer`, `EncryptionClient`, `EncryptionServer`, `RealityClient`,
+`RealityServer`, `ObfuscatorClient`, `ObfuscatorServer`, `Disturber`,
+`TcpOverUdpClient`, and `TcpOverUdpServer` explicitly block splice. Internal node
+copies must preserve these capability flags, including RealityClient's embedded
+TlsClient.
+
 The chain flag applies build/startup/topology restrictions. Final eligibility
 requires `WW_HAVE_SPLICE == 1`, `misc.splice` not disabled, no packet node, a
-nonempty finalized chain, and the flag on every tunnel after helper/topology
-expansion. Eligibility alone does not activate splice I/O; the adapters still
+nonempty finalized chain, support on every tunnel and no explicit blocker after
+helper/topology expansion. Eligibility alone does not activate splice I/O; the adapters still
 select it. `WW_HAVE_SPLICE` reports Linux splice API availability independently
 of the event watcher.
 
-`TcpListener`, `TcpConnector`, `DomainResolver`, `MuxClient`, and `MuxServer`
-advertise the flag. This includes the internal `DomainResolver` inserted by
+`TcpListener`, `TcpConnector`, `DomainResolver`, `MuxClient`, `MuxServer`,
+`HeaderClient`, `Bridge`, `UserController`, `BlackHole`, `ReverseClient`, and
+`JunkDatagramSender` advertise the flag. This includes the internal `DomainResolver` inserted by
 `TcpConnector`. Mux retains valid queued bodies under local queue-capacity charges. Incoming
 assembly shares the parent receive limit with attached child queues; beneficial
 pressure compaction and actual pipe-transfer fallback remain available. Its fixed-header stream and atomic large
 splice batches preserve both callback directions. This does not promise zero-copy
 for every frame. BufferStream and HTTP remain ordinary-only; HTTP nodes do not
 advertise splice support.
+
+HeaderClient prepends its one-time header only in real left padding, preserving
+existing prefixes and the private-pipe body. Bridge transfers the original buffer
+and line through its paired callback mapping; eligibility includes the merged
+chain. UserController forwards opaquely and accounts logical bytes, including
+prefixes, preserving reverse-direction accounting. Rejected traffic and BlackHole
+input recycle through the line's pool, discarding unread pipe bytes; healthy empty
+pipes may remain cached. BlackHole's active Init still closes the line and does
+not admit payload afterward.
+
+ReverseClient forwards application buffers between its owned normal lines and
+recycles held input if activation closes the pair. Its handshake and
+JunkDatagramSender's generated junk/delayed duplicates stay ordinary; forwarded
+application bodies can stay in private pipes. Existing callback directions,
+ordering, lifecycle, and direct Bridge -> ReverseClient adjacency remain required.
+HeaderClient support does not imply HeaderServer support, and ReverseClient
+support does not imply ReverseServer support. Ordinary fallback stays valid;
+packet configurations of dual-layer nodes still disable splice globally. These
+capabilities make no performance promise without measurement.
 
 ### External-node ABI
 
