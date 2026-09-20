@@ -713,24 +713,24 @@ carrier connection; its **children** are the streams multiplexed through it.
 | Payload in one Mux frame | **1 MiB** | Independent protocol maximum. A larger declaration closes that parent as soon as its complete eight-byte header is decoded. |
 | Incomplete incoming frame | **1 MiB + 8 bytes** | Logical bytes, including the cached header. Complete frames drain first; an oversized incomplete remainder closes the parent. |
 | `child-buffer-limit` | **24 MiB charge** | One child's queued decoded data. Reaching the limit closes that child. |
-| `parent-buffer-limit` | **48 MiB charge** | Incoming stream plus all attached child queues on one parent. At the limit, try beneficial incoming compaction, then shed largest queued children. Unrelieved pressure closes the parent. |
-| `parent-write-buffer-pause-threshold` | **32 MiB charge** | One outgoing parent FIFO. Reaching it pauses child producers while the FIFO drains. |
-| `parent-write-buffer-resume-threshold` | **28 MiB charge** | Release the outgoing producer gate at or below this charge while transport is writable. |
+| `parent-buffer-limit` | **128 MiB charge** | Incoming stream plus all attached child queues on one parent. At the limit, try beneficial incoming compaction, then shed largest queued children. Unrelieved pressure closes the parent. |
+| `parent-write-buffer-pause-threshold` | **16 MiB charge** | One outgoing parent FIFO. Reaching it pauses child producers while the FIFO drains. |
+| `parent-write-buffer-resume-threshold` | **12 MiB charge** | Release the outgoing producer gate at or below this charge while transport is writable. |
 | `parent-write-buffer-limit` | **128 MiB charge** | One outgoing parent FIFO, including admitted frame batches. Equality is allowed; exceeding it refuses the new output and closes that parent. |
 | `detached-buffer-limit` | **32–256 MiB charge**, by RAM profile | Per Mux instance/worker, for blocked child queues retained after parent loss. Reaching it closes the newly detached blocked child. L2 defaults to **256 MiB**. |
 | `detached-child-limit` | **4,096–12,000 children**, by RAM profile | Count of those detached blocked children on one Mux instance/worker. Reaching it closes the newly detached blocked child. L2 defaults to **12,000**. |
 
 The named queue settings are JSON-overridable. `parent-buffer-limit: 0` disables
 the combined receive limit; it leaves individual-child and protocol limits in
-force. The two detached limits also support `0` independently. Outgoing limits
-stay positive, with pause threshold below hard limit. The read size follows the
+force. The two detached limits also support `0` independently. Outgoing pause and hard limits
+stay positive; resume may be zero, with `resume < pause < hard`. The read size follows the
 pool/RAM profile, while the Mux frame maximum remains independent of it.
 See the [MuxClient](../02-noderefs/MuxClient.mdx) and
 [MuxServer](../02-noderefs/MuxServer.mdx) references for complete settings and
 profile tables. Connection-count, idle-timeout, and server admission settings
 remain separate from these buffer boundaries.
 
-`parent-buffer-limit` (48 MiB by default) covers incoming frame assembly plus
+`parent-buffer-limit` (128 MiB by default) covers incoming frame assembly plus
 all attached child queues. The stream counter remains separate from the child
 aggregate, and their sum is checked at stable return boundaries. Complete frames
 in a coalesced delivery drain first, even if its temporary charge exceeds the
@@ -754,12 +754,12 @@ that parent through normal parent-loss cleanup. A zero parent limit disables
 this combined finite bound; it introduces no other aggregate cap.
 
 `child-buffer-limit` remains 24 MiB by default and rejects equality. Outgoing
-parent queues remain separate: their pause/resume thresholds are 32/28 MiB, hard limit is
+parent queues remain separate: their pause/resume thresholds are 16/12 MiB, hard limit is
 128 MiB, and hard-limit equality is permitted. Detached queues retain their
-per-worker settings and zero/unlimited meanings. FlowPause/FlowResume continue
-to count logical payload bytes. Ordinary child candidates may still compact to
-a cheaper pooled tier; valid splice candidates are not individually materialized
-for queue pressure.
+per-worker settings and zero/unlimited meanings. The FlowResume threshold counts
+logical payload bytes; FlowPause follows the local child pause state. Ordinary
+child candidates may still compact to a cheaper pooled tier; valid splice
+candidates are not individually materialized for queue pressure.
 
 There is no worker-wide pipe-count or pipe-capacity quota. Other parents cannot
 force fallback through shared pipe reservations. These charges are not physical
@@ -851,7 +851,8 @@ frames. Each splice wrapper still owns its own pipe exclusively.
 6. **Encode the opposite direction toward the parent.** A fitting child payload
    receives its frame header in reserved left padding and can go directly to a
    writable parent when ordering permits. Paused parent output is queued inside
-   Mux. At the outgoing pause threshold, child producers are paused. They resume
+   Mux. A blocked writer is paused after admission; the outgoing pause threshold
+   additionally pauses all children. Local holds resume
    at or below the resume charge threshold while the parent is writable, respecting other
    pause reasons. Large splice inputs are staged as complete ordered batches;
    admission precedes callbacks and Open precedes the first Data frame. A failed
@@ -913,11 +914,11 @@ immediately on Pause. Resume continues the admitted remainder; nested payload or
 reentrant child Close queues after it. Parent death discards undelivered frames.
 Quiescence admits no new stream work, child, batch or protocol output.
 
-`parent-write-buffer-pause-threshold` defaults to **32 MiB**,
-`parent-write-buffer-resume-threshold` to **28 MiB**, and
+`parent-write-buffer-pause-threshold` defaults to **16 MiB**,
+`parent-write-buffer-resume-threshold` to **12 MiB**, and
 `parent-write-buffer-limit` to **128 MiB** of queue-capacity charge. Pause and hard
 accept strict integers in `[1, INT_MAX]`; resume accepts `[0, INT_MAX]`.
-An omitted resume derives as `floor(effective_pause * 7 / 8)` using a wide
+An omitted resume derives as `floor(effective_pause * 3 / 4)` using a wide
 intermediate. Require `0 <= resume < pause < hard` without clamping; diagnostics
 name all three effective values. Explicit zero retains empty-queue release. Every
 split splice batch must fit the hard limit even when the transport is writable;
@@ -926,15 +927,26 @@ frame is sent. The existing fitting single-buffer direct path remains eligible
 for immediate delivery without FIFO admission. Gate release occurs at or below resume while writable, before selecting the
 next buffer and only after the previous callback has returned. Keep the pump
 guarded during fanout so reentrant output follows the FIFO. Renewed pressure
-interrupts Resume; a borrowed parent-local cursor advances before each offered
-release and is repaired on unlink. Snapshot references protect mutation; startup
-completion reconciles both directions. Peer-flow and terminal-close reasons stay
+interrupts Resume; the intrusive FIFO of held children releases only that subset,
+even if the aggregate gate never activated. A writer held again joins the tail.
+Snapshot references protect every member before callbacks, and current line life,
+attachment and mux state are checked before use. Startup completion reconciles
+reasons separately from emitted permission. Detach and terminal transitions
+remove membership before destruction; cleanup does not send Resume. Peer-flow and terminal-close reasons stay
 independent. Quiescence cannot release producers.
+
+Individual holds are applied after complete ordinary/splice admission while the
+transport is paused, or when delivery leaves it paused. Control submissions alone
+do not acquire writer holds. Neither this policy nor a new child changes the
+hard-limit accounting or FIFO ownership. Check low water after delivery returns,
+not between subtracting a popped buffer's charge and delivering it. A release
+that raises charge above low water stops; writable draining supplies the next
+opportunity. An empty writable FIFO also releases ready held children.
 
 These are per-parent retained charges, not physical memory or transport capacity.
 The 4 MiB hysteresis gap does not promise continuous sender output or increased
 carrier bandwidth. Already-admitted Data is not withdrawn by peer FlowPause;
-the unchanged 24 MiB child and 48 MiB aggregate receive budgets still apply.
+the default 24 MiB child and 128 MiB aggregate receive budgets still apply.
 A zero-child exhausted client parent still waits for its final FIFO frames to
 leave before orderly close; crossing resume is not a terminal drain barrier.
 
@@ -975,7 +987,7 @@ header, and allocator alignment overhead. Memory-sensitive code that needs such
 a hard bound must keep a separate storage/resource charge. Mux's child, parent,
 detached and outgoing queues use the queue-capacity policy above; it deliberately
 does not bound physical kernel resources. It must not replace logical length in
-BufferQueue or in incoming-child FlowPause/FlowResume thresholds.
+BufferQueue or in the incoming-child FlowResume threshold.
 
 `sbufGetAllocationCharge(const sbuf_t *buf)` is the canonical O(1) charge for an
 allocated buffer's own userspace storage. For ordinary buffers it returns

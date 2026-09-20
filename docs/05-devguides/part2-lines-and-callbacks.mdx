@@ -959,21 +959,34 @@ remain safe if emitting `Pause` re-enters and destroys the line.
 MuxClient and MuxServer are examples of explicit local buffering: parent transport
 Pause immediately forbids all parent-bound Payload, including protocol controls.
 They retain encoded output in a bounded per-parent FIFO and pause child producers
-only at its queue-capacity threshold. Complete queued frames retain valid private
-bodies under local queue limits. Incoming assembly and attached child queues share
+at its aggregate queue-capacity threshold, in addition to individual writer holds.
+Complete queued frames retain valid private bodies under local queue limits. Incoming assembly and attached child queues share
 the existing parent receive limit, with beneficial pressure compaction followed by
 largest-child shedding or parent close. There is no worker-wide pipe quota. Pause
 still forbids Payload, not retention; see the [Part 3 contract](./part3-buffers-and-padding.mdx#queue-capacity-budgets).
-Short transport stalls do not scan the child list. Resume drains in order; the
-local producer gate releases at or below its resume charge threshold while
-writable, preserving peer-flow and terminal-close reasons. Release is decided
-before the next pop, after the previous payload callback returns; reentrant
-source output appends behind the retained FIFO. A rotating parent-local child
-cursor preserves later Resume opportunities when synchronous refill interrupts
-a pass. Init/Est completion reconciles both gate activation and release. This does not relax the strict permission boundary
-at the paused neighbor. TcpListener also preserves a Pause received during
-accepted-line Init: it enables initial reads only if Init returns alive and the
-source is still unpaused.
+A blocked child writer acquires its own local producer hold immediately after
+admission, including empty Data and complete splice batches. A direct write that
+leaves the transport paused holds its writer before returning; a transient Pause
+then Resume uses the final permission. Controls alone are not attributed writers.
+Idle siblings below aggregate high water remain runnable. At high water the
+separate pause-all latch holds every attached open child.
+
+The local hold FIFO borrows attached child state and is independent of that
+latch. Release requires a live parent state, no Finish/quiescence, writable
+transport and charge at/below low water, even when pause-all never activated.
+Recheck after every callback and before each release/pop. New output appends
+behind existing FIFO entries; renewed transport pressure or charge above low
+water stops release. A writer held again joins behind remaining waiters. Snapshot
+references protect every member before any callback, followed by logical-life,
+attachment and state checks. No persistent references or second cursor are used.
+
+Init/Est defers permission callbacks without confusing a recorded reason with an
+emitted Pause. Completion reconciles the current reasons once safe. Peer pressure
+and terminal-close state remain independent; local unlink and terminal paths
+remove held-list membership without emitting Resume. A writable empty parent
+must release ready waiters rather than depend on a future transport event.
+TcpListener also preserves a Pause received during accepted-line Init: it enables
+initial reads only if Init returns alive and the source is still unpaused.
 
 Mux's fixed header cache owns consumed header bytes until the exact body is
 extracted. No callback observes detached stream ownership. Large splice encoding
@@ -982,10 +995,19 @@ during its first delivery leaves all later frames in the parent FIFO; nested Dat
 or child Close follows that remainder. Parent death discards it, while child death
 alone does not release its cost. Ordinary large encoding keeps one aggregate.
 
+A local child Pause submits FlowPause immediately, without a queued-byte
+threshold. MuxClient defers this control until Open has been admitted. After
+submitting the complete first payload, including a large splice batch, it must
+re-check both referenced lines and the child's attachment and pause state before
+submitting any deferred FlowPause. A resume or close during submission must not
+produce a stale control, and an already submitted FlowPause must not be repeated.
+FlowResume still requires a writable child and logical queued payload below its
+configured resume threshold.
+
 Submitting a Mux control frame can close its child during queue-pressure
-callbacks while leaving the parent alive. Parser-facing queue helpers distinguish
-those outcomes: they retain the parent across callbacks, stop using the closed
-child, and continue processing complete sibling frames on the surviving parent.
+callbacks while leaving the parent alive. The receive path distinguishes
+those outcomes: it retains the parent across callbacks, stops using the closed
+child, and continues processing complete sibling frames on the surviving parent.
 Remaining incoming child queues still undergo the normal parent memory-limit check.
 
 UdpConnector rechecks both line life and read-pause state after its fallback

@@ -77,9 +77,8 @@ responsible for destroying them. It does not create the parent transport line.
   "type": "MuxServer",
   "settings": {
     "child-buffer-limit": 25165824,
-    "child-buffer-pause-tolerance": 524288,
     "child-buffer-resume-threshold": 262144,
-    "parent-buffer-limit": 50331648,
+    "parent-buffer-limit": 134217728,
     "max-children": 10000,
     "max-live-children": 262144,
     "initial-child-idle-timeout-ms": 10000,
@@ -121,18 +120,18 @@ this is not a physical memory, descriptor, or RSS limit.
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `parent-write-buffer-pause-threshold` | `33554432` (32 MiB) | Pause attached child producers when retained charge reaches this value. |
-| `parent-write-buffer-resume-threshold` | `29360128` (28 MiB) | Release parent pressure at or below this charge while transport is writable. Omitted values derive from pause × 7/8, rounded down. |
+| `parent-write-buffer-pause-threshold` | `16777216` (16 MiB) | Pause attached child producers when retained charge reaches this value. |
+| `parent-write-buffer-resume-threshold` | `12582912` (12 MiB) | Release parent pressure at or below this charge while transport is writable. Omitted values derive from pause × 3/4, rounded down. |
 | `parent-write-buffer-limit` | `134217728` (128 MiB) | Maximum retained charge for each parent; equality is allowed. |
 
 Pause and hard limits must be integers in `[1, INT_MAX]`; resume accepts
 `[0, INT_MAX]`. The effective tuple must satisfy `0 <= resume < pause < hard`.
 Omitted pause and hard settings use their defaults; omitted resume derives as
-`floor(pause * 7 / 8)` with a wide intermediate. Explicit zero requests
+`floor(pause * 3 / 4)` with a wide intermediate. Explicit zero requests
 empty-queue release, still subject to transport writability. Booleans, strings,
 null, fractions, negatives and out-of-range values reject startup. Invalid
 combinations report all three effective values without clamping. For example,
-inside `settings` (derives a 1.75 MiB resume threshold):
+inside `settings` (derives a 1.5 MiB resume threshold):
 
 ```json
 {
@@ -145,15 +144,15 @@ The gate uses retained queue charge (`sbufGetQueueCharge`), including header,
 capacity, padding and alignment, rather than wire length. Resume runs before the
 next FIFO pop, after the prior delivery returns. Synchronous resumed output
 appends behind existing frames and complete splice batches. A new pause stops
-an interrupted Resume pass; a parent-local rotating cursor gives later eligible
-children their next opportunity. Init/Est completion reconciles the current gate.
+an interrupted Resume pass; the FIFO of locally held children preserves later
+release opportunities. Init/Est completion reconciles deferred producer permission.
 Peer FlowPause and terminal close remain independent reasons to stop a source.
 
 The 4 MiB hysteresis gap avoids waiting for the entire queue to drain, but does
 not promise continuous sender throughput or a faster carrier. The 128 MiB limit
 is per parent, allocated on demand, and is not an RSS, socket-buffer or FD bound.
-Already-admitted Data can still reach a peer-paused child; the unchanged 24 MiB
-child and 48 MiB parent receive budgets can shed children or close that parent.
+Already-admitted Data can still reach a peer-paused child; the default 24 MiB
+child and 128 MiB parent receive budgets can shed children or close that parent.
 
 With `log-main-line-stats`, five-second samples include
 `parent-output-queued-bytes`, `parent-output-queue-charge`,
@@ -161,6 +160,9 @@ With `log-main-line-stats`, five-second samples include
 `parent-sources-throttled`, `children-parent-write-paused`,
 `children-peer-flow-paused`, `parent-output-throttle-ms`, and
 `parent-output-last-throttle-ms`, plus the three effective settings.
+`children-parent-write-paused` counts individual writer and aggregate holds.
+It can be nonzero while `parent-sources-throttled` is false. That boolean and
+its current/last throttle durations describe only the aggregate pause-all latch.
 Throttle durations use the owner's 64-bit monotonic clock; current duration is
 zero outside a throttle episode. `parent-child-queue-charge` and
 `parent-input-queue-charge` describe incoming storage. Logging remains optional
@@ -174,9 +176,8 @@ from `parent-buffer-limit`, which bounds incoming assembly plus attached child q
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
 | `child-buffer-limit` | integer | `25165824` | Maximum queue-capacity charge for one paused child. Ordinary allocation is charged; splice uses logical sbuf capacity plus sbuf/alignment overhead. Must be greater than `0`; reaching it closes the child with a MUX `Close` frame. |
-| `child-buffer-pause-tolerance` | integer | `524288` | Logical queued-payload threshold for sending fallback `FlowPause` when the normal child pause callback has not already sent it. Must be `0` or greater. Its numeric value is capped to `child-buffer-limit`. |
 | `child-buffer-resume-threshold` | integer | `262144` | Logical queued-payload low-water mark for sending `FlowResume` after the local child becomes writable. Must be greater than `0`. Its numeric value is capped to `child-buffer-limit`. Raising it resumes the peer earlier but weakens hysteresis and may increase pause/resume cycling. |
-| `parent-buffer-limit` | integer | `50331648` | Per-parent queue-capacity budget for incoming assembly plus attached child queues. Beneficial compaction precedes largest-child/oldest-tie shedding; unrelieved pressure closes this parent. Set to `0` to disable the aggregate budget. |
+| `parent-buffer-limit` | integer | `134217728` | Per-parent queue-capacity budget for incoming assembly plus attached child queues. Beneficial compaction precedes largest-child/oldest-tie shedding; unrelieved pressure closes this parent. Set to `0` to disable the aggregate budget. |
 | `max-children` | integer | `10000` | Hard maximum attached live children on one parent. Must be positive and no greater than `max-live-children`; historical destroyed CIDs do not count. |
 | `max-live-children` | integer | `262144` | Hard maximum reserved or initialized children across this MuxServer instance, all parents, and all workers. Draining and detached children count until their MuxServer state is destroyed. |
 | `initial-child-idle-timeout-ms` | integer | `10000` | Idle timeout after `Open` and before the first nonempty Data payload. Must be positive. |
@@ -302,7 +303,7 @@ The receiver does not restore the original callback boundary after this split.
 | --- | --- |
 | parent upstream `Init` | Initializes parent state, optionally schedules stats logging, and reports downstream `Est` to the previous node. |
 | parent upstream `Payload` | Parses MUX frames from `MuxClient`; creates children for `Open`; routes `Data`, `Close`, `FlowPause`, and `FlowResume` by `cid`. |
-| parent upstream `Pause` / `Resume` | Stops all parent output immediately / drains its FIFO. Child producers are gated only at the configured retained-charge threshold. |
+| parent upstream `Pause` / `Resume` | Stops all parent output immediately / drains its FIFO. Blocked writers receive local holds; the retained-charge threshold additionally pauses all children. |
 | parent upstream `Finish` | Destroys parent state immediately, transfers accepted child queues to child-only drains, and finishes each child after its queue becomes empty and writable. |
 | child downstream `Payload` | Prepends a MUX `Data` header and sends the frame back on the parent toward the previous node. |
 | child downstream `Pause` / `Resume` | Sends `FlowPause` / flushes queued data and possibly sends `FlowResume`. |
@@ -333,16 +334,37 @@ available again on that same parent and MuxServer instance.
 ## Backpressure And Queues
 
 Parent transport `Pause` immediately stops every parent-bound Payload callback,
-including controls and Close replies. New encoded output joins the parent's FIFO;
-it does not depend on the originating child remaining alive. Short stalls below
-`parent-write-buffer-pause-threshold` cause no child-wide callback pass. Reaching
-the threshold pauses attached child producers once; newly initialized children
-inherit that gate after their producer Init/Est callback returns.
+including controls and Close replies. A child submitting Data while transport is
+blocked acquires an individual local producer hold after its complete payload or
+splice batch is admitted. A direct submission that leaves transport paused also
+holds its writer before returning. A transient Pause followed by Resume uses the
+final state. Empty Data follows the same policy; control frames alone do not make
+the referenced child a writer. Idle siblings below the aggregate threshold remain
+unpaused until they write.
 
-`Resume` drains FIFO order until empty or paused again. Queue-throttled producers
-resume at or below `parent-write-buffer-resume-threshold` while the transport is writable; peer FlowPause
-and terminal-close pressure remain independent. Reentrant output joins the FIFO
-behind older output. Incoming parent reads and unrelated parents remain active.
+At charge greater than or equal to `parent-write-buffer-pause-threshold`, the
+aggregate pause-all latch still holds every attached open child. Local writer
+holds do not activate that latch themselves. Both causes share one local reason
+per child and one parent-local FIFO of held children; duplicate causes preserve
+the child's place. A resumed writer that becomes held again joins the tail.
+
+The pump releases local holds whenever the parent is alive, not finishing, not
+quiescing, writable, and at or below `parent-write-buffer-resume-threshold`, even
+if the aggregate latch never activated. It clears that latch under the same
+condition. Before each release and the next FIFO pop it checks the state left by
+the previous callback. A transport Pause, charge above low water, renewed
+aggregate gate, parent loss, or quiescence interrupts release. Writable output
+continues draining and reconsiders waiting children without requiring an extra
+transport event. Peer FlowPause and terminal-close reasons remain independent.
+
+Release snapshots reference every locally held line before the first callback;
+callbacks may destroy siblings or the parent. Only surviving, attached, open,
+non-starting children are notified. Init/Est records reasons separately from
+already-emitted producer permission, then reconciles once safe. Unlink, terminal
+transition and shutdown remove registry membership before state destruction and
+never emit Resume just to clear the registry. The registry holds no persistent
+line references. Reentrant output follows existing Data, controls and admitted
+splice-batch remainders. Incoming parent reads and unrelated parents remain active.
 
 A candidate that would exceed `parent-write-buffer-limit`, or a queue reservation
 failure, closes only the affected parent through normal local teardown. The
@@ -364,9 +386,8 @@ MUX keeps backpressure per child:
   service-side child are paused.
 - If parent-delivered data arrives for a paused child, data is queued on that
   child.
-- `FlowPause` is normally sent by the child pause callback before data is queued;
-  `child-buffer-pause-tolerance` is a fallback for an ordering edge where it was
-  not sent yet.
+- `FlowPause` is sent by the child pause callback immediately, without waiting
+  for queued payload to reach a threshold.
 - Once logical queued payload drops below `child-buffer-resume-threshold`, `FlowResume` can
   be sent. The configured value is capped to `child-buffer-limit`.
 - Queue pressure never pauses reads on the shared parent transport, so one
@@ -497,7 +518,7 @@ allocation-based charge; splice entries charge logical sbuf capacity, without
 adding wrapper control storage or kernel pipe capacity. Unknown cached pipe
 capacity does not force a valid retained source into ordinary storage.
 
-`parent-buffer-limit` (48 MiB by default) covers incoming frame assembly plus
+`parent-buffer-limit` (128 MiB by default) covers incoming frame assembly plus
 all attached child queues. The stream counter remains separate from the child
 aggregate, and their sum is checked at stable return boundaries. Complete frames
 in a coalesced delivery drain first, even if its temporary charge exceeds the
@@ -516,12 +537,12 @@ that parent through normal parent-loss cleanup. A zero parent limit disables
 this combined finite bound; it introduces no other aggregate cap.
 
 `child-buffer-limit` remains 24 MiB by default and rejects equality. Outgoing
-parent queues remain separate: their pause/resume thresholds are 32/28 MiB, hard limit is
+parent queues remain separate: their pause/resume thresholds are 16/12 MiB, hard limit is
 128 MiB, and hard-limit equality is permitted. Detached queues retain their
-per-worker settings and zero/unlimited meanings. FlowPause/FlowResume continue
-to count logical payload bytes. Ordinary child candidates may still compact to
-a cheaper pooled tier; valid splice candidates are not individually materialized
-for queue pressure.
+per-worker settings and zero/unlimited meanings. The FlowResume threshold counts
+logical payload bytes; FlowPause follows the local child pause state. Ordinary
+child candidates may still compact to a cheaper pooled tier; valid splice
+candidates are not individually materialized for queue pressure.
 
 There is no worker-wide pipe-count or pipe-capacity quota. Other parents cannot
 force fallback through shared pipe reservations. These charges are not physical
