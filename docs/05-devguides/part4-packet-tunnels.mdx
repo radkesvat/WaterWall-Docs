@@ -5,7 +5,7 @@ sidebar_label: "Part 4: Packet Tunnels"
 description: "Packet-line semantics, pure packet tunnels, packet/stream bridges, packet-line initialization, and paired-tunnel direction rules for layer-3 work."
 ---
 <!--
-Documentation version: 157
+Documentation version: 158
 -->
 
 # Part 4: Packet Lines & Packet Tunnels
@@ -261,28 +261,37 @@ line behave like a connection.
 
 TunDevice and RawSocket accept an optional `fragment-policy`, either
 `reassemble` or `preserve-fragments`. Omission selects `reassemble`; an explicit
-invalid value, including `null`, rejects startup. Raw forwarding paths must
-select `preserve-fragments` explicitly. The policy is immutable for the reader
-session and is passed explicitly on all TUN and capture backends. RawSocket uses
-the same default when capture is disabled; path validation applies only to active
-sources. The default does not bypass the supported-path checks below.
+invalid value, including `null`, rejects startup. The policy is immutable for
+the reader session and is passed to all TUN and capture backends. Write-only
+RawSocket instances have no ingress to assemble.
 
-Validation follows the source's actual publication direction through the final
-expanded topology. The supported path matrix is deliberately finite:
+Fragment policy does not impose a node-name or topology allowlist. Normal chain
+and layer validation remains in force. Reassembled ordinary packets may pass
+through transforms, branches, packet/stream bridges, egress devices or sinks;
+each component remains responsible for its input and output contracts.
 
-| Policy | Supported ingress path |
+| Boundary | Contract |
 | --- | --- |
-| `reassemble` upstream | Source, optional Disturber nodes, PacketsToConnection |
-| `reassemble` downstream | Source, optional Disturber nodes, ConnectionToPackets |
-| `preserve-fragments` either direction | Source, audited same-direction packet transforms, external TunDevice/RawSocket egress or BlackHole/PacketReceiver sink |
+| Device ingress, `reassemble` | Publish complete IPv4 datagrams after bounded assembly; ordinary unfragmented input follows the existing path. |
+| Device ingress, `preserve-fragments` | Preserve fragment bytes/boundaries and fragment-aware worker selection. |
+| `PacketsToConnection`, upstream packet input | Must receive a complete IPv4 datagram before fake DNS, routing or lwIP input. |
+| `ConnectionToPackets`, downstream packet input | Must receive a complete IPv4 datagram before flow lookup, worker injection or lwIP input. |
+| Packet egress | Enforce existing packet-size and device-MTU limits; ingress reassembly does not provide output fragmentation. |
 
-The audited raw transforms are Disturber, PingClient, PingServer, IpOverrider,
-and IpManipulator (including its ProtoSwap trick). BlackHole is an upstream-only
-sink. Packet/stream bridges, routing branches, direction
-changes, unknown transforms and other mixed paths reject startup with an explicit
-unsupported-path diagnostic. A stream buffer does not establish an external I/O
-boundary. Local-stack consumers cannot be reached through raw mode. Normalization
-is not selected from chain membership or the presence of a stack node elsewhere.
+At either packet-to-stack input, MF or a nonzero fragment offset triggers a clear
+`LOGF` diagnostic followed by `abortProgramNow(1)` in Debug and Release. DF alone
+is allowed. Structural packet validation/drop behavior remains unchanged. This
+is an input-contract violation, not proof that a specific topology is wrong:
+a producer, peer or transform can supply the fragment. The failure is deliberately
+process-wide, including unrelated connections.
+
+Reassemble before these consumers, regardless of whether fragments originate
+from a device or another node. `preserve-fragments` is not rejected at startup
+merely because a stack is downstream: the actual delivered packet is checked.
+A device policy affects only that device's reads. In particular, a direct
+`ConnectionToPackets`/`PacketsToConnection` pair cannot exchange fragmented
+output without an intervening reassembly boundary. Both nodes may still emit
+IPv4 fragments on their packet output sides.
 
 Reassembly accepts the existing 20-byte IPv4-header subset, exact total length,
 valid header checksum, nonempty payload, aligned nonfinal fragments, and payload
@@ -323,11 +332,11 @@ mode preserves fragment bytes and boundaries and stages tails until fragment
 zero supplies port-based worker affinity, but makes no downstream residue or
 post-publication generation guarantee.
 
-Only the audited local-stack paths accept complete datagrams up to 65,535 bytes.
-Global 1,500-byte packet/stream and raw-egress limits and device-MTU checks remain.
-Fragment-sensitive transforms are excluded from normalized paths. Fake DNS sees
-a complete normalized UDP query; non-device fragmented queries retain its existing
-fragment rejection behavior.
+Assembly may produce complete datagrams up to 65,535 bytes. Global packet/stream
+and raw-egress limits and device-MTU checks remain; an oversized packet may be
+dropped at those boundaries. Transforms must handle the complete packets they
+receive within their own contracts. Fake DNS sees only complete UDP queries;
+fragments from any source trigger the packet-to-stack input's fatal check.
 
 ## Linux capture conntrack policy
 
