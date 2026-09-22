@@ -5,7 +5,7 @@ sidebar_label: "Part 5: Anatomy & Workflow"
 description: "The on-disk layout of a WaterWall tunnel, what each file owns, node.c metadata, the create/line-state patterns, HTTP constraints, and the implementation workflow."
 ---
 <!--
-Documentation version: 158
+Documentation version: 161
 -->
 
 # Part 5: Anatomy of a Tunnel & Workflow
@@ -253,7 +253,7 @@ select it. `WW_HAVE_SPLICE` reports Linux splice API availability independently
 of the event watcher.
 
 `TcpListener`, `TcpConnector`, `DomainResolver`, `MuxClient`, `MuxServer`,
-`HeaderClient`, `Bridge`, `UserController`, `BlackHole`, `ReverseClient`, and
+`Bgp4Client`, `Bgp4Server`, `HeaderClient`, `Bridge`, `UserController`, `BlackHole`, `ReverseClient`, and
 `JunkDatagramSender`, `UdpListener`, `UdpConnector`, `UdpStatelessSocket`,
 `TcpUdpListener`, and `TcpUdpConnector` advertise the flag. This includes the internal `DomainResolver` inserted by
 `TcpConnector`. Mux retains valid queued bodies under local queue-capacity charges. Incoming
@@ -262,6 +262,11 @@ pressure compaction and actual pipe-transfer fallback remain available. Its fixe
 splice batches preserve both callback directions. This does not promise zero-copy
 for every frame. BufferStream and HTTP remain ordinary-only; HTTP nodes do not
 advertise splice support.
+
+BGP supports both representations through in-place framing, bounded frame FIFOs
+and a 19-byte fixed-header receive stream. OPEN inspection reads only its bounded
+metadata; private-pipe creation or transfer refusal selects ordinary fallback.
+The fixed per-direction retention policy is independent of pool sizing.
 
 HeaderClient prepends its one-time header only in real left padding, preserving
 existing prefixes and the private-pipe body. Bridge transfers the original buffer
@@ -477,20 +482,23 @@ including on IOCP; proxy persistence does not introduce half-close semantics.
 HttpProxyServer treats `max-pending-bytes` (`P`) as its working pending-data
 budget. Four working buffers retain at most `4 * P` allocation bytes. Each
 direction may additionally hold one already-delivered remainder of at most
-`D = max(65536, 2 * L)` logical bytes, where `L` comes from the finalized line
-pool. Total retained logical bytes are bounded by `P + 2 * D`. A single delivery
-is limited to `P + D`; only its immediately drainable prefix may exceed the
+`D = 2 MiB` logical bytes. This node-owned headroom is independent of pool sizes,
+RAM profile and splice settings. Total retained logical bytes are bounded by
+`P + 2 * D`. A single delivery is limited to `P + D`; only its immediately drainable prefix may exceed the
 per-direction remainder allowance. Each remainder's
 payload capacity is at most `max(small_capacity, 2 * D)` plus cache-line rounding;
 its full padding, sbuf header, and aligned-allocation overhead are additional.
-Remainder admission copies into ordinary best-fit pooled storage when needed
-to satisfy this bound. Working slice room excludes deferred
+Remainder admission copies into ordinary best-fit storage (pooled or dedicated)
+when needed to satisfy this bound. Working slice room excludes deferred
 bytes so moving bytes into working storage never double-counts them. Remainders
 participate in pressure, FIFO pumping, and every error/timeout/close cleanup path.
 Blocked pipelined requests leave response progress available.
 
 ReverseServer, HalfDuplexServer, and HttpServer split derive waiting budgets from
-`scale = max(1, ceil(L / 32768))`. ReverseServer closes above `65535 * scale`;
+`scale = max(1, ceil(basis / 32768))`, where
+`basis = bufferpoolGetWaitingBudgetBasis()` is 64 KiB in S1/S2 and 1 MiB in higher
+profiles, independently of allocation sizes and the splice limit.
+ReverseServer closes above `65535 * scale`;
 HalfDuplexServer closes at or above `131070 * scale`, including initial upload
 publication; HttpServer split closes above `131070 * scale` unless its explicit
 buffering-limit bypass is enabled. Handshake/header validation and available-peer

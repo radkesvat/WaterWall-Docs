@@ -5,7 +5,7 @@ sidebar_label: "Part 3: Buffers & Padding"
 description: "The sbuf_t buffer model, worker buffer pools, left-padding budgets, and how to prepend protocol headers without breaking chain composition."
 ---
 <!--
-Documentation version: 157
+Documentation version: 160
 -->
 
 # Part 3: Buffers, Padding & Shift Buffers
@@ -173,14 +173,14 @@ TcpListener owns its normal line; TcpConnector borrows it.
 
 For NIO TCP splice reads, the read loop checks out a splice wrapper with its
 private pipe already initialized by the pool and calls `splice()` directly. Each
-request is capped by the loop's large-buffer size and the 1 MiB
-`LARGE_BUFFER_SIZE_RAM_HIGH` limit. There is no socket `FIONREAD` query before a
+request uses `bufferpoolGetSplicePayloadLimit()`, independently of ordinary
+allocation sizes: 1 MiB in every memory profile.
+There is no socket `FIONREAD` query before a
 successful splice delivery. The socket and pipe are nonblocking, and the transfer
 happens **before invoking the Payload callback**.
 
 The preferred pipe capacity is that same read limit, independent of the bytes
-currently ready: 1 MiB in higher memory profiles and 64 KiB in low-memory
-profiles. Existing larger capacities are never reduced. A successful growth
+currently ready: 1 MiB in every memory profile. Existing larger capacities are never reduced. A successful growth
 request is not a promise of a full-size splice: pipe layout and available input
 can still produce a shorter result. Rejected growth keeps the splice path active
 with the pipe's existing capacity. Larger pipes consume the per-user pipe-page
@@ -495,22 +495,27 @@ place to build a payload you intend to prepend onto.
 Each buffer pool has large, medium, small, and splice caches backed by separate
 shared master pools. `bufferpoolCreate()` takes those four master pools in that
 order, followed by the cache width and explicit large, medium, and small payload
-capacities. Each pool stores its own sizes; device pools inherit all three from
-their worker pool. Payload capacities, excluding reserved left padding, are:
+capacities, then the independent splice payload limit and waiting-budget basis.
+Both independent values must be in `[1, INT_MAX]` and stay fixed after construction.
+Each pool stores its own settings; device pools inherit all five from their worker pool. Payload capacities,
+excluding reserved left padding, are:
 
 | Tier | Capacity | Use |
 | --- | --- | --- |
 | Small | 4 KiB | Small ordinary payloads and control messages |
 | Medium | 32 KiB in S1/S2; 64 KiB in M1/M2/L1/L2 | Framing, retained queues including paused Mux children, and best-fit reads |
-| Large | 64 KiB in S1/S2; 1 MiB in M1/M2/L1/L2 | Ordinary event-loop read buffers and larger working payloads |
-| Splice | 32 bytes of control storage | Explicit splice wrappers; logical body size is independent of allocation size |
+| Large | 64 KiB in S1/S2; 128 KiB in M1/M2/L1/L2 | Ordinary event-loop read buffers and larger working payloads |
+| Splice storage | 32 bytes of control storage | Explicit splice wrappers; logical body size is independent of allocation size |
+| Splice payload limit | 1 MiB in every profile | Socket read limit and preferred pipe capacity; kernel growth is best effort |
 
 S1 and S2 share buffer sizes but retain different profile-based local and master
 cache capacities; S1 caches fewer allocations. Higher profiles retain 64 KiB
-medium and 1 MiB large buffers. Linux NIO ordinary TCP/UDP reads select an
+medium and 128 KiB large buffers. Their independent splice target remains 1 MiB.
+Linux NIO ordinary TCP/UDP reads select an
 ordinary tier through best-fit allocation when a positive size hint is available.
-Medium buffers also serve nodes and retained queues. Mux uses the large tier when a paused frame exceeds medium capacity,
-so even a full-size frame fits pooled storage in S1/S2.
+Medium buffers also serve nodes and retained queues. Mux selects the smallest
+fitting ordinary tier; a full 1 MiB frame requires dedicated ordinary storage in
+every profile. The wire payload maximum remains 1 MiB.
 
 `bufferpoolGetBestFit()` selects the smallest ordinary tier that satisfies both
 payload and padding requirements, comparing actual sizes across small, medium,
@@ -518,6 +523,19 @@ and large. If no tier fits, it creates a dedicated padded buffer that is destroy
 on return. `bufferpoolTryGetBestFit()` accepts a 64-bit computed length and returns
 `NULL` for unrepresentable geometry before using the same allocation path. Neither
 helper shrinks an existing buffer. Splice allocation stays explicit.
+
+The 128 KiB tier is not a maximum payload or total-memory limit. Smaller pooled
+allocations do not cap process memory, kernel pipe memory, frame sizes, or
+dedicated ordinary allocations. Frequent large materializations can incur
+allocation/free work; these sizes make no throughput guarantee.
+
+Materialization callers must request the complete logical payload plus required
+headroom, including real prefixes, residual padding and any destination bytes
+already present. Low-level conversion helpers do not grow caller storage. For
+example, 600 KiB requires dedicated ordinary storage with a 128 KiB large tier;
+a pipe with 1 MiB capacity holding only 20 KiB needs storage for its logical bytes,
+not its kernel capacity. Dedicated buffers above all tiers are destroyed on
+recycling, while consumed splice wrappers return to their separate splice cache.
 
 Each tier refills at most four buffers at a time, further bounded by half the
 local cache capacity and its available slots. Pools whose previous refill batch
@@ -539,8 +557,8 @@ it first restores physical capacity from the 32-byte control storage and its
 reserved padding. Checkout restores `kSbufFlagSplice`.
 
 `bufferpoolGetSpliceBuffer(pool)` initializes the selected wrapper's nonblocking,
-close-on-exec private pipe before returning it. It requests the pool's large
-payload capacity capped at `LARGE_BUFFER_SIZE_RAM_HIGH`, preserving the capacity
+close-on-exec private pipe before returning it. It requests the pool's independent
+`bufferpoolGetSplicePayloadLimit()`, preserving the capacity
 retry policy above. Pipe creation failure returns `NULL` with the original
 `errno`, after internally recycling the unused wrapper; unsupported builds return
 `NULL` with `ENOSYS`. Callers must handle this result before accessing the buffer.
@@ -645,8 +663,15 @@ HTTP nodes remain ordinary-only and do not advertise splice support.
 `splice_stream_t` in `ww/bufio/splice_stream.{h,c}` owns a FIFO, an explicit active
 head, an immutable header size and a trailing resident header cache. It borrows
 its owner-worker pool. Construction checks object
-allocation arithmetic. Only Mux parents allocate the eight-byte-header object;
-children have no receive stream.
+allocation arithmetic. Mux parents use an eight-byte header cache; Mux children
+have no receive stream. Bgp4Client and Bgp4Server use a 19-byte cache for marker,
+length and type. BGP OPEN inspection consumes only ten fixed bytes and up to 255
+optional bytes through representation-aware range helpers. Application bodies
+remain eligible for private-pipe extraction and per-frame delivery. BGP uses a
+fixed 2,162,705-byte logical budget per direction and a 1,024-frame output cap;
+incoming fragment count is unrestricted. Its permission-aware pumps retain FIFO
+order across Pause/Resume and reentrant callbacks, including producer Resume
+when the next header or body is incomplete.
 
 `splicestreamPush()` takes ownership on every result. It reserves fallible FIFO
 metadata before consuming any new header bytes; refusal recycles the submitted
@@ -760,7 +785,7 @@ carrier connection; its **children** are the streams multiplexed through it.
 
 | Boundary | Default | Scope and behavior at the boundary |
 | --- | --- | --- |
-| Splice socket read request | **1 MiB**; **64 KiB in S1/S2** | Upper bound per read attempt. A positive short transfer produces a shorter valid buffer; remaining bytes wait for a later read. |
+| Splice socket read request | **1 MiB in every profile** | Upper bound per read attempt. A positive short transfer produces a shorter valid buffer; remaining bytes wait for a later read. |
 | Payload in one Mux frame | **1 MiB** | Independent protocol maximum. A larger declaration closes that parent as soon as its complete eight-byte header is decoded. |
 | Incomplete incoming frame | **1 MiB + 8 bytes** | Logical bytes, including the cached header. Complete frames drain first; an oversized incomplete remainder closes the parent. |
 | `child-buffer-limit` | **24 MiB charge** | One child's queued decoded data. Reaching the limit closes that child. |
@@ -1007,9 +1032,9 @@ datagram boundaries. Use explicit UdpOverTcp framing for UDP byte-stream transpo
 ### Stream delivery headroom and datagram framing
 
 ConnectionToPackets retains at most `P + L` pending TCP payload bytes per flow,
-where `P` is its configured `max-pending-bytes` and `L` is the line pool's large
-payload capacity. The extra `L` bounds already-delivered input before Pause can
-take effect. Its 1,024-entry cap remains independent, and overflow is rejected
+where `P` is its configured `max-pending-bytes` and `L` is fixed at 1 MiB,
+independent of pool sizes, RAM profile and splice settings. This headroom bounds
+already-delivered input before Pause can take effect. Its 1,024-entry cap remains independent, and overflow is rejected
 before queue insertion. PacketsToConnection applies the same `P + L` bound on
 the return path; its acknowledgement records charge their original payload
 length until fully acknowledged and keeps production paused while that charge
@@ -1023,6 +1048,31 @@ are emitted together in one callback, so an onward Pause cannot leave a local
 fragment sequence unfinished.
 UDP mode still treats each callback as one datagram and drops oversized input;
 it must never split a datagram to accommodate the larger ordinary read tier.
+
+Stream admission limits belong to the node and do not derive from the pool
+large tier, splice read target or actual pipe capacity. HttpProxyServer keeps a
+fixed 2 MiB of delivery headroom per direction alongside its configured working
+budget. ObfuscatorClient/Server retain at most 2 MiB plus one maximum wire record
+(65,540 bytes); their 65,535-byte record-body maximum remains separate. The
+packet/stream adapters above keep 1 MiB of extra delivery headroom. These values
+apply independently of RAM profile, platform support and `misc.splice`. Their
+entry limits, allocation checks and overflow/close behavior remain in force.
+
+A pool tier is not a universal maximum callback size: frame assembly and other
+transforms can produce larger ordinary buffers even in chains without splice.
+Keep protocol record limits, pending-data budgets and allocation geometry
+distinct. Multiple valid records delivered together are not an oversized record;
+process them when possible while preserving bounded admission and Pause. Changing
+a pool or pipe target must not silently change these node policies.
+
+Waiting caps instead use `bufferpoolGetWaitingBudgetBasis()`, a separate immutable
+pool setting: 64 KiB in S1/S2 and 1 MiB in higher profiles. ReverseServer keeps
+`65535 * max(1, ceil(basis / 32768))`; HalfDuplexServer and HttpServer split
+waiting keep `131070 * max(1, ceil(basis / 32768))`. Their S1/S2 limits remain
+131,070 and 262,140 bytes, and their higher-profile limits remain 2,097,120 and
+4,194,240 bytes respectively. Enlarging splice targets does not enlarge these
+waiting caps. Device pools inherit both the splice limit and waiting-budget
+basis from their worker pool; custom pools provide each explicitly.
 
 ### Payload length versus retained allocation charge
 

@@ -6,7 +6,7 @@ description: "Reference documentation for the Bgp4Client node."
 ---
 
 <!--
-Documentation version: 152
+Documentation version: 153
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/Bgp4Client/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/Bgp4Client.mdx, and all files must keep the same documentation version.
 -->
 
@@ -152,7 +152,7 @@ the first OPEN frame must carry payload bytes after the synthetic OPEN body.
 
 ## Downstream Parsing
 
-Downstream bytes are accumulated in a `buffer_stream_t`.
+Downstream bytes are accumulated in a `splice_stream_t`.
 
 For each complete downstream frame, `Bgp4Client`:
 
@@ -173,16 +173,43 @@ grows beyond the current maximum buffered threshold, the line is closed.
 | --- | --- | --- |
 | Maximum body length | `65535` bytes | Includes the 1-byte type. |
 | Maximum ordinary payload body | `65534` bytes | Payload plus type must fit in `65535`. |
-| Maximum retained read bytes | `max(65536, 2 * L) + 65553` | `L` is the line pool large payload capacity; complete frames drain before the next delivery. |
+| Retained logical bytes per direction | `2162705` | Wire bytes, independent of pools and splice configuration. |
+| Queued encoded frames | `1024` | Does not limit incoming fragment count. |
+| Maximum complete wire frame | `65553` bytes | Marker, length, type and body. |
 | Required left padding | `39` bytes | Enough for frame prefix plus largest synthetic OPEN prefix. |
 
-Large deliveries are split into wire-valid frames, with at most 65,534 ordinary
-payload bytes per frame. The first client OPEN's actual synthetic prefix reduces
-its payload room; exactly one OPEN is emitted. Each delivery is encoded into one
-aggregate buffer. Complete decoded frames are combined into one onward callback,
-so a re-entrant Pause cannot be followed by another send from the same batch.
-Fragmented headers/bodies and coalesced complete frames with partial tails are
-supported. Malformed records and unrepresentable allocations close the line.
+Both directions accept ordinary buffers, private-pipe splice buffers, and mixed
+fragments. A fitting delivery is framed in place using reserved left padding
+(39 bytes for the client, 19 for the server), including any existing resident
+prefix. Larger deliveries are prepared as complete batches of separate frame
+buffers before any callback; pipe creation or transfer pressure selects complete
+ordinary best-fit fallback for the affected frame. There is no whole-delivery
+ordinary aggregate.
+
+The decoder caches the 19-byte marker/length/type header and extracts one exact
+body at a time. The server inspects only the ten fixed OPEN bytes and at most
+255 optional bytes, preserving the remaining application's representation. The
+client generates 3–10 optional bytes and subtracts the actual OPEN overhead from
+its first frame's payload room. Empty deliveries emit nothing and do not consume
+OPEN state. Exactly one OPEN is admitted per client line.
+
+The fixed logical retention limit is **2,162,705 bytes per direction**
+(`2 MiB + 65,553`), independent of RAM profile, pools, pipe capacity, platform and
+`misc.splice`. Decoders count retained wire bytes, including the cached header;
+encoders count queued encoded bytes including generated headers. Encoded output
+also has a **1,024-frame FIFO cap**. Incoming fragments have no entry-count cap.
+The maximum complete wire frame is 65,553 bytes, and a non-OPEN frame carries at
+most 65,534 application bytes.
+
+Each decoded frame produces its own callback. Downstream Pause controls upstream
+output; upstream Pause controls downstream output. Drains stop immediately on
+Pause and preserve FIFO order across reentrant input. Resume drains older work
+before releasing the producer; an incomplete frame still permits producer Resume.
+Malformed data, admission overflow or queue/stream allocation refusal closes only
+the borrowed connection through its owner. Finish releases queued buffers and
+pipes before forwarding away from the sender. Stream creation failure during Init
+notifies only the initialized owner side. These behaviors do not guarantee
+zero-copy delivery or a throughput improvement.
 
 ## Data Flow
 
@@ -204,7 +231,7 @@ does not produce the expected frame shape will cause protocol errors.
 ## Lifecycle Behavior
 
 On upstream `init`, `Bgp4Client` initializes its line state and forwards
-upstream `init` to the next tunnel.
+upstream `init` to the next tunnel only after receive-stream allocation succeeds.
 
 On downstream `est`, it forwards downstream `est` to the previous tunnel.
 
@@ -220,7 +247,8 @@ On malformed framed data, `Bgp4Client` destroys local state and closes both
 directions in middle-tunnel order: upstream finish first, then downstream
 finish.
 
-Pause and resume are forwarded directionally:
+Pause is propagated directionally after recording consumer permission. Resume
+is reconciled after older work drains, avoiding duplicate or stale notifications:
 
 | Callback | Forwarded to |
 | --- | --- |
@@ -242,7 +270,7 @@ Source-backed metadata:
 
 | Property | Value |
 | --- | --- |
-| node flags | `kNodeFlagNone` |
+| node flags | `kNodeFlagSupportsSplice` |
 | `can_have_prev` | `true` |
 | `can_have_next` | `true` |
 | `layer_group` | `kNodeLayer4` |
