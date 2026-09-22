@@ -5,7 +5,7 @@ sidebar_label: "Part 3: Buffers & Padding"
 description: "The sbuf_t buffer model, worker buffer pools, left-padding budgets, and how to prepend protocol headers without breaking chain composition."
 ---
 <!--
-Documentation version: 160
+Documentation version: 162
 -->
 
 # Part 3: Buffers, Padding & Shift Buffers
@@ -716,6 +716,71 @@ then append the still-unmoved source range. Return exactly N ordered bytes once,
 leaving unrequested suffixes intact. Missing claimed source bytes or invalid owned
 descriptors remain fatal invariants. Exact transfer primitives live in
 `splice_buffer`, independently of Mux and the event loop.
+
+### TrojanClient variable headers and opaque TCP
+
+TrojanClient forwards established TCP sbufs without body inspection or conversion;
+early or paused downstream TCP uses a FIFO, not BufferStream or a header parser.
+The initial request is one independent ordinary best-fit buffer of at most 320
+bytes. Its allocation preserves onward padding rather than spending the node's
+263-byte UDP header budget.
+
+UDP send keeps pending datagrams unwrapped, then prepends exactly once when the
+carrier is writable. Existing resident prefixes remain payload. Insufficient
+headroom uses `sbufMoveRangeTo()` with sufficient padding and retains its returned
+replacement, including complete ordinary fallback on private-pipe pressure.
+
+UDP receive owns a FIFO, an active popped head and a header cache of at most 263
+bytes. ATYP and domain length determine the exact header extent: 11 bytes for
+IPv4, 23 for IPv6, or 8 plus domain length. `sbufReadRangeToMemory()` consumes only
+required header pieces. Cached bytes remain charged to retained wire input.
+The decoder validates address, nonzero port, CRLF and the 8,192-byte body bound
+before extracting one complete datagram. It never retargets the application from
+the received source address. Whole suitable bodies transfer directly; split or
+mixed bodies use shared exact range movement and full onward padding. Zero-length
+bodies still produce one datagram. Pause stops both body delivery and header
+read-ahead; popped/exhausted wrappers recycle exactly once.
+
+Pending upstream application data has a fixed 1 MiB and 1,024-buffer limit;
+direct-TCP downstream retention has the same limits. Empty UDP entries consume
+slots. UDP carrier input instead has a fixed 1,057,031-byte limit (1 MiB plus one
+8,455-byte maximum frame), including cached headers and the active head, without
+an incoming-fragment cap. The initial request has its own bounded control state.
+These policies are independent of pool geometry, RAM profile and actual pipe
+capacity. Queue admission refusal or overflow closes the affected association;
+ordinary pipe refusal uses the shared representation fallback.
+
+### TrojanServer request inspection and retained wire bytes
+
+TrojanServer owns an input FIFO, a popped active head and at most 320 resident
+initial-header bytes. The first callback's logical size must include all 56 hash
+bytes, even when splice-backed. Consume only the current field with
+`sbufReadRangeToMemory()`. Validate available hex/CRLF before authentication and
+cache successful lookup before later fields arrive. Post-authentication malformed
+input closes the protected flow. Rejected unauthenticated input replays every
+inspected prefix byte before its untouched tail, secured before fallback Init.
+No parser read may consume opaque TCP body just to fill a maximum-sized cache.
+
+UDP stages address/port/length/CRLF, using at most 263 header bytes. Incomplete,
+invalid and complete are distinct results. Body extraction transfers a suitable
+whole source or uses `sbufMoveRangeTo()` with full onward padding; preserve its
+replacement result and unrequested suffix. Empty frames produce one datagram.
+A selected frame waiting for backend permission remains in input ownership and
+accounting. Ordinary-only bodies need no pipe; resource refusal selects complete
+ordinary fallback. Replies prepend at most 263 real bytes and retain the existing
+65,535-byte backend-body limit, separate from the 8,192-byte incoming maximum.
+
+UDP input and initial assembly allow 1,057,031 wire bytes, including cached headers
+and active/selected input, so a partial request plus a 1 MiB delivery fits. Remove
+initial-header cost before applying the selected path's limit; the 4,096-byte
+incomplete-initial policy does not reject coalesced application bodies. Pending
+TCP and fallback each allow 1 MiB and 1,024 output buffers per direction. Fallback
+replay includes inspected prefix bytes. UDP replies share an association-wide
+1 MiB encoded-wire and 1,024-datagram budget, including pre-Est entries. Empty
+replies consume slots; incoming UDP fragment count has no output-entry cap.
+Budgets are independent of pool geometry, RAM profile and kernel pipe capacity.
+Delayed/final fallback batches use exact representation-aware assembly into one
+callback, with suitable sole-buffer transfer and complete ordinary fallback.
 
 ### MUX parent streams and decoded child queues
 

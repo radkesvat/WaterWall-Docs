@@ -5,7 +5,7 @@ sidebar_label: "Part 2: Lines & Lifetime"
 description: "The connection lifecycle, re-entrancy hazards, line references, and the clean-finish patterns that keep WaterWall tunnels free of use-after-free bugs."
 ---
 <!--
-Documentation version: 165
+Documentation version: 175
 -->
 
 # Part 2: Lines, Callbacks & Lifetime Safety
@@ -1043,6 +1043,161 @@ If the line survives, enqueue the buffer normally and preserve FIFO accounting.
 Numeric thresholds and hysteresis are implementation details. Read the target
 adapter's `payload.c`, `helpers.c`, and `structure.h`; do not copy one adapter's
 current tolerance into another node or into this guide as a universal value.
+
+### Client destination preparation before DNS
+
+TrojanClient, VlessClient and Socks5Client apply their configured address, port
+and TCP/UDP selection to the line's destination context before local DNS
+resolution. Their internal DomainResolver invokes a client-owned prepare hook;
+the resolver itself does not choose the client's protocol. These hooks need no
+custom resolver line-state storage.
+
+DNS resolution replaces the destination address while preserving the selected
+protocol flags. When Init reaches the client, read those flags from the prepared
+destination context. Without local DNS, the client applies the target directly
+in Init and then reads the same flags. Target preparation leaves exactly one of
+TCP or UDP selected; this is a debug invariant at the client entry, not another
+runtime configuration check.
+
+Do not apply the target settings a second time after DNS: a configured domain
+could overwrite the resolved destination. Protocol-selection warnings and the
+existing TCP fallback for an invalid incoming `dest_context->protocol` belong
+to target preparation and occur there once.
+
+### TrojanClient establishment and association ownership
+
+TrojanClient borrows direct TCP and UDP application normal lines. UDP creates one
+owned normal TCP carrier on the application's worker and sends Init toward next
+only on that carrier. The application retains its UDP routing context. Carrier
+input becomes datagrams sent toward prev on the application line. Pumps retain
+both exact lines and recheck logical life, phase and association after callbacks.
+Close detaches both links and destroys local buffers/state before outward Finish;
+only the carrier is destroyed here. Source-owner shutdown drains the dependent
+carrier through the application association while chains and pools remain alive.
+
+Directional state uses `prev`/`next`, matching the callback API. In TCP mode,
+`prev_line` and `next_line` are the same line. In UDP mode they refer to the
+application and carrier lines respectively; `app_line` and `carrier_line` retain
+their role names in the association. Flow-control state lives on the direct TCP
+line or the UDP carrier line:
+
+| Field | Meaning |
+| --- | --- |
+| `next_established` | Next has delivered Est. The initial request still precedes Est to prev. |
+| `next_paused` | Next asked this node to stop sending payload toward next. |
+| `prev_paused` | Prev asked this node to stop sending payload toward prev. |
+| `prev_pause_sent` | This node has told prev to pause its upstream producer. |
+| `next_pause_sent` | This node has told next to pause its downstream producer. |
+
+The paused-side flags record consumer permission. The `*_pause_sent` flags record
+notifications sent to producers on the opposite side, preventing repeated or
+stale Pause/Resume callbacks. A flag names the neighbor, not the direction in
+which its Pause callback travels.
+
+Transport Est records request admission before any callback can reenter. The
+separate request precedes application Est and payload; queued data remains attached
+to authoritative FIFO state throughout Est. Duplicate Est does not send a second
+request. The establishment barrier and pump gate prevent nested input or Resume
+from overtaking older work. Pause changes local permission before notification.
+Resume drains ready work before releasing producer pressure, but incomplete UDP
+headers/bodies must still allow carrier Resume so more input can arrive.
+
+`trojanclientPump()` remains the single coordinator. Its private steps run in
+this order: notify paused producers, advance establishment, forward queued
+upstream payload, forward queued downstream payload, then notify resumed
+producers. Payload steps run only after establishment and deliver at most one
+buffer before returning to the coordinator.
+
+Private steps return an explicit pump action, independent of success or failure.
+A step that invokes a callback or closes the association returns
+`kPumpStepRecheck`, making the pump recheck association liveness and restart
+permission checks. `kPumpStepFallThrough` means no callback ran, so the next step
+can inspect state safely; it does not necessarily mean no bytes were consumed,
+since UDP header gathering may be incomplete. Helpers share the pump's retained
+line references and `pumping` guard rather than acquiring independent drain loops
+or reentrancy state.
+
+### TrojanServer association pumps and fallback replay
+
+TrojanServer borrows the client normal line and owns each UDP backend on that
+client's worker. Publish target, credentials and fallible map membership before
+backend Init. AuthenticationClient is a lookup dependency; UserController runs
+only on the protected branch. The client pump retains the client across callbacks;
+backend Init, Payload and permission notification also retain the exact backend.
+Remote removal clears membership, selected-frame links and ineligible reply
+waiters before callbacks, then returns with that backend logically dead.
+
+Directional state follows the same `prev`/`next` convention as TrojanClient;
+client/backend names continue to identify line roles and ownership:
+
+| Field | Meaning |
+| --- | --- |
+| `next_established` | The selected next-side branch or UDP backend has delivered Est. |
+| `prev_est_sent` | Est has been sent toward prev on the client line for TCP/fallback. |
+| `next_paused` | Next asked this node to stop sending upstream payload on this line. |
+| `prev_paused` | Prev asked this node to stop sending downstream payload on the client line. |
+| `prev_pause_sent` | This node has told prev to pause its upstream producer. |
+| `next_pause_sent` | This node has told next to pause its downstream producer. |
+
+For UDP, each backend holds its own `next_paused` and `next_pause_sent` flags.
+The client state's `paused_remotes` counts paused backends and blocks upstream
+delivery until it reaches zero. The client state's `prev_paused` controls replies
+from the whole association. Consumer permission and producer notifications remain
+separate: Pause from a consumer is propagated toward the producer on the opposite
+side.
+
+TrojanServer's upstream Payload/Pause/Resume entry points operate on the borrowed
+client line. It sends backend upstream events directly to next; backend replies
+and notifications return through downstream callbacks. Debug assertions enforce
+this caller-side routing invariant. Keep closing-phase admission checks for the
+final fallback payload and for callbacks involving still-live UDP siblings during
+association teardown. The pump's entry gate also prevents backend removal from
+restarting work while the client is closing. These gates do not permit callbacks
+on the finished side of the same line or callbacks into destroyed local state.
+After an ordinary callback returns, retain the exact line's `lineIsAlive()` check;
+the owner's logical-death postcondition makes a second closing-phase check
+redundant. A live backend also remains attached to its original client; that
+association is a debug invariant, not another runtime admission test.
+
+Any backend Pause contributes once to an association aggregate. Until every
+contribution resumes or is removed, stop carrier decoding/delivery. Client reply
+Pause applies to every initialized backend, including newly created backends.
+Restart permission traversal after each callback; never retain a raw iterator or
+unreferenced sibling across fan-out or teardown. Ready replies share one client
+FIFO; a pre-Est reply blocks later entries until its backend establishes or closes.
+Ready encoded replies survive backend removal, while that backend's ineligible
+entries are discarded. Resume drains ready older work before releasing producers;
+an incomplete request/frame must not prevent the input needed to complete it.
+
+`trojanserverPump()` coordinates pause notifications, establishment notification,
+initial request parsing, pending input, queued replies and resume notifications
+in that order. Initial parsing stays an explicit barrier: wait for more input or
+restart with the selected TCP, UDP or fallback state before delivering payload.
+Private helpers share the pump's client-line reference and reentrancy guard.
+They return `kPumpStepRecheck` when callbacks, parser progress or closure require
+a fresh liveness and permission check. `kPumpStepFallThrough` allows the next step
+to run: incomplete UDP input falls through to replies and Resume; successful
+fallback scheduling also falls through because its task runs later. These actions
+do not report success or failure. The queued-reply step preserves the independent
+fallback reply drain described below rather than imposing an Est or upstream-drain
+requirement on it.
+
+TCP and fallback establish barriers before branch Init/Est, preserving older body
+or replay bytes through reentrant admission. CONNECT may submit data after Init
+returns while the next adapter is still connecting, if writable. Fallback retains
+its delayed one-buffer batch and zero-delay inline/retained-drain rules. Its source
+Finish exception permits at most one synchronous final batch, only outside branch
+Init and while unpaused. Absorb supported nested nonterminal callbacks and record
+nested branch Finish. Zeroed state is terminal; cleanup never revives parsing.
+Source-owner shutdown settles dependent backends and represented fallback tasks
+while line/buffer pools and the chain remain alive.
+
+Fallback replies need no outbound Est: a local service can send Payload followed
+by Finish within its Init or Payload callback. TrojanServer drains writable
+fallback replies independently of its upstream pump, retaining the line across
+delivery and preserving downstream FIFO under reentrant input. Pause stops this
+drain and Resume releases it without waiting for Est. The source-Finish final-batch
+gate still absorbs returned replies; it never reopens the finished direction.
 
 ## Worked Example: Tracing a Payload
 

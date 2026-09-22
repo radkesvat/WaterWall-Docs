@@ -5,7 +5,7 @@ sidebar_label: "Part 5: Anatomy & Workflow"
 description: "The on-disk layout of a WaterWall tunnel, what each file owns, node.c metadata, the create/line-state patterns, HTTP constraints, and the implementation workflow."
 ---
 <!--
-Documentation version: 161
+Documentation version: 164
 -->
 
 # Part 5: Anatomy of a Tunnel & Workflow
@@ -38,7 +38,9 @@ tunnels/MyTunnel/
     destroy.c            # onDestroy hook: free state, then tunnelDestroy()
     api.c                # runtime API entry (tunnelApi)
   common/
-    helpers.c            # shared protocol/state-machine helpers
+    helpers.c            # shared protocol helpers
+    flow.c               # shared progress coordination, when needed
+    input.c              # shared parsing/extraction, when needed
     line_state.c         # initialize + destroy per-line state
   upstream/
     init.c  est.c  payload.c  pause.c  resume.c  fin.c
@@ -67,9 +69,14 @@ runtime callers, together with their declarations and build-source references.
 Check public entrypoints and dynamic loading conventions before declaring a
 function unused; retain callbacks and APIs that remain reachable.
 
-The split into one file per custom `{direction}/{event}` keeps each callback small.
-Shared protocol logic and the state machine live in `common/helpers.c` so the
-callback files stay readable. Follow that convention; reviewers expect it.
+Keep one file per custom `{direction}/{event}`. Each callback may contain its
+direction-specific dispatch, admission checks and direct forwarding so buffer
+ownership and callback direction remain visible. Share parsing, framing, progress
+coordination and teardown in cohesive `common/` files, such as `input.c`, `flow.c`,
+`fallback.c` or `lifecycle.c`, as their responsibilities warrant. Keep file-local
+helpers static and expose only necessary cross-file helpers through the private
+header. Callbacks should remain readable without hiding directional decisions
+behind a boolean dispatcher; common code need not all live in `helpers.c`.
 
 ## What Each File Owns
 
@@ -82,8 +89,8 @@ callback files stay readable. Follow that convention; reviewers expect it.
 | `instance/destroy.c` | `onDestroy`: free settings, SSL contexts, pools, thread-local arrays, then call `tunnelDestroy(t)`. |
 | `instance/api.c` | The `tunnelApi` runtime entry. It receives an `sbuf_t` message, must recycle it, and returns an `api_result_t`. |
 | `common/line_state.c` | `LinestateInitialize` (called from `Init`) and `LinestateDestroy` (zeroes the aligned line-state region). |
-| `common/helpers.c` | Shared protocol parsing, framing, and the close/finish helpers used by the callback files. |
-| `upstream/*.c`, `downstream/*.c` | One custom flow callback each. Omit files for inherited callbacks. Keep them thin; delegate to `helpers.c`. |
+| `common/*.c` | Shared algorithms and coordination grouped by responsibility: protocol helpers, parsing, framing, progress, fallback or lifecycle. |
+| `upstream/*.c`, `downstream/*.c` | One custom flow callback each. Omit files for inherited callbacks. Keep directional dispatch, admission and direct forwarding here; delegate shared algorithms and coordination to cohesive common files. |
 | `include/MyTunnel/structure.h` | `mytunnel_tstate_t`, `mytunnel_lstate_t`, size enums, and small inline helpers. |
 | `include/MyTunnel/interface.h` | `WW_EXPORT` create/api and custom destroy prototypes, plus prototypes for implemented callbacks. |
 
@@ -253,7 +260,7 @@ select it. `WW_HAVE_SPLICE` reports Linux splice API availability independently
 of the event watcher.
 
 `TcpListener`, `TcpConnector`, `DomainResolver`, `MuxClient`, `MuxServer`,
-`Bgp4Client`, `Bgp4Server`, `HeaderClient`, `Bridge`, `UserController`, `BlackHole`, `ReverseClient`, and
+`Bgp4Client`, `Bgp4Server`, `TrojanClient`, `TrojanServer`, `HeaderClient`, `Bridge`, `UserController`, `BlackHole`, `ReverseClient`, and
 `JunkDatagramSender`, `UdpListener`, `UdpConnector`, `UdpStatelessSocket`,
 `TcpUdpListener`, and `TcpUdpConnector` advertise the flag. This includes the internal `DomainResolver` inserted by
 `TcpConnector`. Mux retains valid queued bodies under local queue-capacity charges. Incoming
@@ -262,6 +269,14 @@ pressure compaction and actual pipe-transfer fallback remain available. Its fixe
 splice batches preserve both callback directions. This does not promise zero-copy
 for every frame. BufferStream and HTTP remain ordinary-only; HTTP nodes do not
 advertise splice support.
+
+TrojanClient supports opaque TCP and staged variable-header UDP decoding, including
+its dependent owned carrier and destination-context selection. Its internal
+DomainResolver remains eligible. TlsClient still blocks a chain containing it;
+TrojanServer supports staged request authentication, opaque CONNECT, UDP backends
+and exact fallback replay. Eligibility includes its UserController and all reachable
+fallback/connector helpers; the AuthenticationClient lookup dependency is not a
+payload hop. TlsServer remains a blocker. See the Trojan buffer contracts in Part 3.
 
 BGP supports both representations through in-place framing, bounded frame FIFOs
 and a 19-byte fixed-header receive stream. OPEN inspection reads only its bounded

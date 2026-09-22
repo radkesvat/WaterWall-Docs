@@ -6,7 +6,7 @@ description: "راهنمای نود TrojanServer در WaterWall."
 ---
 
 <!--
-Documentation version: 153
+Documentation version: 155
 -->
 
 # TrojanServer
@@ -269,7 +269,7 @@ replyهای backend UDP lineها دوباره داخل Trojan UDP packet framing
 در نتیجه یک Trojan UDP association می‌تواند با چند endpoint مختلف UDP صحبت کند.
 
 UDP packet header خراب، domain name با طول صفر، port missing، CRLF نامعتبر، یا UDP payload بزرگ‌تر از 8192 بایت باعث
-بسته شدن Trojan line مربوطه می‌شود. pending downstream reply data تا 1 MiB محدود است.
+بسته شدن Trojan line مربوطه می‌شود. پاسخ‌های در صف در کل association به 1 MiB بایت wire کدگذاری‌شده و ۱۰۲۴ دیتاگرام محدود هستند.
 
 ## رفتار Fallback
 
@@ -293,13 +293,84 @@ Fallback ممکن است در این حالت‌ها انتخاب شود:
 - upstream fallback payloadها در عملیات عادی و delay غیرصفر با `fallback-intentional-delay-ms` به علاوه jitter delay می‌شوند
 - در delay صفر، fallback فعال و بدون pause که FIFO قدیمی یا drain زمان‌بندی‌شده ندارد payload را inline می‌گیرد؛ byteهای
   paused یا قدیمی FIFO می‌مانند و Resume drain آن‌ها را پیش از payloadهای بعدی زمان‌بندی می‌کند تا سبقت نگیرند
-- FIFO تأخیردار fallback تا 1 MiB برای هر line محدود است
+- FIFO تأخیردار fallback تا 1 MiB و ۱۰۲۴ بافر برای هر line محدود است
 - در upstream `Finish`، batch صف‌شده فقط وقتی fallback payload می‌پذیرد هم‌زمان و به‌ترتیب FIFO پیش از `Finish` fallback
   flush می‌شود؛ fallback از قبل paused batch محلی را دور می‌ریزد و بدون دور زدن backpressure بسته می‌شود
 - پاسخ‌های downstream در fallback عمداً به تأخیر نمی‌افتند
 
+fallback می‌تواند بدون `Est` خروجی، پاسخ محلی تولید کند؛ حتی پاسخ و سپس `Finish`
+در همان callback مربوط به Init یا Payload. تا وقتی کلاینت Pause نکرده، پاسخ‌ها
+مستقل از پردازش upstream ارسال می‌شوند تا پاسخ پیش از Finish به کلاینت برسد.
+پاسخ‌های متوقف‌شده یا بازدرآمده ترتیب FIFO در downstream را حفظ می‌کنند و Resume
+به Est وابسته نیست. هنگام پاک‌سازی پس از Finish سمت مبدأ، پاسخ‌های batch نهایی
+همچنان جذب می‌شوند و به سمت پایان‌یافته بازتاب داده نمی‌شوند.
+
 delay باقی‌مانده پس از `Finish` زنده نگه داشته نمی‌شود. تأخیر پیش‌فرض fallback عمداً کوتاه است. delay و jitter را بر اساس
 رفتار سرویس عمومی‌ای تنظیم کنید که fallback قرار است شبیه آن باشد؛ این‌ها mitigation هستند، نه اثبات indistinguishability زمانی.
+
+## Splice، بافر و کنترل فشار
+
+`TrojanServer` در احراز هویت، CONNECT، ASSOCIATE و fallback بافر معمولی، splice با pipe
+خصوصی و ورودی ترکیبی را می‌پذیرد. parser اولیه فقط هدر لازم را می‌خواند: ۶۸ بایت برای
+IPv4، ۸۰ بایت برای IPv6 یا ۶۵ بایت به‌علاوه طول دامنه، با حداکثر ۳۲۰ بایت. اولین callback
+همچنان باید تمام ۵۶ بایت hash را داشته باشد. بایت‌های موجود CRLF پیش از احراز هویت بررسی
+می‌شوند؛ اگر hash پیش از رسیدن CRLF پذیرفته شده باشد، lookup تکرار نمی‌شود و CRLF خرابِ
+بعدی جریان را می‌بندد، بدون fallback. credentials و handle کاربر پیش از Init مسیر محافظت‌شده
+ثبت می‌شوند.
+
+بدنه TCP پس از هدر بدون خواندن یا تبدیل عبور می‌کند. داده ورودی حین Init یا Est پشت
+داده قدیمی در FIFO می‌ماند. پس از بازگشت Init، ارسال به connector در حال اتصال مجاز است،
+به شرط رعایت Pause. Est فقط یک بار به سمت client فرستاده می‌شود.
+
+fallback همه بایت‌های اصلی را دقیقاً یک بار بازپخش می‌کند: ابتدا prefix بررسی‌شده در
+حافظه، سپس ادامه دست‌نخورده، پیش از داده جدید. Init فوری است و delay و jitter فعلی حفظ
+می‌شوند. هر batch تأخیردار یک بافر و یک Payload است؛ انتقال دقیق داده روی فشار pipe به
+بافر معمولی کامل برمی‌گردد. هنگام Finish مبدأ، مسیر آماده و بدون Pause حداکثر یک batch
+نهایی را هم‌زمان دریافت می‌کند؛ مسیر paused یا هنوز در Init، replay نگهداری‌شده را دور
+می‌ریزد. callback نهایی به سمت فرستنده Finish بازتاب داده نمی‌شود.
+
+در UDP فقط هدر جاریِ ۱۱، ۲۳ یا `8 + domain_length` بایتی خوانده می‌شود و هر بدنه دقیقاً
+یک دیتاگرام، حتی دیتاگرام خالی، تولید می‌کند. backendها line معمولی متعلق به سرور روی
+worker کلاینت هستند و پیش از Init، مقصد، عضویت association و credentials آن‌ها آماده
+می‌شود. line کلاینت قرضی است و فقط سازنده‌اش آن را نابود می‌کند.
+
+Pause هر backend دریافت و decode کل association را متوقف می‌کند تا تمام backendهای
+paused به Resume برسند یا بسته شوند؛ بنابراین توقف یک مقصد می‌تواند مقصدهای دیگر را
+نیز معطل کند. Pause پاسخ‌های client به همه backendهای initialized منتقل می‌شود و
+backend تازه نیز permission فعلی را می‌گیرد. Resume ابتدا داده قدیمی آماده را تخلیه
+می‌کند؛ هدر یا بدنه ناقص نباید Resume لازم برای تکمیل ورودی را نگه دارد.
+
+پاسخ‌ها یک FIFO مشترک به ترتیب رسیدن دارند. پاسخ پیش از Est منتظر همان backend می‌ماند
+و پاسخ بعدی از آن سبقت نمی‌گیرد. هنگام بسته شدن backend، پاسخ‌های کدگذاری‌شده آماده
+باقی می‌مانند ولی پاسخ‌های پیش از Est آن حذف می‌شوند. آدرس پاسخ هنگام معتبر بودن
+backend در هدر ذخیره می‌شود.
+
+| داده نگهداری‌شده | سقف ثابت |
+| --- | --- |
+| ورودی UDP، شامل هدر cache‌شده و فریم منتظر permission | ۱٬۰۵۷٬۰۳۱ بایت wire، برابر 1 MiB به‌علاوه فریم ۸۴۵۵ بایتی |
+| داده TCP در هر جهت | 1 MiB و ۱۰۲۴ بافر |
+| داده fallback در هر جهت، شامل prefix بازپخش | 1 MiB و ۱۰۲۴ بافر |
+| پاسخ UDP در کل association، شامل پاسخ‌های پیش از Est | 1 MiB بایت wire کدگذاری‌شده و ۱۰۲۴ دیتاگرام |
+| cache هدر اولیه | ۳۲۰ بایت واقعی؛ حد مستقل ورودی اولیه ناقص ۴۰۹۶ بایت است |
+| بدنه UDP ورودی | ۸۱۹۲ بایت |
+| بدنه پاسخ backend | ۶۵۵۳۵ بایت |
+
+مونتاژ اولیه از بودجه wire حالت UDP استفاده می‌کند تا یک درخواست ناقص و ورودی بعدی
+1 MiB جا شوند. پس از تکمیل هدر، هزینه هدر حذف و بودجه مسیر انتخاب‌شده اعمال می‌شود.
+دیتاگرام خروجی خالی یک slot می‌گیرد؛ تعداد قطعه‌های ورودی UDP سقف ۱۰۲۴ ندارد. حدود به
+RAM، اندازه pool یا ظرفیت واقعی pipe وابسته نیستند. سرریز پاسخ مشترک association را
+می‌بندد؛ خطای مختص یک backend محلی می‌ماند.
+
+prepend پاسخ UDP در padding واقعی ۲۶۳ بایتی انجام می‌شود و prefix قبلی جزو payload
+می‌ماند. کمبود padding یا منابع pipe از helperهای مشترک انتقال دقیق و fallback کامل
+به بافر معمولی استفاده می‌کند. shutdown مالک مبدأ، backendها، صف‌ها و بدنه‌های خصوصی
+را پیش از آزاد شدن chain و poolها تسویه می‌کند؛ task تأخیردار فقط عمر فیزیکی line را نگه
+می‌دارد.
+
+قابلیت splice پس از افزودن UserController داخلی، helperهای connector و شاخه fallback
+ارزیابی می‌شود. AuthenticationClient فقط وابستگی lookup است، نه مسیر payload.
+TlsServer و TlsClient همچنان splice را برای زنجیره خود غیرفعال می‌کنند. TLS را در استقرار
+معمول Trojan نگه دارید. این قابلیت تضمین zero-copy همه بافرها یا افزایش سرعت اندازه‌گیری‌شده نیست.
 
 ## رفتار Finish
 
@@ -347,7 +418,7 @@ required_padding_left = 263
 
 | ویژگی | مقدار |
 | --- | --- |
-| node flags | `kNodeFlagNone` |
+| node flags | `kNodeFlagSupportsSplice` |
 | `can_have_prev` | `true` |
 | `can_have_next` | `true` |
 | `layer_group` | `kNodeLayer4` |

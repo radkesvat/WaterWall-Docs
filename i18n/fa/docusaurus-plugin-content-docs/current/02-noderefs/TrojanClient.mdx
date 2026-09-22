@@ -6,7 +6,7 @@ description: "راهنمای نود TrojanClient در WaterWall."
 ---
 
 <!--
-Documentation version: 152
+Documentation version: 154
 -->
 
 # TrojanClient
@@ -226,8 +226,8 @@ payload:      length bytes
 وقتی transport سمت downstream established شد، `TrojanClient`:
 
 1. Trojan request header را upstream ارسال می‌کند
-2. Trojan stream را established علامت می‌زند
-3. downstream `Est` را به نود قبلی می‌فرستد
+2. downstream `Est` را به نود قبلی می‌فرستد
+3. پس از بازگشت این callback، مانع ارسال داده در زمان برقراری را آزاد می‌کند
 4. payloadهای upstream موجود در صف را ارسال می‌کند
 5. byteهای downstream را که پیش از برقراری مسیر رسیده‌اند تحویل می‌دهد
 
@@ -250,9 +250,45 @@ Trojan response header موفقیت ندارد، بنابراین client منت�
 - Trojan UDP frameهای downstream تجزیه می‌شوند، header آن‌ها حذف می‌شود و payload خام UDP به app line برمی‌گردد
 
 payloadهای محلی UDP بزرگ‌تر از ۸۱۹۲ بایت دور ریخته می‌شوند، بی‌آنکه کل association بسته شود. در مقابل، Trojan UDP frame
-ورودی بزرگ‌تر از ۸۱۹۲ بایت، header خراب، CRLF نامعتبر یا عبور حجم buffer ورودی از 1 MiB باعث بسته شدن line مربوطه است.
+ورودی بزرگ‌تر از ۸۱۹۲ بایت، header خراب، CRLF نامعتبر یا عبور حجم buffer ورودی carrier از ۱٬۰۵۷٬۰۳۱ بایت باعث بسته شدن line مربوطه است.
 
-client هنگام انتظار برای برقرار شدن مسیر transport/request، حداکثر 1 MiB از داده upstream application را در صف نگه می‌دارد.
+client هنگام انتظار برای برقرار شدن مسیر transport/request یا دریافت Resume، حداکثر 1 MiB و ۱۰۲۴ buffer از داده upstream application را در صف نگه می‌دارد.
+
+## Splice و محدودیت بافر
+
+`TrojanClient` در حالت‌های TCP، UDP و انتخاب protocol از destination context، بافر معمولی،
+بافر splice با pipe خصوصی و ورودی ترکیبی را می‌پذیرد. TCP هدر پاسخ ندارد و داده آن بدون
+خواندن بدنه عبور می‌کند. در UDP فقط هدر جاری خوانده می‌شود: ۱۱ بایت برای IPv4، ۲۳ بایت
+برای IPv6 یا ۸ بایت به‌علاوه طول دامنه. هر فریم دقیقاً یک دیتاگرام، حتی دیتاگرام خالی،
+تولید می‌کند. آدرس مبدأ دریافتی اعتبارسنجی می‌شود ولی مقصد association را تغییر نمی‌دهد.
+هدر خروجی در padding واقعی ۲۶۳ بایتی اضافه می‌شود؛ کمبود padding یا فشار pipe با helperهای
+مشترک و fallback کامل به بافر معمولی مدیریت می‌شود.
+
+درخواست اولیه یک بافر معمولی مستقل با حداکثر ۳۲۰ بایت است و پس از برقراری transport،
+بدون انتظار برای داده برنامه، فقط یک بار ارسال می‌شود. اگر transport در Pause باشد،
+ارسال تا Resume منتظر می‌ماند. درخواست پیش از `Est` برنامه ارسال می‌شود؛ داده‌ای که
+حین callback وارد شود پشت داده‌های قدیمی در صف می‌ماند. هر دو جهت ترتیب FIFO و Pause
+مصرف‌کننده را رعایت می‌کنند.
+
+| داده نگهداری‌شده | سقف ثابت |
+| --- | --- |
+| داده برنامه در صف upstream، TCP یا UDP | 1 MiB و ۱۰۲۴ بافر؛ دیتاگرام خالی نیز یک ورودی است |
+| داده downstream در TCP تا برقراری یا Resume | 1 MiB و ۱۰۲۴ بافر |
+| ورودی carrier در UDP، شامل هدر cache‌شده و بافر فعال | ۱٬۰۵۷٬۰۳۱ بایت، برابر 1 MiB به‌علاوه یک فریم حداکثری |
+| payload یک دیتاگرام UDP | ۸۱۹۲ بایت |
+
+درخواست اولیه جدا از بودجه داده برنامه حساب می‌شود. داده UDP خروجی تا زمان ارسال بدون
+هدر در صف می‌ماند. تعداد قطعه‌های ورودی UDP سقف ۱۰۲۴ ندارد. این حدود به اندازه pool،
+پروفایل RAM یا ظرفیت واقعی pipe وابسته نیستند. ورودی خراب یا سرریز صف فقط جریان مربوطه
+را می‌بندد؛ دیتاگرام محلی بیش‌ازحد بزرگ بدون بستن association دور ریخته می‌شود.
+
+قابلیت splice پس از افزودن `DomainResolver` داخلی ارزیابی می‌شود و به پشتیبانی تمام
+نودهای زنجیره، پلتفرم مناسب و فعال بودن `misc.splice` نیاز دارد. `TlsClient` همچنان splice
+را برای کل زنجیره غیرفعال می‌کند. `TrojanServer` نیز در احراز هویت، TCP، UDP و fallback
+از splice پشتیبانی می‌کند، به شرط واجد شرایط بودن تمام شاخه‌های payload زنجیره نهایی.
+ارتباط با peer معمولی همچنان پشتیبانی می‌شود. این قابلیت تضمین
+zero-copy یا افزایش سرعت اندازه‌گیری‌شده نیست. برای استقرار معمول Trojan، `TlsClient`
+را در پیکربندی نگه دارید.
 
 ## رفتار Finish
 
@@ -297,7 +333,7 @@ required_padding_left = 263
 
 | ویژگی | مقدار |
 | --- | --- |
-| node flags | `kNodeFlagNone` |
+| node flags | `kNodeFlagSupportsSplice` |
 | `can_have_prev` | `true` |
 | `can_have_next` | `true` |
 | `layer_group` | `kNodeLayer4` |
