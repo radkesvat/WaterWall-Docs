@@ -5,7 +5,7 @@ sidebar_label: "Part 7: Application Termination"
 description: "The shutdown controller, worker quiescence protocol, lifecycle-v2 component stages, task settlement, signals, devices, and destruction order."
 ---
 <!--
-Documentation version: 161
+Documentation version: 162
 -->
 
 # Part 7: Application Termination
@@ -156,8 +156,8 @@ application behavior: an I/O callback, timer, idle, custom event, queued worker
 message, device delivery, or lwIP delivery. Synchronous nested tunnel callbacks
 belong to the admitted root for that exact `wloop_t`; a callback on loop A has no
 inherited authority on loop B. Direct writes follow the same rule on NIO and
-IOCP: an independent caller acquires target-loop admission across the system
-send, interest registration, queue insertion, and asynchronous-operation
+IOCP: an independent owner-thread caller acquires target-loop admission across
+the system send, interest registration, queue insertion, and asynchronous-operation
 publication. A synchronous write callback is a target-loop callback root: it
 runs with the target loop as its only normal authority and restores any outer
 source-loop authority on return. Admission is released before invoking user
@@ -171,8 +171,16 @@ while preserving synchronous nested callbacks within an admitted root. Post-I/O
 delivery checks and checks between callbacks remain necessary: an active event
 handler can contain more than one callback or queue entry.
 
-Independent WIO writes may originate on another thread, but callers must
-serialize writes to one `wio_t`; there is no recursive per-WIO mutex contract.
+WIO access, writes, close and associated callbacks belong to the owning event
+worker during normal operation. An independent write is a call on that worker
+outside an already-admitted normal callback; it is not a foreign-thread call.
+Serialization and target-loop admission do not grant access to another worker's
+WIO. Foreign producers submit through the adapter's worker-message interface;
+the owner resolves and uses its WIO. Canceled messages settle detached buffers
+without accessing a foreign WIO or pool. `wioClose()` does not dispatch foreign
+callers. `wioCloseAsync()` defers close through the owner loop's cleanup-control
+queue; its name and queue do not confer foreign WIO access. Exclusive startup,
+explicit detach/attach and teardown retain their existing contracts.
 Zero-length TCP writes and existing stream-queue branches cross the same target
 loop gate. Rejection sends no bytes, does not close the WIO as a side effect, and
 consumes the transferred buffer once. UDP zero-length datagrams remain valid
@@ -486,6 +494,43 @@ The event loop, chain, tunnel state, tail resources needed for `Finish`, and lin
 and buffer pools remain alive throughout worker drain. Only a normal line's
 creator calls `lineDestroy()`, and every owner drain leaves its normal lines
 logically dead. Runtime shutdown never destroys a packet line.
+
+### UDP send retirement
+
+Incomplete pipe-backed datagram assembly retires only the affected socket. The
+socket owner runs the complete `udpSendBuffer()` assembly and retirement; the
+helper does not transfer ownership. WIO settles the input buffer before closing
+and marks the socket closed before the synchronous close callback, which may
+destroy associated lines or the WIO. Continuations must retain and recheck their
+line, and must not access a reclaimed WIO. Close callbacks detach every cached
+socket pointer before peer cleanup. UdpConnector removes its shared socket and
+peer bindings, finishes affected borrowed lines through their owners, and guards queue/DNS
+continuations against reentrant line death. During a source-initiated Finish,
+the close-time flush retains local cleanup authority and never reflects Finish.
+
+Before the first peer Finish notification, retirement must reject sends through
+every affected binding, including still-live siblings. Binding selection and each
+actual write through a cached binding must honor the socket's Closing state before
+using its WIO or refreshing idle activity. Settle rejected buffers exactly once
+through the existing buffer APIs; leave binding removal and owner notification to
+the close handler. Draining is separate: existing bindings on a healthy Draining
+socket remain usable, while new bindings are refused. A regression test should send
+on a still-live sibling during the first Finish notification, not only verify that
+all lines are dead after close returns.
+
+Static UdpListener side-data survives through shutdown and carries an atomic
+retirement gate plus an immutable diagnostic FD snapshot. Socket-owner close
+clears its WIO and listener slot, then queues each worker's authoritative idle
+inventory drain. Queued ingress checks the gate; retired writes never refresh
+idle deadlines. Drain notifications never run inline inside an expiry callback.
+If a notification is refused/canceled, the existing finite idle deadlines (at
+most the current five-minute peer timeout) or normal worker shutdown drain settle
+the lines; no new retry queue, peer, replacement socket or foreign-pool access is
+introduced. UdpStatelessSocket uses the same inventory settlement and retains its
+local-recycle versus detached-buffer-destruction distinction. Dynamic endpoints
+remove their value handles and owned normal lines together on socket close;
+quiescence disables the close callback before detaching userdata and leaves line
+drain to the endpoint owner. Persistent packet lines are never destroyed here.
 
 ### Per-worker dynamic endpoint inventory
 

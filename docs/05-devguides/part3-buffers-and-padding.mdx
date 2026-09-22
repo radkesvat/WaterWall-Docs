@@ -321,9 +321,60 @@ source handle and remain valid after source reclamation.
 
 Completion recycles empty wrappers. Rejection, output error, overflow, timeout,
 forced close, and teardown discard private bodies through the same cleanup path.
-Graceful close drains the queue normally. Unsupported NIO builds and non-TCP
-destinations reject splice writes fatally. Callback admission and reentrancy
+Graceful TCP close drains the queue normally. Supported NIO UDP destinations
+instead use the one-datagram path below. Generic `wioWrite()` rejects splice
+input fatally on unsupported builds or destinations other than TCP/UDP;
+`wioWriteDatagram()` consumes raw-IP splice input and returns `-1` with `EINVAL`.
+The shared `udpSendBuffer()` returns `ENOSYS` for splice input on unsupported
+builds, which never enable splice chains. Callback admission and reentrancy
 follow the normal WIO contracts.
+
+#### UDP datagram sending
+
+`udpSendBuffer()` in the event layer retains caller ownership of the buffer on
+all results, consumes accepted splice prefixes and actual pipe bytes, and returns
+whole-datagram success, captured error and a separate socket-retirement verdict.
+NIO and UdpStatelessSocket share it. UDP receives remain ordinary; raw-IP writes
+never gain splice support. The caller runs the complete transaction and any
+retirement on the socket's owning worker; the helper does not transfer ownership.
+All sends on that socket, including ordinary sends, remain serialized across the
+transaction. No callback or other send may run while assembly is pending.
+
+One sbuf is one datagram. Prefix-only and empty splice inputs use one ordinary
+send. For nonempty bodies, send the real prefix (possibly empty) to the immutable
+explicit destination with `MSG_MORE`, transfer the entire body with
+`SPLICE_F_NONBLOCK | SPLICE_F_MORE`, then issue an empty send without `MSG_MORE`
+to commit. These empty operations do not publish extra datagrams. Do not change
+a shared socket's connection or default peer. IPv4 and mapped destinations allow
+at most 65,507 payload bytes; IPv6 allows 65,527, including resident prefixes.
+Route/MTU errors still belong to the kernel. There is no splitting or UDP retry
+queue; ordinary sends retain their one-shot policy (UdpStatelessSocket retains
+its ordinary/priming EINTR retry).
+
+Older Linux UDP sendpage implementations have a finite skb fragment limit, so a
+small logical body can still be unrepresentable when spread over many pipe slots.
+A pipe-capacity bound of at most 64 KiB limits its slot count conservatively;
+resident prefix pages reduce that budget, rounded down to a power-of-two number
+of pipe slots. For larger or unknown-capacity pipes, a temporary non-consuming
+`tee` into a pipe capped at that budget checks the bound before socket assembly. The probe pipe is closed on
+every outcome. A short/refused probe selects full materialization and one ordinary
+send before touching the socket. This is a layout/resource fallback; supported
+layouts splice their bodies without userspace reads. Kernel-internal copies are
+still possible, and no measured performance improvement is promised. The fragment
+bound follows Linux's [skb fragment limit](https://github.com/torvalds/linux/blob/v5.15/include/linux/skbuff.h)
+and [UDP sendpage assembly](https://github.com/torvalds/linux/blob/v5.15/net/ipv4/udp.c);
+newer kernels use [splice-to-socket](https://github.com/torvalds/linux/blob/master/fs/splice.c).
+
+Before priming, normal errors/drop policy settles the untouched input. After
+successful priming, any short/failed splice or failed final commit retires the
+socket through its owner. A positive short count may conceal an error that
+already discarded the pending datagram, so never loop over it or send its suffix.
+Account actual pipe consumption before recycling. Never clear `UDP_CORK` or
+connect to `AF_UNSPEC` as an abort trick. The shared helper closes no FD itself;
+its caller must prevent further writes and retire through WIO after settling the
+buffer, before returning. Write/close callbacks may destroy associated lines.
+See [Part 7](./part7-shutdown-and-signals.mdx#8-lines-during-drain) for socket-owned
+peer cleanup.
 
 #### BufferQueue splice ownership
 
