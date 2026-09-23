@@ -5,7 +5,7 @@ sidebar_label: "Part 2: Lines & Lifetime"
 description: "The connection lifecycle, re-entrancy hazards, line references, and the clean-finish patterns that keep WaterWall tunnels free of use-after-free bugs."
 ---
 <!--
-Documentation version: 175
+Documentation version: 177
 -->
 
 # Part 2: Lines, Callbacks & Lifetime Safety
@@ -25,9 +25,9 @@ Every connection is driven by six events, each in two directions (upstream towar
 | Event | Meaning | Direction notes |
 | --- | --- | --- |
 | `Init` | A line is starting; initialize this tunnel's per-line state. | Flows upstream from the creating adapter. |
-| `Est` | The far side is actually established (e.g. the remote socket connected). | Usually flows downstream, back toward the originator. |
+| `Est` | An adapter's transport is established (e.g. the remote socket connected); protocol negotiation is separate. | Normally relayed downstream, back toward the originating adapter. |
 | `Payload` | A chunk of data (`sbuf_t`) to transform and forward. | Either direction. |
-| `Pause` | Backpressure: stop sending in this direction for now. | Either direction. |
+| `Pause` | Stop new source work and independent drains; bounded admitted synchronous input may finish. | Either direction. |
 | `Resume` | Backpressure released: you may send again. | Either direction. |
 | `Finish` | This direction is closing. | Directional and destructive. See below. |
 
@@ -930,49 +930,145 @@ and then trust the adapter to flush. Do **not** keep protocol state alive just t
 
 ## Est, Pause, and Resume
 
-- **`Est`** signals that the downstream side is genuinely established. Do not emit
-  it early. A tunnel that needs to know when its line is up can also check
-  `lineIsEstablished()` / `lineMarkEstablished()` (see `ww/net/line.h`).
+- **`Est`** reports adapter transport establishment. Middle tunnels must relay it
+  promptly; their own protocol readiness must not delay or replace that signal.
 - **`Pause` / `Resume`** are backpressure signals. Emit them only when
   semantically correct and directionally consistent, and never reflect them back
   toward a finished direction (see above). Do not emit them casually; spurious
   pause/resume can deadlock a stream.
 
-### Backpressure Has Two Boundaries
+### Est Is Transport Readiness
 
-`Pause` is a strict permission change for future payload delivery, but it is not
-proof that every queue in the pipeline is empty. Keep these two moments separate:
+Adapters originate and consume transport establishment for their connection.
+On a continuing normal-line path, an intermediate node must forward a received
+`Est` in its supported callback direction without waiting for its request header,
+first application payload, authentication, protocol reply, handshake completion,
+timer or consumer Resume. In the ordinary upstream-created chain, next-side
+`Est` continues toward prev with `tunnelPrevDownStreamEst()`.
 
-- **After receiving `Pause`:** the producer must not initiate another `Payload`
-  toward the paused side until it receives `Resume`. `Pause` is not merely a hint
-  and does not authorize bypassing that neighbor. A queue that must drain through
-  the paused side waits; a terminal path either retains already accepted bytes
-  under its close policy or takes its documented overflow/abort path.
-- **Before emitting `Pause`:** a consumer, especially an adapter writing to an OS
-  resource, may deliberately accept a bounded amount of data before signaling
-  backpressure. `TcpListener`, `TcpConnector`, and `UdpConnector` use local write
-  queues and thresholds to absorb short stalls and callback/event-loop latency.
-  Those bytes were accepted before the producer saw `Pause`, so this does not
-  violate the contract.
+Transport establishment and protocol readiness are different facts. A middle
+node may record transport state and perform required protocol work, but it must
+keep the protocol's readiness and payload barriers separate. `Est` does not prove
+authentication, destination acceptance by a remote proxy, or completion of TLS
+or another negotiation. Use explicit protocol state and, where two cooperating
+nodes need notification, a dedicated protocol-completion hook. Do not send a
+second transport `Est` when that protocol work completes.
 
-Likewise, `Resume` means the consumer can accept payload again under its local
-policy; it does not certify that every adapter, event-loop, OS, or middle-tunnel
-queue is empty. A payload already handed to a callback remains owned by the
-receiver and may be queued according to that node's policy.
+Publish local establishment/notification state before forwarding: the previous
+node can synchronously submit Payload, Pause, Resume or Finish. Keep accepted
+payloads ordered and bounded until their protocol can carry them. Preserve the
+required wire order, including control messages before application bodies, even
+when application data arrives from the Est callback. Pause controls new producer
+admission and independent drains, not the establishment signal or the bounded
+completion of an already-admitted synchronous input batch. Continuing after any callback still requires the exact
+line references and logical-life checks described above. Never forward into a
+finished direction or on a logically dead line.
 
-Do not generalize adapter tolerance into arbitrary buffering in transparent
-middle tunnels. A tunnel with no explicit queue normally forwards `Pause` and
-`Resume` immediately. A node that intentionally absorbs pressure must preserve
-FIFO order and buffer ownership, enforce explicit byte/item bounds, define an
-overflow or close policy, resume only when it can accept payload again, and
-remain safe if emitting `Pause` re-enters and destroys the line.
+Classify each exact line at topology boundaries. A node that owns a carrier,
+multiplexes children, pairs streams or bridges a packet line can terminate one
+line lifecycle and map readiness to another; it must use that role's explicit
+mapping and notify a live application association once. Do not blindly forward
+an owned helper line into a neighbour that was never initialized for it, broadcast
+one child's Est to unrelated children, or manufacture establishment before the
+relevant transport or local lifecycle endpoint exists. Boundary ownership is not
+permission to delay a continuing line's Est behind protocol negotiation.
 
-Bgp4Client and Bgp4Server borrow normal lines. Their encoder batches and decoder
-frame callbacks stop at consumer Pause and resume older work before notifying the
-producer. Reentrant input appends behind retained frames; inline Pause/Resume is
-reconciled against final permission. Incomplete receive frames must still release
-producer pressure so additional input can complete them. A failed receive-stream
-allocation during Init cleans up and finishes only toward the initialized owner.
+Payload admission does not require a prior Est. After the adjacent Init has
+admitted the exact line, a live node may submit valid protocol bytes while the
+transport is connecting; the transport owner handles connection-time writes.
+This does not permit Payload before Init, unauthenticated forwarding, application
+bytes before required wire headers, or callbacks into a finished direction.
+
+A continuing transform deduplicates with its own notification latch when needed;
+a downstream endpoint may mark the shared line before forwarding Est. The shared
+marker alone does not prove that the notification reached this transform.
+
+`lineIsEstablished()` / `lineMarkEstablished()` describe line establishment,
+not protocol readiness. This rule does not enable otherwise unsupported upstream
+Est callbacks on ordinary tunnels, change disabled adapter edges, or replace the
+[packet lifecycle rules](./part4-packet-tunnels.mdx).
+
+### Flow-Control Roles and Admission
+
+Flow-control responsibility follows the work a node owns, not its protocol name
+or whether its line is borrowed. A node can have different roles in its two
+directions or before and after a protocol transition.
+
+| Role | Responsibility |
+| --- | --- |
+| Source or transport adapter | Control new reads/emissions, accept bounded in-flight output, serialize writes and own the necessary transport queue. |
+| Synchronous transform | Forward Pause/Resume promptly and transform already-admitted input inline. Do not add an output queue solely because the next consumer paused. |
+| Protocol parser | Retain incomplete headers/bodies and ordering-critical input under explicit bounds. Parsing storage is not an extra transport-output queue. |
+| Independent producer or retained-backlog drain | Stop starting new output when its consumer is paused; resume its own ordered work when permission returns. Timers, handshake releases and delayed replay belong here. |
+| Association or multiplexing junction | Map exact lines, combine pressure reasons, and own only the queues needed to order or schedule its independent producers. |
+
+Pause tells a source or independent drain to stop admitting new work toward that
+consumer. It does not revoke ownership already transferred into an active
+synchronous input batch. A regular transform forwards the signal toward the
+source, then may finish that batch, checking logical life after every callback.
+It must not read more input, start a timer-generated send, or append unrelated
+queued work to the active batch merely to evade Pause.
+
+#### Completing an admitted input batch
+
+An input batch consists of one accepted Payload delivery and the bounded parser
+prefix/partial frame needed to interpret it. The node must establish its ownership
+and FIFO position before invoking another node. Completing this batch can emit
+multiple Payload callbacks; these are expected to reach a receiver even after
+Pause propagated synchronously through the chain.
+
+Trojan and VLESS UDP decoders complete all complete datagrams in that accepted
+input after Pause. They do not leave ready datagrams queued solely for Resume or
+stop header parsing solely because Pause arrived during an earlier delivery.
+They retain only an incomplete suffix or input held for a genuine protocol or
+reentrancy barrier. Reentrant input has its own FIFO position and bound; serialize already-admitted
+nested batches after older input within the outer synchronous dispatch. They must
+not be relabeled as one ever-growing batch. Work deferred beyond that dispatch,
+or released by a later protocol-completion/task callback, is an independent
+backlog whose drain respects Pause.
+
+Finish, logical death, protocol rejection and hard-limit refusal are terminal:
+stop immediately and release the untransferred remainder. Batch completion never
+permits callbacks after Finish or requires a receiver to exceed its hard limit.
+A partial frame still needs later input; its existence must not itself suppress
+the Resume that allows its producer to complete it.
+
+#### Receiver tolerance and FIFO ownership
+
+A receiver requesting Pause must retain finite admission headroom for output
+already in flight. Specify the supported batch envelope, transformation expansion,
+queue high/low watermarks, hard limits and overflow policy. Count retained bytes
+and entries or allocation charge; tiny and empty datagrams must consume a finite
+budget. One coalesced stream input can decode into many datagrams, so a payload-byte
+limit alone is not a complete resource bound.
+
+Tolerance is not unlimited acceptance or a guarantee that every protocol-valid
+burst fits during congestion. If a burst exhausts the hard limit, close the
+smallest supported association or apply the node's documented datagram-drop policy.
+Never drop arbitrary TCP bytes, silently lose an accepted suffix, or allocate
+without a bound to finish a batch. The sender rechecks exact-line life after each
+handoff and stops on closure. Stronger admission reservations may be used where
+an entire maximum batch must be guaranteed, but that guarantee must be explicit.
+
+Publish ownership, queue accounting and notification state **before** emitting
+Pause, Resume or any callback that can reenter. A callback must not allow newer
+data to overtake an older buffer that is still only in a local variable. Ordinary pop releases budget usage before handing a buffer onward. If the same
+budget still owns active retention, transfer to a reservation without uncharging;
+publish consumption before callbacks and release when that responsibility ends. Use one authoritative FIFO per independent
+ordering obligation; a guarded admission/drain can serialize reentry without
+adding permanent queues to every middle node.
+
+Resume releases a producer according to the consumer's current policy. It does
+not prove that every queue is empty. A junction forwards Resume only after all
+pressure reasons for that producer have cleared. Transparent transforms relay
+Pause/Resume without inventing their own thresholds or permanent permission queues.
+A node that also owns a timer or backlog may record permission for that role
+without gating its synchronous forwarding path on the same flag.
+
+BGP and other protocol engines can retain queues for their own negotiation,
+control generation and independent drains. Those obligations require explicit
+bounds and permission handling; they do not establish a requirement that every
+ordinary encoder/decoder own a transport queue.
 
 MuxClient and MuxServer are examples of explicit local buffering: parent transport
 Pause immediately forbids all parent-bound Payload, including protocol controls.
@@ -1033,12 +1129,29 @@ receive-time Est callback. If Est pauses the line, the already-read datagram is
 recycled under the same drop policy as other paused receives; it is not delivered
 through Pause. Later datagrams may be delivered after Resume.
 
-The TCP adapters capture the line's buffer pool before emitting a threshold
-`Pause` through `lineCallWithRef()`. If that callback destroys the line, the
-incoming buffer has not entered the pause queue and remains locally owned.
-Recycle through the captured pool, which discards any remaining private splice
-body, and return without touching the line or its destroyed state.
-If the line survives, enqueue the buffer normally and preserve FIFO accounting.
+Transport queue admission must be transactional before threshold callbacks.
+Once a queue owns the incoming buffer, callback-driven close releases it through
+that queue; the caller must not recycle it again. If admission fails before
+ownership transfers, the caller recycles it through the captured line pool and
+settles the affected flow. Exact-line references protect callbacks, not logical
+life. Preserve this ordering in connecting, paused-write and write-completion paths.
+
+TCP adapters attach their FIFO to a shared byte/charge budget and transfer popped
+entries to an active WIO reservation. The original admitted capacity charge remains
+until completion or terminal callback detachment. Partial write callbacks, live
+write returns and new admissions refresh logical bytes from WIO without reading
+the transferred buffer. Cleanup settles reservations before destroying line state;
+deferred WIO cleanup retains no budget pointer. UdpConnector initialization and
+all per-destination DNS queues attach to one line budget, including recreated DNS
+queues; socket datagram writes do not create an active reservation or retry queue.
+Empty retained buffers consume charge and entries.
+
+TLS/Reality pending plaintext queues share their existing byte/entry limits with
+active backlog reservations. Consumed plaintext releases bytes before wire-output
+callbacks, while capacity and the entry remain charged until buffer release.
+Direct synchronous inputs retain their existing admitted-input behavior. TrojanServer
+attaches its populated FIFO only when selecting CONNECT or fallback output; initial
+and UDP parser fragments retain their separate byte and framing policies.
 
 Numeric thresholds and hysteresis are implementation details. Read the target
 adapter's `payload.c`, `helpers.c`, and `structure.h`; do not copy one adapter's
@@ -1064,140 +1177,134 @@ could overwrite the resolved destination. Protocol-selection warnings and the
 existing TCP fallback for an invalid incoming `dest_context->protocol` belong
 to target preparation and occur there once.
 
+### SOCKS transport readiness and protocol ordering
+
+Socks5Client forwards transport Est before negotiation, mapping a UDP control
+carrier to its application once. Authentication, command success and relay
+readiness retain their distinct application-data gates. Its pending application
+FIFO uses the default 2 MiB / 1,024-buffer backlog budget described in
+[Part 3](./part3-buffers-and-padding.mdx#protocol-storage-and-admitted-batches).
+It releases independently, honors Pause and keeps nested input behind older bytes.
+The first retained application input pauses its source; protocol backlog pressure
+and transport pressure share one notification latch, and Resume waits until both
+clear. Protocol-wait pressure must not stop handshake progress.
+Socks5Server forwards Est before generating its success reply; that reply still
+precedes backend response bodies, including under Init/Est reentry and Pause.
+
+DomainResolver accepts upstream Init and delays next Init until destination DNS
+completes. Its prepare hook runs before resolution and has no direction argument.
+Downstream Init and upstream Est retain the normal constructor's rejection policy;
+this is a node-specific contract, not a rule for reverse/Bridge or companion lines.
+Payload, Pause/Resume and Finish still operate in both ordinary directions.
+
+The resolver keeps one authoritative upstream backlog through next Init. The
+Open phase permits downstream Est and replies immediately; an Init guard serializes
+new upstream input behind older DNS input. DNS completion releases that FIFO
+independently and observes next-side Pause. Admission checks logical bytes and
+retained allocation charge separately against 2 MiB per line, including empty
+buffers. The local DNS/backlog hold combines with next-side pressure before
+notifying prev. Upstream receive pressure is remembered during DNS and forwarded
+to next once Init starts. Failures before next Init finish only prev; internal
+failures after it starts finish both initialized sides. Received Finish destroys
+local state first and propagates only away from its sender.
+
 ### TrojanClient establishment and association ownership
 
 TrojanClient borrows direct TCP and UDP application normal lines. UDP creates one
-owned normal TCP carrier on the application's worker and sends Init toward next
-only on that carrier. The application retains its UDP routing context. Carrier
-input becomes datagrams sent toward prev on the application line. Pumps retain
-both exact lines and recheck logical life, phase and association after callbacks.
-Close detaches both links and destroys local buffers/state before outward Finish;
-only the carrier is destroyed here. Source-owner shutdown drains the dependent
-carrier through the application association while chains and pools remain alive.
+owned normal TCP carrier on the application's worker; only that carrier receives
+next Init. The application keeps its UDP routing context. Signal forwarding maps
+the application and carrier explicitly, retaining both exact lines across callbacks
+and checking logical life and association afterwards.
 
-Directional state uses `prev`/`next`, matching the callback API. In TCP mode,
-`prev_line` and `next_line` are the same line. In UDP mode they refer to the
-application and carrier lines respectively; `app_line` and `carrier_line` retain
-their role names in the association. Flow-control state lives on the direct TCP
-line or the UDP carrier line:
+A valid first application payload can submit the request after next Init, without
+waiting for transport Est. The request and complete first payload share one ordinary
+buffer; later TCP forwarding is opaque. Transport Est is forwarded once and starts
+an idle first-payload deadline only if the request has not already been sent. The
+configurable header-only timeout is an independent producer: while next is paused,
+it retains a due flag rather than starting a new send. An admitted application
+Payload can still complete its combined-buffer handoff under the batch contract.
 
-| Field | Meaning |
-| --- | --- |
-| `next_established` | Next has delivered Est. The initial request still precedes Est to prev. |
-| `next_paused` | Next asked this node to stop sending payload toward next. |
-| `prev_paused` | Prev asked this node to stop sending payload toward prev. |
-| `prev_pause_sent` | This node has told prev to pause its upstream producer. |
-| `next_pause_sent` | This node has told next to pause its downstream producer. |
+Ordinary TCP forwarding and one-datagram upstream wrapping do not gain separate
+Pause queues. Downstream UDP retains framing input and completes the current
+accepted input batch. Keep only the guard/storage needed for parser reentry,
+initialization ordering or a genuine protocol wait. A node-wide pump is not a
+contract; use explicit directional handlers and focused helpers for actual work.
 
-The paused-side flags record consumer permission. The `*_pause_sent` flags record
-notifications sent to producers on the opposite side, preventing repeated or
-stale Pause/Resume callbacks. A flag names the neighbor, not the direction in
-which its Pause callback travels.
+Close cancels the deadline, detaches both association links and destroys locally
+owned buffers/state before outward Finish. Only the carrier is destroyed here.
+Source-owner shutdown drains the dependent carrier while loops, chains and pools
+remain alive. No duplicate borrowed-line inventory is needed.
 
-Transport Est records request admission before any callback can reenter. The
-separate request precedes application Est and payload; queued data remains attached
-to authoritative FIFO state throughout Est. Duplicate Est does not send a second
-request. The establishment barrier and pump gate prevent nested input or Resume
-from overtaking older work. Pause changes local permission before notification.
-Resume drains ready work before releasing producer pressure, but incomplete UDP
-headers/bodies must still allow carrier Resume so more input can arrive.
+### VlessClient establishment and association ownership
 
-`trojanclientPump()` remains the single coordinator. Its private steps run in
-this order: notify paused producers, advance establishment, forward queued
-upstream payload, forward queued downstream payload, then notify resumed
-producers. Payload steps run only after establishment and deliver at most one
-buffer before returning to the coordinator.
+VlessClient borrows direct TCP and UDP application lines and owns only each UDP
+application's dependent TCP carrier on the same worker. Both links are attached
+before next Init. Its first-payload batching, idle deadline, signal mapping and
+opaque TCP paths follow the same ownership/admission rules as TrojanClient.
 
-Private steps return an explicit pump action, independent of success or failure.
-A step that invokes a callback or closes the association returns
-`kPumpStepRecheck`, making the pump recheck association liveness and restart
-permission checks. `kPumpStepFallThrough` means no callback ran, so the next step
-can inspect state safely; it does not necessarily mean no bytes were consumed,
-since UDP header gathering may be incomplete. Helpers share the pump's retained
-line references and `pumping` guard rather than acquiring independent drain loops
-or reentrancy state.
+VLESS protocol readiness remains separate. The request must precede upstream body,
+but neither transport Est nor a response is required before submitting a valid
+request/body batch after Init. Downstream body waits for complete validated
+response metadata. Consuming that metadata cannot lose or reorder a coalesced TCP
+body or the first UDP frame. UDP input retains incomplete framing bytes, completes
+all ready datagrams in its active accepted batch and preserves an incomplete suffix.
 
-### TrojanServer association pumps and fallback replay
+Record request admission before the first outward callback so nested data cannot
+send a second request or overtake it. Protocol/reentry storage is bounded; an
+otherwise-ready TCP buffer is not retained merely for Pause or Est. Independent
+release of an older deferred backlog still respects its consumer's permission.
+Close clears timer/parser/ordering state and both links before outward Finish,
+never reflects toward its sender, and leaves an owned carrier logically dead.
+
+### TrojanServer associations and fallback replay
 
 TrojanServer borrows the client normal line and owns each UDP backend on that
-client's worker. Publish target, credentials and fallible map membership before
-backend Init. AuthenticationClient is a lookup dependency; UserController runs
-only on the protected branch. The client pump retains the client across callbacks;
-backend Init, Payload and permission notification also retain the exact backend.
-Remote removal clears membership, selected-frame links and ineligible reply
-waiters before callbacks, then returns with that backend logically dead.
+client's worker. Target, credentials, map membership and callback-ready state must
+be published before backend Init. AuthenticationClient is a lookup dependency;
+UserController runs only on the protected branch. Authentication, initial parsing
+and exact fallback replay remain required independently of transport Est.
 
-Directional state follows the same `prev`/`next` convention as TrojanClient;
-client/backend names continue to identify line roles and ownership:
+After selecting and initializing the TCP/fallback branch, ordinary synchronous
+body/reply forwarding needs no queue solely for Pause or Est. Preserve older body
+or replay bytes across reentrant branch Init; this is a protocol-ordering barrier,
+not permission to maintain permanent TCP transport queues. A local fallback may
+send Payload and Finish within Init without ever sending Est.
 
-| Field | Meaning |
-| --- | --- |
-| `next_established` | The selected next-side branch or UDP backend has delivered Est. |
-| `prev_est_sent` | Est has been sent toward prev on the client line for TCP/fallback. |
-| `next_paused` | Next asked this node to stop sending upstream payload on this line. |
-| `prev_paused` | Prev asked this node to stop sending downstream payload on the client line. |
-| `prev_pause_sent` | This node has told prev to pause its upstream producer. |
-| `next_pause_sent` | This node has told next to pause its downstream producer. |
+UDP is an association junction. Upstream callbacks operate on the borrowed client;
+backend upstream events use each owned backend, and replies/notifications return
+through downstream callbacks. Aggregate backend pressure by exact membership: one
+backend's Resume cannot release a carrier still paused by another backend. Client
+reply pressure applies to every initialized backend, including new backends.
+Publish each contribution before callbacks, clear it on removal, and restart
+traversal after callbacks rather than retaining raw sibling pointers or iterators.
 
-For UDP, each backend holds its own `next_paused` and `next_pause_sent` flags.
-The client state's `paused_remotes` counts paused backends and blocks upstream
-delivery until it reaches zero. The client state's `prev_paused` controls replies
-from the whole association. Consumer permission and producer notifications remain
-separate: Pause from a consumer is propagated toward the producer on the opposite
-side.
+Pause stops future carrier admission, not completion of the carrier input already
+being decoded. Each complete datagram in that active input is submitted to its
+selected backend even if an earlier datagram caused Pause; the backend's receiver
+owns bounded in-flight tolerance. Preserve framing/destination checks, initial
+input ordering and the incomplete suffix. Stop immediately if the affected line
+or association closes. Do not drain unrelated pending input as part of this batch.
 
-TrojanServer's upstream Payload/Pause/Resume entry points operate on the borrowed
-client line. It sends backend upstream events directly to next; backend replies
-and notifications return through downstream callbacks. Debug assertions enforce
-this caller-side routing invariant. Keep closing-phase admission checks for the
-final fallback payload and for callbacks involving still-live UDP siblings during
-association teardown. The pump's entry gate also prevents backend removal from
-restarting work while the client is closing. These gates do not permit callbacks
-on the finished side of the same line or callbacks into destroyed local state.
-After an ordinary callback returns, retain the exact line's `lineIsAlive()` check;
-the owner's logical-death postcondition makes a second closing-phase check
-redundant. A live backend also remains attached to its original client; that
-association is a debug invariant, not another runtime admission test.
+Replies received on initialized live backends do not wait for backend Est. They may
+forward synchronously with the required datagram framing. If independent backend
+producers or reentry require an association FIFO, keep one bounded encoded FIFO,
+account entries before callbacks, and stop its independent drain at consumer Pause.
+Already-admitted immutable replies belong to the client FIFO and do not need a
+borrowed backend pointer kept alive merely as an Est waiter.
 
-Any backend Pause contributes once to an association aggregate. Until every
-contribution resumes or is removed, stop carrier decoding/delivery. Client reply
-Pause applies to every initialized backend, including newly created backends.
-Restart permission traversal after each callback; never retain a raw iterator or
-unreferenced sibling across fan-out or teardown. Ready replies share one client
-FIFO; a pre-Est reply blocks later entries until its backend establishes or closes.
-Ready encoded replies survive backend removal, while that backend's ineligible
-entries are discarded. Resume drains ready older work before releasing producers;
-an incomplete request/frame must not prevent the input needed to complete it.
+Intentional fallback delay owns a real backlog and scheduled drain. That drain
+honors Pause and preserves FIFO; Resume permits older ready work before releasing
+new producers. Source Finish retains the existing narrow final-batch exception:
+at most one synchronous batch, outside branch Init, while unpaused, with the
+finished side closed before any callback. Returned callbacks cannot revive parsing
+or reopen the finished direction. A zero-delay inline fallback transform follows
+the ordinary admitted-batch rule; a deferred release follows the backlog rule.
 
-`trojanserverPump()` coordinates pause notifications, establishment notification,
-initial request parsing, pending input, queued replies and resume notifications
-in that order. Initial parsing stays an explicit barrier: wait for more input or
-restart with the selected TCP, UDP or fallback state before delivering payload.
-Private helpers share the pump's client-line reference and reentrancy guard.
-They return `kPumpStepRecheck` when callbacks, parser progress or closure require
-a fresh liveness and permission check. `kPumpStepFallThrough` allows the next step
-to run: incomplete UDP input falls through to replies and Resume; successful
-fallback scheduling also falls through because its task runs later. These actions
-do not report success or failure. The queued-reply step preserves the independent
-fallback reply drain described below rather than imposing an Est or upstream-drain
-requirement on it.
-
-TCP and fallback establish barriers before branch Init/Est, preserving older body
-or replay bytes through reentrant admission. CONNECT may submit data after Init
-returns while the next adapter is still connecting, if writable. Fallback retains
-its delayed one-buffer batch and zero-delay inline/retained-drain rules. Its source
-Finish exception permits at most one synchronous final batch, only outside branch
-Init and while unpaused. Absorb supported nested nonterminal callbacks and record
-nested branch Finish. Zeroed state is terminal; cleanup never revives parsing.
-Source-owner shutdown settles dependent backends and represented fallback tasks
-while line/buffer pools and the chain remain alive.
-
-Fallback replies need no outbound Est: a local service can send Payload followed
-by Finish within its Init or Payload callback. TrojanServer drains writable
-fallback replies independently of its upstream pump, retaining the line across
-delivery and preserving downstream FIFO under reentrant input. Pause stops this
-drain and Resume releases it without waiting for Est. The source-Finish final-batch
-gate still absorbs returned replies; it never reopens the finished direction.
+Retain the client across association callbacks and each exact backend across its
+own Init/Payload/permission calls. Close detaches membership and selected-input
+links before callbacks, releases only locally owned bytes and returns with owned
+backends logically dead. Source shutdown settles dependent lines and delayed work
+before reclaiming their reachable resources.
 
 ## Worked Example: Tracing a Payload
 
@@ -1250,9 +1357,11 @@ Before you call a flow change done:
   then return?
 - If you send final protocol bytes during `Finish`, do you mark the sender side
   finished before the send and block reflected `Pause`/`Resume`?
-- After receiving `Pause`, does the producer stop new payload delivery until
-  `Resume`? Is any intentional pre-Pause tolerance bounded, FIFO-preserving,
-  accounted, and backed by a clear Resume or overflow/close path?
+- Does Pause stop new source admission and independent drains while allowing only
+  the bounded completion of admitted synchronous input? Are receiver tolerance,
+  FIFO publication, tiny/empty entries and overflow/close behavior explicit?
+- Does retained data have a parser, protocol, ordering or producer obligation,
+  rather than an unnecessary output queue copied into a transparent transform?
 - Does only the line **owner** ever call `lineDestroy()`?
 - Did you classify each line as **owned normal**, **borrowed normal**, or
   **packet** before editing its `Finish` path?

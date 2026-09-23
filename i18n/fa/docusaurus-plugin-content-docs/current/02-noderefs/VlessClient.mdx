@@ -6,7 +6,7 @@ description: "راهنمای نود VlessClient در WaterWall."
 ---
 
 <!--
-Documentation version: 152
+Documentation version: 159
 -->
 
 # VlessClient
@@ -140,6 +140,7 @@ UUID با byte order شبکه در RFC4122 سریال می‌شود؛ نه به�
 | فیلد | پیش‌فرض | توضیح |
 | --- | --- | --- |
 | `protocol` | `"tcp"` | انتخاب VLESS command. نام `proto` هم پذیرفته می‌شود. |
+| `first-payload-timeout-ms` | `400` | مهلت به میلی‌ثانیه صحیح در بازه 0 تا 4,294,967,295؛ صفر انتظار عمدی را غیرفعال می‌کند. |
 | `verbose` | `false` | جزئیات بیشتری از tunnel را log می‌کند. |
 | `domain-strategy` | `"do-not-resolve-domains"` | مشخص می‌کند domain مقصد پیش از نوشتن درخواست به‌صورت محلی resolve شود یا نه. |
 
@@ -201,38 +202,62 @@ response header:
 برای سازگاری بیشتر، client response addon غیرخالی را می‌پذیرد و یک warning در log ثبت می‌کند. byteهای addon نادیده گرفته
 می‌شوند و سپس body تحویل داده می‌شود؛ خود addon پردازش نخواهد شد.
 
-## رفتار TCP در زمان اجرا
+## اولین داده و برقراری transport
 
-در upstream `Init`، مقصد پیش از راه‌اندازی هسته protocol آماده می‌شود؛ یا از طریق prepare hook مربوط به resolver داخلی،
-یا در صورت غیرفعال بودن DNS محلی مستقیماً در init خود client. سپس `VlessClient` state مربوط به line را مقداردهی می‌کند و
-`Init` را به نود بعدی می‌فرستد.
+`Init` مقصد و نود بعدی را آماده می‌کند و به‌تنهایی درخواستی ارسال نمی‌کند.
+اولین payload معتبر می‌تواند پیش از `Est`، داخل callback آن یا هنگام Pause برسد.
+درخواست کامل و تمام اولین payload در یک بافر معمولی ارسال می‌شوند؛ در حالت UDP
+هدر یک دیتاگرام نیز در همان بافر قرار می‌گیرد. prefix مقیم و بدنه pipe خصوصی
+هر دو خوانده می‌شوند. TCP خالی درخواست را فعال نمی‌کند.
+دیتاگرام خالی VLESS در ورودی محلی حذف می‌شود.
 
-وقتی transport downstream برقرار شود، `VlessClient`:
+رویداد transport `Est` مستقل از داده پروتکل و Pause فقط یک بار به برنامه می‌رسد.
+اگر درخواست هنوز ارسال نشده باشد، مهلت از همین Est آغاز می‌شود.
+`settings.first-payload-timeout-ms` به‌طور پیش‌فرض **400** است و عدد صحیح از **0**
+تا **4,294,967,295** را می‌پذیرد؛ نوع‌ها و مقدارهای دیگر نامعتبرند. صفر انتظار عمدی
+را غیرفعال می‌کند. زمان Pause نیز محاسبه می‌شود. انقضا یک درخواست بدون payload
+ارسال می‌کند؛ در Pause فقط وضعیت موعدرسیده نگهداری می‌شود تا Resume برسد.
+رسیدن payload معتبر، timer را لغو کرده و خروجی ترکیبی را ارسال می‌کند. Est یا
+Resume تکراری درخواست یا مهلت را تکرار نمی‌کنند. Finish نیز timer را لغو می‌کند.
+یک بافر معمولی تضمین یک syscall، بسته TCP یا رکورد TLS نیست.
 
-1. downstream `Est` را به نود قبلی می‌فرستد
-2. VLESS request header را upstream می‌فرستد
-3. payloadهای upstream موجود در صف را بلافاصله پس از header ارسال می‌کند
+مسیر مستقیم TCP و بسته‌بندی هر UDP در upstream، صف خروجی برای Est یا Resume ندارند.
+در پاسخ VLESS نسخه صفر و تمام addonها، حداکثر 257 بایت metadata، مصرف و اعتبارسنجی می‌شوند. addon غیرخالی با هشدار رد می‌شود. ارسال خروجی منتظر پاسخ نیست.
 
-برای ارسال byteهای application منتظر response header مربوط به VLESS نمی‌ماند؛ بااین‌حال body برگشتی تا زمان خواندن و
-اعتبارسنجی response header نگه داشته می‌شود.
+line برنامه در UDP قرضی می‌ماند و client یک carrier معمولی TCP وابسته روی همان
+worker ایجاد می‌کند. Est و Pause/Resume و Finish به association درست نگاشت می‌شوند.
+درخواست مقصد ثابت را حمل می‌کند و هر فریم یک طول دوبایتی big-endian دارد.
+decoder تمام دیتاگرام‌های کامل ورودی پذیرفته‌شده را حتی پس از Pause تحویل می‌دهد.
+ورودی callback تو در تو پشت ورودی قدیمی در FIFO parser قرار می‌گیرد؛ تنها قطعه
+ناقص یا وضعیت لازم برای ترتیب باقی می‌ماند. Finish، ورودی خراب یا رد گیرنده،
+تحویل را متوقف و association را می‌بندد. این نود فقط carrier متعلق به خودش را
+نابود می‌کند؛ مالک برنامه در shutdown همین carrier وابسته را نیز تخلیه می‌کند.
 
-## رفتار UDP در زمان اجرا
+## Splice و محدودیت نگهداری
 
-در حالت UDP، application line از carrier line جداست:
+اولین درخواست و payload معمولی هستند؛ خود درخواست حداکثر 278 بایت است.
+TCP بعدی هویت بافر معمولی یا splice را حفظ می‌کند. UDP از padding اعلام‌شده
+2 بایتی استفاده می‌کند. parser فقط هدر لازم را می‌خواند و حرکت دقیق بدنه،
+مرز دیتاگرام و padding کامل مسیر بعدی را حفظ می‌کند. کمبود padding یا ظرفیت pipe
+با fallback کامل معمولی مدیریت می‌شود.
 
-| Line | هدف |
+| ورودی نگهداری‌شده parser | سقف منطقی شامل برابری |
 | --- | --- |
-| UDP app line | line قابل مشاهده برای نود UDP-facing قبلی. |
-| TCP carrier line | line داخلی ساخته‌شده توسط `VlessClient` و ارسال‌شده به نود stream-facing بعدی. |
+| بدنه TCP فقط برای ترتیب ورودی تو در تو | 2,097,152 بایت، برابر 2 MiB |
+| تکمیل پاسخ TCP با head فعال و metadata | 2,097,409 بایت، برابر 2 MiB به‌علاوه 257 بایت |
+| تکمیل ورودی UDP با head فعال و هدرها | 2,162,689 بایت، برابر 2 MiB به‌علاوه 65,537 بایت |
+| بدنه UDP | از 1 تا 65,535 بایت |
 
-carrier line یک VLESS UDP request برای یک destination ثابت می‌فرستد. بعد از آن:
+برابری مجاز است؛ سرریز یا رد صف parser همان association را می‌بندد. صف خروجی
+decodeشده و محدودیت 1,024 رکورد برای batch همزمان وجود ندارد. تعداد قطعه‌های
+ورودی سهمیه خروجی را مصرف نمی‌کند. این حدود از اندازه pool، پروفایل RAM و ظرفیت
+pipe مستقل‌اند. دیتاگرام محلی بیش‌ازحد بزرگ حذف می‌شود و فریم دریافتی خراب association
+را می‌بندد.
 
-- هر UDP payload در جهت upstream به‌شکل `uint16_be length + payload` نوشته می‌شود
-- length هر VLESS UDP frame برگشتی خوانده می‌شود و payload خام UDP به app line برمی‌گردد
-- UDP payload با length برابر `0` یا بزرگ‌تر از `65535` در همان سمت دور ریخته می‌شود
-
-client هنگام انتظار برای carrier/request حداکثر 1 MiB داده upstream را در صف نگه می‌دارد. byteهای پاسخ downstream نیز تا
-کامل شدن response header یا UDP frameها همین محدودیت 1 MiB را دارند.
+splice نیازمند `misc.splice`، build مناسب و پشتیبانی تمام نودهای زنجیره است.
+`DomainResolver` پشتیبانی می‌کند؛ `TlsClient` همچنان splice را برای کل زنجیره
+غیرفعال می‌کند. در استقرار معمول TLS را نگه دارید؛ این قابلیت تضمین zero-copy
+یا افزایش سرعت اندازه‌گیری‌شده نیست.
 
 ## رفتار Finish
 
@@ -278,7 +303,7 @@ required_padding_left = 2
 
 | ویژگی | مقدار |
 | --- | --- |
-| node flags | `kNodeFlagNone` |
+| node flags | `kNodeFlagSupportsSplice` |
 | `can_have_prev` | `true` |
 | `can_have_next` | `true` |
 | `layer_group` | `kNodeLayer4` |

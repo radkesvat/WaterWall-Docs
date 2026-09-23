@@ -6,13 +6,13 @@ description: "Reference documentation for the DomainResolver node."
 ---
 
 <!--
-Documentation version: 152
+Documentation version: 159
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/Internals/DomainResolver/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/DomainResolver.mdx, and all files must keep the same documentation version.
 -->
 
 # DomainResolver
 
-`DomainResolver` is an advanced support node that resolves a line's destination domain before forwarding that line's `Init`.
+`DomainResolver` is an advanced support node that resolves a line's destination domain before forwarding that line's upstream `Init`.
 
 Normal users usually should not configure this node manually. Several higher-level nodes create and configure it internally, including `TcpConnector`, `UdpConnector`, `Router`, `Socks5Client`, `VlessClient`, and `TrojanClient`. Use the public settings on those nodes first unless you are deliberately building a custom chain that sets `line->routing_context.dest_ctx` yourself.
 
@@ -67,7 +67,7 @@ In many real configs this is unnecessary because the connector/protocol node ins
 | `settings` | object | No | Optional settings object. If present, it must be an object. |
 | `next` | string | Usually | The node that receives the line after destination resolution in the upstream direction. |
 
-`DomainResolver` can technically receive upstream or downstream `Init`, but normal manual use is upstream in the middle of a stream chain.
+`DomainResolver` accepts upstream `Init` and downstream `Est`. Downstream `Init` and upstream `Est` use the constructor defaults that reject unsupported callbacks. Payload, Pause/Resume, and Finish retain their ordinary bidirectional meanings.
 
 ## Settings
 
@@ -90,15 +90,20 @@ On upstream `Init`:
 6. the delayed upstream `Init` is forwarded
 7. payloads queued during DNS are replayed upstream
 
-The downstream direction behaves the same way, but forwards the delayed `Init` to the previous node.
+Downstream payloads forward directly once next `Init` has started, including replies during Init itself.
 
 ## Pending Payloads
 
-Payloads that arrive from the initiating side while DNS is pending are queued. The queue limit is `1 MiB` per line.
+Upstream payloads are retained during DNS, adjacent `Init` reentry, or an older ordered backlog. Admission checks both logical bytes and retained allocation charge against `2 MiB` per line before enqueue. Overflow closes only prev before next `Init`, or both initialized directions afterwards.
 
-The limit is checked after enqueue, so the pending queue may exceed the limit by one buffer before the line is closed. If DNS fails or the queue overflows, the node destroys its own line state and finishes only the side that initiated the unresolved line.
+Transport `Est` forwards promptly once the path opens. The backlog drains in FIFO order while the consumer permits it; nested input cannot overtake older input. Pause received during DNS remains effective when the adjacent path opens.
 
-Callbacks other than payload are ignored until the resolver reaches open state.
+The first retained input pauses only the initiating source, after FIFO ownership
+and accounting are published. This local DNS/order hold is separate from received
+Pause permission and does not pause DNS or the transport being initialized. It stays
+active through drain callbacks and is released only when the FIFO is empty and the
+adjacent consumer permits sending. Reentrant Pause/Resume cannot overtake older
+input, clear another pressure reason, or resurrect work after Finish.
 
 ## Failure Behavior
 

@@ -5,7 +5,7 @@ sidebar_label: "Part 3: Buffers & Padding"
 description: "The sbuf_t buffer model, worker buffer pools, left-padding budgets, and how to prepend protocol headers without breaking chain composition."
 ---
 <!--
-Documentation version: 162
+Documentation version: 163
 -->
 
 # Part 3: Buffers, Padding & Shift Buffers
@@ -383,6 +383,15 @@ peek, reserve, and destroy API. It preserves entries, including empty entries,
 and FIFO order. Logical byte accounting includes each splice buffer's real prefix
 and remaining private-pipe body; it does not count control-storage capacity.
 
+`bufferqueueGetBufLen()` reports logical bytes. `bufferqueueGetCharge()` reports
+the sum of `sbufGetQueueCharge()` for entries still owned by the queue. Both are
+cached O(1) totals, maintained by successful front/back insertion and pop. Empty
+entries contribute charge even though they add no logical bytes. Callers choose
+limits, their accounting scope, Pause/Resume decisions and overflow handling.
+An optional attached `buffer_budget_t` enforces admission across one or more
+queues and active reservations. Unbound queues retain their existing accounting
+without a finite admission policy; parser and Mux policies remain with their owners.
+
 Splice insertion retains the original wrapper and private pipe in every build.
 It neither copies metadata as payload nor converts or consumes the body.
 Splice entries must already own any claimed body bytes in their private pipes;
@@ -391,17 +400,56 @@ Ordinary Debug insertion
 continues to replace allocations to detect stale aliases.
 
 Successful insertion transfers ownership to the queue. Failed try-insertion
-leaves the pointer, buffer, private-pipe contents, queue entries, and byte count
-unchanged. Pop transfers ownership back to the caller. Peek is borrowed: do not
+leaves the pointer, buffer, private-pipe contents, queue entries, and byte/charge
+totals unchanged. Unrepresentable totals are refused before ownership transfers,
+including before ordinary Debug replacement. Pop transfers ownership back to the
+caller. Peek is borrowed: do not
 consume or modify a queued buffer through an alias. Pop first, consume through
 the splice helpers, and reinsert any remainder so queue accounting stays correct.
 
 Destroying a nonempty queue discards remaining private bodies and recycles the
 wrappers on the owning event worker, preserving healthy empty pipes. Drain errors
 close the affected pair before recycling; teardown never creates a replacement.
-Empty queue destruction requires no worker context. TCP adapter pause queues
-use these same ownership rules; final stream delivery order remains the caller's
+Destroy releases only this queue's contribution to its attached budget and leaves
+a valid empty, unbound queue with both totals zero. Empty queue destruction
+requires no worker context. TCP adapter pause queues use these same ownership
+rules; final stream delivery order remains the caller's
 responsibility.
+
+A budget tracks logical bytes, canonical queue-capacity charge and entries in O(1).
+Initialize all three limits explicitly: `SIZE_MAX` is unrestricted and zero is a
+real zero allowance. Admission checks representability even in unrestricted
+dimensions. Empty buffers consume charge and an entry. Budgets own no buffers,
+pools, callbacks or flow-control state; each lives at a stable address on its
+owning worker until all attached queues and active reservations have settled.
+Limits remain fixed while in use.
+
+`bufferqueueTryAttachBudget()` requires an unbound queue and atomically admits its
+existing totals before publishing the binding. It can attach populated parser
+storage when that queue becomes output storage. Refusal preserves the queue and
+budget unchanged. Initialize the final line-state object before attaching queues
+to embedded budgets; copying a temporary with self-references is invalid.
+
+Ordinary `bufferqueuePopFront()` releases the entry's budget cost before returning
+ownership. When the same scope continues retaining a popped buffer, use
+`bufferqueuePopFrontReserved()` with an empty reservation. It moves accounting to
+the active owner without reducing aggregate usage or attempting new admission.
+Reduce reservation bytes as plaintext or WIO progress is consumed, before reentrant
+callbacks can admit more input. Retained capacity and the entry remain charged
+until responsibility ends. Release clears the reservation; empty release is safe.
+Never copy one live reservation into two independently released owners.
+
+Same-budget `bufferqueueTryPushFrontReserved()` and `bufferqueueTryPushBackReserved()`
+reserve destination storage before transferring accounting, without charging twice.
+Their reservation must match the actual buffer cost; reconcile any consumption
+first. Failure preserves the buffer and reservation; success clears the reservation.
+`bufferqueueReserveExtra()` reserves deque slots only, never budget allowance.
+
+Whole-queue moves carry the binding and both cached totals by assignment, then
+initialize the relinquished source empty and unbound. Destroy an empty destination's
+storage before overwriting it. Never reset a populated queue to erase accounting.
+Destroy all queues and release all active reservations before asserting an embedded
+budget empty and clearing its owner. Recreated queues must attach explicitly again.
 
 BufferStream accepts ordinary entries only. The fixed-header splice stream owns
 mixed representations for Mux; NIO's internal WIO FIFO stores owned wrappers directly.
@@ -717,70 +765,169 @@ leaving unrequested suffixes intact. Missing claimed source bytes or invalid own
 descriptors remain fatal invariants. Exact transfer primitives live in
 `splice_buffer`, independently of Mux and the event loop.
 
+### Protocol storage and admitted batches
+
+Choose storage by the work it represents: incomplete metadata/body, a protocol
+wait, an initialization/reentrancy ordering barrier, delayed replay, or an
+association's independent producers. An otherwise-ready synchronous TCP buffer
+must not acquire another output queue solely for Pause or Est. See
+[Part 2's admission contract](./part2-lines-and-callbacks.mdx#flow-control-roles-and-admission).
+
+Middle tunnels that need an application-data backlog use a default budget of
+**2 MiB logical bytes and 1,024 buffers per retention budget**. Count queued buffers
+and active backlog buffers still retained under that budget; multiple queues
+sharing it do not each receive a separate allowance. This is a hard admission
+limit, not a universal payload-size limit, a memory/RSS limit or a Pause threshold.
+Do not create a queue on an otherwise-ready synchronous forwarding path just to
+apply the default.
+
+Protocol parsers, frame allowances, ciphertext shaping and transport/Mux storage
+retain their own explicit bounds. Explicit node-specific application-backlog
+limits take precedence over the default. For example,
+[Socks5Server](../02-noderefs/Socks5Server.mdx) retains its 1 MiB /
+1,024-buffer ordering limit per direction, and
+[ConnectionFisherClient](../02-noderefs/ConnectionFisherClient.mdx) retains its
+1 MiB selection backlog. Socks5Client follows the default application-data limit;
+its separate 4,096-byte handshake-input limit remains unchanged.
+
+TrojanClient, TrojanServer and VlessClient also use a **2 MiB logical-byte base
+budget** for their necessary parser state. Input fragments have a byte
+bound plus bounded parser metadata; do not apply an output-datagram count limit to
+fragments of one incomplete frame. Empty queued datagrams consume output entries.
+A parser's active head, cached header and queued sources are charged exactly once.
+
+| Necessary retained state | Byte limit |
+| --- | --- |
+| Protocol/order/replay or output backlog in these three nodes | 2,097,152 bytes; 1,024 output/backlog entries |
+| Trojan UDP input, including partial-frame/header state | 2,105,607 bytes: 2 MiB plus the 8,455-byte maximum incoming frame |
+| TrojanServer initial request assembly | 2,105,607 wire bytes; incomplete-initial policy remains 4,096 bytes |
+| VlessClient TCP response assembly | 2,097,409 bytes: 2 MiB plus 257 response metadata bytes |
+| VlessClient UDP input, including pending response/frame metadata | 2,162,689 bytes: 2 MiB plus the 65,537-byte maximum frame |
+
+Equality is accepted. Overflow or failed queue admission settles only the affected
+flow/association; private-pipe pressure instead uses the shared ordinary fallback.
+Remove consumed metadata before applying a remaining-body/backlog budget. The
+incomplete-initial limit must not reject a complete header coalesced with body.
+These logical limits do not measure RSS or descriptor use. Receiving adapters and
+Mux additionally bound entries or allocation/queue charge for the many outputs a
+single coalesced input can produce, including empty datagrams.
+
+TlsClient's pre-handshake application queue and RealityClient's early application
+queue follow the default 2 MiB / 1,024-entry bound. They represent a real protocol wait,
+including application data admitted before TCP Est. Their later plaintext release
+is an independent FIFO drain that honors Pause; it is not part of the final
+handshake input's synchronous batch. Keep ciphertext-shaping budgets separate.
+
+An admitted input batch is not a newly allocated array of all decoded outputs.
+Decode and transfer each complete frame in order, continuing after Pause for the
+remainder of this accepted input while the exact lines remain live. Hold only an
+incomplete suffix or data genuinely blocked by protocol/reentrancy. Stop on Finish,
+malformed input or receiver closure; never exceed a receiver's hard limit just to
+finish the batch. A separately scheduled or deferred backlog drain honors Pause.
+
+### Client first-payload requests
+
+TrojanClient and VlessClient assemble their initial request and the entire first
+eligible application payload in **one ordinary best-fit buffer**. Write request
+bytes into payload storage and append the source with the shared exact range
+helpers, preserving any existing resident prefix and fully materializing a pipe
+body. Do not spend another node's padding or leave the body in a splice wrapper
+for this first combined transfer. Later opaque TCP preserves buffer identity and
+splice representation where the existing helpers permit it.
+
+Each client exposes `first-payload-timeout-ms`, a nonnegative integer defaulting
+to **400**. A valid payload after next Init triggers the combined request immediately,
+even before transport Est. If no request has been sent when Est arrives, establish
+the deadline then; paused time counts. At expiry, a header-only request becomes due
+and waits for Resume if its consumer is paused. Zero disables deliberate waiting.
+An already-available eligible payload is still combined; expiry never forces it
+into a second send if the request has not yet been submitted.
+
+The timer is an independent producer. A synchronous admitted input can complete
+its combined handoff under the in-flight contract even when a timer-generated send
+would have to wait. Publish request admission before forwarding, cancel the timer,
+and never send a second header. Empty TCP input does not trigger a request or
+restart the deadline. UDP eligibility follows the protocol's own datagram rules.
+
+Keep full onward padding in the new allocation: TrojanClient advertises **263**
+bytes for subsequent UDP headers; VlessClient advertises **2**. UDP first output
+contains the initial request, one datagram frame header and that complete body.
+Its later datagrams prepend once within the existing budget. Header-only timeout
+output has ordinary best-fit storage with onward padding. No queue or extra timer
+is needed just to await Est or a peer response before outbound submission.
+
+First-buffer construction can transiently add the actual request/frame headers
+to a selected retained payload's size. That finite construction overhead is not
+permission to hide a second retained output queue. Nested clients add headers and
+repeat assembly; a normal 1 MiB splice delivery plus 64 maximum-size Trojan headers
+adds only 20 KiB, within the 2 MiB retained-input base budget. One ordinary output
+buffer does not promise one syscall, TCP packet or TLS record.
+
 ### TrojanClient variable headers and opaque TCP
 
-TrojanClient forwards established TCP sbufs without body inspection or conversion;
-early or paused downstream TCP uses a FIFO, not BufferStream or a header parser.
-The initial request is one independent ordinary best-fit buffer of at most 320
-bytes. Its allocation preserves onward padding rather than spending the node's
-263-byte UDP header budget.
+The initial request is 68 bytes for IPv4, 80 for IPv6, or 65 plus domain length,
+at most 320. UDP association uses `0.0.0.0:0`, a 68-byte initial request. The first
+combined UDP output also includes `ATYP ADDR PORT LEN CRLF` for its datagram.
+Subsequent upstream datagrams are wrapped inline; insufficient headroom uses
+`sbufMoveRangeTo()` with full onward padding and preserves its returned pointer.
 
-UDP send keeps pending datagrams unwrapped, then prepends exactly once when the
-carrier is writable. Existing resident prefixes remain payload. Insufficient
-headroom uses `sbufMoveRangeTo()` with sufficient padding and retains its returned
-replacement, including complete ordinary fallback on private-pipe pressure.
+UDP receive caches at most 263 header bytes: 11 for IPv4, 23 for IPv6, or 8 plus
+domain length. Consume only required metadata with `sbufReadRangeToMemory()`.
+Validate address, nonzero port, CRLF and the 8,192-byte body bound before extraction.
+Never retarget the application from a received source address. A zero-length body
+is a valid datagram, including as the first application payload. Oversized local
+UDP is dropped without triggering the first request; malformed carrier frames close
+that association. Complete current-input datagrams continue after Pause; only an
+incomplete suffix or a genuine protocol/ordering barrier is retained.
 
-UDP receive owns a FIFO, an active popped head and a header cache of at most 263
-bytes. ATYP and domain length determine the exact header extent: 11 bytes for
-IPv4, 23 for IPv6, or 8 plus domain length. `sbufReadRangeToMemory()` consumes only
-required header pieces. Cached bytes remain charged to retained wire input.
-The decoder validates address, nonzero port, CRLF and the 8,192-byte body bound
-before extracting one complete datagram. It never retargets the application from
-the received source address. Whole suitable bodies transfer directly; split or
-mixed bodies use shared exact range movement and full onward padding. Zero-length
-bodies still produce one datagram. Pause stops both body delivery and header
-read-ahead; popped/exhausted wrappers recycle exactly once.
+### VlessClient response transition and UDP framing
 
-Pending upstream application data has a fixed 1 MiB and 1,024-buffer limit;
-direct-TCP downstream retention has the same limits. Empty UDP entries consume
-slots. UDP carrier input instead has a fixed 1,057,031-byte limit (1 MiB plus one
-8,455-byte maximum frame), including cached headers and the active head, without
-an incoming-fragment cap. The initial request has its own bounded control state.
-These policies are independent of pool geometry, RAM profile and actual pipe
-capacity. Queue admission refusal or overflow closes the affected association;
-ordinary pipe refusal uses the shared representation fallback.
+The initial request is 26 bytes for IPv4, 38 for IPv6, or 23 plus domain length,
+at most 278. UDP frames contain a two-byte big-endian body length and no address.
+Valid bodies are 1 through 65,535 bytes. Local empty/oversized datagrams are dropped
+without triggering the initial request; a received zero length is malformed.
+
+Response parsing caches at most 257 metadata bytes. Consume exactly the two fixed
+response bytes and the indicated addons before body delivery. Version must be zero;
+nonempty addons are accepted/skipped with the existing warning. TCP then stops
+interpreting headers; preserve a coalesced body in its representation without
+waiting for Est or building a separate ready-output queue. UDP gathers its exact
+length header and extracts one complete body at a time, including every complete
+frame in the accepted input after Pause. Retain the incomplete suffix.
+
+Whole suitable bodies transfer directly. Split/mixed bodies use shared exact range
+movement and preserve the returned replacement pointer, unrequested suffix and full
+onward padding. Mutate only a popped, locally owned active head. Metadata, active
+input and queued sources remain charged once until consumed.
 
 ### TrojanServer request inspection and retained wire bytes
 
-TrojanServer owns an input FIFO, a popped active head and at most 320 resident
-initial-header bytes. The first callback's logical size must include all 56 hash
-bytes, even when splice-backed. Consume only the current field with
-`sbufReadRangeToMemory()`. Validate available hex/CRLF before authentication and
-cache successful lookup before later fields arrive. Post-authentication malformed
-input closes the protected flow. Rejected unauthenticated input replays every
-inspected prefix byte before its untouched tail, secured before fallback Init.
-No parser read may consume opaque TCP body just to fill a maximum-sized cache.
+Initial parsing caches at most 320 resident header bytes. Preserve authentication
+and fallback policy: the first callback's logical length must include all 56 hash
+bytes, even if splice-backed; validate available hex/CRLF before authentication and
+cache successful lookup. Post-authentication malformed input closes the protected
+flow. Rejected unauthenticated input replays every inspected byte before its untouched
+tail, with replay ownership secured before fallback Init. Do not read opaque TCP
+body merely to fill a maximum-sized header cache.
 
-UDP stages address/port/length/CRLF, using at most 263 header bytes. Incomplete,
-invalid and complete are distinct results. Body extraction transfers a suitable
-whole source or uses `sbufMoveRangeTo()` with full onward padding; preserve its
-replacement result and unrequested suffix. Empty frames produce one datagram.
-A selected frame waiting for backend permission remains in input ownership and
-accounting. Ordinary-only bodies need no pipe; resource refusal selects complete
-ordinary fallback. Replies prepend at most 263 real bytes and retain the existing
-65,535-byte backend-body limit, separate from the 8,192-byte incoming maximum.
+After selecting and initializing CONNECT, ordinary body/reply forwarding is inline;
+retain only input needed to preserve ordering across branch Init or nested callbacks.
+UDP stages address/port/length/CRLF with at most 263 metadata bytes and the existing
+8,192-byte incoming-body maximum. A complete current-input datagram is submitted
+through its selected backend even after Pause; the receiver owns bounded tolerance.
+Keep only incomplete input or actual initialization/protocol-ordering state. Replies
+preserve their distinct 65,535-byte backend-body maximum and prepend at most 263 bytes.
 
-UDP input and initial assembly allow 1,057,031 wire bytes, including cached headers
-and active/selected input, so a partial request plus a 1 MiB delivery fits. Remove
-initial-header cost before applying the selected path's limit; the 4,096-byte
-incomplete-initial policy does not reject coalesced application bodies. Pending
-TCP and fallback each allow 1 MiB and 1,024 output buffers per direction. Fallback
-replay includes inspected prefix bytes. UDP replies share an association-wide
-1 MiB encoded-wire and 1,024-datagram budget, including pre-Est entries. Empty
-replies consume slots; incoming UDP fragment count has no output-entry cap.
-Budgets are independent of pool geometry, RAM profile and kernel pipe capacity.
-Delayed/final fallback batches use exact representation-aware assembly into one
-callback, with suitable sole-buffer transfer and complete ordinary fallback.
+A necessary association reply FIFO accounts encoded wire bytes and datagram entries
+under the 2 MiB / 1,024 limits. Live initialized backend replies have no Est waiter.
+Immutable replies already accepted into the client FIFO belong to that FIFO, not to
+a borrowed backend pointer. Its independent drain honors Pause; inline forwarding
+of an already-admitted backend reply follows the synchronous batch rule.
+
+Delayed fallback retains a real bounded backlog, including inspected replay bytes.
+Its scheduled drain and narrow source-Finish final batch use exact representation-aware
+assembly, sole-buffer transfer where suitable, and complete ordinary fallback. Those
+independent/final drains retain their permission and no-reflection obligations.
 
 ### MUX parent streams and decoded child queues
 
@@ -1154,6 +1301,14 @@ a hard bound must keep a separate storage/resource charge. Mux's child, parent,
 detached and outgoing queues use the queue-capacity policy above; it deliberately
 does not bound physical kernel resources. It must not replace logical length in
 BufferQueue or in the incoming-child FlowResume threshold.
+
+Use `bufferqueueGetCharge()` for an individual BufferQueue instead of maintaining
+a duplicate counter beside it. A whole-queue ownership transfer carries the budget binding and both cached
+totals; initialize the relinquished source as empty and unbound. Reserved pop
+keeps continued active retention charged. TCP adapters share one budget between
+the queue and active WIO reservation, retaining original capacity charge until
+completion or terminal callback detachment. Partial writes release logical bytes.
+Mux's children, parser and detached associations retain their existing policies.
 
 `sbufGetAllocationCharge(const sbuf_t *buf)` is the canonical O(1) charge for an
 allocated buffer's own userspace storage. For ordinary buffers it returns

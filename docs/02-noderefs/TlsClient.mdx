@@ -283,13 +283,21 @@ socket connection completes.
 
 WaterWall `Est` is transport establishment, not TLS readiness.
 
-In normal mode, downstream `Est` from the next node is forwarded to the previous node immediately. The TLS handshake may
-finish later when downstream TLS records arrive. If the previous tunnel sends application payload before the TLS handshake
-is complete, `TlsClient` queues it and flushes it through `SSL_write()` after the handshake finishes.
+Downstream transport `Est` is forwarded immediately and once in both ordinary and takeover modes. Payload may arrive
+after adjacent Init, before either transport Est or TLS completion. Plaintext waiting for TLS readiness or older reentrant
+output is bounded to 2 MiB and 1,024 buffers, including its active retained head. Equality is accepted; transactional
+admission failure closes the borrowed line through its owner and releases retained buffers. Handshake completion and
+Resume release this FIFO through `SSL_write()` only while wire output is not paused, stopping before the next record
+when a callback pauses output. New input cannot overtake the retained head. Ciphertext-shaping limits remain separate.
+The first retained plaintext buffer is published before notifying the cleartext source with Pause. Protocol/order wait,
+wire pressure and ciphertext-shaping pressure share one source notification latch. Resume is emitted only after TLS is
+ready, the older plaintext FIFO is empty and wire/shaping pressure has cleared. This source pressure does not pause
+incoming TLS handshake records.
 
-In handshake-takeover mode, `TlsClient` suppresses the normal downstream `Est` until the TLS handshake completes.
-It also frames takeover input one TLS record at a time and stops feeding BoringSSL at the exact record that completes the
-handshake, leaving later records outside the SSL object for explicit dispatch.
+Takeover registers a dedicated owner completion callback with `tlsclientTunnelEnableHandshakeTakeover(t, owner, callback)`.
+`TlsClient` frames takeover input one TLS record at a time and stops at the exact record that completes the handshake,
+leaving later records outside the SSL object. It publishes completion before invoking the callback, retains the exact line,
+and rechecks life and TLS state afterwards. Neither completion nor later Reality activation emits another `Est`.
 
 ## Payload Flow
 
@@ -325,7 +333,7 @@ Internal WaterWall code can use `TlsClient` in handshake-takeover mode:
 
 | API | Purpose |
 | --- | --- |
-| `tlsclientTunnelEnableHandshakeTakeover()` | Enables takeover behavior on the tunnel. |
+| `tlsclientTunnelEnableHandshakeTakeover()` | Registers the owner and its handshake-ready callback and enables takeover. |
 | `tlsclientTunnelIsHandshakeCompleted()` | Checks whether a line has completed TLS handshake. |
 | `tlsclientTunnelGetHandshakeBinding()` | Captures the negotiated version, cipher, randoms, and TLS 1.2 sequence state while BoringSSL is retained. |
 | `tlsclientTunnelDeinitAfterHandshake()` | TLS 1.2-only immediate release into raw pass-through. It rejects TLS 1.3. |

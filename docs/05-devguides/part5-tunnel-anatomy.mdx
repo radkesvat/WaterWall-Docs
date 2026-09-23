@@ -5,7 +5,7 @@ sidebar_label: "Part 5: Anatomy & Workflow"
 description: "The on-disk layout of a WaterWall tunnel, what each file owns, node.c metadata, the create/line-state patterns, HTTP constraints, and the implementation workflow."
 ---
 <!--
-Documentation version: 164
+Documentation version: 166
 -->
 
 # Part 5: Anatomy of a Tunnel & Workflow
@@ -64,6 +64,19 @@ default; nodes that support these events must explicitly install handlers.
 Other ordinary flow defaults forward. State changes, event absorption, cleanup,
 and error handling require custom callbacks even when their bodies are short.
 
+For an ordinary middle node, a custom Est handler must still promptly relay
+adapter establishment. Protocol negotiation, request emission and payload
+readiness belong in separate state, not in a delayed or replacement Est. Follow
+[Part 2's Est contract](./part2-lines-and-callbacks.mdx#est-is-transport-readiness)
+when mapping distinct lines or adding a protocol-completion callback.
+
+Choose flow state by role, not by copying another protocol's pump. Synchronous
+transforms use direct Payload and signal forwarding without redundant output
+queues. Parsers keep incomplete input; junctions map pressure; timers and deferred
+backlogs own bounded, permission-aware drains. Keep any reentry guard attached to
+the specific ordering obligation it protects. Completing a bounded admitted input
+can continue after Pause; see [Part 2](./part2-lines-and-callbacks.mdx#flow-control-roles-and-admission).
+
 Remove obsolete callback implementations when they have no registrations or
 runtime callers, together with their declarations and build-source references.
 Check public entrypoints and dynamic loading conventions before declaring a
@@ -93,6 +106,36 @@ behind a boolean dispatcher; common code need not all live in `helpers.c`.
 | `upstream/*.c`, `downstream/*.c` | One custom flow callback each. Omit files for inherited callbacks. Keep directional dispatch, admission and direct forwarding here; delegate shared algorithms and coordination to cohesive common files. |
 | `include/MyTunnel/structure.h` | `mytunnel_tstate_t`, `mytunnel_lstate_t`, size enums, and small inline helpers. |
 | `include/MyTunnel/interface.h` | `WW_EXPORT` create/api and custom destroy prototypes, plus prototypes for implemented callbacks. |
+
+### Caller preconditions and failure handling
+
+Callers establish an internal helper's preconditions. A required tunnel, line,
+buffer or output pointer is not an optional input merely because C can represent
+NULL. Do not turn a programmer error into an ordinary `false`, `NULL`, success or
+silent return, or duplicate argument validation at every layer.
+
+Choose the check according to what can actually cause the condition:
+
+| Condition | Handling |
+| --- | --- |
+| Caller-owned precondition or programmer-only invariant | Use `assert()` to document and check it in Debug, or remove a redundant check when the surrounding contract already establishes it. |
+| Critical internal invariant requiring release-build protection, such as corrupted resource ownership | Keep a runtime check, emit `LOGF`, then call `abortProgramNow()`. Do not disguise corruption as a recoverable protocol failure or request orderly shutdown and continue. |
+| Expected failure, external input or supported state | Keep ordinary runtime validation and the documented failure/cleanup path. Examples include allocation/I/O refusal, malformed peer data, exhausted budgets, incomplete frames and optional NULL arguments. |
+
+Trace callers before classifying a condition. A NULL callback context after
+detachment, a stale association, a canceled timer, or state released during a
+reentrant callback can be expected. Keep those guards and exact-line lifetime
+checks. A reference preserves the allocation, not the logical life of the line.
+An entry assertion never replaces a required check after calling another tunnel.
+Required internal arguments normally belong in the first row; the possibility
+that caller misuse could crash does not by itself justify another runtime guard.
+
+Split mixed checks instead of deleting the whole expression. For example, a TLS
+output helper can assert that its tunnel, line, state and write BIO are non-null,
+while still returning failure if TLS output fails or a callback releases its
+state. Document nullable parameters explicitly. Keep operations with side effects
+outside `assert()` so Release builds perform them too; assertions disappear under
+`NDEBUG`.
 
 ### Typed internal capabilities versus runtime messages
 
@@ -260,7 +303,7 @@ select it. `WW_HAVE_SPLICE` reports Linux splice API availability independently
 of the event watcher.
 
 `TcpListener`, `TcpConnector`, `DomainResolver`, `MuxClient`, `MuxServer`,
-`Bgp4Client`, `Bgp4Server`, `TrojanClient`, `TrojanServer`, `HeaderClient`, `Bridge`, `UserController`, `BlackHole`, `ReverseClient`, and
+`Bgp4Client`, `Bgp4Server`, `VlessClient`, `TrojanClient`, `TrojanServer`, `HeaderClient`, `Bridge`, `UserController`, `BlackHole`, `ReverseClient`, and
 `JunkDatagramSender`, `UdpListener`, `UdpConnector`, `UdpStatelessSocket`,
 `TcpUdpListener`, and `TcpUdpConnector` advertise the flag. This includes the internal `DomainResolver` inserted by
 `TcpConnector`. Mux retains valid queued bodies under local queue-capacity charges. Incoming
@@ -277,6 +320,13 @@ TrojanServer supports staged request authentication, opaque CONNECT, UDP backend
 and exact fallback replay. Eligibility includes its UserController and all reachable
 fallback/connector helpers; the AuthenticationClient lookup dependency is not a
 payload hop. TlsServer remains a blocker. See the Trojan buffer contracts in Part 3.
+
+VlessClient supports both callback directions for TCP, UDP and destination-context
+selection, including retained input and dependent carrier cleanup. Its internal
+DomainResolver remains eligible. The response/addon barrier and UDP length parser
+use node-local bounded metadata storage; ordinary fallback remains valid. TlsClient
+and VlessServer do not become eligible merely by adjoining VlessClient. See Part 3
+for exact retention limits and representation handling.
 
 BGP supports both representations through in-place framing, bounded frame FIFOs
 and a 19-byte fixed-header receive stream. OPEN inspection reads only its bounded
@@ -469,6 +519,10 @@ Rules (from [Part 2](./part2-lines-and-callbacks.mdx), restated where you write 
 code):
 
 - Initialize in `Init`; later callbacks assume the state exists.
+- Initialize the final line-state object before attaching queues to an embedded
+  buffer budget. Its address must remain stable; never copy populated state with
+  self-references. Destroy attached queues and release active reservations, assert
+  zero budget usage, then clear the line-state slot.
 - Destroy once; after `LinestateDestroy()` consider the state dead and zeroed.
 - Never read a field after destroying the state.
 - Do not add an `initialized` boolean unless an explicitly documented

@@ -157,15 +157,15 @@ through `abortProgramNow(1)`. Downstream `Est` and payload callbacks remain supp
 For TCP mode, the lifecycle is:
 
 1. Upstream `Init` initializes `Socks5Client` line state and forwards `Init` to the next transport.
-2. The next transport establishes the proxy connection and sends downstream `Est`.
+2. The next transport establishes the proxy connection; its downstream `Est` is forwarded immediately, before SOCKS negotiation.
 3. `Socks5Client` sends the SOCKS5 method greeting.
 4. If credentials are configured and the server selects username/password auth, it sends the username/password request.
 5. It sends a SOCKS5 `CONNECT` command for the configured target.
-6. After a successful command reply, it emits downstream `Est` toward the previous node.
-7. Pending upstream payload is flushed to the proxy connection.
+6. A successful command reply opens the application-data gate; it does not emit another `Est`.
+7. The pending upstream FIFO drains while the next consumer is writable; nested input follows older bytes.
 
 If upstream payload arrives before the SOCKS request succeeds, it is queued. The pending queue is created with capacity
-for 8 buffers and the total queued upstream payload is limited to 1 MiB. The handshake input buffer is limited to 4096
+for 8 buffers; retained upstream payload is limited to 2 MiB and 1,024 buffers. The handshake input buffer is limited to 4096
 bytes.
 
 If the proxy rejects all methods, authentication fails, the command reply is invalid, or the command fails, the tunnel
@@ -192,8 +192,8 @@ application-protocol metadata. The outbound UDP adapter consumes it exactly
 once, then clears the internal marker so it cannot affect later unrelated
 routing.
 
-The application line is established only after both the TCP control association and the UDP relay line are ready. Until
-then, upstream datagrams are queued under the same 1 MiB pending-payload limit.
+The control transport Est maps once to the application line. Datagram delivery still waits for both the successful
+control association and UDP relay readiness, under the 2 MiB / 1,024-buffer pending limit.
 
 When application payload goes upstream, `Socks5Client` prepends a SOCKS5 UDP request header containing the configured
 final target and sends the datagram through the UDP relay line. When a relay datagram comes back downstream, it validates
@@ -226,3 +226,10 @@ Source-backed metadata:
 | `layer_group_prev_node` | `kNodeLayer4` |
 | `layer_group_next_node` | `kNodeLayer4` |
 | `required_padding_left` | `262` bytes |
+
+Transport `Est` does not mean SOCKS negotiation has succeeded. Application payload can be accepted after Init;
+the real protocol backlog is bounded at 2 MiB and 1,024 buffers. Its later release honors consumer Pause and FIFO,
+including reentrant input. The first retained application input pauses its source; the source resumes only after
+the older FIFO drains and transport pressure clears. This protocol hold does not stop handshake traffic.
+Application receive Pause does not stop the handshake's own input before readiness.
+For UDP, control and relay write pressure combine; one Resume cannot clear the other's outstanding Pause.

@@ -42,8 +42,7 @@ intermediate tunnels must preserve the fixed probe bytes end to end.
 ## What It Does
 
 - Reads `settings.simultaneous-tries-perline`.
-- Creates that many internal child lines for every upstream `Init` on the main
-  line.
+- Creates up to that many internal child lines for each upstream `Init`; synchronous selection stops new attempts.
 - Sends upstream `Init` to `next` on every child line.
 - Sends the fixed client probe `FISH?` on every child line.
 - Waits for the fixed server reply `FISH!`.
@@ -106,7 +105,7 @@ The probe is fixed and has no configurable secret:
 
 | Direction | Bytes | Meaning |
 | --- | --- | --- |
-| client to server | `FISH?` | Sent by every child line immediately after child upstream `Init`. |
+| client to server | `FISH?` | Sent after child upstream `Init` when transport permission allows. |
 | server to client | `FISH!` | Required reply from `ConnectionFisherServer`. |
 
 These markers only prove that the child line reached a matching
@@ -132,16 +131,15 @@ selected child.
 For each upstream `Init` on the main line:
 
 1. The main line state is initialized.
-2. `simultaneous-tries-perline` child lines are created on the same worker.
+2. Up to `simultaneous-tries-perline` child lines are created on the same worker; synchronous selection stops new attempts.
 3. Each child line is initialized toward `next`.
-4. Each child sends `FISH?`.
-5. The main line schedules a 5000 ms selection timeout.
+4. Each child sends `FISH?` after Init when its transport is unpaused.
+5. If no child has already won synchronously, the main line schedules a 5000 ms selection timeout.
 6. Upstream payload on the main line is queued until a child wins.
 7. The first child to receive `FISH!` becomes the selected child.
 8. Losing child lines are closed.
-9. Queued upstream payload is flushed to the selected child.
-10. Any extra downstream bytes already buffered after `FISH!` are sent to the
-    previous node as downstream payload.
+9. Any downstream bytes coalesced with `FISH!` are sent before application work can induce newer replies.
+10. Queued upstream payload drains in FIFO order while the selected transport is unpaused.
 
 If no child validates before the timeout, the main line is closed.
 
@@ -150,7 +148,7 @@ If no child validates before the timeout, the main line is closed.
 | Limit | Value | Behavior |
 | --- | --- | --- |
 | Selection timeout | `5000 ms` | Main line closes if no child is selected in time. |
-| Pending upstream payload | `1 MiB` | Main line closes if queued upstream payload exceeds this while waiting for selection. |
+| Pending upstream payload | `1 MiB` | Main line closes if its retained protocol/order backlog exceeds this. |
 | Child handshake buffer | `4096 bytes` | Main line closes if a child accumulates too much non-selected handshake data. |
 | Required left padding | `0` | The client does not prepend protocol headers to existing payload buffers. |
 
@@ -163,10 +161,9 @@ Before selection:
 
 - upstream payload from the main line is queued
 - downstream payload from a child is treated as handshake data
-- downstream `Est` marks the child established but is not forwarded to the main
-  line unless that child is already selected
-- pause and resume are not reflected to the main line until a selected child is
-  available
+- the first eligible associated transport `Est` is forwarded to the main line once, independently of selection
+- an already-established child returned by next Init produces the same one-time transport notification
+- child transport pressure is recorded before selection; application backlog independently pauses the main source immediately after its first retained payload
 
 After selection:
 
@@ -174,12 +171,24 @@ After selection:
   `tunnelNextUpStreamPayload`
 - downstream payload on the selected child is forwarded to the previous node with
   `tunnelPrevDownStreamPayload`
-- downstream `Est` from the selected child is forwarded once to the previous
-  node
+- selection and handshake completion do not emit another `Est`
 - pause and resume are bridged only across the selected child/main-line pair
 
 If the selected child closes, the main line is closed. If every child closes
 before a winner is selected, the main line is also closed.
+
+The application backlog remains bounded to 1 MiB and admits buffers transactionally.
+Its first retained payload publishes source Pause after FIFO ownership is settled.
+This hold combines with selected-child transport pressure; neither an unrelated
+child Resume nor selection alone releases it. It affects the application source,
+so FISH probes and replies can still complete.
+Selection and Resume release it as an independent producer: Pause stops the drain,
+and nested application input appends behind older retained bytes. Empty stream
+buffers need no retained entry. Main-side reply Pause is recorded before selection
+and applied to the chosen backend after its handshake, so it cannot stall FISH!.
+Temporary downstream ordering during selection also has a 1 MiB bound and keeps
+coalesced reply bytes before reentrant replies. Close settles all retained bytes
+and exact child/main references.
 
 ## Notes and Caveats
 
