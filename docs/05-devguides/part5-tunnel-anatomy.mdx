@@ -5,7 +5,7 @@ sidebar_label: "Part 5: Anatomy & Workflow"
 description: "The on-disk layout of a WaterWall tunnel, what each file owns, node.c metadata, the create/line-state patterns, HTTP constraints, and the implementation workflow."
 ---
 <!--
-Documentation version: 167
+Documentation version: 171
 -->
 
 # Part 5: Anatomy of a Tunnel & Workflow
@@ -500,6 +500,14 @@ line callback, `worker->wid` in a worker-message callback, or a checked
 worker. Never index them with raw `getWID()`. Per-connection state lives in
 **lstate**.
 
+Private flags owned by the same worker can use adjacent `bool flag : 1` fields,
+as in the Trojan/VLESS line states and HttpProxyServer session/header states.
+Group flags to avoid alignment holes. Keep ordinary booleans when callers need
+their addresses, including JSON output parameters, and preserve indexed arrays
+where useful. Packed flags share a storage unit: they are not independent atomic
+objects or a wire format. Compare both `sizeof` and the rounded line-state size
+before claiming an allocation saving; layouts depend on the target compiler/ABI.
+
 Line-state types must require no more than `kTunnelLineStateAlignment` (32-byte)
 alignment. Use `tunnelTryAlignLineStateSize()` when composing embedded line-state
 regions, and include each rounded region in the tunnel's reservation before
@@ -558,6 +566,30 @@ inherited identities and avoid appending repeated markers to the borrowed
 client or reused child. Current TCP read EOF closes the full transport,
 including on IOCP; proxy persistence does not introduce half-close semantics.
 
+HttpProxyServer keeps request authentication and selection in `upstream/payload.c`
+and response processing in `downstream/payload.c`. Init, Est, Finish and receiver
+permission updates live in their corresponding callback files. `common/input.c`
+shares bounded admission and HTTP framing; `common/flow.c` coordinates exchange
+progress, raw relay and combined producer pressure; `common/lifecycle.c` owns
+session references and child creation/teardown. The shared pump serializes reentry
+and advances retained work from Payload, Resume, Est and timer callbacks.
+
+Optional `fallback-node-name` selects a distinct configured L4 branch only for
+first-request authentication denial or service unavailability. Explicit lookup
+outcomes distinguish rejection from internal errors; parser, local-storage and
+post-authentication failures never select fallback. Successful authentication
+commits a monotonic connection latch before rewriting, local OPTIONS or outward
+callbacks. Returning to request parsing must not reset it. Fallback creates only
+one owned child through the resolved callable entry, bypasses this proxy's private
+UserController, inherits legitimate metadata, and never installs rejected
+credentials or the failed authority as child routing metadata. Its exact original
+wire replay includes credential bytes, followed by permanent opaque bidirectional
+relay. No local HTTP response or branch retry is allowed after selection. Connect
+and idle deadlines remain; HTTP header deadlines end at handoff. The node remains
+ordinary-only and uses the existing worker child inventory and quiescence gates.
+All HTTP activity and deadline timestamps use `wloopNowMonotonicMS()` on the
+client line's owner loop, with cached-loop freshness and no wall-clock adjustment.
+
 HttpProxyServer treats `max-pending-bytes` (`P`) as its working pending-data
 budget. Four working buffers retain at most `4 * P` allocation bytes. Each
 direction may additionally hold one already-delivered remainder of at most
@@ -572,6 +604,11 @@ when needed to satisfy this bound. Working slice room excludes deferred
 bytes so moving bytes into working storage never double-counts them. Remainders
 participate in pressure, FIFO pumping, and every error/timeout/close cleanup path.
 Blocked pipelined requests leave response progress available.
+Raw fallback and CONNECT relay do not copy their deferred bytes back into working
+storage to forward them. One paused direction must not consume the capacity
+required to drain the other. Their owned child's Finish settles that child
+immediately and drains already accepted replies under current client permission
+before finishing the borrowed client.
 
 ReverseServer, HalfDuplexServer, and HttpServer split derive waiting budgets from
 `scale = max(1, ceil(basis / 32768))`, where
