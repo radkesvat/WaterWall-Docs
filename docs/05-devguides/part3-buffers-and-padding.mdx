@@ -5,7 +5,7 @@ sidebar_label: "Part 3: Buffers & Padding"
 description: "The sbuf_t buffer model, worker buffer pools, left-padding budgets, and how to prepend protocol headers without breaking chain composition."
 ---
 <!--
-Documentation version: 163
+Documentation version: 164
 -->
 
 # Part 3: Buffers, Padding & Shift Buffers
@@ -790,7 +790,7 @@ limits take precedence over the default. For example,
 1 MiB selection backlog. Socks5Client follows the default application-data limit;
 its separate 4,096-byte handshake-input limit remains unchanged.
 
-TrojanClient, TrojanServer and VlessClient also use a **2 MiB logical-byte base
+TrojanClient, TrojanServer, VlessClient and VlessServer also use a **2 MiB logical-byte base
 budget** for their necessary parser state. Input fragments have a byte
 bound plus bounded parser metadata; do not apply an output-datagram count limit to
 fragments of one incomplete frame. Empty queued datagrams consume output entries.
@@ -798,10 +798,11 @@ A parser's active head, cached header and queued sources are charged exactly onc
 
 | Necessary retained state | Byte limit |
 | --- | --- |
-| Protocol/order/replay or output backlog in these three nodes | 2,097,152 bytes; 1,024 output/backlog entries |
+| Protocol/order/replay or output backlog in these four nodes | 2,097,152 bytes; 1,024 output/backlog entries |
 | Trojan UDP input, including partial-frame/header state | 2,105,607 bytes: 2 MiB plus the 8,455-byte maximum incoming frame |
 | TrojanServer initial request assembly | 2,105,607 wire bytes; incomplete-initial policy remains 4,096 bytes |
 | VlessClient TCP response assembly | 2,097,409 bytes: 2 MiB plus 257 response metadata bytes |
+| VlessServer request/UDP input, including active head and cached metadata | 2,162,689 bytes; incomplete-initial policy remains 4,096 bytes |
 | VlessClient UDP input, including pending response/frame metadata | 2,162,689 bytes: 2 MiB plus the 65,537-byte maximum frame |
 
 Equality is accepted. Overflow or failed queue admission settles only the affected
@@ -928,6 +929,28 @@ Delayed fallback retains a real bounded backlog, including inspected replay byte
 Its scheduled drain and narrow source-Finish final batch use exact representation-aware
 assembly, sole-buffer transfer where suitable, and complete ordinary fallback. Those
 independent/final drains retain their permission and no-reflection obligations.
+
+### VlessServer request inspection and replay
+
+VlessServer borrows the client normal line and owns only its fixed-destination UDP backend. It caches at most 278 request
+metadata bytes, consuming only the next required field through shared range helpers. The first callback must contain
+17 logical bytes (version plus UUID), regardless of resident/pipe boundaries; shorter or empty input takes fallback/reject.
+Cache successful authentication. Nonzero request addons remain unsupported once their advertised bytes arrive;
+post-authentication malformed input closes rather than replays. Remove accepted metadata before body budgeting.
+
+One guarded mixed-input FIFO and popped active head preserve old body bytes across Init and nested input. TCP output
+and fallback replay share a 2 MiB / 1,024-entry upstream budget; the response-header/reentry FIFO has its own equal budget.
+Attach populated parser storage transactionally only when it becomes output. Parser bytes include cached metadata,
+active head and queued sources exactly once, without an output-entry limit on incomplete UDP fragments.
+
+Fallback restores all inspected bytes before untouched tails before branch Init. No drain or final batch runs inside Init.
+Zero-delay admitted handoff follows synchronous input rules; delayed or independently retained replay honors Pause.
+Sole suitable buffers transfer directly; mixed batches use exact range movement with complete ordinary fallback.
+UDP gathers exactly two length bytes, rejects zero, extracts 1..65,535 body bytes with full onward padding, and leaves
+following frames untouched. Complete accepted frames continue after Pause. Replies prepend only the advertised two bytes;
+insufficient headroom uses shared movement, preserving any resident prefix and private body. Empty/oversized local replies
+drop without closing the backend. The single `00 00` response precedes every protected body, including pre-Est replies;
+Est remains prompt and independent of header readiness and output Pause.
 
 ### MUX parent streams and decoded child queues
 

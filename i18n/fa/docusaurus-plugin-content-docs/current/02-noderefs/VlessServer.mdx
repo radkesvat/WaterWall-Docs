@@ -6,7 +6,7 @@ description: "راهنمای نود VlessServer در WaterWall."
 ---
 
 <!--
-Documentation version: 153
+Documentation version: 154
 -->
 
 # VlessServer
@@ -17,6 +17,34 @@ Documentation version: 153
 
 این نود فقط بخش پایه پروتکل VLESS را پیاده‌سازی می‌کند؛ TLS، REALITY، XTLS Vision، mux، reverse، XUDP و wrapperهای
 transport باید با نودهای دیگری ساخته شوند.
+
+## پشتیبانی splice و محدودیت نگهداری
+
+VlessServer در هر دو جهت payload عادی و splice را می‌پذیرد. فعال شدن splice به Linux پشتیبانی‌شده،
+فعال بودن `misc.splice` و قابلیت تمام nodeهای زنجیره نهایی وابسته است؛ UserController، helperهای connector و
+DomainResolver و تمام شاخه‌های fallback نیز در این بررسی هستند. TLS و fallback فقط عادی همچنان کل زنجیره را مسدود می‌کنند.
+
+parser فقط metadata لازم را در cache حداکثر 278 بایتی می‌خواند. طول **منطقی** نخستین Payload باید version و تمام
+16 بایت UUID را در بر بگیرد، حتی اگر بخشی در pipe خصوصی باشد. کمتر از 17 بایت، از جمله ورودی خالی، به fallback یا
+رد شدن می‌انجامد. authentication موفق cache می‌شود؛ addons غیرصفر و درخواست نامعتبر پس از authentication اتصال
+محافظت‌شده را می‌بندند. metadata پذیرفته‌شده پیش از محاسبه بودجه body حذف می‌شود.
+
+body در TCP تا حد امکان opaque باقی می‌ماند. UDP یک مقصد ثابت از درخواست اولیه دارد؛ هر frame شامل طول دو بایتی
+و body با اندازه 1 تا 65,535 بایت است. شکست ساخت pipe یا فشار هنگام انتقال، fallback کامل به حافظه عادی دارد؛
+zero-copy برای همه frameها تضمین نمی‌شود.
+
+| داده نگه‌داشته‌شده | سقف با پذیرش مقدار مساوی |
+| --- | --- |
+| Init/reentry و backlog مربوط به fallback در upstream، مشترک | 2,097,152 بایت منطقی و 1,024 buffer |
+| صف response-header/reentry در downstream | 2,097,152 بایت منطقی و 1,024 buffer |
+| parser درخواست/UDP، شامل metadata در cache و ورودی فعال | 2,162,689 بایت منطقی |
+| درخواست اولیه ناقص | 4,096 بایت؛ header کامل همراه body درخواست ناقص نیست |
+
+buffer خروجی خالی نیز یک entry مصرف می‌کند؛ fragmentهای یک UDP frame ناقص سقف 1,024 entry خروجی را ندارند.
+overflow یا رد پذیرش صف، association مربوط را می‌بندد و داده محلی را آزاد می‌کند. این اعداد سقف RSS، حافظه kernel pipe
+یا اندازه TCP آماده برای تحویل مستقیم نیستند. fallback با تأخیر صفر و بدون backlog قدیمی می‌تواند Payload پذیرفته‌شده
+را همگام حتی پس از Pause کامل کند؛ تخلیه مستقل backlog تابع Pause است. هنگام Finish فقط یک batch نهایی، خارج از
+branch Init و در حالت بدون Pause، مجاز است؛ در غیر این صورت داده محلی آزاد می‌شود.
 
 ## جایگاه رایج
 
@@ -195,7 +223,7 @@ usernameهای متفاوتی داشته باشد.
 | `udp` | `true` | VLESS UDP command `0x02` را فعال می‌کند. |
 | `verbose` | `false` | جزئیات بیشتری از رد اتصال و diagnostics را log می‌کند. |
 | `fallback-node-name` | تنظیم نشده | branch جایگزین برای probeهای نامعتبر و احراز هویت‌نشده. نام‌های `fallback-node` و `fallback` هم پذیرفته می‌شوند. |
-| `fallback-intentional-delay-ms` | `7` | تأخیر payloadهای upstream که به fallback می‌روند؛ در delay غیرصفر jitter اعمال می‌شود. در `0`، fallback فعال و بدون pause که FIFO قدیمی یا drain زمان‌بندی‌شده ندارد payload را inline می‌گیرد؛ byteهای paused یا پشت FIFO قدیمی می‌مانند و Resume drain را پیش از payloadهای بعدی زمان‌بندی می‌کند تا سبقت نگیرند. |
+| `fallback-intentional-delay-ms` | `7` | تأخیر payloadهای upstream که به fallback می‌روند؛ در delay غیرصفر jitter اعمال می‌شود. در `0`، fallback فعال که FIFO قدیمی یا drain زمان‌بندی‌شده ندارد payload را inline می‌گیرد؛ byteهای مستقلِ نگه‌داشته‌شده پشت FIFO قدیمی می‌مانند و Resume drain را پیش از payloadهای بعدی زمان‌بندی می‌کند تا سبقت نگیرند. |
 | `fallback-intentional-delay-jitter-ms` | `1` | jitter تصادفی برای زمان‌بندی payloadهای تأخیردار fallback؛ با delay صفر نادیده گرفته می‌شود. |
 
 حداقل یکی از `connect` یا `udp` باید فعال باشد.
@@ -230,7 +258,7 @@ response header:
 رویداد transport Est فقط یک بار روی association صحیح client منتقل می‌شود و به response header یا Pause وابسته نیست.
 response header پیش از هر پاسخ backend، حتی پاسخ معتبر پیش از Est، ارسال می‌شود. header یا صفی که به‌صورت مستقل
 از Est تخلیه می‌شود هنگام Pause منتظر می‌ماند؛ نخستین پاسخ پذیرفته‌شده می‌تواند header و body خود را همگام کامل کند.
-reentry از header یا Est ترتیب پاسخ‌های قدیمی‌تر را تغییر نمی‌دهد. صف ضروری پاسخ سقف قبلی ۱ MiB و ۱٬۰۲۴ buffer
+reentry از header یا Est ترتیب پاسخ‌های قدیمی‌تر را تغییر نمی‌دهد. صف ضروری پاسخ سقف ۲ MiB و ۱٬۰۲۴ buffer
 دارد؛ پذیرش تراکنشی است و سرریز همان association را می‌بندد. Pause ثبت‌شده پیش از Init پس از مقداردهی backend TCP
 و هر backend UDP تازه یا بازسازی‌شده دوباره به آن منتقل می‌شود. ورودی application داخل Init یا replay شاخه نیز
 در صف موقت با همین سقف‌ها پشت ورودی اصلی می‌ماند. احراز هویت، انتخاب fallback و مالکیت backend UDP حفظ می‌شوند.
@@ -264,7 +292,7 @@ payload:  length bytes
 prefix به آن line می‌روند. پاسخ backend نیز با همان prefix دو بایتی length بسته‌بندی می‌شود و در جهت downstream به client
 VLESS برمی‌گردد.
 
-UDP frame با length `0` نامعتبر است. buffering ورودی UDP تا 1 MiB محدود است. prefix دو بایتی length یا body ناقص تا رسیدن ورودی بعدی نگه داشته می‌شود.
+UDP frame با length `0` نامعتبر است. ورودی parser در UDP، شامل metadata و ورودی فعال، تا 2,162,689 بایت محدود است. prefix دو بایتی length یا body ناقص تا رسیدن ورودی بعدی نگه داشته می‌شود.
 
 ## رفتار Fallback
 
@@ -284,11 +312,11 @@ Fallback ممکن است در این حالت‌ها انتخاب شود:
 - byteهای ابتدایی ذخیره‌شده و payloadهای بعدی upstream به fallback فرستاده می‌شوند
 - payloadهای upstream در fallback در عملیات عادی و delay غیرصفر به‌اندازه `fallback-intentional-delay-ms` به‌علاوه jitter
   تأخیر دارند
-- در delay صفر، fallback فعال و بدون pause که FIFO قدیمی یا drain زمان‌بندی‌شده ندارد payload را inline می‌گیرد؛ byteهای
-  paused یا قدیمی FIFO می‌مانند و Resume drain آن‌ها را پیش از payloadهای بعدی زمان‌بندی می‌کند تا سبقت نگیرند
-- FIFO تأخیردار fallback تا 1 MiB برای هر line محدود است
+- در delay صفر، fallback فعال که FIFO قدیمی یا drain زمان‌بندی‌شده ندارد payload را inline می‌گیرد؛ byteهای
+  مستقل یا قدیمی FIFO می‌مانند و Resume drain آن‌ها را پیش از payloadهای بعدی زمان‌بندی می‌کند تا سبقت نگیرند
+- FIFO تأخیردار fallback با ورودی Init/reentry یک بودجه مشترک 2 MiB و 1,024 buffer دارد
 - در upstream `Finish`، batch صف‌شده فقط وقتی fallback payload می‌پذیرد هم‌زمان و به‌ترتیب FIFO پیش از `Finish` fallback
-  flush می‌شود؛ fallback از قبل paused batch محلی را دور می‌ریزد و بدون دور زدن backpressure بسته می‌شود
+  flush می‌شود؛ fallback از قبل paused یا در حال Init، batch محلی را دور می‌ریزد و بدون دور زدن backpressure بسته می‌شود
 - پاسخ‌های downstream در fallback عمداً به تأخیر نمی‌افتند
 
 delay باقی‌مانده پس از `Finish` زنده نگه داشته نمی‌شود. کیفیت fallback بخشی از fingerprint عمومی سرویس است. fallback خراب،
