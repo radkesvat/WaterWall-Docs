@@ -303,15 +303,17 @@ select it. `WW_HAVE_SPLICE` reports Linux splice API availability independently
 of the event watcher.
 
 `TcpListener`, `TcpConnector`, `DomainResolver`, `MuxClient`, `MuxServer`,
-`Bgp4Client`, `Bgp4Server`, `VlessClient`, `VlessServer`, `TrojanClient`, `TrojanServer`, `HeaderClient`, `Bridge`, `UserController`, `BlackHole`, `ReverseClient`, and
+`Bgp4Client`, `Bgp4Server`, `HttpProxyServer`, `VlessClient`, `VlessServer`, `TrojanClient`, `TrojanServer`, `HeaderClient`, `Bridge`, `UserController`, `BlackHole`, `ReverseClient`, and
 `JunkDatagramSender`, `UdpListener`, `UdpConnector`, `UdpStatelessSocket`,
 `TcpUdpListener`, and `TcpUdpConnector` advertise the flag. This includes the internal `DomainResolver` inserted by
 `TcpConnector`. Mux retains valid queued bodies under local queue-capacity charges. Incoming
 assembly shares the parent receive limit with attached child queues; beneficial
 pressure compaction and actual pipe-transfer fallback remain available. Its fixed-header stream and atomic large
 splice batches preserve both callback directions. This does not promise zero-copy
-for every frame. BufferStream and HTTP remain ordinary-only; HTTP nodes do not
-advertise splice support.
+for every frame. BufferStream and HTTP parsers require ordinary memory. HttpClient and HttpServer
+do not advertise splice support. HttpProxyServer materializes at admission except
+for ready, unpaused CONNECT/fallback whole-buffer relay; its session slots remain
+ordinary in both directions (see Part 3).
 
 TrojanClient supports opaque TCP and staged variable-header UDP decoding, including
 its dependent owned carrier and destination-context selection. Its internal
@@ -574,6 +576,26 @@ progress, raw relay and combined producer pressure; `common/lifecycle.c` owns
 session references and child creation/teardown. The shared pump serializes reentry
 and advances retained work from Payload, Resume, Est and timer callbacks.
 
+The session embeds two `hps_direction_state_t` objects in `directions`, indexed
+by `kHpsUpstream` (client to selected child entry) and `kHpsDownstream` (child to
+client). Each groups its ordinary input/output/deferred/active buffers, body
+parser, saved header and trailer context, header deadline, receive nesting count,
+and permission flags. The saved header owns the bytes borrowed by its trailer
+context. `paused` records consumer permission; `read_paused` records pressure
+sent to the producer. Thus upstream Pause/Resume changes downstream `paused`,
+and downstream Pause/Resume changes upstream `paused`.
+
+Directions share the session's allocation and lifetime; an interior direction
+pointer grants no independent lifetime or permission after a callback. Never copy
+or reset a complete live direction object. Header cleanup clears its saved header,
+trailer context and header length, leaving the header deadline independent.
+Exchange and terminal cleanup preserve the existing member-specific resets,
+including receive counters that unwind after reentrant close. Child close
+resets only upstream `paused` and downstream `read_paused` within the directions.
+Association, authentication, timer, pump and asymmetric exchange state remain in
+the session. Upstream producer pressure still considers total session retention;
+downstream response progress must remain possible while request storage is full.
+
 Optional `fallback-node-name` selects a distinct configured L4 branch only for
 first-request authentication denial or service unavailability. Explicit lookup
 outcomes distinguish rejection from internal errors; parser, local-storage and
@@ -585,8 +607,14 @@ UserController, inherits legitimate metadata, and never installs rejected
 credentials or the failed authority as child routing metadata. Its exact original
 wire replay includes credential bytes, followed by permanent opaque bidirectional
 relay. No local HTTP response or branch retry is allowed after selection. Connect
-and idle deadlines remain; HTTP header deadlines end at handoff. The node remains
-ordinary-only and uses the existing worker child inventory and quiescence gates.
+and idle deadlines remain; HTTP header deadlines end at handoff. The node uses the existing worker child inventory and quiescence gates.
+Splice relay requires no older directional storage, no active pump/Init or outer
+Payload dispatch, and a live exact association. CONNECT also requires its success
+handoff; fallback does not require Est. Delivery uses the selected entry under
+the pump guard, so nested input materializes and waits in FIFO order. Handoff
+consumes the wrapper even if a callback closes the session. All retained input,
+output, deferred and active incoming buffers remain ordinary; HTTP bodies stay
+materialized throughout an exchange.
 All HTTP activity and deadline timestamps use `wloopNowMonotonicMS()` on the
 client line's owner loop, with cached-loop freshness and no wall-clock adjustment.
 
