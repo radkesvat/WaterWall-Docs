@@ -160,16 +160,47 @@ nonfatal. The hard limit and `fs.pipe-max-size` are never changed, and no
 persistent sysctl configuration is written. A successful increase remains in
 effect after WaterWall exits. Disabled splice skips this startup operation.
 
-`wioEnableSplice()` selects the mode on the owner thread before any successful
-read registration. Its debug assertions require an open WIO and a clear sticky
-`read_started` bit; stopping reads does not clear that bit. Supported builds
-return zero without creating a pipe. Unsupported builds return `-1` with
-`ENOSYS`. New descriptor adoption resets the mode. Disable and query helpers
-only change or read the mode.
+`wioEnableSplice()` and `wioDisableSplice()` select the read mode on the WIO's
+owning worker. The WIO must be open. Selection may change before or after reads
+start, including from a read callback; no read stop/restart is needed. The next
+read observes the selected mode. Already delivered buffers, retained private
+pipes, and queued writes keep their representations and ownership. Writes
+dispatch by the buffer's representation, independently of the read mode.
+Enabling on supported builds returns zero without creating a pipe; unsupported
+builds return `-1` with `ENOSYS`. New descriptor adoption resets the mode.
 
-TcpListener selects the mode for a finalized splice-capable chain before Init
-and reads; TcpConnector selects it after adopting its socket and before reads.
-TcpListener owns its normal line; TcpConnector borrows it.
+A normal line has two one-way ordinary-read preferences, initially clear:
+
+- `linePreferOrdinaryReadUpstream(l)` requests ordinary source reads that produce
+  upstream payload: TcpListener applies it to its accepted socket.
+- `linePreferOrdinaryReadDownstream(l)` requests ordinary source reads that produce
+  downstream payload: TcpConnector applies it to its connected socket.
+
+Call these helpers on the live line's owning worker. Requests may occur during
+Init or later, are idempotent, and remain set for that exact line's lifetime.
+There is no clear operation: one node must not undo another node's preference.
+The `linePrefersOrdinaryReadUpstream()` and `linePrefersOrdinaryReadDownstream()`
+queries expose the flags. A clear flag permits the adapter's normal splice policy;
+it never overrides chain eligibility or the core setting.
+
+TcpListener initially selects splice only for an eligible finalized chain, then
+applies its preference after Init and before reading. TcpConnector consults its
+preference when adopting the socket and again before connected reads start.
+Both adapters also apply preferences at receive and payload/write callback entry,
+including queued payload, write completion and read Resume. Applying a preference
+only disables splice; it never re-enables it. TcpListener owns its normal line;
+TcpConnector borrows it. These two sockets can share the same line and consult
+different flags. No WIO pointer or ownership is stored in the line header.
+
+These preferences are advisory, not representation guarantees. The receive
+callback runs after its input was read: that delivery can still be splice, and
+a preference requested while processing it may only be noticed on the following
+receive. Nodes must still handle both representations and must not use the flag
+as permission to inspect private pipe bytes as ordinary memory. Preferences do
+not propagate to associated lines: a Mux child cannot disable its shared parent's
+socket, and Mux need not materialize child payload because of a preference.
+Choosing ordinary reads for a short parsing phase still applies for the rest of
+the line; there is no automatic restoration after a handshake.
 
 For NIO TCP splice reads, the read loop checks out a splice wrapper with its
 private pipe already initialized by the pool and calls `splice()` directly. Each
