@@ -175,6 +175,8 @@ A normal line has two one-way ordinary-read preferences, initially clear:
   upstream payload: TcpListener applies it to its accepted socket.
 - `linePreferOrdinaryReadDownstream(l)` requests ordinary source reads that produce
   downstream payload: TcpConnector applies it to its connected socket.
+- `linePreferOrdinaryReadBoth(l)` requests both directions on the same line by
+  calling the two directional helpers.
 
 Call these helpers on the live line's owning worker. Requests may occur during
 Init or later, are idempotent, and remain set for that exact line's lifetime.
@@ -368,6 +370,10 @@ whole-datagram success, captured error and a separate socket-retirement verdict.
 NIO and UdpStatelessSocket share it. UDP receives remain ordinary; raw-IP writes
 never gain splice support. The caller runs the complete transaction and any
 retirement on the socket's owning worker; the helper does not transfer ownership.
+The caller supplies that socket owner's buffer pool. Any materialization fallback
+uses best-fit storage with zero required left padding and returns the temporary
+buffer to the same pool on success or failure. The input remains caller-owned,
+including when it was posted from another worker.
 All sends on that socket, including ordinary sends, remain serialized across the
 transaction. No callback or other send may run while assembly is pending.
 
@@ -888,6 +894,69 @@ remainder of this accepted input while the exact lines remain live. Hold only an
 incomplete suffix or data genuinely blocked by protocol/reentrancy. Stop on Finish,
 malformed input or receiver closure; never exceed a receiver's hard limit just to
 finish the batch. A separately scheduled or deferred backlog drain honors Pause.
+
+### HalfDuplex setup and direct forwarding
+
+HalfDuplexClient must combine its 17-byte upload intro and complete first input
+into one ordinary best-fit buffer with full onward padding. Consume splice input
+through exact representation helpers, including any resident prefix before its
+private-pipe body; never treat logical length as pointer accessibility. Its
+separate download intro is ordinary. Both intros and the publication guard exist
+before callbacks. Empty input retains the same first-Payload timing. The existing
+Init/intro FIFO may own splice wrappers and retains its inclusive 2 MiB / 1,024
+buffer policy. Later payload in both directions transfers the original wrapper.
+
+HalfDuplexServer must materialize whole deliveries in unknown and waiting-upload
+states before parsing or retention. Its buffering slot is always ordinary,
+including body bytes accompanying an intro. Check combined lengths and reserve
+full onward padding before merging. Pair an available peer before applying the
+existing waiting-upload limit. Strip exactly 17 ordinary bytes and replay the
+retained body before direct traffic. After startup replay, upload and return traffic remain
+representation-blind; download-side extra input is recycled without reading its
+body. Conversion refusal removes any waiting map entry and releases retained input
+before finishing the borrowed half through its owner.
+
+The owned server main line publishes startup ownership before next Init: a separate
+ordinary initial body, an Init/replay barrier, permission state, and a budgeted
+FIFO for later input. Both transport halves (including a PipeTunnel companion)
+remain borrowed. Reentrant upload must join that FIFO while the barrier is active,
+even when the role enum already indicates direct upload. The initial body retains
+its previous admission and is not charged to the new FIFO budget.
+
+The later-input budget has inclusive 2 MiB logical bytes, 2 MiB canonical
+allocation charge, and 1,024 entries. Initialize it and attach its queue at their
+final stable addresses. Empty entries consume charge and entries. Materialize each
+retained splice delivery fully with checked best-fit storage and onward padding;
+refusal closes the association. Ready deliveries have no new cap or transport
+queue. The waiting-map policy and HalfDuplexClient's policy are unchanged.
+
+Replay cannot run inside next Init or recursively inside initial-body dispatch.
+It waits while next is paused, detaches the initial body before handing it off,
+then rechecks exact main/upload/download life and associations. Keep the barrier
+active across that first handoff. Prepare the entire currently queued tail without
+outward callbacks, reusing a sole entry or coalescing multiple entries into checked
+ordinary storage. Release queue charges as ownership moves into this bounded
+scratch. Clear the barrier immediately before the final tail handoff, so any
+nested direct input follows all older bytes already handed to next. Do not loop
+through a FIFO that callbacks can continuously refill or require a future input
+to make progress. Materialization and coalescing overlap are not an aggregate
+physical-memory bound.
+
+Next-side Pause publishes permission and source notification state before
+callbacks. Resume during Init/replay records permission without bypassing the
+barrier. Release source Resume only after older startup output is handed off and
+next remains writable. Publish notification state before callbacks and retain and
+recheck all exact association lines. Every close origin releases main-owned
+initial/FIFO storage, verifies empty budget usage, and detaches associations before
+outward Finish; internal refusal finishes all initialized affected sides, while a
+received Finish never reflects toward its sender. The owned main dies before its
+Finish handler returns. Preserve the existing sibling-close scheduling fallback.
+
+PipeTunnel transfers the wrapper through worker messages without inspecting its
+body. The already-inspected intro is replayed as ordinary memory on the target
+worker. Private-pipe bytes survive source closure; canceled messages destroy the
+wrapper without borrowing a foreign worker's pool. No permanent ordinary-read
+preference is needed for either HalfDuplex node.
 
 ### Client first-payload requests
 
@@ -1487,6 +1556,42 @@ On the downstream side the paired tunnel reads and strips the header with
 - Using a different worker's pool than the line's own.
 - Treating `sbufGetMaximumWriteableSize` as "spare room beyond the payload" — it
   is room from the cursor, so subtract the current length first.
+
+### HttpProxyClient framing and retention
+
+Optional origin DNS precedes client Init. DomainResolver retains early ordinary,
+private-pipe and prefix-plus-pipe input under its own 2 MiB logical/2 MiB allocation
+charge FIFO bound, with no separate 1,024-entry cap. Client retention below starts
+after core Init; these are separate stages, not a shared entry cap or an aggregate
+2 MiB connection-memory guarantee. Neither DNS nor helper insertion requires
+materializing body bytes or changing read preferences or splice capability.
+
+HttpProxyClient advertises ten bytes of chunk-prefix padding. Its initial request
+uses a separate checked best-fit ordinary buffer with onward padding. A chunk's
+size prefix stays with its original body wrapper; an ordinary two-byte CRLF
+suffix is published before handing off the body and sent immediately afterward.
+Nested upload input waits behind that suffix. Pause permits completion of this
+bounded admitted frame, while independent backlog drains wait for Resume.
+
+HttpProxyClient does not request ordinary reads by default: uploads and body-only
+response deliveries can preserve splice buffers. Preferences set by other nodes
+remain advisory; both ordinary and splice input are valid in every phase.
+
+Ready CONNECT, fixed uploads, and response buffers wholly within an established
+fixed/EOF/chunk-data range can transfer intact. Inputs containing HTTP metadata
+or crossing a body boundary materialize completely into checked best-fit storage.
+No splice wrapper enters the ordinary parser. This practical scope deliberately
+allows copies for mixed inputs and small chunks.
+
+A delivery is at most 2 MiB. Necessary pending input per direction shares a
+buffer_budget_t bound of 2 MiB logical bytes, 2 MiB queue-capacity charge and
+1,024 entries. Active retained parsing input holds a reservation under the same
+budget; consumption releases bytes before callbacks. The opposite direction has
+its own budget so full upload storage cannot stop response progress. Header and
+framing carry have explicit fixed bounds; they are not general body queues.
+Materialization may transiently allocate one additional complete ordinary input
+of at most 2 MiB payload with onward padding, independently of pool tier sizes.
+This is not a physical-memory or kernel-pipe capacity guarantee.
 
 ---
 

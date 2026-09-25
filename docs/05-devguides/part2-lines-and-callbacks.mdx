@@ -803,7 +803,7 @@ identical:
 | `TrojanServer`, `VlessServer` | `fallback_close_draining` | Settles a delayed fallback batch without reflecting toward the finished previous side |
 | `TcpOverUdpClient` | `can_downstream` | Must finish its reliable-stream teardown before closing |
 | `TcpOverUdpServer` | `can_upstream` | The same, in the opposite direction |
-| `HttpClient`, `HttpServer`, `Socks5Server` | `prev_finished`, `next_finished` | Send final protocol bytes before transport close |
+| `HttpClient`, `HttpServer`, `HttpProxyClient`, `Socks5Server` | `prev_finished`, `next_finished` | Send final protocol bytes before transport close |
 
 If your tunnel does **not** send final bytes during `Finish`, it should not carry
 any of these flags. Destroy local state and forward — that is the whole job.
@@ -1212,6 +1212,14 @@ could overwrite the resolved destination. Protocol-selection warnings and the
 existing TCP fallback for an invalid incoming `dest_context->protocol` belong
 to target preparation and occur there once.
 
+HttpProxyClient also prepares its configured/dynamic origin in a client-owned
+DomainResolver hook when local resolution is enabled for CONNECT. It is TCP-only:
+validate and reject explicit UDP/ICMP/packet inputs before replacing context;
+an unspecified protocol becomes TCP. Copy dynamic address and port before any
+setter resets their storage. Do not apply the other clients' protocol fallback
+rules here. After DNS, format the numeric origin without reapplying settings,
+before the following connector replaces context with the proxy endpoint.
+
 ### UDP line role names
 
 TrojanClient, VlessClient and Socks5Client name the borrowed UDP-facing line
@@ -1469,6 +1477,41 @@ Before you call a flow change done:
 - Is `requestProgramShutdown()` used *in addition to* closing an owned line, never
   instead of it?
 - Did you avoid adding an `initialized` flag the source does not require?
+
+### HttpProxyClient single exchange
+
+HttpProxyClient borrows one normal line from its source and creates no child line.
+An optional owned DomainResolver tunnel precedes the client core on that same
+line. Origin DNS completes before core Init, client timers, or next Init begin;
+early input stays in the resolver FIFO. DNS uses the service timeout/retry policy,
+not the client idle deadline. Failed DNS finishes only the initialized source.
+Core Init starts idle accounting, including subsequent proxy DNS/connect waiting.
+CONNECT response timing starts at header handoff; incomplete header timing starts
+at its first byte. Paused time counts after these deadlines start.
+Init snapshots the origin before next Init can replace destination context, then
+hands off its complete request header when permitted. An Init/header guard keeps
+reentrant application data behind that header. Est forwards promptly once,
+independently of HTTP readiness. CONNECT releases application input only after a
+2xx reply; normal HTTP uploads need not wait for the response.
+
+Fixed/bodyless request completion leaves the response live. A complete framed
+response closes both directions and cancels upload, including a suspended chunk
+suffix; trailing bytes never start another exchange. Downstream Finish completes
+only close-delimited responses or an established CONNECT stream; other incomplete
+responses are truncated. The borrowed line is always destroyed by its source.
+Chunked source Finish can emit one terminal chunk only with no older backlog or
+active frame, a sent request header, a writable next side and normal loop
+admission, before response completion. Its final-byte window suppresses
+reflection and duplicate next Finish. It then destroys local state and
+propagates Finish: it cannot wait for a response after source Finish. There is
+no separate upload-completion callback, and an empty Payload does not finish
+the body. A terminal HTTP chunk would suffice to end a request without TCP
+half-close, but Finish cannot represent that send-only completion. Finite
+uploads that need a later response must use a known Content-Length; chunked
+exchanges require peers that respond while the upload remains open. See the
+[HttpProxyClient completion limitation](../02-noderefs/HttpProxyClient.mdx#chunked-upload-completion-limitation).
+Worker quiescence
+unlinks the timer registry; it is not another borrowed-line inventory.
 
 ---
 
