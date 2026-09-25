@@ -91,6 +91,7 @@ VlessClient -> TlsClient -> TcpConnector
 | `alpns` | `["h2", "http/1.1"]` | فهرست ترتیبی protocolهای پیشنهادی ALPN؛ ترتیب JSON عیناً در ClientHello حفظ می‌شود. |
 | `verify` | `true` | بررسی certificate متعلق به peer را در BoringSSL فعال می‌کند. |
 | `x25519mlkem768` | `true` | برای نزدیک‌تر شدن رفتار به Chrome، گروه hybrid با نام `X25519MLKEM768` را اعلام می‌کند. |
+| `fragment` | تنظیم نشده | تنظیمات StreamFragmenter داخلی برای تقسیم و تأخیر byteهای TLS خروجی. |
 | `tls13-record-shaping` | تنظیم نشده | تنظیم آزمایشی padding و delay سمت فرستنده برای TLS 1.3. |
 | `verbose` | `false` | جزئیات بیشتری از state مربوط به TLS را log می‌کند. |
 
@@ -104,6 +105,46 @@ VlessClient -> TlsClient -> TcpConnector
 
 بهتر است `x25519mlkem768` را فعال نگه دارید. غیرفعال کردن آن ClientHello را کوچک‌تر می‌کند، اما شباهت handshake به نسخه‌های
 فعلی Chrome را هم کاهش می‌دهد.
+
+## تقسیم جریان TLS
+
+تنظیم اختیاری `fragment` یک StreamFragmenter خصوصی بلافاصله بعد از TlsClient قرار می‌دهد:
+
+```text
+previous -> TlsClient -> internal StreamFragmenter -> configured next
+```
+
+```json
+"fragment": {
+  "mode": "counter",
+  "count": 1,
+  "cuts": [[250, 2, 100], [300, 5, 100]]
+}
+```
+
+این object همان تنظیمات و اعتبارسنجی StreamFragmenter را دارد: `mode`، گزینه `count` یا
+`duration-ms`، آرایه `cuts` و گزینه‌های اختیاری `bypass_chance` و `wait-for-est`.
+برای نداشتن helper، کلید `fragment` را حذف کنید. مقدار حاضر باید object معتبر باشد؛
+`null`، boolean، object خالی و کلید تکراری `fragment` خطای startup هستند.
+
+تقسیم روی byteهای TLS خروجی پس از رمزنگاری انجام می‌شود. پرواز اولیه ClientHello در یک
+Payload فرستاده می‌شود، پس `count: 1` همین پرواز اول را انتخاب می‌کند. شمارنده و offsetها
+به callbackهای Payload مربوط‌اند، نه مرز TLS record یا TCP packet. محتوا و headerهای TLS
+تغییر نمی‌کنند و ورودی downstream نیز بدون تغییر عبور می‌کند.
+
+مقدار پیش‌فرض `wait-for-est` برابر `true` است: خروجی تا عبور transport Est در FIFO می‌ماند
+و سپس delayها آغاز می‌شوند. بازه timed نیز از اولین Est شروع می‌شود. مقدار صریح `false`
+زمان‌بندی پیش از Est را مجاز می‌کند؛ برای مسیری که پیش از تولید Est به byteهای TLS نیاز دارد
+از آن استفاده کنید. buffering نودهای بعدی همچنان می‌تواند ارسال‌ها را ادغام یا فاصله روی wire را تغییر دهد.
+
+helper از همان line قرض‌گرفته‌شده استفاده می‌کند و line جدیدی نمی‌سازد. FIFO آن حد مستقل
+۸ MiB برای byteهای منطقی، ۸ MiB برای capacity charge و ۱٬۰۲۴ job دارد. قواعد Pause، reentry،
+Finish و shutdown همان قواعد StreamFragmenter هستند؛ این بودجه با صف plaintext یا shaping
+متعلق به TLS مشترک نیست. TlsClient همچنان splice را برای کل زنجیره مسدود می‌کند.
+
+می‌توانید `tls13-record-shaping` و `fragment` را هم‌زمان فعال کنید: ابتدا padding و delay
+مربوط به record و سپس تقسیم جریان و delayهای آن اعمال می‌شوند. API تولید ClientHello خام
+همچنان buffer معمولی را برمی‌گرداند و این helper مربوط به جریان line را اجرا نمی‌کند.
 
 ## شکل‌دهی آزمایشی TLS 1.3 Record
 
