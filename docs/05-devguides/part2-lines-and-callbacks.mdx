@@ -1203,11 +1203,27 @@ notification. Record shaping precedes stream fragmentation; their queues and
 budgets remain independent. Raw ClientHello-generation calls do not enter this
 per-line helper.
 
-StreamFragmenter borrows ordinary upstream-created Layer 4 lines. Its immutable
-settings select the first `count` Payload arrivals or arrivals strictly before a
-`duration-ms` deadline established at the first downstream Est by default. Every arrival consumes counter scope,
-including empty, bypassed, and too-short input. Eligibility and selected absolute
-cut offsets are fixed before admission or any reentrant handoff.
+StreamFragmenter borrows ordinary upstream-created Layer 4 lines. In default
+stream mode, its immutable settings select the first `count` Payload arrivals or
+arrivals strictly before a `duration-ms` deadline established at the first
+downstream Est by default. Every arrival consumes counter scope, including empty,
+bypassed, and too-short input. Eligibility and selected absolute cut offsets are
+fixed before admission or any reentrant handoff.
+
+With `tls-hello-fragment: true`, the first non-empty arrival latches eligibility
+and bypass for one initial ClientHello; later callbacks can complete it after
+scope expiry. Earlier empty callbacks still count. Selected cuts are sampled
+once when the four-byte handshake header reveals the complete message length.
+Offsets count handshake bytes, including that header and excluding TLS record
+headers. The node keeps the exact original wire prefix in a single budgeted
+candidate FIFO job. It accepts supported handshake records up to a 64 KiB
+message ending at an original record boundary, preserves record versions and
+boundaries, and adds headers only for selected cuts inside an original record.
+Failure to recognize that initial candidate, bypass, no selected cuts, or
+assembly deadline expiry makes the original prefix ready unchanged and ends
+detection for the line. No later ClientHello is probed. A suffix from the
+completing input is admitted behind the candidate before any callback can
+deliver newer input.
 
 Optional `wait-for-est` defaults to true. When enabled, all pre-Est upstream
 input joins the same bounded FIFO, including bypassed, empty and exhausted-scope
@@ -1232,7 +1248,16 @@ position. After eligibility and the FIFO are both exhausted, writable traffic
 uses direct forwarding. New arrivals during an active drain append behind its
 remainder, including from Pause, Resume, or Payload callbacks.
 
-Consumer Pause stops this independent producer. Its one active timer keeps
+The incomplete TLS candidate also occupies that FIFO, but its parser can
+advance through bounded admitted input while Est or Pause closes the output
+gate. The separate assembly deadline starts with the first selected non-empty
+input, counts Est and Pause time, and may arm the line's one timer before Est.
+It is canceled on successful commitment. After completion, the first fragment
+delay starts only when the ready job reaches the head and the startup gate is
+open. Expiry makes original bytes ready without bypassing Est or Pause; Finish
+discards them. An empty callback during collection needs no extra parser job.
+
+Consumer Pause stops this independent producer. A running fragment-delay timer keeps
 elapsed time; expiry while paused records due work without output or timer
 polling. Resume releases due work rather than restarting that delay. Monotonic
 deadline checks prevent the event loop's coarse timer rounding from sending early.
@@ -1248,8 +1273,12 @@ consumption. One transient output fragment is additional extraction workspace,
 not another retained FIFO. Neither charge nor the entry limit promises physical
 kernel pipe memory usage.
 
-The splice-capable node extracts selected ranges through `sbufMoveRangeTo`, with
-ordinary fallback, and transfers the final remainder directly. Received Finish
+The splice-capable node extracts generic selected ranges through `sbufMoveRangeTo`,
+with ordinary fallback, and transfers the final remainder directly. TLS
+inspection uses range helpers to materialize only the candidate prefix; later
+opaque splice buffers can still pass intact. Rewriting temporarily reserves both
+original and replacement buffers in the same budget before replacing the job.
+Received Finish
 cancels its timer and discards all queued bytes before forwarding away from the
 sender. Local admission/setup refusal closes the borrowed line upstream then
 downstream; it never destroys that line itself. Generic event-loop quiescence
