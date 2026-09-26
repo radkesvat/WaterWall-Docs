@@ -688,6 +688,59 @@ There are many roundtrip cases to model new tests on, including
 closest to your tunnel as a structural reference, then verify that its assertions
 actually exercise the changed behavior and failure mode.
 
+### TUN TCP Chain Correctness And Throughput
+
+On native Linux, `waterwall.tundevice_tcp_chain` exercises the exact chain
+`TunDevice → PacketsToConnection → TcpConnector` with `gso` explicitly disabled
+and enabled in the node JSON. It verifies payload bytes in both directions,
+concurrent TCP connections, actual GSO activity when supported, and clean shutdown.
+The test uses Python sockets and does not require iperf3. It belongs to the
+privileged lane. The runner creates fresh runtime and peer namespaces through the
+existing network namespace wrapper, after checking that isolation is available.
+Run it directly after building Release:
+
+```bash
+cmake --preset linux -DWATERWALL_ENABLE_PRIVILEGED_INTEGRATION_TESTS=ON
+cmake --build --preset linux -j8
+sudo -E ctest --test-dir build/linux -C Release --output-on-failure \
+  -R '^waterwall\.tundevice_tcp_chain$'
+```
+
+The same runner, `tests/tun_tcp_chain.py`, provides the optional
+`waterwall.speedtest_tundevice_tcp_chain` iperf3 comparison. Enable it separately;
+`WATERWALL_ENABLE_TUN_TCP_SPEEDTEST` defaults to `OFF`, so ordinary test runs do
+not perform this longer benchmark:
+
+```bash
+cmake --preset linux -DWATERWALL_ENABLE_PRIVILEGED_INTEGRATION_TESTS=ON \
+  -DWATERWALL_ENABLE_TUN_TCP_SPEEDTEST=ON
+sudo -E ctest --test-dir build/linux -C Release --output-on-failure \
+  -R '^waterwall\.speedtest_tundevice_tcp_chain$'
+```
+
+The benchmark runs serially with four workers, the server RAM profile, and MTU 1500. For both one and four
+TCP streams it collects three GSO-off/on pairs, alternating order, with two seconds
+of warm-up followed by ten measured seconds per sample. Paired runs reuse the
+same flow tuples so worker assignment is repeatable. Results include each sample,
+throughput medians and ranges, CPU usage, and retransmits in JSON. CPU seconds
+cover the full client run, including warm-up. Successful
+execution and valid measurements determine pass/fail; there is no minimum
+throughput or requirement that GSO be faster. Host contention and run-to-run
+variation must be considered before drawing performance conclusions.
+
+Both modes require Linux TUN support and the privileges to configure their private
+network namespaces; the speed mode also requires iperf3. Missing runtime
+capabilities or dependencies are reported as skipped (exit 77), not passed. Speed
+runs always retain their run directory, including raw samples, generated settings,
+logs, `results.json`, and `summary.json`. Integration runs retain any created run
+directory on failure or skip; set `WATERWALL_TEST_KEEP_RUN_DIR=1` to retain it on
+success too. When enabled, the optional benchmark is selected by both the speed
+and privileged lane labels.
+
+CI installs iperf3 and enables this benchmark in the `linux-gcc-x64` job. Its
+unprivileged speed lane excludes privileged cases; the subsequent privileged
+lane runs it with `sudo`. Other CI matrix entries leave the benchmark disabled.
+
 :::tip Write a test that would fail if direction were reversed
 The highest-value test for a flow or packet change is one that breaks if you swap
 upstream/downstream handling. For paired tunnels (client/server, encode/decode),
