@@ -1523,13 +1523,32 @@ geometry returns false without changing the output. Predictions remain valid
 while pool geometry is unchanged. Mux uses this query for ordinary compaction
 and batch fallback reservations; compaction still requires a smaller pooled tier.
 
-Linux TUN GSO reserves both the predicted actual allocation charge and one
-packet slot before creating each segment. Its credit stays with the existing
-reserved worker batch while a private destination-worker callback completes
-the TCP checksum and calls normal TunDevice delivery. Release the credit after
-delivery, or exactly once on refusal or cancellation; posting the message is
-not settlement. This uses the existing buffer and worker admission path without
-a new per-packet lock or packet-line flag.
+Linux TUN GSO reserves storage before transferring a whole aggregate to its
+flow's worker. Its session budget is 8 MiB of allocation charge and 512 packet
+slots. Each GSO work item charges its actual aggregate buffer allocation, its
+work context, and one maximum output-buffer allocation allowance; it reserves
+two packet slots for the retained aggregate and active output. The worker
+allocates and delivers one independent segment at a time. The output allowance
+stays reserved through every segment's checksum completion and normal TunDevice
+delivery, so the worker never waits for reader budget capacity. Downstream
+retention follows ordinary packet-chain ownership after delivery.
+
+A later startup configuration can increase shared worker-pool padding. Before
+allocating each segment, the worker checks the current best-fit charge against
+its prepaid allowance. If that tier no longer fits, it creates an exact-sized
+ordinary buffer with this chain's original sufficient padding instead.
+
+Ordinary batches use the same per-worker FIFO and reserve their actual buffer
+allocation charges and packet slots before posting. Reader drain staging and
+fragment storage retain their separate existing bounds; session and FIFO-message
+metadata are bounded separately by the packet limit. The 8 MiB admission charge
+is not a total process-memory limit. Budget exhaustion makes
+the reader wait, retaining at most one unadmitted aggregate in its current
+scratch buffer. Successful GSO admission transfers that buffer itself and
+replaces reader scratch; it does not copy the aggregate payload on the reader.
+Release each work reservation exactly once after completion, refusal,
+cancellation, or stale-generation discard. Posting a work item is not
+settlement, and cancellation must not borrow a device or worker buffer pool.
 
 ### Buffers transferred to scheduled line tasks
 

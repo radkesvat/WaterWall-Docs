@@ -727,22 +727,31 @@ messages and async DNS requests settle before the owning workers acknowledge
 `io_wid`.
 
 Linux TUN GSO attempts a nullable direct receive scratch allocation before
-device publication; failure logs and falls back to raw-IP framing. Once
-allocated, the device retains this one buffer across reader generations. The
-running reader alone owns access to it and any unfinished aggregate. It resumes
-pending segments before reading
-the next record, and waits on a session-owned capacity event when its reserved
-output budget is full. Stop wakes the reader and discards the unexpanded
-remainder; every local output reservation is either transferred with its
-reserved worker batch or released before reader exit. A transferred GSO
-reservation stays charged while its private destination-worker callback
-completes the TCP checksum and calls normal TunDevice delivery. It is released
-after delivery, stale-generation discard, refusal, or cancellation, including
-cancellation on a foreign thread. Cancellation does not run the normal TunDevice
-callback. The budget event remains owned by the refcounted reader session until
-its final message reference is gone. No pending aggregate crosses a reader
-generation, and a failed join retains everything the reader may still access.
-Device destruction releases scratch only after the reader has joined.
+device publication; failure logs and falls back to raw-IP framing. The running
+reader alone accesses current scratch. It validates an aggregate and reserves
+its storage, work context, and one output allowance before transferring scratch
+ownership to the selected worker FIFO and acquiring replacement scratch. If
+capacity is unavailable, it keeps that one unadmitted record in scratch and
+waits on the session capacity event before reading again. Stop wakes that wait;
+the unadmitted record is discarded on reader exit. The device retains current
+scratch across restarts and releases it only after reader join.
+
+Ordinary batches and GSO work share each worker's session FIFO. A GSO step
+allocates, segments, completes checksums, and delivers bounded output while the
+existing delivery gate is held. An unfinished aggregate remains at the head
+for a later callback. Completed small entries share the callback's remaining
+packet/byte budget. Each entry separately enters the gate and checks its
+generation, so shutdown or stale work cannot admit later delivery in the batch.
+Credits remain charged through each segment's delivery and are released once
+when the work finishes or is discarded. Refusal or cancellation destroys owned
+input and work storage and settles credits without device access, normal
+delivery, or borrowing a buffer pool, including on a foreign thread.
+
+A scheduled FIFO token holds a reader-session reference through continuation
+or cancellation. The queue and capacity event therefore survive late cleanup
+after device teardown. Retained old-generation work cannot deliver into a
+reopened generation. A failed join retains everything the reader may still
+access; it never forces cleanup of storage reachable by a live reader.
 
 Device delivery uses local generation/session gates. A producer entering before
 gate closure may finish; a later entrant is refused and releases its retained

@@ -278,37 +278,49 @@ and writes for the lifetime of the device.
 
 The Linux reader completes metadata-requested Internet checksums on ordinary
 records and keeps their fragment handling in the reader. Ordinary `GSO_NONE`
-records of either IP family remain accepted. For TCPv4 GSO, the reader builds
-separate MTU-sized packets, copies IPv4 and TCP option bytes, uses the GSO
-payload size, adjusts TCP sequence/FIN/PSH/CWR, and completes IPv4 lengths,
-IDs and header checksums. It writes an adjusted TCP pseudoheader seed into each
-segment's checksum field. A partial seed must retain the kernel's pseudoheader
+records of either IP family remain accepted. For TCPv4 GSO, the reader validates
+the entire aggregate, selects its worker with the existing flow hash, and
+transfers the aggregate buffer and conversion plan to that worker. The worker
+allocates independent MTU-sized packets, copies headers and payload, uses the GSO
+payload size, adjusts TCP sequence/FIN/PSH/CWR, and completes IPv4 lengths, IDs,
+and both IPv4 and TCP checksums before normal TunDevice delivery, logging, or
+packet publication. IPv4 and TCP option bytes retain the negotiated contract's
+copying semantics. A partial TCP seed must retain the kernel's pseudoheader
 contribution while changing its length; the IPv4 header's current destination
 can be a source-route hop rather than TCP's final destination. Valid negotiated
-TCPv4 GSO traffic is not filtered by a TCP-option allowlist.
+TCPv4 GSO traffic is not filtered by a TCP-option allowlist. No virtio metadata,
+checksum request flag, or new line state reaches the chain.
 
-The existing reserved flow-affinity worker batch carries a private completion
-callback for GSO segments. The destination worker finishes the TCP checksum
-before normal TunDevice delivery, logging, or packet publication. No virtio
-metadata, checksum request flag, or new line state reaches the chain, and this
-path adds no per-packet lock.
+An enabled Linux GSO session has one FIFO per event worker. Ordinary batches and
+GSO work share that FIFO, so a later ordinary packet cannot overtake unfinished
+segmentation on the same worker. Each callback shares a budget of 64 packets and
+64 KiB across ordinary packets and GSO segments. Completed small aggregates share
+remaining capacity with subsequent FIFO entries; an aggregate boundary alone
+does not force rescheduling. An unfinished aggregate remains the FIFO head and
+schedules a continuation without needing another TUN read event. Queue locking
+covers work/batch admission and FIFO maintenance, not each generated segment.
 
 The kernel's requested `gso_max_segs` value of 2,048 is best effort: failure
 is logged and GSO continues. It limits some producers, but is not an ingress
-validity bound: forwarded/injected GSO can exceed it. The reader
-uses one device-owned WaterWall buffer. It selects the pool's best-fit geometry,
-then allocates that buffer through the nullable direct-buffer API before
-publication, so allocation failure can fall back to raw-IP framing. It retains
-one aggregate and expands it in bounded batches. GSO-generated output uses a
-reservation budget of at most 512 packets and 8 MiB of actual buffer allocation
-charge across reader-owned packets and pending worker deliveries;
-exhaustion pauses expansion until a delivery or cancellation returns capacity.
-Each credit remains charged through worker TCP completion and TunDevice delivery;
-refusal or cancellation settles it without normal delivery.
-There is no drop-only segment-count limit. Ordinary records continue through
-the existing reader-session and fragment-affinity path. Segment output is
-independent packet storage, and reassembly can later publish a complete
-datagram larger than the TUN MTU without re-entering the GSO converter.
+validity bound: forwarded/injected GSO can exceed it. Before publication, the
+reader's initial scratch buffer uses best-fit pool geometry and a nullable
+direct allocation, so startup allocation failure can fall back to raw-IP
+framing. Admission transfers scratch itself to worker work and obtains a
+replacement; the reader does not copy aggregate payloads.
+
+The session's 512 packet-slot and 8 MiB allocation-charge budget covers queued
+ordinary packets and GSO work. Each GSO item reserves its actual aggregate
+allocation, work context, and one maximum output allocation allowance, with two
+packet slots. It retains that allowance through every segment's delivery and
+releases the reservation after finishing or being discarded. Workers do not
+wait for capacity. When admission is full, the reader keeps the unadmitted
+aggregate in scratch and waits for a session capacity notification. Reader
+drain staging and fragment storage have separate existing bounds; session and
+FIFO-message metadata are bounded separately by packet count. The 8 MiB limit
+is an admission charge, not a total process-memory bound. There is no
+drop-only segment-count limit. Ordinary records retain the existing fragment
+policy; reassembly can publish a complete datagram larger than the TUN MTU
+without re-entering the GSO converter.
 
 TunDevice and RawSocket accept an optional `fragment-policy`, either
 `reassemble` or `preserve-fragments`. Omission selects `reassemble`; an explicit

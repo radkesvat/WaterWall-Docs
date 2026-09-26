@@ -18,9 +18,13 @@ Documentation version: 157
 در callback دریافت TunDevice فقط IPv4 برای chain پذیرفته می‌شود. با فعال بودن GSO
 در Linux، reader checksumهای واگذارشدهٔ رکوردهای معمولی را کامل می‌کند و
 fragmentهای آن‌ها را در همان reader پردازش می‌کند. برای TCPv4 GSO، reader
-packetهای مستقل در اندازهٔ MTU با checksum کامل IPv4 و seed اصلاح‌شدهٔ TCP
-می‌سازد؛ worker مقصد checksum نهایی TCP را در callback خصوصی، پیش از تحویل،
-ثبت log یا انتشار packet توسط TunDevice کامل می‌کند. رکوردهای معمولی
+کل aggregate را اعتبارسنجی می‌کند و مالکیت buffer آن را به worker همان flow
+می‌دهد. worker مقصد packetهای مستقل در اندازهٔ MTU را تخصیص می‌دهد، header و
+payload را کپی می‌کند و checksumهای IPv4 و TCP را پیش از تحویل، ثبت log یا
+انتشار packet توسط TunDevice کامل می‌کند. batchهای معمولی و aggregateهای GSO
+در FIFO محدود مشترک هر worker قرار می‌گیرند؛ segmentation ناتمام در ابتدای
+صف می‌ماند و در callbackهای محدود ادامه پیدا می‌کند تا packet بعدی از آن جلو
+نزند. worker برای ظرفیت صف منتظر نمی‌ماند. رکوردهای معمولی
 `GSO_NONE`، از جمله IPv6، بدون الزام به IPv4 از reader عبور می‌کنند و
 همچنان به callback فعلی می‌رسند که غیر IPv4 را رد می‌کند. در framing معمولی TUN، packet
 unfragmented تولیدشده توسط kernel در این مرز trusted است و consumer بعدی آن را
@@ -105,12 +109,6 @@ object مربوط به `settings` الزامی است و نباید خالی ب�
 |---|---|---|
 | `device-mtu` | MTU سراسری واتروال | مقدار MTU برای TUN device در بازهٔ inclusive ‏`68..65535`. عدد کسری، string، boolean و `null` رد می‌شوند. |
 | `gso` | `true` | درخواست TCPv4 GSO در Linux. مقدار `false` از framing معمولی TUN استفاده می‌کند. نوع‌های نامعتبر از جمله `null` رد می‌شوند. اگر سیستم‌عامل یا kernel حالت کامل offload را نپذیرد، دلیل در startup log ثبت می‌شود و device با framing معمولی ادامه می‌دهد. MTU تنظیم‌شده همچنان اندازهٔ هر packet خروجی segmentation را محدود می‌کند. |
-
-modifier مربوط به ECN در رکورد TCPv4 GSO لینوکس نیز پشتیبانی می‌شود.
-
-در Linux، درخواست GSO به ساخت interface جدید با نام تنظیم‌شده نیاز دارد؛ اگر
-این نام از قبل استفاده شده باشد، startup شکست می‌خورد. با `"gso": false` رفتار
-فعلی attach در حالت معمولی TUN حفظ می‌شود.
 | `route-table` | `off` | نصب routeهای native سیستم‌عامل را کنترل می‌کند. مقدارهای `off`، `main`، `auto` یا table name/number لینوکس. |
 | `system-route` | `false` | میان‌بری برای full-device routing. اگر `true` باشد و `route-table` را ننویسید، مانند `route-table: "main"` عمل می‌کند. |
 | `route-cidrs` | full route بر اساس family آدرس device | CIDRهایی که وقتی routing فعال است باید از TUN عبور کنند. |
@@ -119,6 +117,14 @@ modifier مربوط به ECN در رکورد TCPv4 GSO لینوکس نیز پش�
 | `loop-protection` | وقتی system routing فعال است، فعال می‌شود | نمی‌گذارد socketهای outbound خود WaterWall دوباره از TUN عبور کنند. |
 | `post-up-script` | ندارد | commandی که پس از بالا آمدن interface، نصب routeها و تنظیم DNS اجرا می‌شود. |
 | `pre-down-script` | ندارد | commandی که پیش از پاک شدن DNS و routeها و پایین آوردن interface اجرا می‌شود. |
+
+modifier مربوط به ECN در رکورد TCPv4 GSO لینوکس نیز پشتیبانی می‌شود.
+
+> **interfaceهای از پیش ساخته‌شده در Linux:** درخواست GSO به یک نام interface
+> جدید نیاز دارد. اگر تنظیمات شما به TUN از پیش ساخته‌شده متصل می‌شود، باید
+> `"gso": false` را صریحاً تنظیم کنید تا رفتار اتصال معمولی حفظ شود؛ این نکته
+> شامل تنظیماتی هم می‌شود که قبلاً گزینهٔ `gso` را نداشتند. fallback خودکار
+> هنگام در دسترس نبودن امکانات offload به معنای پذیرش تداخل نام interface نیست.
 
 ## معنی آدرس TUN
 
@@ -331,7 +337,11 @@ rate-limited drop و هرگز به TUN نوشته نمی‌شود.
 | `layer_group` | `kNodeLayer3` |
 | `layer_group_prev_node` | `kNodeLayer3` |
 | `layer_group_next_node` | `kNodeLayer3` |
-| `required_padding_left` | `0` bytes |
+| `required_padding_left` | ۱۰ بایت در Linux؛ ۰ بایت در سایر پلتفرم‌های پشتیبانی‌شده |
+
+این مقدار نیاز منطقی اعلام‌شدهٔ نود به فضای خالی سمت چپ است. در Linux حتی با
+`"gso": false` نیز همین مقدار اعلام می‌شود. هم‌ترازی تخصیص حافظه موضوع جداگانه‌ای
+است؛ بنابراین هر تخصیص لزوماً دقیقاً ده بایت بزرگ‌تر نمی‌شود.
 
 ### `fragment-policy` (اختیاری، پیش‌فرض: `reassemble`)
 
