@@ -5,7 +5,7 @@ sidebar_label: "Part 4: Packet Tunnels"
 description: "Packet-line semantics, pure packet tunnels, packet/stream bridges, packet-line initialization, and paired-tunnel direction rules for layer-3 work."
 ---
 <!--
-Documentation version: 160
+Documentation version: 161
 -->
 
 # Part 4: Packet Lines & Packet Tunnels
@@ -269,6 +269,46 @@ If you need real per-flow or per-connection lifecycle behind packet traffic,
 line behave like a connection.
 
 ## Device ingress fragment policy
+
+On Linux, TunDevice requests IPv4 TCP GSO by default. Explicit `"gso": false`
+keeps raw-IP TUN framing. Requested GSO uses a 10-byte little-endian virtio
+header and `TUN_F_CSUM | TUN_F_TSO4`; negotiation failure is logged and startup
+continues with raw-IP framing. The active framing choice applies to both reads
+and writes for the lifetime of the device.
+
+The Linux reader completes metadata-requested Internet checksums on ordinary
+records and keeps their fragment handling in the reader. Ordinary `GSO_NONE`
+records of either IP family remain accepted. For TCPv4 GSO, the reader builds
+separate MTU-sized packets, copies IPv4 and TCP option bytes, uses the GSO
+payload size, adjusts TCP sequence/FIN/PSH/CWR, and completes IPv4 lengths,
+IDs and header checksums. It writes an adjusted TCP pseudoheader seed into each
+segment's checksum field. A partial seed must retain the kernel's pseudoheader
+contribution while changing its length; the IPv4 header's current destination
+can be a source-route hop rather than TCP's final destination. Valid negotiated
+TCPv4 GSO traffic is not filtered by a TCP-option allowlist.
+
+The existing reserved flow-affinity worker batch carries a private completion
+callback for GSO segments. The destination worker finishes the TCP checksum
+before normal TunDevice delivery, logging, or packet publication. No virtio
+metadata, checksum request flag, or new line state reaches the chain, and this
+path adds no per-packet lock.
+
+The kernel's requested `gso_max_segs` value of 2,048 is best effort: failure
+is logged and GSO continues. It limits some producers, but is not an ingress
+validity bound: forwarded/injected GSO can exceed it. The reader
+uses one device-owned WaterWall buffer. It selects the pool's best-fit geometry,
+then allocates that buffer through the nullable direct-buffer API before
+publication, so allocation failure can fall back to raw-IP framing. It retains
+one aggregate and expands it in bounded batches. GSO-generated output uses a
+reservation budget of at most 512 packets and 8 MiB of actual buffer allocation
+charge across reader-owned packets and pending worker deliveries;
+exhaustion pauses expansion until a delivery or cancellation returns capacity.
+Each credit remains charged through worker TCP completion and TunDevice delivery;
+refusal or cancellation settles it without normal delivery.
+There is no drop-only segment-count limit. Ordinary records continue through
+the existing reader-session and fragment-affinity path. Segment output is
+independent packet storage, and reassembly can later publish a complete
+datagram larger than the TUN MTU without re-entering the GSO converter.
 
 TunDevice and RawSocket accept an optional `fragment-policy`, either
 `reassemble` or `preserve-fragments`. Omission selects `reassemble`; an explicit
