@@ -605,9 +605,15 @@ inherited identities and avoid appending repeated markers to the borrowed
 client or reused child. Current TCP read EOF closes the full transport,
 including on IOCP; proxy persistence does not introduce half-close semantics.
 
-HttpProxyServer keeps request authentication and selection in `upstream/payload.c`
-and response processing in `downstream/payload.c`. Init, Est, Finish and receiver
-permission updates live in their corresponding callback files. `common/input.c`
+HttpProxyServer keeps authentication commitment, request reuse and branch selection
+in `upstream/payload.c`, with credential evaluation in `common/auth.c` returning
+explicit acceptance, denial, service-unavailability or internal-failure outcomes.
+Strict settings and local-user parsing live in `common/settings.c`; constructor
+allocation, callback wiring and rollback remain in `instance/create.c`. Response
+processing stays in `downstream/payload.c`. Both HTTP nodes put implementation
+helpers in `internal.h`, state in `structure.h`, and exports/custom callbacks in
+`interface.h`. Init, Est, Finish and receiver permission updates live in their
+corresponding callback files. `common/input.c`
 shares bounded admission and HTTP framing; `common/flow.c` coordinates exchange
 progress, raw relay and combined producer pressure; `common/lifecycle.c` owns
 session references and child creation/teardown. The shared pump serializes reentry
@@ -616,18 +622,23 @@ and advances retained work from Payload, Resume, Est and timer callbacks.
 The session embeds two `hps_direction_state_t` objects in `directions`, indexed
 by `kHpsUpstream` (client to selected child entry) and `kHpsDownstream` (child to
 client). Each groups its ordinary input/output/deferred/active buffers, body
-parser, saved header and trailer context, header deadline, receive nesting count,
-and permission flags. The saved header owns the bytes borrowed by its trailer
-context. `paused` records consumer permission; `read_paused` records pressure
-sent to the producer. Thus upstream Pause/Resume changes downstream `paused`,
+parser, optional trailer-owner pointer, header deadline, receive nesting count,
+and permission flags. Only an effective chunked body allocates a trailer owner,
+which holds the parsed context, saved raw header and its length together. Parsed
+trailer names borrow that saved header. Transfer-Encoding metadata on HEAD/304
+responses does not allocate an owner. `paused` records consumer permission;
+`read_paused` records pressure sent to the producer. Thus upstream Pause/Resume changes downstream `paused`,
 and downstream Pause/Resume changes upstream `paused`.
 
 Directions share the session's allocation and lifetime; an interior direction
 pointer grants no independent lifetime or permission after a callback. Never copy
-or reset a complete live direction object. Header cleanup clears its saved header,
-trailer context and header length, leaving the header deadline independent.
-Exchange and terminal cleanup preserve the existing member-specific resets,
-including receive counters that unwind after reentrant close. Child close
+or reset a complete live direction object. Trailer cleanup detaches the owner
+pointer before wiping and freeing the header and owner, leaving the header deadline
+independent. Completion, canceled upload on an early final response, errors and
+terminal cleanup settle the owner. Acquisition happens before outward callbacks;
+allocation refusal leaves the raw header with its caller. Exchange and terminal
+cleanup preserve the existing member-specific resets, including receive counters
+that unwind after reentrant close. Child close
 resets only upstream `paused` and downstream `read_paused` within the directions.
 Association, authentication, timer, pump and asymmetric exchange state remain in
 the session. Upstream producer pressure still considers total session retention;
