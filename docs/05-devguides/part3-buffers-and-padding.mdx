@@ -227,7 +227,7 @@ of a full-size transfer; a pipe smaller than the requested count remains usable.
 
 `EINTR` retries the transfer. On `EAGAIN` or a zero result, the empty wrapper is
 recycled and the loop attempts one ordinary nonblocking receive through the
-best-fit path. TCP urgent data can stop splice at the urgent boundary while
+large-buffer path. TCP urgent data can stop splice at the urgent boundary while
 `recv()` can advance and deliver subsequent ordinary bytes. With a peer FIN
 already received, splice can even return zero at that boundary before those bytes
 are drained. The ordinary receive confirms EOF rather than treating a zero splice
@@ -241,8 +241,8 @@ and returns `NULL` with `errno`; the read loop also falls back to an ordinary
 receive. None of these fallbacks has consumed socket bytes in the splice attempt.
 Splice mode stays enabled for later reads.
 
-`FIONREAD` remains an allocation hint in the ordinary receive path, including
-these fallbacks. A failed or zero hint still attempts the ordinary receive.
+Ordinary TCP receives, including these fallbacks, take the pool's large buffer
+directly without a socket `FIONREAD` query. Linux UDP retains its size hint.
 Disabled, non-TCP, and unsupported splice paths retain ordinary behavior.
 
 The common NIO event handler checks admission before entering the read path;
@@ -626,7 +626,7 @@ Payload capacities, excluding reserved left padding, are:
 | Tier | Capacity | Use |
 | --- | --- | --- |
 | Small | 4 KiB | Small ordinary payloads and control messages |
-| Medium | 32 KiB in S1/S2; 64 KiB in M1/M2/L1/L2 | Framing, retained queues including paused Mux children, and best-fit reads |
+| Medium | 32 KiB in S1/S2; 64 KiB in M1/M2/L1/L2 | Framing, retained queues including paused Mux children, and best-fit UDP reads |
 | Large | 64 KiB in S1/S2; 128 KiB in M1/M2/L1/L2 | Ordinary event-loop read buffers and larger working payloads |
 | Splice storage | 32 bytes of control storage | Explicit splice wrappers; logical body size is independent of allocation size |
 | Splice payload limit | 1 MiB in every profile | Socket read limit and preferred pipe capacity; kernel growth is best effort |
@@ -634,7 +634,7 @@ Payload capacities, excluding reserved left padding, are:
 S1 and S2 share buffer sizes but retain different profile-based local and master
 cache capacities; S1 caches fewer allocations. Higher profiles retain 64 KiB
 medium and 128 KiB large buffers. Their independent splice target remains 1 MiB.
-Linux NIO ordinary TCP/UDP reads select an
+NIO ordinary TCP reads use the large tier directly. Linux NIO UDP reads select an
 ordinary tier through best-fit allocation when a positive size hint is available.
 Medium buffers also serve nodes and retained queues. Mux selects the smallest
 fitting ordinary tier; a full 1 MiB frame requires dedicated ordinary storage in
@@ -710,28 +710,29 @@ Cached splice-tier entries use `sbufDestroySplice()` even with reset flags.
 
 ### Ordinary TCP and UDP receive sizing
 
-On Linux, NIO uses `FIONREAD` as an allocation hint for ordinary TCP and UDP
-reads. A positive TCP count is capped at the pool's large payload size before
-calling `bufferpoolGetBestFit()`. The receive can fill the chosen buffer; any
-remaining stream bytes stay queued for later reads. A TCP splice fallback obtains
-this hint only after pipe creation fails or splice makes no progress.
+NIO ordinary TCP reads take the pool's large buffer directly and call `recv()`
+with its full writable payload capacity, without first querying `FIONREAD`.
+This also applies to an ordinary receive after a failed pipe allocation or a
+splice attempt that makes no progress. A receive may return fewer bytes than
+the capacity; remaining stream bytes stay queued for later reads. Its actual
+return value determines the published length, and zero confirms TCP EOF.
+Buffer capacity does not define TCP application message boundaries.
 
-For UDP, the hint is the full size of the next datagram, not the sum of queued
-packets. Best-fit requests that complete size without the TCP cap. It can select
-a larger tier or dedicated storage if the datagram exceeds a custom pool's large
-tier. Each receive still delivers one datagram. The socket has one serialized
-reader between the query and receive.
+On Linux, UDP uses `FIONREAD` as an allocation hint for the full size of the next
+datagram, not the sum of queued packets. `bufferpoolGetBestFit()` requests that
+complete size. It can select a larger tier or dedicated storage if the datagram
+exceeds a custom pool's large tier. Each receive still delivers one datagram.
+The socket has one serialized reader between the query and receive.
 
-Both paths request at least the large tier's reserved left padding, so a smaller
-tier with insufficient padding is ineligible. A failed or zero ordinary size query
-falls back to the original large-buffer receive. Zero never skips the receive:
-it may represent an empty UDP datagram, TCP EOF, or transient readiness. The
-actual receive result determines the published length, and Linux UDP truncation
-detection still drops incomplete datagrams. Small/medium/large allocation is not
-an application message-boundary guarantee for TCP.
+UDP best-fit reads request at least the large tier's reserved left padding, so
+a smaller tier with insufficient padding is ineligible. A failed or zero size
+query falls back to a large-buffer receive. Zero never skips the receive: it
+may represent an empty UDP datagram or transient readiness. The actual receive
+result determines the published length, and Linux UDP truncation detection
+still drops incomplete datagrams.
 
-Other NIO socket types and non-Linux/IOCP receive paths keep their existing
-allocation policy. The splice representation and its separate pool are unchanged.
+TunDevice uses its separate raw-IP/GSO reader and buffer sizing. Other NIO socket
+types and non-Linux/IOCP receive paths retain their own allocation policy.
 
 ### Sizing Destination Buffers for Untrusted or Variable Payloads
 
