@@ -925,7 +925,7 @@ TlsClient and TlsServer use owned-buffer ciphertext BIOs. Feeding ordinary input
 transfers its complete `sbuf_t` on every result, including admission refusal;
 empty input is recycled without an entry. Reads advance the owned buffers without
 copying into an intermediate memory BIO or moving the unread suffix. TLS library
-writes copy directly into padded pooled output buffers. Taking output transfers
+writes normally copy directly into padded pooled output buffers. Taking output transfers
 the allocation, which remains valid after later SSL calls or TLS-state release.
 BIO callbacks must never invoke another tunnel: drain owned output only after
 the SSL operation returns, with the usual line-reference and reentry checks.
@@ -942,6 +942,33 @@ never exchange library objects. Initial ClientHello delivery still assembles a
 complete flight for StreamFragmenter; takeover still exposes the exact unread
 wire tail. ServerHello routing inspects a non-consuming prefix across BIO entries.
 Neither uses a borrowed pointer into TLS-library storage.
+
+TlsClient installs an optional BoringSSL record-output reservation hook. Completed
+TLS 1.2/1.3 handshakes can seal nonempty application records directly into the
+owned BIO's padded output storage when no control flight or write retry is pending.
+The ordinary output path handles other cases, including a declined reservation.
+Reserve obtains writable capacity and any required queue slot before sealing;
+commit publishes only the actual ciphertext length and cannot allocate or fail.
+A sealing error cancels the reservation without retrying encryption. New output
+allocations retain onward headroom and prefer aligned ciphertext bodies; appends
+preserve existing tail coalescing. The byte and entry limits still apply.
+
+A reservation is exclusive and synchronous within one SSL operation. Callbacks
+may query SSL state but must not start SSL I/O, replace its BIOs or output
+callbacks, or drain/mutate its reserved BIO before commit or cancellation.
+The library retains no output pointer afterward, and outward delivery still waits
+until the SSL operation returns. The hook uses the existing record sealer, so
+record padding is selected once and control-record ordering remains in BoringSSL.
+Its commits bypass `BIO_write`, including that function's byte counters; payload
+accounting follows the owned output buffers. TlsServer's OpenSSL path uses ordinary
+BIO writes.
+
+When updating the vendored BoringSSL tree, port the record-padding patch before
+`tunnels/TlsClient/RadkesvatPatches/record_write_buffer_callbacks.patch`, retain
+`SSL_set_record_write_buffer_callbacks` in `boringssl_symbols.txt`, and rerun the
+upgrade checks in `tunnels/TlsClient/my notes.txt`. The output patch is incremental
+on top of the earlier local patches; successful patch application alone does not
+verify record ordering, retry behavior or ownership against the newer library.
 
 An admitted input batch is not a newly allocated array of all decoded outputs.
 Decode and transfer each complete frame in order, continuing after Pause for the
