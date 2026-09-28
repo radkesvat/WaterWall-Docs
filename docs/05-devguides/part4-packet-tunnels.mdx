@@ -599,7 +599,7 @@ verification instead of certifying its unchecked suffix.
 
 Only active PTC netifs omit IPv4 TCP/UDP receive sums. IPv6, UDP-Lite, parsing,
 flow lookup, fragment guards, repair requests, alignment copies, receive credit,
-and deferred output retain their contracts. Active, exactly bound IPv4 PCBs copy
+and output admission retain their contracts. Active, exactly bound IPv4 PCBs copy
 TCP payload without checksum-on-copy work. Uncomputed segment caches remain
 invalid through append and split operations. When a full output sum is needed,
 an invalid cache selects a checksum over the actual pbuf chain.
@@ -612,7 +612,7 @@ including oversized UDP and exceptional TCP retransmissions. Fake DNS uses the
 same immutable route MTU and header geometry. Its input uses TUN assurance only
 on an active instance; other instances still validate UDP before cache mutation.
 
-The active TUN writer replaces each complete supported packet's checksum field
+The ordinary active TUN writer replaces each complete supported packet's checksum field
 with the folded, non-complemented pseudoheader seed and emits ten-byte
 little-endian virtio metadata: `NEEDS_CSUM`, `GSO_NONE`, exact checksum start and
 offset, and zero GSO fields. A zero partial UDP seed is valid. Fragments and other
@@ -622,6 +622,33 @@ forwarding. `DATA_VALID` is never used to ask a TUN writer to repair bytes.
 The mode is immutable through quiescence, pending work settlement, and teardown.
 ConnectionToPackets, raw/capture devices, and ordinary PTC netifs retain their
 full checksum behavior, including when sharing an engine with an active route.
+
+### PTC output dispatch and TUN TCP aggregation
+
+PTC detaches one owned best-fit sbuf from lwIP output. Only its reciprocal
+immediate enqueue-only TunDevice sink may receive it inline on the exact packet
+worker; other neighbours stay deferred. The same rule covers fake-DNS fragments.
+Normal-line callbacks retain their deferred reentry boundary.
+
+On an active direct trusted Linux pair with actual virtio framing, the writer
+collects only already-available FIFO entries, without a fill timer or per-flow
+cache. It combines only adjacent exact IPv4 TCP data packets with IHL 20, valid
+headers, original lengths within MTU, identical flow/ACK/window/options/DF/TTL/TOS
+and reserved/urgent semantics, consecutive IDs and contiguous wrapping sequence
+numbers. Only ACK and final PSH are supported. The first payload sets `gso_size`;
+a shorter final member or PSH closes the record. An aggregate is at most 65,535
+IPv4 bytes and 64 members. Controls, UDP, fragments and incompatible packets keep
+ordinary order and framing; no packet-line or sbuf GSO marker is introduced.
+
+A private header carries the combined IPv4 length/checksum, first ID/sequence,
+final PSH and folded non-complemented pseudoheader seed for the complete TCP span.
+Ten-byte little-endian virtio metadata requests TCPv4 GSO and checksum completion
+at TCP offset 16. The native `writev()` receives that header and original payload
+slices as one record. EINTR retries retain ownership; a short result is never
+replayed. Linux TUN's pre-injection `EINVAL` rejection falls back to originals and
+latches off writer aggregation with one diagnostic, leaving framing and checksum
+trust unchanged. Invalid generated metadata remains a defect. Other I/O errors
+retain the device's existing transient, packet-local and fatal handling.
 
 ## ProtoSwap checksum representation
 
