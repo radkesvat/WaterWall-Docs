@@ -172,11 +172,11 @@ datagram را lossy drop می‌کند.
   `onQuiesceWait()` بازگشت همهٔ callbackهای admitted را تضمین می‌کند. تحت lifecycle-v2،
   Messageهای emit، inject، fragment-purge و packet-`Init` اولیه پیش از stop و
   destruction component تسویه می‌شوند؛ بنابراین می‌توانند pointer مربوط به tunnel
-  را مستقیم حمل کنند و message لغوشده فقط منابع خودش را آزاد می‌کند. پس از drain شدن lineهای
-  worker-owned، `onStop()` زیر core lock همهٔ PCB، flow، netif و fragmentهای staged
-  را detach می‌کند و PCBها را abort می‌کند تا بعد از حذف netif روی list سراسری lwIP
-  زنده نمانند.
-- Refused-data replay از timer واقعی lwIP به owner worker queue می‌شود. Refusal کار
+  را مستقیم حمل کنند و message لغوشده فقط منابع خودش را آزاد می‌کند. `onWorkerStop()` روی owner همهٔ PCB، flow، deadline، drain و netif محلی را detach
+  و PCBها را abort می‌کند. State و buffer و reference مربوط به borrowed line تا Finish
+  از source واقعی باقی می‌مانند، حتی اگر CTP زودتر drain شود. `onStop()` فقط پس از
+  barrier همهٔ workerها رجیستری مشترک را آزاد می‌کند و PCB خارجی را پیمایش نمی‌کند.
+- Refused-data replay از timer روی event loop همان owner اجرا می‌شود؛ callback تحویل همچنان queue می‌شود. Refusal کار
   کنترلی لازم ابتدا PCB callback/route را detach و borrowed line را در terminal
   registry preallocated منتشر می‌کند؛ orderly shutdown فقط escalation بعد از این
   handoff است. Owner واقعی borrowed line در پایان آن را destroy می‌کند.
@@ -198,9 +198,11 @@ count است: هر datagram حداکثر ۱۶ pbuf، pool سراسری ۳۲×۱�
 آن است. Wrapper zero-copy در PTC reassembly و TCP out-of-order را پوشش می‌دهد و
 `TCP_OOSEQ_MAX_PBUFS` مصرف یک peer را محدود می‌کند.
 
-با defaultها Linux Release حدود **9.6 MB BSS** دارد، تقریباً **8.6 MB** بیشتر از
-poolهای development قدیمی. Namespace netif سراسری ۲۵۵ index دارد؛ loopback و همهٔ
-nodeهای lwIP در آن شریک‌اند و pair CTP/PTC تقریباً `1 + 2 * workers` مصرف می‌کند.
+Poolها static و بین workerها مشترک‌اند. آرایه‌های اشغال TCP/UDP در مجموع ۵۱۲ KiB
+control storage ثابت دارند و جدول‌ها و timeoutهای engine فقط برای worker فعال
+allocate می‌شوند. ظرفیت pool، اندازهٔ BSS و RSS سه معیار جدا هستند.
+هر engine دارای namespace مستقل با ۲۵۵ index برای netif است؛ loopback و
+nodeهای همان worker در آن شریک‌اند. هویت interface شامل engine و netif دقیق است.
 Exhaustion flow affected را با diagnostic rate-limited می‌بندد و process را abort
 نمی‌کند.
 
@@ -229,3 +231,28 @@ Exhaustion flow affected را با diagnostic rate-limited می‌بندد و pr
 کل بایت‌های pending برابر `P + L` است تا Pause فرصت اثرگذاری داشته باشد. سقف
 ۱۰۲۴ entry و زمان ارسال Pause/Resume تغییر نمی‌کند؛ ورودیِ بیش از این سقف پیش
 از ورود به صف رد می‌شود و فقط همان flow را می‌بندد.
+
+## منابع engine و چرخهٔ عمر
+
+Runtime برای هر event worker معمولی حداکثر یک engine خام lwIP را هنگام نخستین
+استفاده می‌سازد. همهٔ bridgeهای همان worker آن را share می‌کنند؛ thread جداگانهٔ
+stack و core mutex وجود ندارد. PTC مالک packet تحویل‌شده را حفظ می‌کند و CTP مالک
+normal line برنامه را. پاسخ CTP پس از lookup کامل tuple/WID/generation به owner
+queue می‌شود و engine و netif دقیق دوباره بررسی می‌شوند. Callback همسایه همیشه
+deferred است، حتی روی همان worker.
+
+Poolهای flow/payload با همان ظرفیت سراسری باقی می‌مانند. هر engine فعال control
+storage مستقل و ۱۷ timeout record دارد؛ worker استفاده‌نشده engine ندارد. انتخاب
+خودکار portهای TCP و UDP از حساب مشترک جداگانه استفاده می‌کند و اشغال تا آزادشدن
+PCB، شامل TIME_WAIT، باقی می‌ماند. IDهای تولیدی IPv4 و fragment IPv6 sequence
+مشترک جداگانه دارند و wrap محدود قبلی حفظ می‌شود. Drain list محلی worker است ولی
+سقف هر node همچنان ۴۰۹۶ object و ۱۶ MiB است. قفل pool/quota هیچ traversal یا output
+stack را دربر نمی‌گیرد. Fake DNS در PTC یک mutex مشترک node برای transaction و کپی
+نام reverse دارد؛ هیچ pointer رکوردی بیرون lock باقی نمی‌ماند و output پس از unlock است.
+
+Quiesce تایمر engine را پیش از بستن normal work جدا می‌کند. Node در drain همان
+owner ریشه‌های stack خود را آزاد می‌کند. Runtime پس از تسویهٔ messageهای detached
+و پیش از نابودی loop و poolها engine را آزاد می‌کند. Poolها و port accountهای مشترک
+و secret پردازهٔ ISN فقط پس از خروج همهٔ workerها نهایی می‌شوند. Fragment ورودی هر
+دو bridge همچنان رد می‌شود و reassembly دستگاه پیش از انتخاب worker انجام می‌شود؛
+MTU و fragmentation خروجی تغییر نکرده‌اند.

@@ -477,7 +477,7 @@ Worker thread identity in WaterWall is explicit and invalid by default:
 - Unregistered threads (TUN reader/writer threads, raw device threads, capture threads, helper threads, or test threads) observe `getWID() == kInvalidWID` (`UINT8_MAX`).
 - `getWID()` can return `kInvalidWID`. Callers accessing worker-owned state must verify thread identity with predicates like `currentThreadIsEventWorker()` or `workerWIDIsRegistered(wid)`.
 - **Auxiliary threads** must post ownership-bearing work through the worker message queue and must **never borrow a worker-local pool** directly. Raw loop custom events are reserved for loop-owned, non-owning operations.
-- **lwIP pseudo-worker** is registered (`workerWIDIsRegistered()` returns true), but is not an event worker (`workerWIDIsEventWorker()` returns false) as it owns no WaterWall event loop.
+- lwIP runs on ordinary event workers. There is no stack thread or extra worker slot; the configured maximum remains 254 event workers.
 - Native/library threads use `getTID()` for logging/diagnostics and remain WID-invalid unless explicitly bound via `workerBindCurrentThread()`.
 
 During normal operation, a `wio_t` belongs exclusively to its event worker:
@@ -503,11 +503,25 @@ consumer fallback. Hot worker paths consume that coherently published,
 bounded-atomic tuple; they never open system files, refresh stale host state,
 allocate, wait, or take the sampler mutex.
 
+### lwIP engine ownership
+
+The runtime lazily creates at most one engine per event worker. Every PTC/CTP
+instance on that worker attaches its own netif to that engine. Stack entry must
+select the explicit engine and prove its owner WID and saved loop identity;
+private TLS selects an already-owned context and never grants foreign access.
+Nodes detach their objects during owner drain; only runtime teardown destroys
+engines. Recursive packet input and timeout dispatch are refused.
+
+TCP/UDP lists, input scratch, protocol tables and timers belong to the engine.
+Shared backing pools, port occupancy, generated packet IDs, node fake DNS and
+aggregate drain quotas retain short synchronization. Those locks must not cover
+protocol traversal, custom-pbuf destruction, neighbour callbacks or worker posts.
+
 ### Choosing a Worker-Context Helper
 
 Never write `getWID()` into an affinity check, an array index, or a resource
 lookup. Pick the narrowest helper for the context you are already in — the
-helper encodes the domain, so an unregistered thread or the lwIP pseudo-worker
+helper encodes the domain, so an unregistered thread
 cannot slip through an equality comparison that happens to match.
 
 | Context | Use |
@@ -519,7 +533,7 @@ cannot slip through an equality comparison that happens to match.
 | Lifecycle callback given an explicit `wid` | `currentThreadIsEventWorkerWID(wid)` |
 | Code that needs worker 0 by design | explicit WID `0` plus `currentThreadIsEventWorkerWID(0)`; never infer it from default TLS |
 | Externally reachable or otherwise fallible API | `tryGetCurrentEventWorker()` / `currentThreadIsEventWorker()`, then return an error, `NULL`, or queue |
-| Code that may run on lwIP | `workerWIDIsRegistered()` or an explicit target WID; never an event-worker array |
+| lwIP raw callback | The selected engine owner; validate explicit engine/WID ownership before stack entry |
 | Auxiliary device thread | device-owned pools/channels only; post to an explicit event worker |
 | Logging only | raw `getWID()` is fine, passed through `workerWIDForLog()` printed with `%d` (`-1` means unregistered) alongside `getTID()` |
 
@@ -563,9 +577,9 @@ static void onWorkerMessage(worker_t *worker, void *arg1, void *arg2, void *arg3
 const wid_t wid = getLoopEventWorkerWID(weventGetLoop(timer));
 ts->worker_timers[wid] = NULL;
 
-// lwIP callback: only the target packet worker may act inline.
-if (currentThreadIsEventWorkerWID(route_ctx->packet_wid)) { emitInline(); }
-else                                                     { queueToPacketWorker(); }
+// lwIP output: always queue, including delivery to the same worker.
+// A neighbour must not recursively inject into active stack input scratch.
+queueToPacketWorker();
 
 // Device thread: device-owned resources only, delivery by explicit WID.
 sbuf_t *buf = bufferpoolGetLargeBuffer(dev->reader_buffer_pool);
@@ -644,17 +658,17 @@ WaterWall provides three related random-generation and selection facilities in
 
 The lwIP port uses this same fast CSPRNG on every host. `LWIP_RAND()` delegates
 to `fastRand32()` and therefore requires initialized fast-RNG TLS, but it does
-not require an event-worker WID. Startup initializes the main-thread stream
-before `tcpip_init()` and the lwIP thread's stream in its init callback;
-shutdown clears the lwIP stream before that thread exits.
+not require an event-worker WID. Shared stack bootstrap runs after main-thread RNG initialization and before
+worker spawning. Protocol execution uses each ordinary worker's initialized TLS
+stream, which is erased during that worker's teardown.
 
 TCP initial sequence numbers use a separate immutable 32-byte process secret.
 It is generated from `getRandomBytes()` after the fast RNG and crypto runtime
 are ready and before lwIP starts. The hook adds the millisecond clock converted
 to nominal 4-microsecond units to a keyed BLAKE2s result over a canonical
 address-family, local/remote address, and local/remote port tuple. Shutdown
-erases the secret only after all TCP PCBs are gone and the lwIP thread has
-joined; startup rollback follows the same ordering.
+erases the secret only after all engines and their TCP PCBs are gone and workers
+have joined; startup rollback follows the same ordering.
 
 ## Glossary
 

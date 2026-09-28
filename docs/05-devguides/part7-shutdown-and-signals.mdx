@@ -136,9 +136,8 @@ dispatch has ended; lifecycle commands are not smuggled through a normal event
 queue.
 
 Worker 0 uses the same semantics but executes its quiesce, drain, and teardown
-stages directly on the main thread. The lwIP slot is a pseudo-worker: it owns
-pools but no WaterWall event loop or spawned worker thread. Its resources are
-destroyed only after the lwIP thread has joined.
+stages directly on the main thread. lwIP engines belong to ordinary workers;
+there is no extra stack worker or thread. Unused workers need no engine.
 
 WIO stores and closes its own descriptor directly. Loop cleanup settles these
 descriptors and all pending/native roots before destroying the existing WIO
@@ -352,9 +351,9 @@ The main coordinator performs:
 4. release every worker into drain; SocketManager drains its UDP source-owner
    table before NodeManager invokes `onWorkerStop` in chain storage order;
 5. wait for every `Drained` acknowledgement, then call every `onStop`;
-6. release ordinary workers into loop/message/pool teardown, wait for `Exited`,
+6. release ordinary workers into message/engine/loop/pool teardown, wait for `Exited`,
    and join non-main workers;
-7. stop and join lwIP, then destroy pseudo-worker pools;
+7. finalize shared lwIP pools, ports and quotas and erase the ISN secret after all engines/workers exit;
 8. run late, non-owning exit observers and the explicit application finalizer;
 9. freeze exit status and destroy nodes, SocketManager, pools, shortcuts, worker
    synchronization, signal infrastructure, and global storage;
@@ -677,8 +676,9 @@ microsecond precision. PingClient and PingServer use the millisecond getter for
 reply-ID idle bookkeeping; the shared generator ignores older worker timestamps.
 Do not substitute cached time for fresh measurements, precise pacing within a
 callback, or authentication expiry checks shared across threads. Code running
-outside event workers, including lwIP callbacks and startup, retains a
-thread-independent clock source and must not read another worker's loop cache.
+outside event workers, including startup, retains a thread-independent clock
+source and must not read another worker's loop cache. lwIP runs on owner workers
+but retains its fresh monotonic `sys_now()` clock for protocol deadline arithmetic.
 
 A timer that generates protocol output or releases delayed work is an independent
 producer under Part 2's flow-control contract. Expiry while its consumer is paused
@@ -811,9 +811,24 @@ ownership. See Part 4 for policy, expiry and resource limits.
 Every failed join retains the native handle and resources the thread can access.
 Destroying them underneath a potentially live thread is never an orderly fallback.
 
-lwIP callback admission is detached before its thread is asked to stop. Its
-thread joins after ordinary workers and component stop, and only then may the
-pseudo-worker's pools be destroyed.
+After stack work, the engine recomputes its next deadline and advances the owner
+wakeup only when needed. It preserves an existing earlier or already-pending
+wakeup; repeated packet input must not postpone due protocol work indefinitely.
+Due dispatch remains bounded and yields back to the loop.
+
+Worker quiescence closes engine admission and detaches its timer root before
+`wloopQuiesceNormalWork()`. No new engine, flow or netif may appear afterward.
+Node worker drain detaches local stack roots while engine and pools remain live.
+PTC destroys its owned normal lines; CTP preserves borrowed state until the
+source's Finish, even if CTP is visited first. Main node stop only releases shared
+services after all workers acknowledge drain.
+
+`workerPerformTeardown()` settles detached worker messages, releases the engine,
+then destroys the saved loop and pools. Message detachment already cleared
+`worker->loop`, so engine cleanup uses its saved explicit loop reference. Retained
+pbufs and deferred timer roots must settle before their storage disappears.
+Shared pool/port/quota finalization and ISN-secret erasure occur after all engines
+and workers exit; destroying one engine must not affect another's live state.
 
 ## 11. Choosing a termination API
 

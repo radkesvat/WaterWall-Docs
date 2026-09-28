@@ -160,7 +160,7 @@ packet کامل پس از reassembly مالکیت معمول buffer دارد و 
 دو gate جدا publication packet و callback normal-line را پوشش می‌دهند.
 `onQuiesceRequest()` هر دو gate را می‌بندد و `onQuiesceWait()` پیش از توقف هر
 component منتظر بازگشت callbackهای admitted می‌ماند. Output lwIP همیشه queue
-می‌شود، حتی روی همان worker، تا callback همسایه زیر core lock اجرا نشود. Messageهای
+می‌شود، حتی روی همان worker، تا callback همسایه دوباره وارد input فعال stack نشود. Messageهای
 pending تحت lifecycle-v2 پیش از stop و destruction component تسویه می‌شوند؛ gate
 پذیرش output بسته می‌شود تا work دیررس بدون callback به همسایهٔ متوقف‌شده cancel
 شود. Work عادیِ ردشده منابع تحت مالکیت خود را آزاد می‌کند و teardown را به مسیر owner می‌سپارد؛
@@ -169,8 +169,8 @@ lineای که Init آن کامل شده است در drain همان owner-worker 
 
 Callbackهای lwIP کار را با قرارداد نتیجه‌دار `lineScheduleTask()` و
 `lineScheduleTaskWithBuf()` به worker مالک line می‌سپارند. ردشدن control ضروری،
-producer را در حالی terminal می‌کند که core lock رجیستری را محافظت می‌کند؛ callback
-لغو عمداً `NULL` است تا cleanup دوباره وارد همان lock نشود. تحویل بافر در هر نتیجه
+producer را در engine همان owner terminal می‌کند؛ callback
+لغو عمداً `NULL` است و cleanup روی owner انجام می‌شود. تحویل بافر در هر نتیجه
 مالکیت کپی را منتقل می‌کند.
 
 هر TCP/UDP line ساخته‌شده تا close در owner list همان worker است. Drain آن
@@ -216,7 +216,7 @@ worker packet line مشترک با lineهای TCP/UDP ساخته‌شده توس
 
 destination IP هم در packet IPv4 و هم در tuple مربوط به PCB در lwIP حفظ می‌شود، اما کلید ساخت route context جداگانه نیست. patch مربوط به حالت pretend در lwIP واتروال به PCBهای wildcard اجازه می‌دهد روی netif مجازی، ترافیک مربوط به هر destination address و port را بپذیرند و در عین حال local tuple اصلی flowهای پذیرفته‌شده را نگه دارند.
 
-وقتی lwIP خروجی packet تولید می‌کند، `PacketsToConnection` آن را با `tunnelPrevDownStreamPayload()` به worker packet line می‌فرستد. اگر خروجی lwIP روی worker دیگری ایجاد شده باشد، بایت‌های packet در یک worker message کپی می‌شوند تا از packet worker درست ارسال شوند.
+وقتی lwIP خروجی packet تولید می‌کند، `PacketsToConnection` آن را با `tunnelPrevDownStreamPayload()` به worker packet line می‌فرستد. بایت‌های خروجی همیشه در یک worker message کپی و queue می‌شوند، حتی اگر مقصد همان worker باشد.
 
 ## رفتار TCP
 
@@ -436,7 +436,7 @@ tunnel برای هر payload، framing header اضافه نمی‌کند و به
 - map مربوط به fake DNS فقط در همین tunnel instance وجود دارد و با از بین رفتن tunnel پاک می‌شود.
 - packet-line `Finish` در طول runtime نقض قرارداد به حساب می‌آید.
 - IPv6 و ICMP فعلاً کنار گذاشته می‌شوند.
-- Netifهای process فقط ۲۵۵ index دارند و loopback و همهٔ nodeهای lwIP در آن شریک‌اند؛ exhaustion creation را سریع fail می‌کند.
+- هر engine دارای ۲۵۵ index برای netif است که loopback و nodeهای همان worker از آن استفاده می‌کنند؛ exhaustion ساخت interface را سریع رد می‌کند.
 - poolهای سراسری default برای ۲۰۴۸ flow TCP، ‏۲۰۴۸ flow UDP، ‏۳۲ datagram reassembly و ۳۲۰ listener ساخته می‌شوند و Linux Release تقریباً `9.6 MB` BSS دارد.
 - packetهایی که پس از IPv4 total length بایت اضافه دارند کنار گذاشته می‌شوند؛ زیرا پیاده‌سازی به برابری دقیق طول `sbuf` و IP total length نیاز دارد.
 
@@ -465,3 +465,28 @@ tunnel برای هر payload، framing header اضافه نمی‌کند و به
 اثرگذاری Pause، است. هر رکورد تا ACK کامل طول اصلی payload را حساب می‌کند.
 محدودیت تعداد entry مستقل است و پذیرش پیش از انتقال مالکیت به صف بررسی می‌شود.
 وقتی این هزینه از `P` بیشتر است، حتی اگر صف write خالی باشد، Pause تا پیشرفت کافی ACK حفظ می‌شود.
+
+## منابع engine و چرخهٔ عمر
+
+Runtime برای هر event worker معمولی حداکثر یک engine خام lwIP را هنگام نخستین
+استفاده می‌سازد. همهٔ bridgeهای همان worker آن را share می‌کنند؛ thread جداگانهٔ
+stack و core mutex وجود ندارد. PTC مالک packet تحویل‌شده را حفظ می‌کند و CTP مالک
+normal line برنامه را. پاسخ CTP پس از lookup کامل tuple/WID/generation به owner
+queue می‌شود و engine و netif دقیق دوباره بررسی می‌شوند. Callback همسایه همیشه
+deferred است، حتی روی همان worker.
+
+Poolهای flow/payload با همان ظرفیت سراسری باقی می‌مانند. هر engine فعال control
+storage مستقل و ۱۷ timeout record دارد؛ worker استفاده‌نشده engine ندارد. انتخاب
+خودکار portهای TCP و UDP از حساب مشترک جداگانه استفاده می‌کند و اشغال تا آزادشدن
+PCB، شامل TIME_WAIT، باقی می‌ماند. IDهای تولیدی IPv4 و fragment IPv6 sequence
+مشترک جداگانه دارند و wrap محدود قبلی حفظ می‌شود. Drain list محلی worker است ولی
+سقف هر node همچنان ۴۰۹۶ object و ۱۶ MiB است. قفل pool/quota هیچ traversal یا output
+stack را دربر نمی‌گیرد. Fake DNS در PTC یک mutex مشترک node برای transaction و کپی
+نام reverse دارد؛ هیچ pointer رکوردی بیرون lock باقی نمی‌ماند و output پس از unlock است.
+
+Quiesce تایمر engine را پیش از بستن normal work جدا می‌کند. Node در drain همان
+owner ریشه‌های stack خود را آزاد می‌کند. Runtime پس از تسویهٔ messageهای detached
+و پیش از نابودی loop و poolها engine را آزاد می‌کند. Poolها و port accountهای مشترک
+و secret پردازهٔ ISN فقط پس از خروج همهٔ workerها نهایی می‌شوند. Fragment ورودی هر
+دو bridge همچنان رد می‌شود و reassembly دستگاه پیش از انتخاب worker انجام می‌شود؛
+MTU و fragmentation خروجی تغییر نکرده‌اند.
