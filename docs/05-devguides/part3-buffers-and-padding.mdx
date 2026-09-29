@@ -1746,6 +1746,14 @@ Continue to **[Part 4: Packet Lines & Packet Tunnels](./part4-packet-tunnels.mdx
 
 ## lwIP engine and shared buffer storage
 
+PTC admits a stream payload into a scaled TCP send buffer through successive
+16-bit `tcp_write()` calls. That API's 65,535-byte limit is not backpressure:
+admission and FIFO retry continue while send capacity and allocation permit.
+Only the uncopied suffix stays in the pause queue; the original payload's ACK
+record remains charged until acknowledgement. A retryable failure after a
+successful prefix still flushes that prefix so acknowledgement can restore
+progress.
+
 Worker engines share one bounded set of flow/payload pools, including PTC RX
 wrappers. Engine creation must not reset shared allocation metadata. Pool locks
 cover allocator metadata only; custom destructors and local protocol reclamation
@@ -1763,6 +1771,17 @@ messages carry detached bytes and lookup identity, not permission to access
 foreign pbufs, PCBs or worker pools. Retained custom pbufs must settle before
 owner buffer pools disappear. Foreign cancellation destroys detached storage;
 it does not recycle into another worker's local pool.
+
+PTC copies accepted TCP receive bytes into one owner-held sbuf while its deferred
+normal-line delivery is pending. The first allocation uses the smallest fitting
+tier; growth is geometric and staging is bounded by `TCP_WND`, including a
+dedicated fallback when a custom pool tier exceeds that bound. Growth briefly
+owns both old and new storage. The task owns a line reference, not this buffer;
+owner teardown releases staging after cancellation. Delivery detaches the sbuf
+before calling the next tunnel, preserving reentrant input and Finish ordering.
+One aggregated Payload retains the existing accepted-input Pause tolerance and
+returns or withholds exactly its byte count as TCP receive credit. Refused task
+submission releases staging and rolls back credit without consuming lwIP's pbuf.
 
 PTC netif output copies exactly one packet's `tot_len` from its pbuf spans into
 one best-fit sbuf on the route owner worker, preserving chain padding. Empty
