@@ -1755,10 +1755,32 @@ successful prefix still flushes that prefix so acknowledgement can restore
 progress.
 
 Worker engines share one bounded set of flow/payload pools, including PTC RX
-wrappers. Engine creation must not reset shared allocation metadata. Pool locks
-cover allocator metadata only; custom destructors and local protocol reclamation
-run after unlocking. An engine may reclaim its own eligible objects under
-pressure, then refuse allocation; it must never traverse another engine's PCBs.
+wrappers. Each engine caches at most 256 free objects per TCP-segment, pooled-heap
+size class and PTC RX-wrapper pool. A cache miss refills up to eight objects from
+the existing backing pool; it does not allocate another copy of that pool or
+increase its process-wide capacity. Warm checkout/return avoids the shared
+allocator mutex. The owner atomically detaches a free list before reading or
+changing it, then publishes the remaining list. Shared-pressure allocation can
+detach published lists from other engines, returning their free objects to the
+backing pool before retrying. A list briefly detached by an in-progress owner
+operation is published again before that operation returns. No pressure path
+traverses another engine's live PCBs or pbufs.
+
+An entered engine may cache returned backing-pool storage regardless of which
+worker originally allocated it. An unscoped or unregistered free uses the shared
+allocator, without dereferencing a former owner's cache. Engine destruction
+unregisters and drains its caches under shared protection before releasing the
+engine; backing pools outlive all engines. Engine creation must not reset shared
+allocation metadata. Pool locks cover allocator metadata only; custom destructors
+and local protocol reclamation run after unlocking. Exhaustion still returns
+`NULL`; an engine may reclaim its own eligible protocol objects before refusal.
+
+Pool `used`/`max` statistics include objects reserved in local caches as well as
+live objects; they describe storage checked out from the backing pool. Heap-byte
+statistics continue to count live requested bytes. `pbuf` reference protection,
+shared heap-byte statistics, ports, packet IDs and reassembly quotas keep their
+existing synchronization. Allocator overflow/sanity diagnostics and memp-available
+hooks use the uncached implementation so their per-operation checks remain intact.
 
 Each active engine separately owns 17 timeout records and its control tables.
 This control overhead does not multiply TCP, UDP, listener, segment, pbuf or heap
