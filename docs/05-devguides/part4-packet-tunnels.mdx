@@ -306,13 +306,15 @@ metadata-requested Internet checksums on ordinary records and keeps their
 fragment handling in the reader. Ordinary `GSO_NONE`
 records of either IP family remain accepted. For TCPv4 GSO, the reader validates
 the entire aggregate, selects its worker with the existing flow hash, and
-transfers the aggregate buffer and conversion plan to that worker. The worker
-allocates independent MTU-sized packets, copies headers and payload, uses the GSO
-payload size, adjusts TCP sequence/FIN/PSH/CWR, and completes IPv4 lengths, IDs,
-and both IPv4 and TCP checksums before normal TunDevice delivery, logging, or
-packet publication in ordinary mode. The direct trusted pair retains complete
-IPv4 headers but can omit transport completion as specified below. IPv4 and TCP option bytes retain the negotiated contract's
-copying semantics. A partial TCP seed must retain the kernel's pseudoheader
+transfers the aggregate buffer and conversion plan to that worker. Outside the
+intact delivery path below, the worker allocates independent MTU-sized packets,
+copies headers and payload, uses the GSO payload size, adjusts TCP
+sequence/FIN/PSH/CWR, and completes IPv4 lengths, IDs, and both IPv4 and TCP
+checksums before normal TunDevice delivery, logging, or packet publication in
+ordinary mode. The direct trusted pair delivers assured
+TCPv4 aggregates intact and omits transport completion as specified below.
+IPv4 and TCP option bytes retain the negotiated contract's copying semantics
+when segmenting. A partial TCP seed must retain the kernel's pseudoheader
 contribution while changing its length; the IPv4 header's current destination
 can be a source-route hop rather than TCP's final destination. Valid negotiated
 TCPv4 GSO traffic is not filtered by a TCP-option allowlist. No virtio metadata,
@@ -320,10 +322,12 @@ checksum request flag, or new line state reaches the chain.
 
 An enabled Linux GSO session has one FIFO per event worker. Ordinary batches and
 GSO work share that FIFO, so a later ordinary packet cannot overtake unfinished
-segmentation on the same worker. Each callback shares a budget of 64 packets and
-64 KiB across ordinary packets and GSO segments. Completed small aggregates share
-remaining capacity with subsequent FIFO entries; an aggregate boundary alone
-does not force rescheduling. An unfinished aggregate remains the FIFO head and
+GSO work on the same worker. Each callback shares a budget of 64 packets and
+64 KiB across ordinary packets, GSO segments, and intact aggregates. An intact
+aggregate consumes one packet from that budget and its full IPv4 length from the
+byte budget. Completed small aggregates share remaining capacity with subsequent
+FIFO entries; an aggregate boundary alone does not force rescheduling.
+An unfinished aggregate remains the FIFO head and
 schedules a continuation without needing another TUN read event. Queue locking
 covers work/batch admission and FIFO maintenance, not each generated segment.
 
@@ -338,7 +342,7 @@ replacement; the reader does not copy aggregate payloads.
 The session's 512 packet-slot and 8 MiB allocation-charge budget covers queued
 ordinary packets and GSO work. Each GSO item reserves its actual aggregate
 allocation, work context, and one maximum output allocation allowance, with two
-packet slots. It retains that allowance through every segment's delivery and
+packet slots. It retains that allowance through segmented or intact delivery and
 releases the reservation after finishing or being discarded. Workers do not
 wait for capacity. When admission is full, the reader keeps the unadmitted
 aggregate in scratch and waits for a session capacity notification. Reader
@@ -581,12 +585,20 @@ when each owner-worker route is created lazily, regardless of node start order.
 The active TUN verifies IPv4 structure and header checksums. Complete TCP/UDP
 records with matching `NEEDS_CSUM` coordinates, or applicable `DATA_VALID`, carry
 assurance only in TUN-private queued work. Simultaneous flags are rejected.
-Ordinary records and generated GSO segments share the existing bounded worker
-FIFO; no checksum marker is added to an sbuf or line. Supported partial GSO
-seeds retain the kernel pseudoheader destination and adjust only transport
-length. Segment IPv4 headers are completed, while assured TCP sums are omitted.
+Ordinary records, generated GSO segments, and intact aggregates share the existing
+bounded worker FIFO; no checksum marker is added to an sbuf or line.
+
+On this active pair, preflighted, assured TCPv4 GSO is delivered intact as one
+complete, unfragmented IPv4 packet of at most 65,535 bytes. PTC's custom pbuf
+wraps the aggregate for lwIP input without userspace segmentation or transport
+checksum completion. The aggregate retains the worker selected by the ordinary
+flow hash and its position in the worker FIFO. lwIP sees one larger TCP segment;
+no GSO metadata or original segment count is passed into the stack.
+
 Unmarked GSO is verified before segmentation, then segments receive ordinary
-completion. Unmarked ordinary packets are verified after reassembly; corrupt
+completion. Supported partial GSO seeds retain the kernel pseudoheader
+destination; segmentation adjusts the transport length and completes IPv4
+headers. Unmarked ordinary packets are verified after reassembly; corrupt
 bytes are never repaired into apparent validity. Generic offload coordinates
 retain materialization followed by transport validation. Partial IP fragments
 are rejected; preserved ordinary fragments still reach PTC's fatal input guard.
