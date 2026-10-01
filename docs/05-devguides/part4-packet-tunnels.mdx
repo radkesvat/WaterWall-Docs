@@ -898,6 +898,54 @@ So if you create or modify a packet bridge: do not assume packet-line init
 happened automatically. Verify whether the init comes from the node manager (chain
 head is layer-3) or whether your tunnel must trigger it in `onStart()`.
 
+### External readers and packet startup
+
+**A constructor must not start a reader or enable external callbacks that can
+immediately enqueue packet delivery.** Creating an inactive device handle is
+different from bringing it up and launching its reader. If a creation/open API
+also starts reading, call that API from the later startup callback instead of
+`createHandle`. TunDevice keeps device creation and `tundeviceBringUp()` in
+`onStart`; the latter starts its reader and writer threads.
+
+The risk is initialization order, even when workers have not started dispatching.
+`createHandle` runs before chain finalization establishes packet lines, line-state
+offsets and buffer padding. An early reader can create buffers with insufficient
+padding or enqueue delivery before the packet side's `Init`. Workers wait behind
+`workers_run_flag` until startup finishes, but queued messages retain their order:
+a Payload queued ahead of Init can later access uninitialized state and crash.
+Do not rely on a quiet device, low packet rates, or sleeps to avoid this.
+
+Use this startup sequence:
+
+1. In `createHandle`, validate settings and allocate inactive state. Keep reader
+   threads and automatic callback delivery disabled.
+2. In `onPrepare`, finish setup that needs finalized topology or buffer padding,
+   while keeping the reader inactive.
+3. In `onStart`, bind the publication target and finish reader-visible settings,
+   buffer geometry and lifetime gates. Ensure the required packet Init has been
+   successfully queued for every destination worker **before** starting the reader.
+   Required bootstrap admission failure must fail startup; do not start reading.
+
+For a layer-3 head, NodeManager queues Init after finalization and before
+`onPrepare` and `onStart`. For a stream-headed chain, a bridge such as
+StreamToPackets or ConnectionToPackets queues its packet bootstrap in `onStart`.
+If another node owns that bootstrap, explicitly establish its ordering before
+reader activation; choosing `onStart` alone does not establish ordering between
+different nodes' hooks. Queue admission is not Init completion, but placing Init
+ahead of delivery in the same worker FIFO preserves the required order.
+
+An auxiliary reader thread is not an event worker. Use a device-owned buffer pool
+and an explicit destination worker; never index worker state with its raw
+`getWID()`, borrow a worker-local pool, or invoke tunnel flow callbacks directly
+from that thread. Post ownership-bearing delivery through
+`sendWorkerMessageForceQueueWithCleanup()` or the existing
+`device_reader_session` APIs. Resolve the packet line and invoke tunnel callbacks
+inside the destination worker callback, using its supplied worker identity.
+Cancellation cleanup must release message-owned storage and references without
+borrowing worker-local state. Follow [Part 1's worker-context rules](./doc1.mdx#choosing-a-worker-context-helper)
+and [Part 7's reader lifetime rules](./part7-shutdown-and-signals.mdx#10-external-devices-and-lwip)
+to close admission and join the reader before reclaiming its reachable state.
+
 ## Paired Tunnel Direction (the PingClient / PingServer Rule)
 
 Transform role and callback forwarding direction are separate decisions. Ping
