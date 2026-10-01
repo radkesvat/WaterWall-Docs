@@ -48,8 +48,8 @@ bytes exactly.
 - Initializes local line state on upstream `Init`.
 - Tracks initialized lines in a worker-aware list.
 - Starts one periodic timer per worker during tunnel startup.
-- Sends an empty ping frame every `ping-interval` milliseconds on each live
-  tracked line.
+- Schedules empty ping frames using `ping-interval`; sensitive mode starts after
+  transport `Est` and waits for each reply.
 - Encodes upstream payloads as normal keepalive frames and sends them to
   `next`.
 - Splits upstream payloads larger than `6 MiB` into multiple normal
@@ -58,14 +58,14 @@ bytes exactly.
 - Decodes downstream normal frames and forwards their payload to the previous
   node.
 - Answers downstream ping frames by sending upstream pong frames.
-- Ignores downstream pong frames.
+- Uses empty downstream pong frames to acknowledge an outstanding ping when
+  `sensitive-mode` is enabled; otherwise ignores them.
 - Drops empty normal frames and unknown frame kinds.
 - Untracks the line, destroys local line state, and forwards the received
   directional `Finish`.
 
-The current implementation sends and answers ping/pong frames, but it does not
-enforce a missed-pong timeout and does not close a line just because a pong was
-not observed.
+The optional reply watchdog closes connections whose pong is missing or late.
+It is disabled by default.
 
 ## Configuration Example
 
@@ -74,7 +74,9 @@ not observed.
   "name": "ka-client",
   "type": "KeepAliveClient",
   "settings": {
-    "ping-interval": 60000
+    "ping-interval": 30000,
+    "sensitive-mode": false,
+    "tolerance-ms": 90000
   },
   "next": "transport"
 }
@@ -99,7 +101,7 @@ Top-level fields:
 | --- | --- | --- |
 | `name` | string | User-chosen node name. Must be unique inside the config file. |
 | `type` | string | Must be exactly `"KeepAliveClient"`. |
-| `settings` | object | Optional. If omitted, the default ping interval is used. |
+| `settings` | object | Optional. If omitted, default intervals are used and the reply watchdog is disabled. |
 | `next` | string | Required in normal use. The next node receives framed upstream data. |
 
 `KeepAliveClient` must have a previous node and must reach a matching
@@ -109,11 +111,36 @@ Top-level fields:
 
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
-| `ping-interval` | integer | `60000` | Periodic ping interval in milliseconds. Must be at least `1`; startup fails if the value is lower. |
+| `ping-interval` | integer | `30000` | Periodic ping interval in milliseconds. Must be at least `1`; startup fails if the value is lower. |
+| `sensitive-mode` | boolean | `false` | Enables one outstanding ping per line and closes on a missing or late pong. |
+| `tolerance-ms` | integer | `90000` | Reply deadline in milliseconds, excluding local Pause. Must be in `1..2147483647`. Used when sensitive mode is enabled. |
 
 Avoid very small intervals unless you intentionally want high keepalive traffic.
-Each live line tracked by this client receives one ping frame per interval while
-its upstream output is writable; paused lines skip timer pings.
+With sensitive mode disabled, each live tracked line receives one ping frame per
+interval while its upstream output is writable; paused lines skip timer pings.
+
+## Reply Watchdog
+
+In sensitive mode, the first ping is due one `ping-interval` after downstream
+transport `Est`. Only one ping may be outstanding. An empty pong on that exact
+line clears the wait. Application frames, peer pings, unknown kinds and nonempty
+pongs do not acknowledge it; unsolicited pongs are ignored.
+
+A missing or late pong closes the borrowed connection through the existing
+Finish path. KeepAliveClient does not recreate the connection. Deadlines use the
+owner event loop's monotonic clock. Its existing worker timer checks every
+`min(ping-interval, tolerance-ms, 1000)` milliseconds; sends still obey
+`ping-interval`. Expiry is handled on the first check at or after the deadline,
+or when a late pong is decoded.
+
+Pause in either direction suppresses new watchdog pings and suspends the reply
+countdown. Repeated and overlapping pauses count once; both directions must
+resume before the countdown continues. An already-admitted pong can acknowledge
+the wait during Pause. Finish discards the pending wait.
+
+Choose a tolerance that permits the path's throughput and latency. Pongs share
+the ordered stream with normal frames, so unpaused queueing and a 6 MiB body can
+delay a reply. KeepAliveServer already answers these pings.
 
 ## Frame Format
 
@@ -143,11 +170,12 @@ same five-byte prefix.
 | --- | --- |
 | upstream `Init` | Initializes the read buffer and tracking fields, tracks the line, then forwards `Init` to `next`. |
 | upstream `Payload` | Encodes the payload into one or more normal frames and forwards them to `next`. Empty payloads are recycled. |
-| upstream `Est` / `Pause` / `Resume` | Forwards to `next`. |
+| upstream `Est` | Forwards to `next`. |
+| upstream `Pause` / `Resume` | Records reply-read permission and watchdog pause time, then forwards to `next`. |
 | upstream `Finish` | Untracks the line, destroys local state, then forwards `Finish` to `next`. |
 | downstream `Payload` | Treats bytes as framed input from `KeepAliveServer`; forwards decoded normal payloads to the previous node. |
-| downstream `Est` | Forwards to the previous node. |
-| downstream `Pause` / `Resume` | Records timer-output permission, then forwards to the previous node. |
+| downstream `Est` | Publishes transport readiness for the watchdog, then promptly forwards to the previous node. |
+| downstream `Pause` / `Resume` | Records timer-output permission and watchdog pause time, then forwards to the previous node. |
 | downstream `Finish` | Untracks the line, destroys local state, then forwards `Finish` to the previous node. |
 | downstream `Init` | Disabled; reaching this callback is treated as a fatal invalid chain flow. |
 
