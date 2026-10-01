@@ -147,6 +147,15 @@ buffer, or the full length of an ordinary buffer. After successful pipe I/O,
 without moving the cursor. This accounting helper does not read or discard pipe
 bytes itself; use it only for bytes already removed from the private pipe.
 
+`sbufEnsureOrdinary(pool, buf)` returns ordinary input unchanged. For exclusively
+owned splice input it materializes the complete resident prefix and private-pipe
+body into best-fit ordinary storage with the pool's large-buffer padding, then
+recycles the source wrapper. The caller owns only the returned buffer. No callbacks
+occur, and allocation follows `bufferpoolGetBestFit()`'s fail-fast contract. The
+node chooses when ordinary storage is needed; nodes with checked allocation
+refusal, custom framing, range extraction, or retained-charge requirements keep
+their specialized conversion paths.
+
 #### Mode selection and pipe-backed reads
 
 The core `misc.splice` boolean defaults to `true`. Setting it to `false` keeps
@@ -297,6 +306,16 @@ prefix/body bytes. It validates source length, cursor, and destination append
 space, without growing storage or consuming destination headroom. Zero bytes
 is a validated no-op. The caller retains both buffers and returns the wrapper
 through `bufferpoolReuseBuffer()` when finished, discarding any unconsumed remainder.
+
+Router and SniffRouter establish an ordinary-memory boundary while their route
+state is undecided: each complete splice delivery is materialized before pending
+storage or classification, preserving onward pool padding. Their pending buffers
+remain ordinary and are replayed intact when the selected branch is initialized.
+After route commitment, both callback directions forward opaque buffers unchanged.
+Metadata-only Router rules can commit during Init and preserve the first splice
+delivery. Complete-delivery materialization preserves the existing sniff-window
+semantics, including classification of complete headers larger than the
+incomplete-input cutoff.
 
 StreamFragmenter's optional ClientHello inspection consumes only the bounded
 initial wire prefix through these range helpers, including private-pipe and
@@ -1606,6 +1625,14 @@ waiting keep `131070 * max(1, ceil(basis / 32768))`. Their S1/S2 limits remain
 waiting caps. Device pools inherit both the splice limit and waiting-budget
 basis from their worker pool; custom pools provide each explicitly.
 
+ReverseServer also materializes complete splice deliveries in both directions
+while a half is unpaired. Handshake validation/removal, waiting-buffer merges
+and cross-worker handshake replay use ordinary buffers. Handshake completion
+does not permit opaque retention while waiting; only pairing enables unchanged
+splice forwarding. Materialization preserves onward padding, and waiting caps
+remain independent of splice read sizes. PipeTunnel transfers paired opaque
+buffers across workers under its existing ownership and cancellation contract.
+
 ### Payload length versus retained allocation charge
 
 `sbufGetLength()` measures buffer contents. That is the correct unit for ordinary
@@ -1768,7 +1795,8 @@ remain advisory; both ordinary and splice input are valid in every phase.
 
 Ready CONNECT, fixed uploads, and response buffers wholly within an established
 fixed/EOF/chunk-data range can transfer intact. Inputs containing HTTP metadata
-or crossing a body boundary materialize completely into checked best-fit storage.
+or crossing a body boundary materialize completely into best-fit ordinary storage
+through `sbufEnsureOrdinary()`, after admission enforces the delivery bound.
 No splice wrapper enters the ordinary parser. This practical scope deliberately
 allows copies for mixed inputs and small chunks.
 
