@@ -21,8 +21,8 @@ Source of truth: `ww/bufio/shiftbuffer.h`, `ww/bufio/buffer_pool.h`, and the
 ## The `sbuf_t` Anatomy
 
 WaterWall payloads are carried in `sbuf_t` ("shift buffer"), a padded, shiftable
-byte buffer. Its header is exactly 32 bytes and the data area is 32-byte aligned
-(so AVX2 copies stay aligned):
+byte buffer. Its header is exactly 32 bytes and the allocation's data area is
+32-byte aligned:
 
 ```c
 struct sbuf_s
@@ -38,6 +38,12 @@ struct sbuf_s
 
 For ordinary buffers, the cursor moves inside a fixed allocation. The flag
 `kSbufFlagSplice` gives the payload a different representation, described below.
+
+Fresh and reset ordinary buffers start at padding rounded to 32 bytes. Moving
+`curpos` can change the current payload's alignment; allocation alignment alone
+does not justify aligned loads or stores through `sbufGetRawPtr()` or
+`sbufGetMutablePtr()`. Check the actual address, including any copy offset.
+
 The storage diagram and accessor descriptions here apply to ordinary buffers:
 
 ```text
@@ -615,9 +621,10 @@ Device backends use `devicePoolCreate()` with an explicit, exclusively accessibl
 worker pool and a backend-specific minimum small tier. Construction preserves
 zero initial padding; `devicePoolUpdatePadding()` copies all four finalized
 padding values during BringUp, before publishing I/O threads. Neither helper
-obtains a worker pool from thread-local identity. Darwin TUN includes its packet
-family prefix in the minimum; other TUN backends use the MTU. The worker GSO
-output allowance and its exact-sized fallback remain a separate calculation.
+obtains a worker pool from thread-local identity. TUN reader pools use the packet
+MTU as their minimum; Darwin receives its family prefix into separate storage.
+The worker GSO output allowance and its exact-sized fallback remain a separate
+calculation.
 
 Worker and device pools select their local width with `PROPER_BUFFER_POOL_WIDTH()`;
 it applies to all four local tiers. Ordinary masters use twice that width as their
@@ -1817,6 +1824,13 @@ shared heap-byte statistics, ports, packet IDs and reassembly quotas keep their
 existing synchronization. Allocator overflow/sanity diagnostics and memp-available
 hooks use the uncached implementation so their per-operation checks remain intact.
 
+The Unix `SYS_ARCH_PROTECT` guard uses the project's hybrid `wmutex_t`.
+Exclusive shared bootstrap initializes it before allocator use, and shared
+finalization destroys it after all engines and retained buffers have settled.
+Thread-local nesting acquires the mutex only on the outermost entry and releases
+it on the matching final exit. This protects shared metadata; it does not add a
+TCP/IP core lock around worker-local protocol execution.
+
 Each active engine separately owns 17 timeout records and its control tables.
 This control overhead does not multiply TCP, UDP, listener, segment, pbuf or heap
 capacities. IPv4 and IPv6 reassembly retain separate process-wide pbuf allowances.
@@ -1848,6 +1862,13 @@ submission releases copied staging and rolls back credit without consuming
 lwIP's pbuf. A reusable input remains unchanged until the owner task is admitted;
 then its sbuf transfers to staging and only the custom pbuf wrapper is freed.
 Stripping packet headers does not replace the original padding reservation.
+
+PTC receive copies use `pbufLargeCopyToPtr()`, which copies at most the first
+packet's `tot_len`, skips empty spans, and stops before a queued next packet.
+The caller supplies nonoverlapping destination storage for that length. Each
+span below 64 bytes uses ordinary copying; larger spans use `memoryCopyLarge()`.
+Receive-buffer growth uses the same cutoff. Neither path assumes the TCP payload
+or append position retains the original IP packet's alignment.
 
 PTC netif output copies exactly one packet's `tot_len` from its pbuf spans into
 one best-fit sbuf on the route owner worker, preserving chain padding. Empty

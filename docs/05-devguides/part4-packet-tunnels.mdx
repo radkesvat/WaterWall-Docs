@@ -286,6 +286,21 @@ Netlink parsing/transactions/verdicts in `capture_linux_nfqueue.c`, and firewall
 identities, command supervision and reconciliation in `capture_linux_rules.c`.
 These are private implementation boundaries, not interchangeable device backends.
 
+TunDevice makes a best-effort attempt to place the first byte of each received IP
+packet on a 32-byte boundary, independently of GSO and trusted-checksum mode.
+Ordinary reads and Wintun copies use the aligned start of a padded buffer. Linux
+receives virtio metadata before that start, in reserved headroom; Darwin receives
+the utun family word separately with `readv()`. These layouts preserve the
+onward chain's padding without inserting bytes into the IP packet.
+
+This placement preference is not a negotiated capability or an input requirement
+for other nodes. A path that cannot preserve it may still deliver a valid packet.
+Consumers must not infer alignment from the source node or checksum trust flags:
+check the actual address before using aligned accesses. Other packet carriers,
+header removal and cursor shifts can change alignment, and an aligned IP header
+does not imply an aligned TCP/UDP payload. Existing alignment checks and copy
+fallbacks remain necessary where their own operations require them.
+
 `device_fragment_policy.h` defines only the policy enum. Pure packet hashing is
 provided by `device_flow_hash.h`; worker reduction and posting remain in
 `device_flow_affinity.h`. Checksum provenance and validity helpers live in
@@ -612,9 +627,11 @@ verification instead of certifying its unchecked suffix.
 Only active PTC netifs omit IPv4 TCP/UDP receive sums. IPv6, UDP-Lite, parsing,
 flow lookup, fragment guards, repair requests, alignment copies, receive credit,
 and output admission retain their contracts. Active, exactly bound IPv4 PCBs copy
-TCP payload without checksum-on-copy work. Uncomputed segment caches remain
-invalid through append and split operations. When a full output sum is needed,
-an invalid cache selects a checksum over the actual pbuf chain.
+TCP payload without checksum-on-copy work. These copy-only writes keep ordinary
+copying below 64 bytes and call WaterWall's `wwMemoryCopyLarge()` entry point for
+larger spans, without requiring aligned payload addresses. Uncomputed segment
+caches remain invalid through append and split operations. When a full output sum
+is needed, an invalid cache selects a checksum over the actual pbuf chain.
 
 Complete IPv4 TCP/UDP output fitting the actual netif MTU may omit its transport
 sum. The transport paths call `ip_output_if` with no IP options and account for
