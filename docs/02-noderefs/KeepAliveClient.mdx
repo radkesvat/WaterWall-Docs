@@ -52,7 +52,7 @@ bytes exactly.
   tracked line.
 - Encodes upstream payloads as normal keepalive frames and sends them to
   `next`.
-- Splits upstream payloads larger than `65534` bytes into multiple normal
+- Splits upstream payloads larger than `6 MiB` into multiple normal
   frames.
 - Buffers downstream framed bytes until complete frames are available.
 - Decodes downstream normal frames and forwards their payload to the previous
@@ -117,12 +117,12 @@ its upstream output is writable; paused lines skip timer pings.
 
 ## Frame Format
 
-Every frame starts with a 3-byte prefix:
+Every frame starts with a 5-byte prefix:
 
 | Bytes | Field | Description |
 | --- | --- | --- |
-| `0..1` | body length | Unsigned 16-bit big-endian integer. This length includes the 1-byte frame kind plus any payload bytes. |
-| `2` | frame kind | `1` normal payload, `2` ping, or `3` pong. |
+| `0..3` | body length | Unsigned 32-bit big-endian integer. This length includes the 1-byte frame kind plus any payload bytes. |
+| `4` | frame kind | `1` normal payload, `2` ping, or `3` pong. |
 
 Frame kinds:
 
@@ -132,9 +132,10 @@ Frame kinds:
 | `2` | ping | Empty in normal keepalive traffic. |
 | `3` | pong | Empty response to a ping frame. |
 
-Because the body length is 16-bit and includes the kind byte, the maximum
-payload carried by one normal frame is `65534` bytes. Larger upstream payloads
-are split into multiple frames.
+The body length includes the kind byte. Each normal frame carries at most
+`6 MiB` (`6,291,456 bytes`) of payload; the maximum body length is `6,291,457`.
+Larger upstream payloads are split into multiple frames. Both peers use the
+same five-byte prefix.
 
 ## Direction Behavior
 
@@ -159,18 +160,18 @@ one callback.
 The decoder behavior is conservative:
 
 - waits for more bytes when the prefix or full body has not arrived yet
-- closes the borrowed line through its owner when a frame body length smaller than `1` is seen
+- closes the borrowed line through its owner when a frame body length outside `1..6,291,457` is seen
 - drops empty normal frames
 - drops unknown frame kinds
 - drains complete frames first, then closes on excessive incomplete remainder or retained allocation charge
 
 ## Buffer And Padding Notes
 
-`KeepAliveClient` prepends the 3-byte frame prefix while encoding, so its node
+`KeepAliveClient` prepends the 5-byte frame prefix while encoding, so its node
 metadata advertises:
 
 ```text
-required_padding_left = 3
+required_padding_left = 5
 layer_group = kNodeLayer4
 layer_group_next_node = kNodeLayer4
 layer_group_prev_node = kNodeLayer4
@@ -201,28 +202,28 @@ Source-backed metadata:
 | `layer_group` | `kNodeLayer4` |
 | `layer_group_prev_node` | `kNodeLayer4` |
 | `layer_group_next_node` | `kNodeLayer4` |
-| `required_padding_left` | `3` bytes |
+| `required_padding_left` | `5` bytes |
 
 ## Splice Support
 
 `KeepAliveClient` advertises `kNodeFlagSupportsSplice`. Framing continues for the
-whole connection. Upstream encoding writes only the three-byte header into real
-left padding; downstream decoding uses a three-byte `splice_stream_t` header
+whole connection. Upstream encoding writes only the five-byte header into real
+left padding; downstream decoding uses a five-byte `splice_stream_t` header
 cache. Payload bodies remain eligible for private-pipe forwarding. Payloads
-larger than 65,534 bytes are split using representation-aware range operations.
+larger than 6 MiB are split using representation-aware range operations.
 Pipe allocation or capacity pressure may select complete ordinary fallback.
-The wire format is unchanged; ping and pong frames use ordinary buffers.
+Ping and pong frames use ordinary buffers.
 
-Nested encoder input stays behind the active payload under a shared 2 MiB
+Nested encoder input stays behind the active payload under a shared 8 MiB
 logical-byte and 1,024-buffer reentry bound, counting the active suffix. The decoder serializes nested input,
-limits nested retained bytes to 2 MiB, and limits retained allocation charge to
-2 MiB, attempting beneficial ordinary compaction before refusing excess charge.
-Complete frames in an admitted delivery drain before checking the 131,074-byte
+limits nested retained bytes to 8 MiB, and limits retained allocation charge to
+16 MiB, attempting beneficial ordinary compaction before refusing excess charge.
+Complete frames in an admitted delivery drain before checking the 6 MiB + 5 byte
 incomplete-remainder limit. Pause is forwarded promptly and does not interrupt
 that synchronous batch. Timer-generated pings stop while upstream output is
 paused and resume on a later timer tick after Resume.
 
-Invalid zero-length frame bodies, admission failure and retained-storage overflow
+Zero or oversized frame body lengths, admission failure and retained-storage overflow
 close the borrowed line through its owner. Finish releases incomplete frames,
 active encoder suffixes and queued reentrant input; this node never destroys
 `line_t` itself.

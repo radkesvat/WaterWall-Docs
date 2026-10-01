@@ -43,7 +43,7 @@ server side: TcpListener -> KeepAliveServer -> TcpConnector
 - pong frame‌های upstream را نادیده می‌گیرد.
 - فریم‌های عادی خالی و typeهای ناشناخته را دور می‌اندازد.
 - payloadهای downstream را به‌عنوان keepalive frame عادی encode می‌کند و به نود قبلی می‌فرستد.
-- payloadهای downstream بزرگ‌تر از `65534` بایت را به چند frame عادی تقسیم می‌کند.
+- payloadهای downstream بزرگ‌تر از `6 MiB` را به چند frame عادی تقسیم می‌کند.
 - state محلی line را از بین می‌برد و `Finish` را در همان جهت منتشر می‌کند.
 
 سرور timer جداگانه‌ای برای keepalive ندارد؛ `KeepAliveClient` مسئول ساخت pingهای دوره‌ای است.
@@ -91,12 +91,12 @@ server side: TcpListener -> KeepAliveServer -> TcpConnector
 
 ## فرمت Frame
 
-سرور از همان prefix سه‌بایتی client استفاده می‌کند:
+سرور از همان prefix پنج‌بایتی client استفاده می‌کند:
 
 | Bytes | فیلد | توضیح |
 | --- | --- | --- |
-| `0..1` | body length | عدد صحیح unsigned و 16-bit با ترتیب big-endian. این طول شامل بایت type فریم به‌علاوه بایت‌های payload است. |
-| `2` | frame kind | `1` payload عادی، `2` ping، یا `3` pong. |
+| `0..3` | body length | عدد صحیح unsigned و 32-bit با ترتیب big-endian. این طول شامل بایت type فریم به‌علاوه بایت‌های payload است. |
+| `4` | frame kind | `1` payload عادی، `2` ping، یا `3` pong. |
 
 نوع‌های frame:
 
@@ -106,7 +106,7 @@ server side: TcpListener -> KeepAliveServer -> TcpConnector
 | `2` | ping | در ترافیک keepalive عادی خالی است. |
 | `3` | pong | پاسخ خالی به یک ping frame. |
 
-چون body length 16-bit است و kind byte را هم شامل می‌شود، حداکثر payload حمل‌شده توسط یک frame عادی `65534` بایت است. payloadهای downstream بزرگ‌تر به چند frame تقسیم می‌شوند.
+body length شامل kind byte است. هر فریم حداکثر `6 MiB` (`6,291,456` بایت) payload دارد و حداکثر طول بدنه `6,291,457` است. payloadهای downstream بزرگ‌تر به چند فریم تقسیم می‌شوند. هر دو peer از همین prefix پنج‌بایتی استفاده می‌کنند.
 
 ## رفتار جهت‌ها
 
@@ -128,17 +128,17 @@ server side: TcpListener -> KeepAliveServer -> TcpConnector
 رفتار decoder محافظه‌کارانه است:
 
 - وقتی prefix یا body کامل نرسیده، منتظر بایت‌های بعدی می‌ماند.
-- اگر body length frame کمتر از `1` باشد، line از طریق owner بسته می‌شود
+- اگر body length frame خارج از بازهٔ `1..6,291,457` باشد، line از طریق owner بسته می‌شود
 - فریم‌های عادی خالی دور ریخته می‌شوند.
 - typeهای ناشناخته فریم دور ریخته می‌شوند.
 - فریم‌های کامل ابتدا تخلیه می‌شوند؛ remainder ناقص یا هزینهٔ تخصیص بیش از سقف، line را می‌بندد
 
 ## یادداشت‌های Buffer و Padding
 
-`KeepAliveServer` هنگام encode کردن payloadهای downstream، prefix سه‌بایتی frame را prepend می‌کند، بنابراین متادیتای نود آن اعلام می‌کند:
+`KeepAliveServer` هنگام encode کردن payloadهای downstream، prefix پنج‌بایتی frame را prepend می‌کند، بنابراین متادیتای نود آن اعلام می‌کند:
 
 ```text
-required_padding_left = 3
+required_padding_left = 5
 layer_group = kNodeLayer4
 layer_group_next_node = kNodeLayer4
 layer_group_prev_node = kNodeLayer4
@@ -166,24 +166,24 @@ caller باید padding کافی در سمت چپ برای prefix فراهم ک�
 | `layer_group` | `kNodeLayer4` |
 | `layer_group_prev_node` | `kNodeLayer4` |
 | `layer_group_next_node` | `kNodeLayer4` |
-| `required_padding_left` | `3` bytes |
+| `required_padding_left` | `5` bytes |
 
 ## پشتیبانی از splice
 
 `KeepAliveServer` پرچم `kNodeFlagSupportsSplice` را دارد. framing در تمام طول اتصال ادامه
-دارد. decoder از cache سه‌بایتی `splice_stream_t` استفاده می‌کند و encoder فقط
-header سه‌بایتی را در padding واقعی سمت چپ می‌نویسد. بدنهٔ payload می‌تواند در pipe
-باقی بماند. payload بزرگ‌تر از ۶۵٬۵۳۴ بایت با عملیات range سازگار با representation
+دارد. decoder از cache پنج‌بایتی `splice_stream_t` استفاده می‌کند و encoder فقط
+header پنج‌بایتی را در padding واقعی سمت چپ می‌نویسد. بدنهٔ payload می‌تواند در pipe
+باقی بماند. payload بزرگ‌تر از ۶ MiB با عملیات range سازگار با representation
 تقسیم می‌شود. شکست تخصیص pipe یا فشار ظرفیت می‌تواند fallback کامل به buffer عادی
-ایجاد کند. قالب wire تغییر نکرده و فریم‌های کنترلی buffer عادی دارند.
+ایجاد کند. فریم‌های کنترلی buffer عادی دارند.
 
-ورودی reentrant encoder پشت suffix فعال می‌ماند و مجموع آن‌ها به ۲ MiB بایت منطقی
+ورودی reentrant encoder پشت suffix فعال می‌ماند و مجموع آن‌ها به ۸ MiB بایت منطقی
 و ۱٬۰۲۴ buffer، با احتساب suffix فعال، محدود است. decoder ورودی nested را به ترتیب پردازش می‌کند؛ بایت‌های
-nested و هزینهٔ تخصیص باقی‌مانده هرکدام سقف ۲ MiB دارند. پیش از رد هزینهٔ اضافی،
+nested سقف ۸ MiB و هزینهٔ تخصیص باقی‌مانده سقف ۱۶ MiB دارند. پیش از رد هزینهٔ اضافی،
 compaction سودمند به buffer عادی امتحان می‌شود. فریم‌های کامل یک delivery قبل از
-بررسی سقف ۱۳۱٬۰۷۴ بایتِ remainder ناقص تخلیه می‌شوند. Pause فوری منتقل می‌شود و
+بررسی سقف ۶ MiB + ۵ بایتِ remainder ناقص تخلیه می‌شوند. Pause فوری منتقل می‌شود و
 پردازش batch همگامِ پذیرفته‌شده را قطع نمی‌کند.
 
-بدنهٔ فریم با طول صفر، شکست admission یا سرریز ذخیره‌سازی، line قرض‌گرفته‌شده را
+طول بدنهٔ صفر یا بیش از ۶ MiB + ۱، شکست admission یا سرریز ذخیره‌سازی، line قرض‌گرفته‌شده را
 از طریق owner می‌بندد. Finish، فریم ناقص، suffix فعال encoder و صف ورودی reentrant
 را آزاد می‌کند؛ این نود خودش `line_t` را destroy نمی‌کند.
