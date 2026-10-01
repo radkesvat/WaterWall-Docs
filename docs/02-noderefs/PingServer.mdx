@@ -6,16 +6,17 @@ description: "Reference documentation for the PingServer Echo v2 packet tunnel."
 ---
 
 <!--
-Documentation version: 154
+Documentation version: 156
 Sync note: Keep this file aligned with tunnels/PingServer/description.md and the versioned translation notice.
 -->
 
 # PingServer
 
 `PingServer` is the server-side endpoint of Ping wire v2. It handles a peer
-Echo Request upstream, immediately returns its exact Echo Reply downstream,
-then delivers the inner IPv4 packet upstream. Local data in the reverse
-direction starts a new Echo Request; it never modifies an unrelated Echo Reply.
+Echo Request upstream and delivers the inner IPv4 packet upstream once. With
+`send-replies: true`, it first returns an exact Echo Reply downstream. Reply
+generation is disabled by default. Local data in the reverse direction starts
+a new Echo Request; it never modifies an unrelated Echo Reply.
 
 ```text
 TunDevice -> PingClient -> RawSocket
@@ -24,7 +25,7 @@ RawSocket -> PingServer -> TunDevice
 
 | PingServer callback | Behavior |
 | --- | --- |
-| upstream peer request | Build/send a type-0 reply downstream; strip and forward the request upstream. |
+| upstream peer request | If `send-replies` is true, build/send a type-0 reply downstream; strip and forward the request upstream once. |
 | upstream matching reply | Consume as acknowledgement. |
 | downstream plain packet | Build a type-8 request; forward downstream. |
 
@@ -32,6 +33,13 @@ This is a pure packet tunnel with no connection line state. One synchronized
 node-wide tracker owns a bounded 1024-entry outstanding ring and 1024-entry
 replay ring. Device worker affinity is not correlation identity, so a reply or
 duplicate request may match on a different packet-line WID.
+
+False or omission of `send-replies` skips reply allocation, copying, and
+transmission. The endpoints choose this setting independently; request tracking
+and replay suppression remain active, and incoming correlated replies are
+consumed regardless of the local setting. Data delivery does not wait for a
+reply. Duplicate peer requests deliver their inner data once and get another
+reply only when `send-replies` is true.
 
 ## Settings
 
@@ -42,6 +50,7 @@ duplicate request may match on a different packet-line WID.
   "settings": {
     "local-ipv4": "203.0.113.20",
     "peer-ipv4": "198.51.100.10",
+    "send-replies": false,
     "identifier": "random",
     "sequence-start": 1,
     "ttl": 64,
@@ -55,6 +64,7 @@ duplicate request may match on a different packet-line WID.
 | --- | --- | --- | --- |
 | `local-ipv4` | yes | — | Local source of requests/replies. |
 | `peer-ipv4` | yes | — | Request destination and expected source of peer carrier traffic. |
+| `send-replies` | no | `false` | Boolean. Send exact Echo Replies for received peer requests when true; false or omission skips reply generation. |
 | `identifier` | no | `"random"` | Stable local request-session ID. Integer `0..65535` is a deterministic override. |
 | `sequence-start` | no | `1` | First local request sequence, `0..65535`; wrap is valid. |
 | `ttl` | no | `64` | Locally generated packet TTL. |
@@ -70,9 +80,9 @@ complete inner IPv4 packet.
 
 - Locally originated requests use type `8`, code `0`, DF set, IPv4 ID `0`, and
   configured source/destination/TOS/TTL.
-- Generated replies use type `0`, code `0`, reverse addresses, copy request
-  identifier, sequence, ICMP payload length, payload bytes, and TOS; they use
-  local TTL and clear fragmentation bits.
+- When `send-replies` is true, generated replies use type `0`, code `0`, reverse
+  addresses, copy request identifier, sequence, ICMP payload length, payload
+  bytes, and TOS; they use local TTL and clear fragmentation bits.
 - Reply IPv4 IDs are selected by a securely seeded tuple-scoped,
   Linux-like approximation with bounded idle perturbation. It is not a copy of
   a host kernel's global ID state.
@@ -86,9 +96,18 @@ pass-through.
 The node advertises 28 bytes of left padding, produces at most 1500-byte
 carriers, and does not perform fragmentation, PMTU discovery, or MSS adjustment.
 
+Packet rejection diagnostics use the network logger at `ERROR` level and
+identify the specific validation, checksum, size, headroom, or tracking failure.
+Each drop message includes the packet length, maximum inner/carrier lengths,
+wrapper overhead, and available/required left headroom, all in bytes. Reply
+allocation/build failures also log at `ERROR` and report the request length;
+inner delivery can continue without an acknowledgement. The existing five-second
+log gate is shared by all failure reasons, directions, and workers of each node,
+so it does not emit one message per rejected packet.
+
 ## Breaking Migration From v1
 
-Ping v2 accepts only `local-ipv4`, `peer-ipv4`, `identifier`,
+Ping v2 accepts only `local-ipv4`, `peer-ipv4`, `send-replies`, `identifier`,
 `sequence-start`, `ttl`, and `tos`. All v1 strategies, aliases, header reuse,
 ICMP-only and protocol-swap modes, `source`/`dest`, identifier-checking, XOR,
 roundup, and `ipv4-id-start` are removed and rejected with a migration error.

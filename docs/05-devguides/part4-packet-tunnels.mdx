@@ -5,7 +5,7 @@ sidebar_label: "Part 4: Packet Tunnels"
 description: "Packet-line semantics, pure packet tunnels, packet/stream bridges, packet-line initialization, and paired-tunnel direction rules for layer-3 work."
 ---
 <!--
-Documentation version: 161
+Documentation version: 163
 -->
 
 # Part 4: Packet Lines & Packet Tunnels
@@ -953,34 +953,50 @@ wire v2 uses two independent Echo sessions:
 
 ```text
 client data: PingClient -- Echo Request --> PingServer
-             PingClient <-- exact Echo Reply -- PingServer
+             PingClient <-- optional exact Echo Reply -- PingServer
 
 server data: PingClient <-- Echo Request -- PingServer
-             PingClient -- exact Echo Reply --> PingServer
+             PingClient -- optional exact Echo Reply --> PingServer
 ```
 
 - PingClient upstream and PingServer downstream originate type-8 requests with
   their local data. Their peer decodes the request in its corresponding
   callback and forwards the inner packet in the same callback direction.
-- A received request's type-0 reply travels back to its sender before the
-  original request is delivered. It is an acknowledgement only; the sender
-  consumes a matching reply instead of delivering its payload.
+- Inbound parsing validates exact IPv4 framing and the IPv4 header checksum
+  before classifying the configured peer/local/ICMP tuple. Carrier-only
+  restrictions, including a 20-byte outer header and no outer fragmentation,
+  apply only after that match. Unrelated valid IPv4 packets, including options
+  and fragments, pass through unchanged in the received direction.
+- Validation failures expose a concrete diagnostic reason without changing
+  classification or forwarding. Packet drops log at `ERROR` with packet length,
+  inner/carrier limits, wrapper overhead and available/required left headroom.
+  The existing five-second gate stays shared per node across reasons and workers.
+- `send-replies` is a boolean configured independently on each endpoint and
+  defaults to `false`. Only `true` allocates a reply clone and emits the received
+  request's exact type-0 reply back to its sender before delivering the original
+  request. False or omission skips reply allocation and output. A reply is an
+  acknowledgement only; the sender consumes a matching reply instead of
+  delivering its payload regardless of its own `send-replies` setting. Data
+  delivery does not wait for a reply.
 - Correlation and replay suppression belong to one bounded synchronized tracker
   per Ping node. Device flow affinity chooses the packet line that runs a
-  callback; its WID is not request/reply correlation identity.
-- A request receiver publishes two distinct buffers. The generated reply clone
-  travels back toward the request sender, while the decoded original continues
-  in the direction in which the request was received.
-- Consequently, PingServer's upstream request handler sends the reply clone with
-  `tunnelPrevDownStreamPayload()` and the decoded original with
+  callback; its WID is not request/reply correlation identity. Both remain
+  active when reply generation is disabled. Duplicate requests deliver inner
+  data once and receive another reply only when local reply generation is enabled.
+- With reply generation enabled, a request receiver publishes two distinct
+  buffers. The generated reply clone travels back toward the request sender,
+  while the decoded original continues in the received direction. With it
+  disabled, only the decoded original is published.
+- Consequently, PingServer's upstream request handler sends an enabled reply
+  clone with `tunnelPrevDownStreamPayload()` and the decoded original with
   `tunnelNextUpStreamPayload()`. PingClient's downstream request handler sends
   the clone with `tunnelNextUpStreamPayload()` and the decoded original with
   `tunnelPrevDownStreamPayload()`.
 
 Sending the **original received request** back toward its sender would be an
-invalid reflection. Sending the separately generated exact Echo Reply in that
-opposite direction is required by the wire protocol. Likewise, encapsulating
-the original in PingServer's upstream callback would transform it twice.
+invalid reflection. An enabled, separately generated exact Echo Reply travels
+in that opposite direction. Likewise, encapsulating the original in PingServer's
+upstream callback would transform it twice.
 
 The procedure for any packet tunnel:
 
@@ -1005,11 +1021,15 @@ TesterClient(packet-mode=true)
     -> TesterServer(packet-mode=true)
 ```
 
-The upstream request must be acknowledged and restored before TesterServer sees
-it; reverse data must become a separate Echo Request and be acknowledged before
-TesterClient sees it. Add coverage that would fail if PingServer upstream
-encapsulated instead of decoding, if a reply were delivered twice, or if server
-data were put into the original request's reply.
+The upstream request must be restored before TesterServer sees it; reverse data
+must become a separate Echo Request and be restored before TesterClient sees
+it. Exercise omitted/false and true `send-replies` settings at both endpoints,
+including asymmetric settings. Enabled replies must precede inner delivery and
+be consumed by the originator; disabled replies must cause no clone or reply
+output. Add coverage that would fail if PingServer upstream encapsulated instead
+of decoding, if an inner request were delivered twice, if reply consumption or
+deduplication depended on local reply generation, or if server data were put
+into the original request's reply.
 
 The packet-line `Finish` contract has its own coverage, and a new packet-side
 handler belongs in it:
