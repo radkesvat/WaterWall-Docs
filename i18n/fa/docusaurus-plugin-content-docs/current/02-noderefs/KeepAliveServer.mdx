@@ -123,15 +123,15 @@ server side: TcpListener -> KeepAliveServer -> TcpConnector
 
 ## پردازش ورودی Framed
 
-بایت‌های upstream در یک `buffer_stream_t` جمع می‌شوند؛ بنابراین ممکن است یک فریم در چند callbackِ payload تکه‌تکه برسد یا چند فریم در یک callback دریافت شوند.
+بایت‌های upstream در یک `splice_stream_t` جمع می‌شوند؛ بنابراین ممکن است یک فریم در چند callbackِ payload تکه‌تکه برسد یا چند فریم در یک callback دریافت شوند.
 
 رفتار decoder محافظه‌کارانه است:
 
 - وقتی prefix یا body کامل نرسیده، منتظر بایت‌های بعدی می‌ماند.
-- اگر body length frame کمتر از `1` باشد، read stream پاک می‌شود
+- اگر body length frame کمتر از `1` باشد، line از طریق owner بسته می‌شود
 - فریم‌های عادی خالی دور ریخته می‌شوند.
 - typeهای ناشناخته فریم دور ریخته می‌شوند.
-- اگر ورودی upstream buffer شده از `131074` بایت بیشتر شود، read stream پاک می‌شود
+- فریم‌های کامل ابتدا تخلیه می‌شوند؛ remainder ناقص یا هزینهٔ تخصیص بیش از سقف، line را می‌بندد
 
 ## یادداشت‌های Buffer و Padding
 
@@ -144,7 +144,7 @@ layer_group_next_node = kNodeLayer4
 layer_group_prev_node = kNodeLayer4
 ```
 
-اگر بافر فریم فضای کافی در سمت چپ برای prefix نداشته باشد، فریم حذف و بافر برای استفاده مجدد برگردانده می‌شود. در chain درست، محاسبه padding در WaterWall باید این فضا را رزرو کرده باشد.
+caller باید padding کافی در سمت چپ برای prefix فراهم کند؛ Debug این پیش‌شرط را assert می‌کند. محاسبه padding در chain این فضای اعلام‌شده را رزرو می‌کند.
 
 ## نکته‌های عملی
 
@@ -160,10 +160,30 @@ layer_group_prev_node = kNodeLayer4
 
 | ویژگی | مقدار |
 | --- | --- |
-| node flags | `kNodeFlagNone` |
+| node flags | `kNodeFlagSupportsSplice` |
 | `can_have_prev` | `true` |
 | `can_have_next` | `true` |
 | `layer_group` | `kNodeLayer4` |
 | `layer_group_prev_node` | `kNodeLayer4` |
 | `layer_group_next_node` | `kNodeLayer4` |
 | `required_padding_left` | `3` bytes |
+
+## پشتیبانی از splice
+
+`KeepAliveServer` پرچم `kNodeFlagSupportsSplice` را دارد. framing در تمام طول اتصال ادامه
+دارد. decoder از cache سه‌بایتی `splice_stream_t` استفاده می‌کند و encoder فقط
+header سه‌بایتی را در padding واقعی سمت چپ می‌نویسد. بدنهٔ payload می‌تواند در pipe
+باقی بماند. payload بزرگ‌تر از ۶۵٬۵۳۴ بایت با عملیات range سازگار با representation
+تقسیم می‌شود. شکست تخصیص pipe یا فشار ظرفیت می‌تواند fallback کامل به buffer عادی
+ایجاد کند. قالب wire تغییر نکرده و فریم‌های کنترلی buffer عادی دارند.
+
+ورودی reentrant encoder پشت suffix فعال می‌ماند و مجموع آن‌ها به ۲ MiB بایت منطقی
+و ۱٬۰۲۴ buffer، با احتساب suffix فعال، محدود است. decoder ورودی nested را به ترتیب پردازش می‌کند؛ بایت‌های
+nested و هزینهٔ تخصیص باقی‌مانده هرکدام سقف ۲ MiB دارند. پیش از رد هزینهٔ اضافی،
+compaction سودمند به buffer عادی امتحان می‌شود. فریم‌های کامل یک delivery قبل از
+بررسی سقف ۱۳۱٬۰۷۴ بایتِ remainder ناقص تخلیه می‌شوند. Pause فوری منتقل می‌شود و
+پردازش batch همگامِ پذیرفته‌شده را قطع نمی‌کند.
+
+بدنهٔ فریم با طول صفر، شکست admission یا سرریز ذخیره‌سازی، line قرض‌گرفته‌شده را
+از طریق owner می‌بندد. Finish، فریم ناقص، suffix فعال encoder و صف ورودی reentrant
+را آزاد می‌کند؛ این نود خودش `line_t` را destroy نمی‌کند.

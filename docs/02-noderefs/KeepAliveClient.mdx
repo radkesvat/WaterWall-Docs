@@ -112,7 +112,8 @@ Top-level fields:
 | `ping-interval` | integer | `60000` | Periodic ping interval in milliseconds. Must be at least `1`; startup fails if the value is lower. |
 
 Avoid very small intervals unless you intentionally want high keepalive traffic.
-Each live line tracked by this client receives one ping frame per interval.
+Each live line tracked by this client receives one ping frame per interval while
+its upstream output is writable; paused lines skip timer pings.
 
 ## Frame Format
 
@@ -144,24 +145,24 @@ are split into multiple frames.
 | upstream `Est` / `Pause` / `Resume` | Forwards to `next`. |
 | upstream `Finish` | Untracks the line, destroys local state, then forwards `Finish` to `next`. |
 | downstream `Payload` | Treats bytes as framed input from `KeepAliveServer`; forwards decoded normal payloads to the previous node. |
-| downstream `Est` / `Pause` / `Resume` | Forwards to the previous node. |
+| downstream `Est` | Forwards to the previous node. |
+| downstream `Pause` / `Resume` | Records timer-output permission, then forwards to the previous node. |
 | downstream `Finish` | Untracks the line, destroys local state, then forwards `Finish` to the previous node. |
 | downstream `Init` | Disabled; reaching this callback is treated as a fatal invalid chain flow. |
 
 ## Framed Input Handling
 
-Downstream bytes are accumulated in a `buffer_stream_t`. This means a frame can
+Downstream bytes are accumulated in a `splice_stream_t`. This means a frame can
 arrive split across multiple payload callbacks, or multiple frames can arrive in
 one callback.
 
 The decoder behavior is conservative:
 
 - waits for more bytes when the prefix or full body has not arrived yet
-- clears the read stream when a frame body length smaller than `1` is seen
+- closes the borrowed line through its owner when a frame body length smaller than `1` is seen
 - drops empty normal frames
 - drops unknown frame kinds
-- clears the read stream if buffered downstream input grows beyond `131074`
-  bytes
+- drains complete frames first, then closes on excessive incomplete remainder or retained allocation charge
 
 ## Buffer And Padding Notes
 
@@ -175,9 +176,8 @@ layer_group_next_node = kNodeLayer4
 layer_group_prev_node = kNodeLayer4
 ```
 
-If a frame buffer does not have enough left padding for the prefix, the frame is
-dropped and the buffer is recycled. In a correctly composed chain, WaterWall's
-chain padding calculation should reserve this space.
+The caller must provide enough left padding for the prefix; Debug asserts this
+precondition. WaterWall's chain padding calculation reserves the advertised space.
 
 ## Practical Notes
 
@@ -195,10 +195,34 @@ Source-backed metadata:
 
 | Property | Value |
 | --- | --- |
-| node flags | `kNodeFlagNone` |
+| node flags | `kNodeFlagSupportsSplice` |
 | `can_have_prev` | `true` |
 | `can_have_next` | `true` |
 | `layer_group` | `kNodeLayer4` |
 | `layer_group_prev_node` | `kNodeLayer4` |
 | `layer_group_next_node` | `kNodeLayer4` |
 | `required_padding_left` | `3` bytes |
+
+## Splice Support
+
+`KeepAliveClient` advertises `kNodeFlagSupportsSplice`. Framing continues for the
+whole connection. Upstream encoding writes only the three-byte header into real
+left padding; downstream decoding uses a three-byte `splice_stream_t` header
+cache. Payload bodies remain eligible for private-pipe forwarding. Payloads
+larger than 65,534 bytes are split using representation-aware range operations.
+Pipe allocation or capacity pressure may select complete ordinary fallback.
+The wire format is unchanged; ping and pong frames use ordinary buffers.
+
+Nested encoder input stays behind the active payload under a shared 2 MiB
+logical-byte and 1,024-buffer reentry bound, counting the active suffix. The decoder serializes nested input,
+limits nested retained bytes to 2 MiB, and limits retained allocation charge to
+2 MiB, attempting beneficial ordinary compaction before refusing excess charge.
+Complete frames in an admitted delivery drain before checking the 131,074-byte
+incomplete-remainder limit. Pause is forwarded promptly and does not interrupt
+that synchronous batch. Timer-generated pings stop while upstream output is
+paused and resume on a later timer tick after Resume.
+
+Invalid zero-length frame bodies, admission failure and retained-storage overflow
+close the borrowed line through its owner. Finish releases incomplete frames,
+active encoder suffixes and queued reentrant input; this node never destroys
+`line_t` itself.
