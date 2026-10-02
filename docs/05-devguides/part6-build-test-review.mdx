@@ -560,12 +560,12 @@ creates only a private network namespace. This preserves access to runner-owned
 workspace paths; nesting root inside a mapped user namespace would lose that
 host-filesystem permission authority.
 
-- `support`: production policy and test-harness tests (13 tests), run strictly serially.
-- `functional`: deterministic integration tests (153 tests) run in parallel (`min(32, max(4, 4 * CPUs))` jobs).
+- `support`: production policy and test-harness tests, run strictly serially.
+- `functional`: deterministic integration tests run in parallel (`min(32, max(4, 4 * CPUs))` jobs).
 - `external`: integration tests requiring live host internet access (e.g. Reality against Google), run strictly serially.
-- `speed`: multi-stream throughput benchmarks (16 tests), run strictly serially (`RUN_SERIAL TRUE`) to avoid contention.
-- `privileged`: root/TUN probe tests (6 tests) run under `sudo -E`.
-- `all`: runs support, functional, external, and speed lanes in sequence (183 tests total).
+- `speed`: multi-stream throughput benchmarks, run strictly serially (`RUN_SERIAL TRUE`) to avoid contention.
+- `privileged`: root/TUN probe tests run under `sudo -E`.
+- `all`: runs support, functional, external, and speed lanes in sequence.
 
 The production tree contains integration, smoke, and source-policy tests. Native
 unit tests live in the separate no-LTO tree below. `ctest --preset linux` is
@@ -675,6 +675,121 @@ Release, AddressSanitizer, UndefinedBehaviorSanitizer, or ThreadSanitizer. Never
 build native unit tests in the production tree: it contains the LTO-enabled
 libraries used by `Waterwall`.
 
+Native source files live under `tests/unittests/{base,crypto,bufio,core,net,devices,lwip,tunnels}/`;
+the owning source documents its purpose, important cases, fixture and exact CTest
+selection. Multi-file suites refer to their driver, and shared fixture headers
+describe setup, ownership and cleanup. The worker driver under `net/worker/`
+keeps an explicit lifecycle order across accessor, message, pipe, HalfDuplex and
+teardown modules. Forked cases run before shared runtime initialization; cases
+requiring live workers precede teardown races that close worker admission.
+
+CTest registration stays in explicit CMake. `tests/cmake/TestHelpers.cmake`
+captures absolute test, native and support roots at its definition site and is
+shared by Linux and root platform registrations. `waterwall_add_native_executable`
+creates ordinary targets from explicit sources with optional private includes,
+libraries, definitions and test support. `waterwall_register_native_test`
+registers an existing target with its labels, execution allowance and selected
+aggregate. Its optional `SOURCE_DIR` lets standalone fixture projects expose the
+repository source root independently of their own project root. Keep linker
+wraps, source substitutions, feature variants and
+PCH/Unity exclusions beside the owning target. Native subsystem fragments live
+under `tests/cmake/native/`; integration family fragments live under
+`tests/cmake/integration/`. Public portable and specialized runner entry paths
+remain under `tests/unittests/`. Adding a test requires editing the owning
+registration, not a second source inventory or source glob.
+
+Each runnable `tests/cases/` or `tests/speedtests/` directory has a local README
+describing topology, settings that matter to the scenario, worker/feature
+variants, prerequisites and its actual success criterion. Script tests put this
+intent and their execution reference in module docstrings or opening comments.
+Benchmark documentation records workload, metrics and limits beside the code;
+refactoring test support does not change performance workloads or thresholds.
+Use `ctest --preset linux --show-only=json-v1` and the two native-unit presets to
+discover current names and properties. The repository testing READMEs provide
+directory maps, authoring steps and focused/full commands rather than duplicate
+test catalogs or planning timings.
+
+Native CTest auto-build runners execute in private directories beneath
+`<build>/test-runs/<configuration>/<test-name>/<invocation>/`, printing the path
+before lock acquisition or child startup. Build and executable stdout/stderr are
+captured separately. Registration passes explicit source and fixture directories;
+immutable input paths must resolve independently of CWD. The child environment
+also exposes `WATERWALL_TEST_SOURCE_DIR` and `WATERWALL_TEST_FIXTURE_DIR`.
+
+The shared portable CMake boundary holds `waterwall-native-test.lock` in the build
+tree across build and execution, including the hard-abort and DNS-bus fixtures.
+Keep existing CTest resource locks. Different build trees do not share this lock;
+manual builds outside the runner require an idle tree. Lock acquisition is bounded
+to 30 seconds, build to 60 seconds, and execution to the suite's original allowance.
+Outer native CTest timeouts add 95 seconds for lock/build/cleanup (120 becomes 215;
+30 becomes 125). Scenario deadlines, expected signals/exits and the Release-only
+abort suite remain unchanged.
+
+Native and shell run directories are retained on failure, interruption, timeout
+and initialized skip. Successful runs remove them by default; set
+`WATERWALL_TEST_KEEP_RUN_DIR=1` to retain them. An accepted expected failure is a
+successful enclosing test. Only clean idle trees with
+`tests/cleanup_generated_outputs.sh`; it selects generated native directories and
+legacy leftovers, preserving fixtures, build products and the cooperative lock.
+
+Test authors can link the private `ww_test_support` target and include
+`test_assert.h` for requirements that remain active under `NDEBUG`. Runtime
+fixtures include the WaterWall header first, in a separate include group, so its
+feature macros precede the support header's system includes after formatting.
+Comparisons evaluate operands once and report the case, original call site and values; byte
+diagnostics identify the first mismatch with bounded output. Choose `exit(1)` or
+`_Exit(1)` explicitly to preserve the fixture's failure boundary. These helpers
+do not replace production Debug assertions or their expected-failure tests.
+`TEST_CHECK` reports and returns a boolean without terminating; a suite using it
+retains its accumulated-failure, return-status, `abort()` or platform-exit policy.
+The pure library under `tests/support/c/` can be imported by standalone platform
+fixtures without registering other tests or linking runtime code. Standalone
+archive/header probes retain their independent link boundary where support would
+invalidate the probe.
+Use ordered `TEST_RUN_CASE` calls or explicit `testCaseSet` before parameterized
+cases. The executable has one case context across translation units: publish a
+static name before admitting work and keep it stable until all case threads and
+callbacks finish. Keep scenario setup and successful teardown visible.
+
+The line-failure harness remains a composition entry point for opt-in process
+guards, buffer accounting, callback observation and worker/normal-line setup in
+`tests/support/c/fixtures/`. Link support privately and preserve wrapper symbols,
+exact line ownership, buffer transfers and teardown ordering. Simple tests must
+not inherit runtime failure wrappers. Examples and API obligations live in
+`tests/support/README.md`, with base64, atomic and HeaderServer tests demonstrating
+the appropriate scope.
+
+Python entries using `tests/support/python/wwtest/` resolve imports from
+`__file__` and disable source-tree bytecode before importing. Socket exact reads
+and positive strace parsing preserve scenario semantics. Keep the private run
+directory outside process/socket/executor contexts so child/tracer cleanup and
+peer joins finish before deletion; retain failures, initialized skips and
+timeouts, with the same `WATERWALL_TEST_KEEP_RUN_DIR=1` success override. The POSIX
+process helper preserves `strace -D` runtime ownership and bounds cleanup while
+keeping the original scenario exception. Prerequisites, readiness behavior,
+expected exits and scenario deadlines stay explicit in each test.
+
+Copied case probes resolve support from the mirrored tests root; owners of
+arbitrary copied directories, including native Windows examples, pass
+`WATERWALL_TEST_SUPPORT_DIR` explicitly. Import reusable utilities and named
+protocol fixtures from support rather than executable test programs. Match exact
+read/EOF/timeout and readiness semantics: keep the scenario's successful TCP
+connection and never create an extra UDP association to establish readiness.
+Startup configuration tests retain complete captured command output under their
+private directory without recording environments. Mains returning captured
+failure/skip statuses settle the directory with that enclosing verdict after all
+resources finish; benchmark retention and workloads remain caller obligations.
+
+Shell entry points and `case_run_dir.lib.sh` retain their public paths while
+sharing private-directory, log, explicit-PID shutdown/reap and core-setting
+mechanics under `tests/support/shell/`. Traps capture the enclosing status first.
+Marker, expected-failure, report, probe, privileged and speed decisions remain in
+their runners. Specialized native build-lock orchestration, Win32 capability
+events, namespace holders and process-group fault injection retain their own
+ownership policy rather than acquiring another lock or borrowing a mismatched
+process abstraction. Put the actual setup, important checks, limits and CTest
+references beside each changed test and probe.
+
 On Win64, `waterwall_platform_unit_tests` also builds
 `device_reader_session_windows_fallback_compile`. This compile-only target
 compiles the real session, budget and dispatch sources separately with
@@ -724,7 +839,7 @@ To run a single integration case directly while debugging — passing the binary
 the case directory, and a timeout in seconds:
 
 ```bash
-tests/run_waterwall_case.sh \
+bash tests/run_in_network_namespace.sh bash tests/run_waterwall_case.sh \
   build/linux/Release/Waterwall \
   tests/cases/tls_roundtrip \
   60
