@@ -163,7 +163,7 @@ TcpListener -> EncryptionServer -> SpeedTestServer
 | `mode` | `tcp` | mode framing. مقدارهای مجاز: `tcp`, `TCP`, `udp`, `UDP`. |
 | `direction` | `upload` | جهت تست. مقدارهای مجاز: `upload`, `UPLOAD`, `send`, `download`, `DOWNLOAD`, `receive`, `bidirectional`, `both`, `BOTH`. |
 | `duration-ms` | `10000` | مدت اندازه‌گیری پس از warmup؛ باید مثبت باشد. |
-| `warmup-ms` | `0` | مدت warmup؛ باید منفی نباشد. frame‌های warmup ارسال و اعتبارسنجی می‌شوند، اما در مجموع بایت‌های اندازه‌گیری‌شده حساب نمی‌شوند. |
+| `warmup-ms` | `0` | مدت warmup؛ باید منفی نباشد. frame‌های warmup ارسال و در صورت فعال بودن گزینه اعتبارسنجی می‌شوند، اما در مجموع بایت‌های اندازه‌گیری‌شده حساب نمی‌شوند. |
 | `report-interval-ms` | `1000` | فاصله میان گزارش‌های دوره‌ای؛ باید مثبت باشد. |
 | `start-delay-ms` | `50` | تأخیر آغاز هر stream پس از startup؛ باید منفی نباشد. |
 | `timeout-ms` | `warmup-ms + duration-ms + 30000` | watchdog هر stream. باید بزرگ‌تر از `warmup-ms + duration-ms` باشد. |
@@ -172,6 +172,7 @@ TcpListener -> EncryptionServer -> SpeedTestServer
 | `target-bits-per-sec` | TCP: `0` | pacing اختیاری بر حسب bit/sec. مقدار `0` یعنی تا جایی که backpressure اجازه دهد ارسال شود. |
 | `udp-target-bits-per-sec` | UDP: `10000000` | pacing مخصوص UDP بر حسب bit/sec. |
 | `target-megabits-per-sec` | تنظیم نشده | فرم جایگزین pacing بر حسب megabit/sec. |
+| `verify-payload` | `false` | تولید و بررسی الگوی داده در هر دو سمت؛ برای تست صحت فعال شود. |
 | `json-summary` | `false` | علاوه بر log‌های معمول، یک خلاصه فشرده شبیه JSON چاپ می‌کند. |
 | `terminate-on-complete` | `true` | پس از پایان همه stream‌ها WaterWall را متوقف می‌کند؛ exit code در حالت موفق `0` و در صورت خطا `1` است. |
 
@@ -184,9 +185,9 @@ TcpListener -> EncryptionServer -> SpeedTestServer
 
 | Frame | جهت | کاربرد |
 | --- | --- | --- |
-| `HELLO` | client به server | mode، direction، duration، warmup، report interval، payload size، pacing، تعداد stream و stream id را اعلام می‌کند. |
+| `HELLO` | client به server | mode، direction، duration، warmup، report interval، payload size، pacing، سیاست اعتبارسنجی، تعداد stream و stream id را اعلام می‌کند. |
 | `ACK` | server به client | تایید `HELLO`. در UDP client قبل از ارسال data منتظر آن می‌ماند. |
-| `DATA` | sender به receiver | payload deterministic برای upload یا download. |
+| `DATA` | sender به receiver | بدنه صفرشده یا الگوی اعتبارسنجی برای upload یا download. |
 | `END` | sender به receiver | پایان یک جهت sender. |
 | `REPORT` | server به client | آمار final sender/receiver. |
 | `ERROR` | server به client | خطای protocol. |
@@ -238,12 +239,32 @@ packet‌های تکراری و خارج از ترتیب، خطاهای اعتب
 - validation errors
 - jitter estimate
 
-payload‌ها از الگویی deterministic بر اساس stream id، sequence number و direction
-استفاده می‌کنند؛ در نتیجه هر دو سمت می‌توانند خرابی داده یا ترتیب غیرمنتظره را
-تشخیص دهند.
+با `verify-payload=true` بدنه‌ها از الگویی قطعی بر اساس stream id، sequence number
+و direction استفاده می‌کنند. شمارش ترتیب بسته‌ها در حالت غیرفعال هم برقرار است.
 
 در پایان، client گزارش‌های remote per-stream را از server چاپ می‌کند و یک summary نهایی aggregate می‌سازد. اگر
 `json-summary: true` باشد، یک خط compact JSON-style aggregate هم چاپ می‌شود.
+
+## اعتبارسنجی payload و splice
+
+تنظیم `verify-payload` در `SpeedTestClient` به‌صورت پیش‌فرض `false` است و از طریق
+flag پیام `HELLO` برای هر دو سمت اعمال می‌شود. مقدار `true` تولید و بررسی الگوی
+قطعی داده را فعال می‌کند. در حالت غیرفعال، فرستنده بدنه را با صفر مقداردهی می‌کند
+و گیرنده فقط تعداد بایت‌ها را حساب می‌کند. بررسی header، طول، stream id، sequence
+و گزارش نهایی همیشه برقرار است. در این حالت `valid_packets` و `validation_errors`
+مربوط به payload صفر هستند و خلاصه JSON فیلد `verification_enabled` دارد.
+
+هر دو node در chain مناسب TCP با `misc.splice=true` از splice پشتیبانی می‌کنند.
+گیرنده header چهل‌وهشت‌بایتی را می‌خواند و برای frame ناقص فوراً بازمی‌گردد. در
+Linux بدنه DATA بدون بررسی، از pipe مستقیماً به `/dev/null` تخلیه می‌شود؛ در صورت
+نبود پشتیبانی، خواندن معمولی با حافظه موقت محدود استفاده می‌شود. بدنه پیام‌های
+کنترلی و DATA نیازمند اعتبارسنجی به حافظه معمولی منتقل می‌شوند. UDP همچنان هر
+datagram را جدا پردازش می‌کند. تولید داده خروجی از حافظه معمولی انجام می‌شود.
+
+حد هزینه ذخیره frame ناقص برای هر line برابر `2 * (16 MiB + 48)` است؛ پیش از رد
+ورودی، فشرده‌سازی bufferها امتحان می‌شود. این عدد حد کل حافظه process یا kernel
+نیست. هر task حداکثر ۳۲ frame می‌فرستد و به Pause احترام می‌گذارد؛ pacing با
+زمان‌بندی task انجام می‌شود و worker را به خواب نمی‌برد.
 
 ## اشتباه‌های رایج
 
@@ -258,7 +279,7 @@ payload‌ها از الگویی deterministic بر اساس stream id، sequenc
 
 | ویژگی | مقدار |
 | --- | --- |
-| node flags | `kNodeFlagChainHead` |
+| node flags | `kNodeFlagChainHead` + `kNodeFlagSupportsSplice` |
 | `can_have_prev` | `false` |
 | `can_have_next` | `true` |
 | `layer_group` | `kNodeLayer4` |

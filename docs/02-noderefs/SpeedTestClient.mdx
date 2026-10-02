@@ -163,7 +163,7 @@ specific mode, duration, direction, payload size, stream count, pacing rate, or 
 | `mode` | `tcp` | Framing mode. Accepted values: `tcp`, `TCP`, `udp`, `UDP`. |
 | `direction` | `upload` | Test direction. Accepted values: `upload`, `UPLOAD`, `send`, `download`, `DOWNLOAD`, `receive`, `bidirectional`, `both`, `BOTH`. |
 | `duration-ms` | `10000` | Measured test duration after warmup. Must be positive. |
-| `warmup-ms` | `0` | Warmup duration. Warmup frames are sent and validated but excluded from measured byte totals. Must be non-negative. |
+| `warmup-ms` | `0` | Warmup duration. Warmup frames are sent and optionally validated but excluded from measured byte totals. Must be non-negative. |
 | `report-interval-ms` | `1000` | Interval report cadence. Must be positive. |
 | `start-delay-ms` | `50` | Delay before each generated stream is started after tunnel startup. Must be non-negative. |
 | `timeout-ms` | `warmup-ms + duration-ms + 30000` | Per-stream watchdog. Must be greater than `warmup-ms + duration-ms`. |
@@ -172,6 +172,7 @@ specific mode, duration, direction, payload size, stream count, pacing rate, or 
 | `target-bits-per-sec` | TCP: `0` | Optional pacing rate in bits per second. `0` means send as fast as backpressure allows. |
 | `udp-target-bits-per-sec` | UDP: `10000000` | UDP-specific pacing rate in bits per second. |
 | `target-megabits-per-sec` | unset | Alternative pacing field in megabits per second. |
+| `verify-payload` | `false` | Generate and verify deterministic payload bytes at both endpoints; enable for correctness tests. |
 | `json-summary` | `false` | Print a compact final JSON-style summary in addition to normal logs. |
 | `terminate-on-complete` | `true` | Exit Waterwall after all streams complete. Exit code is `0` on success and `1` if any stream failed. |
 
@@ -187,9 +188,9 @@ Each generated stream uses these frame types:
 
 | Frame | Direction | Purpose |
 | --- | --- | --- |
-| `HELLO` | Client to server | Announces mode, direction, duration, warmup, report interval, payload size, pacing rate, stream count, and stream id. |
+| `HELLO` | Client to server | Announces mode, direction, duration, warmup, report interval, payload size, pacing rate, verification policy, stream count, and stream id. |
 | `ACK` | Server to client | Confirms the `HELLO`. In UDP mode the client waits for this before sending data. |
-| `DATA` | Sender to receiver | Carries deterministic payload bytes for upload or download. |
+| `DATA` | Sender to receiver | Carries zero-filled or verification-pattern payload bytes for upload or download. |
 | `END` | Sender to receiver | Marks the end of a sender direction. |
 | `REPORT` | Server to client | Carries final sender/receiver statistics. |
 | `ERROR` | Server to client | Reports a protocol failure. |
@@ -240,8 +241,8 @@ The receiver side tracks:
 - validation errors
 - jitter estimate
 
-Payloads use a deterministic pattern keyed by stream id, sequence number, and direction, so both sides can detect
-corruption or unexpected frame ordering.
+With `verify-payload=true`, payloads use a deterministic pattern keyed by stream id, sequence number, and direction.
+Sequence accounting remains active when payload verification is disabled.
 
 At the end, the client prints per-stream remote reports from the server and an aggregate final summary. With
 `json-summary: true`, it also prints one compact JSON-style aggregate line.
@@ -254,13 +255,36 @@ At the end, the client prints per-stream remote reports from the server and an a
 - Do not expect it to open sockets directly; use `TcpConnector`, `UdpConnector`, or another transport stack after it.
 - Do not use very large UDP payloads unless the whole path can carry them without fragmentation or loss.
 
+## Payload verification and splice
+
+`verify-payload` on `SpeedTestClient` defaults to `false` and selects the policy
+for both endpoints through the HELLO flags. Set it to `true` to generate and check
+the deterministic payload pattern. With verification disabled, senders generate
+initialized zero-filled bodies and receivers count their lengths without checking
+payload bytes. Frame headers, lengths, stream IDs, sequence accounting and final
+reports are still processed. `valid_packets` and payload `validation_errors` stay
+zero when verification is disabled; JSON summaries include `verification_enabled`.
+
+Both nodes support splice on eligible TCP chains when `misc.splice=true`.
+The receiver caches the 48-byte header, returns immediately for incomplete frames,
+and discards unchecked DATA bodies from their private pipes through `/dev/null`
+on Linux without copying the body into userspace. Unavailable sink/splice support
+falls back to bounded ordinary reads. Control bodies and verified DATA bodies are
+materialized when needed. UDP retains per-datagram handling. Generated output is
+ordinary memory; enabling splice does not make payload generation zero-copy.
+
+Each line bounds retained incomplete-frame storage to `2 * (16 MiB + 48)` charged
+bytes, compacting before refusing excess storage. This is a queue accounting bound,
+not a limit on total process or kernel memory. Send tasks respect Pause and yield
+after at most 32 frames; pacing uses scheduled tasks rather than blocking sleeps.
+
 ## Node Metadata
 
 Source-backed metadata:
 
 | Property | Value |
 | --- | --- |
-| node flags | `kNodeFlagChainHead` |
+| node flags | `kNodeFlagChainHead` + `kNodeFlagSupportsSplice` |
 | `can_have_prev` | `false` |
 | `can_have_next` | `true` |
 | `layer_group` | `kNodeLayer4` |
