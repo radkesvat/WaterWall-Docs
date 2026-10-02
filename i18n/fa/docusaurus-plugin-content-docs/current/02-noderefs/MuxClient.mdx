@@ -178,7 +178,50 @@ server side: TcpListener -> TlsServer -> HttpServer -> MuxServer -> TcpConnector
 
 در حالت timer و counter، هر worker یک parent فعال و قابل استفاده دارد. child‌های جدید تا exhausted شدن parent به آن متصل می‌شوند. اگر با رسیدن child بعدی count به `max-children` رسیده باشد، parent از selection بازنشسته می‌شود، برای child‌های فعلی زنده می‌ماند و پس از صفر شدن تعداد child و تحویل خروجی صف بسته می‌شود؛ child جدید parent دیگری می‌گیرد.
 
-در حالت pool ثابت parent‌ها، نخستین child روی یک worker باعث می‌شود `MuxClient` به تعداد `per-worker-connections-count` برای همان worker parent line بسازد. child‌های تازه به کم‌بارترین parent غیر-finishing با count کمتر از `max-children` می‌روند و تساوی با round-robin شکسته می‌شود. اگر همه full باشند child از نوع borrowed جدید فوراً Finish می‌گیرد؛ parent اضافه یا صف انتظار نامحدود ساخته نمی‌شود. با افت count، parent دوباره قابل استفاده است.
+در حالت pool ثابت، هر worker به تعداد `per-worker-connections-count` جایگاه قابل انتخاب دارد. ابتدا parentهای غیرمشکوک که به `max-children` نرسیده‌اند ترجیح داده می‌شوند؛ سپس انتخاب با هش rendezvous میان همان گروه انجام می‌شود. هر child جدید یک کلید مستقل در worker و هر parent یک شناسه ثابت در طول عمرش دارد. تعداد childها فقط سقف پذیرش است و امتیاز انتخاب نیست. اتصال childهای موجود تغییر نمی‌کند. اگر تمام گزینه‌ها مشکوک باشند، انتخاب در همان گروه ادامه دارد؛ اگر همه پر یا در حال پایان باشند، child جدید Finish می‌گیرد و صف انتظار نامحدود ساخته نمی‌شود.
+
+## Ping/Pong و جایگزینی نرم parent
+
+گزینهٔ boolean به نام `keepalive` به‌صورت پیش‌فرض `true` است و در همهٔ modeها
+اعمال می‌شود. `false` ارسال probe، پذیرش پاسخ و جایگزینی مبتنی بر سلامت را
+غیرفعال می‌کند؛ انتخاب rendezvous در حالت ثابت باقی می‌ماند.
+`ping-interval` پیش‌فرض `15000` و `tolerance-ms` پیش‌فرض `45000` میلی‌ثانیه دارد.
+هر دو باید حتی در حالت غیرفعال عدد صحیح بین `1` و `2147483647` باشند.
+
+هر worker یک timer دارد که parentهای قابل انتخاب و established را بررسی می‌کند،
+نه childها را. فاصلهٔ بررسی `min(ping-interval, tolerance-ms, 1000)` است؛ اولین
+Ping در اولین tick پس از Est آمادهٔ ارسال است و ارسال‌های بعدی فاصلهٔ تنظیم‌شده
+را رعایت می‌کنند. روی هر parent فقط یک probe در انتظار پاسخ است. Ping و Pong
+بدنه ندارند و CID آن‌ها یک token سی‌ودوبیتی است. فقط Pong کامل با همان token
+روی همان parent پاسخ محسوب می‌شود؛ Data، بخشی از header و token اشتباه کافی نیست.
+
+اولین پاسخ معتبر پشتیبانی peer را تأیید می‌کند. قبل از آن، probe بی‌پاسخ دوباره
+امتحان می‌شود ولی parent مشکوک یا جایگزین نمی‌شود. بنابراین خاموش‌بودن پاسخ‌گویی
+MuxServer باعث چرخش اتصال نمی‌شود؛ البته parentی که هرگز اولین پاسخ را نمی‌دهد
+از این راه بازیابی نمی‌شود. در سکوت شبانه و آپلود یک‌طرفه، خود MuxServer پاسخ
+می‌دهد و نیازی به پاسخ برنامهٔ کاربر نیست.
+
+تا وقتی خروجی parent Pause است، pump فعال دارد یا صفش خالی نیست، probe جدید
+ارسال نمی‌شود. Pause ترنسپورت شمارش انتظار را متوقف می‌کند و Resume مدت Pause
+را از آن حذف می‌کند؛ سیگنال تکراری دوباره حساب نمی‌شود. FlowPause یک child اثری
+بر کل parent ندارد. زمان با ساعت monotonic همان worker اندازه‌گیری می‌شود.
+صف‌های nodeهای بعدی و انتقال شبکه هنوز از tolerance مصرف می‌کنند؛ Pause دائمی
+می‌تواند تشخیص را نامحدود عقب بیندازد.
+
+پس از یک‌چهارم tolerance، با گردکردن رو به پایین و حداقل ۱ میلی‌ثانیه
+(پیش‌فرض `11250`)، parent تأییدشده اولویت کمتری در حالت ثابت دارد. پس از کل
+مدت، درخواست child جدید می‌تواند آن را بازنشسته و جایگزین کند. Pong معتبر دیررس
+parentی را که هنوز بازنشسته نشده سالم می‌کند. parent بازنشسته دوباره انتخاب
+نمی‌شود، ولی childهای موجود روی آن می‌مانند و تا پایان معمول خود کار می‌کنند.
+پس از خروج آخرین child و تخلیهٔ خروجی نهایی بسته می‌شود. parent بی‌پاسخِ بدون
+child با پاک‌سازی معمول، حتی همراه خروجی مسدود، بسته و جایگزین می‌شود.
+
+سقف parentهای بازنشستهٔ keepalive در هر worker برابر `per-worker-connections-count`
+در حالت ثابت و یک در حالت‌های timer/counter است. خروجی نهایی در انتظار تخلیه
+نیز در این سقف حساب می‌شود. با پرشدن سقف، parent دارای child همچنان قابل انتخاب
+می‌ماند تا ظرفیت آزاد شود؛ parent خالی قابل جایگزینی است. چرخش معمول timer/counter
+مستقل باقی می‌ماند. timer فقط probe می‌فرستد؛ جایگزینی هنگام درخواست child جدید
+انجام می‌شود و هیچ child فعالی به‌اجبار قطع نمی‌شود.
 
 ## رفتار modeها
 
@@ -186,9 +229,9 @@ server side: TcpListener -> TlsServer -> HttpServer -> MuxServer -> TcpConnector
 | --- | --- | --- |
 | `timer` | وقتی عمر parent از `connection-duration-ms` بیشتر شود | چرخش parent transport line‌ها در طول زمان. |
 | `counter` | وقتی `cid` به `connection-capacity` برسد | cap ساده روی stream‌های منطقی به‌ازای هر parent. |
-| `fixed-connections-count` | با زمان یا counter تجمعی exhausted نمی‌شود؛ `max-children` همچنان اعمال می‌شود | تعداد ثابت اتصال بیرونی per-worker. |
+| `fixed-connections-count` | عمر اتصال و counter تجمعی باعث چرخش نمی‌شوند؛ سقف child و سیاست Ping/Pong اعمال می‌شوند | pool قابل انتخاب با جایگزینی نرم محدود. |
 
-parentِ exhausted بی‌درنگ بسته نمی‌شود؛ فقط child تازه نمی‌پذیرد و child‌های موجود تا پایان ادامه می‌دهند. اگر چنین parent‌ای child نداشته باشد، تا تحویل آخرین خروجی و پایان ارسال فعال در فهرست مالکیت می‌ماند، ولی دیگر برای child تازه انتخاب نمی‌شود. در حالت fixed، parent طبق سیاست قبلی قابل استفاده مجدد است. worker Stop همه parent‌های تحت مالکیت، حتی parent بازنشسته بدون child، را بدون انتظار برای Resume می‌بندد و خروجی باقی‌مانده را آزاد می‌کند.
+parentِ exhausted بی‌درنگ بسته نمی‌شود؛ فقط child تازه نمی‌پذیرد و child‌های موجود تا پایان ادامه می‌دهند. اگر چنین parent‌ای child نداشته باشد، تا تحویل آخرین خروجی و پایان ارسال فعال در فهرست مالکیت می‌ماند، ولی دیگر برای child تازه انتخاب نمی‌شود. در حالت fixed، فقط parent بازنشسته‌نشده قابل انتخاب مجدد است. worker Stop همه parent‌های تحت مالکیت، حتی parent بازنشسته بدون child، را بدون انتظار برای Resume می‌بندد و خروجی باقی‌مانده را آزاد می‌کند.
 
 همچنین یک hard limit مطلق برای cid وجود دارد: وقتی parent به `4294967295` برسد، exhausted می‌شود.
 
@@ -236,6 +279,8 @@ flag‌های frame:
 | `2` | `FlowPause` |
 | `3` | `FlowResume` |
 | `4` | `Data` |
+| `5` | `Ping`؛ بدون بدنه، CID برابر token probe |
+| `6` | `Pong`؛ بدون بدنه، CID برابر همان token پاسخ |
 
 `1,048,576` بایت سقف payload در **یک** فریم `Data` است، نه سقف یک callback از نوع
 `Payload` برای child. encoder یک payload بزرگ‌تر را، با حفظ ترتیب دقیق بایت‌ها، به
@@ -375,7 +420,7 @@ layer_group = kNodeLayer4
 - `connection-duration-ms` فقط برای timer mode اعمال می‌شود.
 - `connection-capacity` فقط برای counter mode اعمال می‌شود.
 - `per-worker-connections-count` فقط برای fixed parent pool mode اعمال می‌شود.
-- با چند worker، اندازه pool ثابت parent‌ها نیز با تعداد worker‌ها بالا می‌رود. برای مثال، `per-worker-connections-count: 2` با چهار worker می‌تواند تا هشت parent transport line بسازد.
+- با چند worker، اندازه pool ثابت parent‌ها نیز با تعداد worker‌ها بالا می‌رود. برای مثال، `per-worker-connections-count: 2` با چهار worker هشت جایگاه قابل انتخاب و حداکثر هشت parent بازنشسته زنده دارد.
 - `Finish` محلی child یا shutdown منظم برنامه ممکن است صف detached باقی‌مانده را به‌جای forward کردن آزاد کند.
 - detached drain هیچ بایتی از پروتکل MUX یا نیازمندی قابلیت peer را تغییر نمی‌دهد.
 - `MuxClient` یک تونل میانی است، نه endpoint عمومی.
