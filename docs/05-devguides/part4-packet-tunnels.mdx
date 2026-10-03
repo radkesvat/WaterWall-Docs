@@ -341,6 +341,14 @@ can be a source-route hop rather than TCP's final destination. Valid negotiated
 TCPv4 GSO traffic is not filtered by a TCP-option allowlist. No virtio metadata,
 checksum request flag, or new line state reaches the chain.
 
+Ordinary `NEEDS_CSUM` completion uses `tunLinuxOffloadCompleteChecksum()` to
+sum the metadata-selected span, including its existing checksum-field seed.
+That helper stores an arithmetic zero as `0xffff`, matching Linux
+[`skb_checksum_help()` / `CSUM_MANGLED_0`](https://github.com/torvalds/linux/blob/master/net/core/dev.c)
+for any accepted protocol. The rule applies on both the worker and reader
+completion paths. TCP GSO segment completion instead preserves a computed TCP
+zero. Keep this offload encoding outside the generic checksum backend.
+
 An enabled Linux GSO session has one FIFO per event worker. Ordinary batches and
 GSO work share that FIFO, so a later ordinary packet cannot overtake unfinished
 GSO work on the same worker. Each callback shares a budget of 64 packets and
@@ -570,6 +578,21 @@ generic Internet sums through `LWIP_CHKSUM = wwLwipChecksum`. The adapter calls
 or normalizing zero. For example, bytes `01 02` produce raw sum bytes `01 02`
 and completed checksum bytes `fe fd`. lwIP retains responsibility for pbuf-chain
 parity, IPv4/IPv6 pseudoheaders, checksum fields, and protocol zero semantics.
+
+`calcGenericChecksum()` returns the final complemented checksum in network byte
+order, including a legitimate zero result; it performs no zero normalization.
+Verification includes the checksum field and any required pseudoheader seed and
+expects a result of zero. Verification and raw-sum callers must preserve that
+arithmetic result. Applying `0 -> 0xffff` in the generic backend would break
+those consumers.
+
+Protocol and offload helpers own output encoding. Enabled UDP generation stores
+an arithmetic zero as `0xffff`; in IPv4 UDP, a transmitted zero means checksum
+disabled ([RFC 768](https://www.rfc-editor.org/rfc/rfc768.html)). Ordinary TCP and
+IPv4 header generation preserve a computed zero. Ordinary TUN `NEEDS_CSUM`
+completion follows the Linux offload rule described above. These encoding
+decisions belong after calculation in the appropriate helper, never in
+`calcGenericChecksum()` or `wwLwipChecksum()`.
 
 The adapter accepts a nonnegative `int` length and readable storage for that
 span; zero length permits a null pointer and returns raw zero. Spans exceeding
