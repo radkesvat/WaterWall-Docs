@@ -148,8 +148,10 @@ If no child validates before the timeout, the main line is closed.
 | Limit | Value | Behavior |
 | --- | --- | --- |
 | Selection timeout | `5000 ms` | Main line closes if no child is selected in time. |
-| Pending upstream payload | `1 MiB` | Main line closes if its retained protocol/order backlog exceeds this. |
-| Child handshake buffer | `4096 bytes` | Main line closes if a child accumulates too much non-selected handshake data. |
+| Pending upstream payload | `2 MiB` | Main line closes if its retained protocol/order backlog exceeds this. |
+| Incomplete child reply | `4 bytes` | A complete five-byte reply is validated immediately. |
+| Coalesced reply body / selection ordering | `2 MiB` | Marker bytes do not consume this application-data allowance. |
+| Pending upstream entries | `1,024 buffers` | Empty TCP input consumes no retained entry. |
 | Required left padding | `0` | The client does not prepend protocol headers to existing payload buffers. |
 
 The `FISH?` probe is allocated as its own small buffer. User payload is queued
@@ -177,7 +179,7 @@ After selection:
 If the selected child closes, the main line is closed. If every child closes
 before a winner is selected, the main line is also closed.
 
-The application backlog remains bounded to 1 MiB and admits buffers transactionally.
+The upstream application backlog is bounded to 2 MiB and 1,024 buffers and admits buffers transactionally.
 Its first retained payload publishes source Pause after FIFO ownership is settled.
 This hold combines with selected-child transport pressure; neither an unrelated
 child Resume nor selection alone releases it. It affects the application source,
@@ -186,7 +188,7 @@ Selection and Resume release it as an independent producer: Pause stops the drai
 and nested application input appends behind older retained bytes. Empty stream
 buffers need no retained entry. Main-side reply Pause is recorded before selection
 and applied to the chosen backend after its handshake, so it cannot stall FISH!.
-Temporary downstream ordering during selection also has a 1 MiB bound and keeps
+Temporary downstream ordering during selection also has a 2 MiB bound and keeps
 coalesced reply bytes before reentrant replies. Close settles all retained bytes
 and exact child/main references.
 
@@ -200,13 +202,26 @@ and exact child/main references.
   nodes around it when the path needs security.
 - Upstream `Est` and downstream `Init` are disabled callbacks for this node.
 
+## Splice Support and Setup Retirement
+
+Both nodes accept ordinary buffers and private-pipe payloads. Complete deliveries entering handshake
+or selection parsing are materialized with `sbufEnsureOrdinary()`; application FIFOs retain buffers
+opaquely. A complete five-byte marker can carry up to 2 MiB of following application data. An incomplete
+marker retains at most four bytes, and the marker does not consume the application-data allowance.
+
+After setup and FIFO drain, the nodes release their handshake streams and empty queue storage. Ready
+payloads pass through without inspection, materialization or the startup backlog limit. The client
+keeps the main-to-selected-child mapping needed for payload, pressure and Finish callbacks. Server
+backend initialization still waits for the first application payload, so losing candidates create no
+backend connection. Neither node requests ordinary reads for the established TCP stream.
+
 ## Node Metadata
 
 Source-backed metadata:
 
 | Property | Value |
 | --- | --- |
-| node flags | `kNodeFlagNone` |
+| node flags | `kNodeFlagSupportsSplice` |
 | `can_have_prev` | `true` |
 | `can_have_next` | `true` |
 | `layer_group` | `kNodeLayer4` |
