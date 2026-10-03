@@ -113,16 +113,21 @@ Top-level fields:
 | --- | --- | --- | --- |
 | `ping-interval` | integer | `30000` | Periodic ping interval in milliseconds. Must be at least `1`; startup fails if the value is lower. |
 | `sensitive-mode` | boolean | `false` | Enables one outstanding ping per line and closes on a missing or late pong. |
-| `tolerance-ms` | integer | `90000` | Reply deadline in milliseconds, excluding local Pause. Must be in `1..2147483647`. Used when sensitive mode is enabled. |
+| `tolerance-ms` | integer | `90000` | Reply deadline in milliseconds, including local Pause. Must be in `1..2147483647`. Used when sensitive mode is enabled. |
 
 Avoid very small intervals unless you intentionally want high keepalive traffic.
-With sensitive mode disabled, each live tracked line receives one ping frame per
-interval while its upstream output is writable; paused lines skip timer pings.
+In both modes, the first ping is due one `ping-interval` after downstream transport
+`Est`. The worker timer sends it on the first check at or after that deadline.
+Application traffic can flow during this wait; a reply deadline starts only when
+a ping is sent in sensitive mode.
+
+With sensitive mode disabled, the worker timer checks every `ping-interval`
+milliseconds and sends one ping on each live line whose ping is due, including
+during Pause.
 
 ## Reply Watchdog
 
-In sensitive mode, the first ping is due one `ping-interval` after downstream
-transport `Est`. Only one ping may be outstanding. An empty pong on that exact
+In sensitive mode, only one ping may be outstanding. An empty pong on that exact
 line clears the wait. Application frames, peer pings, unknown kinds and nonempty
 pongs do not acknowledge it; unsolicited pongs are ignored.
 
@@ -133,13 +138,13 @@ owner event loop's monotonic clock. Its existing worker timer checks every
 `ping-interval`. Expiry is handled on the first check at or after the deadline,
 or when a late pong is decoded.
 
-Pause in either direction suppresses new watchdog pings and suspends the reply
-countdown. Repeated and overlapping pauses count once; both directions must
-resume before the countdown continues. An already-admitted pong can acknowledge
-the wait during Pause. Finish discards the pending wait.
+Pause in either direction leaves periodic pings and the reply deadline running.
+The watchdog closes an expired line on its next check without waiting for Resume.
+An already-admitted pong can acknowledge a timely ping during Pause. Finish
+discards the pending wait.
 
 Choose a tolerance that permits the path's throughput and latency. Pongs share
-the ordered stream with normal frames, so unpaused queueing and a 6 MiB body can
+the ordered stream with normal frames, so paused time, queueing and a 6 MiB body can
 delay a reply. KeepAliveServer already answers these pings.
 
 ## Frame Format
@@ -171,11 +176,11 @@ same five-byte prefix.
 | upstream `Init` | Initializes the read buffer and tracking fields, tracks the line, then forwards `Init` to `next`. |
 | upstream `Payload` | Encodes the payload into one or more normal frames and forwards them to `next`. Empty payloads are recycled. |
 | upstream `Est` | Forwards to `next`. |
-| upstream `Pause` / `Resume` | Records reply-read permission and watchdog pause time, then forwards to `next`. |
+| upstream `Pause` / `Resume` | Forwards to `next`; probes and watchdog deadlines continue. |
 | upstream `Finish` | Untracks the line, destroys local state, then forwards `Finish` to `next`. |
 | downstream `Payload` | Treats bytes as framed input from `KeepAliveServer`; forwards decoded normal payloads to the previous node. |
 | downstream `Est` | Publishes transport readiness for the watchdog, then promptly forwards to the previous node. |
-| downstream `Pause` / `Resume` | Records timer-output permission and watchdog pause time, then forwards to the previous node. |
+| downstream `Pause` / `Resume` | Forwards to the previous node; probes and watchdog deadlines continue. |
 | downstream `Finish` | Untracks the line, destroys local state, then forwards `Finish` to the previous node. |
 | downstream `Init` | Disabled; reaching this callback is treated as a fatal invalid chain flow. |
 
@@ -248,8 +253,8 @@ limits nested retained bytes to 8 MiB, and limits retained allocation charge to
 16 MiB, attempting beneficial ordinary compaction before refusing excess charge.
 Complete frames in an admitted delivery drain before checking the 6 MiB + 5 byte
 incomplete-remainder limit. Pause is forwarded promptly and does not interrupt
-that synchronous batch. Timer-generated pings stop while upstream output is
-paused and resume on a later timer tick after Resume.
+that synchronous batch. Timer-generated pings continue while either direction
+is paused; Pause and Resume never postpone an outstanding reply deadline.
 
 Zero or oversized frame body lengths, admission failure and retained-storage overflow
 close the borrowed line through its owner. Finish releases incomplete frames,

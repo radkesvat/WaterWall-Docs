@@ -995,7 +995,13 @@ Reentrant source Finish destroys the unattached state without reflection; a
 finished child must not be attached or established afterward.
 
 MuxClient's `keepalive` defaults true in all modes, with `ping-interval` 15000 ms
-and `tolerance-ms` 45000 ms (integers in `1..INT_MAX`). MuxServer's boolean
+and `tolerance-ms` 45000 ms (integers in `1..INT_MAX`). Each parent schedules its
+first probe one `ping-interval` after downstream transport Est, sending on the
+first worker tick at or after that deadline. Waiting for this probe does not
+make the parent suspect or block child attachment; reply timing starts only
+when a probe is sent. A parent-local transport notification latch sets this
+schedule even if a downstream junction already marked the shared line established;
+repeated Est does not reset it. MuxServer's boolean
 `keepalive` defaults true and controls replies only. Disabled endpoints consume
 controls without responding or acknowledging. Only a matching complete Pong on
 the same parent clears an outstanding probe; user traffic and partial frames do
@@ -1003,23 +1009,27 @@ not. The first matching Pong confirms peer support. Unanswered discovery probes
 are retried without suspicion or retirement, so disabled responders are safe but
 parents that never confirm support have no health-based recovery.
 
-At new-child selection, one quarter of unpaused tolerance (at least 1 ms) makes
-a confirmed parent lower priority in fixed mode; full tolerance permits soft
-retirement in every mode. Late matching replies restore unretired parents.
+One quarter of elapsed tolerance (at least 1 ms) makes a confirmed parent lower
+priority in fixed selection. Full tolerance permits soft retirement in every
+mode on the worker timer or new-child selection, including during Pause. Late
+matching replies restore unretired parents.
 Retirement preserves attached children and the authoritative owner inventory,
 but never returns a parent to selection. Each worker retains at most one
 keepalive-retired parent per fixed slot, or one in timer/counter modes. Pending
 final output still counts; Unregister settles the count exactly once. At the
 bound, occupied unresponsive parents remain selectable. Empty unresponsive
-parents may close through normal parent-loss cleanup. Last-child closure
-otherwise preserves output until drain. Timer/counter rotation is independent.
+parents close through normal parent-loss cleanup without waiting for Resume.
+A watchdog-retired parent closes when its last child leaves, discarding blocked
+final output. Ordinary timer/counter rotation still preserves output until drain.
 No active child is forcibly terminated and no timer creates replacement parents.
 
 Probe times use `wloopNowMonotonicMS()` on the owner worker. Parent transport
-Pause freezes elapsed time; repeated signals must not count twice. Child
-FlowPause is independent. The timer emits only with writable output, no active
-pump and no pending queue. Downstream queueing still consumes tolerance. Permanent
-Pause or unconfirmed support can defer recovery indefinitely. Quiet connections
+Pause and child FlowPause do not suspend probes or reply deadlines. Complete
+Ping/Pong frames may precede queued ordinary output, but never interrupt a frame
+callback. Reentrant controls use their own FIFO under the same parent charge
+limit; application frames retain their ordering and Pause gate. Downstream
+buffering and transfer consume tolerance. Unconfirmed support still prevents
+health-based retirement. Quiet connections
 and one-way uploads need only the Mux peer's reply. See Part 7 for timer ownership.
 
 ## Est, Pause, and Resume
@@ -1100,8 +1110,12 @@ Pause tells a source or independent drain to stop admitting new work toward that
 consumer. It does not revoke ownership already transferred into an active
 synchronous input batch. A regular transform forwards the signal toward the
 source, then may finish that batch, checking logical life after every callback.
-It must not read more input, start a timer-generated send, or append unrelated
-queued work to the active batch merely to evade Pause.
+It must not read more input, start a timer-generated application send, or append
+unrelated queued work to the active batch merely to evade Pause. Mux and
+KeepAlive Ping/Pong are an explicit exception: fixed-size protocol controls may
+be submitted during Pause while their watchdog deadlines continue. This never
+authorizes application backlog draining or callbacks after Finish, and receiver
+hard limits still apply.
 
 #### Completing an admitted input batch
 
@@ -1165,13 +1179,15 @@ bounds and permission handling; they do not establish a requirement that every
 ordinary encoder/decoder own a transport queue.
 
 MuxClient and MuxServer are examples of explicit local buffering: parent transport
-Pause immediately forbids all parent-bound Payload, including protocol controls.
-They retain encoded output in a bounded per-parent FIFO and pause child producers
+Pause forbids ordinary parent-bound Payload, including Open, Close and flow
+controls. Empty Ping/Pong frames bypass Pause at complete frame boundaries;
+reentrant keepalive controls share the parent charge limit through a separate
+control FIFO. They retain ordinary encoded output in a bounded per-parent FIFO and pause child producers
 at its aggregate queue-capacity threshold, in addition to individual writer holds.
 Complete queued frames retain valid private bodies under local queue limits. Incoming assembly and attached child queues share
 the existing parent receive limit, with beneficial pressure compaction followed by
 largest-child shedding or parent close. There is no worker-wide pipe quota. Pause
-still forbids Payload, not retention; see the [Part 3 contract](./part3-buffers-and-padding.mdx#queue-capacity-budgets).
+still forbids ordinary Payload, not retention; see the [Part 3 contract](./part3-buffers-and-padding.mdx#queue-capacity-budgets).
 A blocked child writer acquires its own local producer hold immediately after
 admission, including empty Data and complete splice batches. A direct write that
 leaves the transport paused holds its writer before returning; a transient Pause
