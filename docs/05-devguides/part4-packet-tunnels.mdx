@@ -310,11 +310,38 @@ this source organization.
 
 ## Device ingress fragment policy
 
-On Linux, TunDevice requests IPv4 TCP GSO by default. Explicit `"gso": false`
-keeps raw-IP TUN framing. Requested GSO uses a 10-byte little-endian virtio
-header and `TUN_F_CSUM | TUN_F_TSO4`; negotiation failure is logged and startup
-continues with raw-IP framing. The active framing choice applies to both reads
-and writes for the lifetime of the device.
+Every fresh Linux TunDevice attempts checksum offload independently of `gso`.
+It probes an exclusive new interface with `IFF_VNET_HDR`, selects a 10-byte
+little-endian virtio header and requests `TUN_F_CSUM` first. The existing `gso`
+setting defaults to true and controls TCPv4 segmentation only. When requested,
+a second ioctl replaces the mask with `TUN_F_CSUM | TUN_F_TSO4`; a rejected
+upgrade keeps checksum-only mode on that descriptor.
+
+| Final mode | TUN framing | Active features |
+| --- | --- | --- |
+| Raw fallback | IP bytes | None negotiated |
+| Checksum only | 10-byte little-endian virtio header + IP | `TUN_F_CSUM` |
+| Checksum and TCPv4 GSO | Same virtio framing | `TUN_F_CSUM \| TUN_F_TSO4` |
+
+Unavailable checksum/virtio setup or common scratch, capacity-notifier or FIFO
+resources cause a close/reopen into raw mode before publication. Open, MTU,
+nonblocking and other genuine construction failures still fail construction.
+A GSO output-allowance failure disables TSO4 with a successful `TUN_F_CSUM`
+downgrade before publishing checksum-only state; if that ioctl fails, the
+descriptor is closed and reopened in checksum-only or raw mode. The session
+budget is configured once; partial common setup remains session-owned through
+raw fallback and cleanup. Startup logs both the active mode and requested GSO.
+That active mode fixes framing in both directions through stop and restart.
+
+The checksum probe is always exclusive. Requested `gso:false` preserves the
+nonexclusive attachment path for pre-existing raw interfaces, including its
+resolver-baseline ownership; requested `gso:true` still rejects name conflicts.
+No offload is negotiated on a nonexclusively attached interface.
+
+Checksum-only mode rejects every non-NONE GSO type before trust or work admission.
+`TUN_F_CSUM` permits deferred checksums but does not require `NEEDS_CSUM` on each
+record: completed, unmarked and applicable `DATA_VALID` input keep their existing
+validation and admission rules.
 
 Outside the direct trusted pair described below, ordinary `GSO_NONE` TCP/UDP
 records with matching `NEEDS_CSUM` coordinates complete their checksum on the
@@ -349,9 +376,9 @@ for any accepted protocol. The rule applies on both the worker and reader
 completion paths. TCP GSO segment completion instead preserves a computed TCP
 zero. Keep this offload encoding outside the generic checksum backend.
 
-An enabled Linux GSO session has one FIFO per event worker. Ordinary batches and
-GSO work share that FIFO, so a later ordinary packet cannot overtake unfinished
-GSO work on the same worker. Each callback shares a budget of 64 packets and
+Either Linux offload mode has one FIFO per event worker. Ordinary batches,
+checksum work and GSO work share that FIFO, so a later ordinary packet cannot
+overtake unfinished GSO work on the same worker. Each callback shares a budget of 64 packets and
 64 KiB across ordinary packets, GSO segments, and intact aggregates. An intact
 aggregate consumes one packet from that budget and its full IPv4 length from the
 byte budget. Completed small aggregates share remaining capacity with subsequent
@@ -625,8 +652,9 @@ trusted IPv4 header and TCP/UDP transport checksums. Both nodes advertise the
 static `kNodeFlagSupportsTrustedPacketChecksums` capability. TunDevice configures its
 private device after successful Linux virtio/checksum setup, scratch allocation,
 and worker FIFO setup, then publishes `kNodeFlagTrustedPacketChecksumsActive` on
-both instances before starting device threads. `gso:false`, any fallback,
-non-Linux devices, or an intervening node retain ordinary behavior. A pair of
+both instances before starting device threads. Checksum-only mode, including
+`gso:false` and a rejected GSO upgrade, is eligible. Raw fallback, non-Linux
+devices, or an intervening node retain ordinary behavior. A pair of
 TUN devices cannot negotiate the bridge contract. PTC reads the published mode
 when each owner-worker route is created lazily, regardless of node start order.
 
@@ -640,8 +668,8 @@ assurance only in TUN-private queued work. Simultaneous flags are rejected.
 Ordinary records, generated GSO segments, and intact aggregates share the existing
 bounded worker FIFO; no checksum marker is added to an sbuf or line.
 
-On this active pair, preflighted, assured TCPv4 GSO is delivered intact as one
-complete, unfragmented IPv4 packet of at most 65,535 bytes. PTC's custom pbuf
+With active GSO on this pair, preflighted, assured TCPv4 GSO is delivered intact
+as one complete, unfragmented IPv4 packet of at most 65,535 bytes. PTC's custom pbuf
 wraps the aggregate for lwIP input without userspace segmentation or transport
 checksum completion. The aggregate retains the worker selected by the ordinary
 flow hash and its position in the worker FIFO. lwIP sees one larger TCP segment;
@@ -696,7 +724,7 @@ immediate enqueue-only TunDevice sink may receive it inline on the exact packet
 worker; other neighbours stay deferred. The same rule covers fake-DNS fragments.
 Normal-line callbacks retain their deferred reentry boundary.
 
-On an active direct trusted Linux pair with actual virtio framing, the writer
+On an active direct trusted Linux pair with active TCPv4 GSO, the writer
 collects only already-available FIFO entries, without a fill timer or per-flow
 cache. It combines only adjacent exact IPv4 TCP data packets with IHL 20, valid
 headers, original lengths within MTU, identical flow/ACK/window/options/DF/TTL/TOS
@@ -713,7 +741,10 @@ at TCP offset 16. The native `writev()` receives that header and original payloa
 slices as one record. EINTR retries retain ownership; a short result is never
 replayed. Linux TUN's pre-injection `EINVAL` rejection falls back to originals and
 latches off writer aggregation with one diagnostic, leaving framing and checksum
-trust unchanged. Invalid generated metadata remains a defect. Other I/O errors
+trust unchanged. Checksum-only writers never collect GSO batches; trusted
+ordinary TCP/UDP writes retain partial seeds and `NEEDS_CSUM` with `GSO_NONE`,
+while untrusted ordinary writes use zero metadata and complete IP bytes.
+Invalid generated metadata remains a defect. Other I/O errors
 retain the device's existing transient, packet-local and fatal handling.
 
 ## ProtoSwap checksum representation
