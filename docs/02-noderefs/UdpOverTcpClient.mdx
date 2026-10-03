@@ -12,7 +12,7 @@ Sync note: Any change to this file must also be applied to WaterWall/tunnels/Udp
 
 # UdpOverTcpClient
 
-`UdpOverTcpClient` carries UDP-style packet payloads over a TCP-style byte stream. It preserves packet boundaries by
+`UdpOverTcpClient` carries UDP datagrams over a TCP byte stream. It preserves packet boundaries by
 prefixing each outbound payload with a 2-byte length field before sending it to the next stream-facing node.
 
 It is normally paired with `UdpOverTcpServer` on the remote side.
@@ -39,7 +39,7 @@ Client side:
 UdpListener -> UdpOverTcpClient -> TcpConnector
 UdpListener -> UdpOverTcpClient -> TlsClient -> TcpConnector
 UdpListener -> UdpOverTcpClient -> EncryptionClient -> TcpConnector
-TcpUdpListener -> UdpOverTcpClient -> TcpConnector
+TcpUdpListener -> Router (UDP branch) -> UdpOverTcpClient -> TcpConnector
 ```
 
 Server side:
@@ -131,66 +131,59 @@ previous node.
 
 The length prefix is transport framing. It is not part of the original UDP payload.
 
-## Protocol Marker
-
-The normal packet frame uses a non-zero length. Length `0` is reserved for an internal protocol marker:
-
-```text
-00 00 <protocol-byte>
-```
-
-During upstream `Init`, the client checks the line source protocol:
-
-| Source protocol | Marker behavior |
-| --- | --- |
-| exact UDP | No marker is sent. The server will default the reconstructed destination protocol to UDP when it sees the first data frame. |
-| exact TCP | Sends a marker with `IP_PROTO_TCP`. |
-| other or ambiguous | Sends a marker with `IP_PROTO_UDP`. |
-
-This marker lets `UdpOverTcpServer` set the destination protocol before it initializes the next node. It is especially
-useful in mixed-protocol chains that end in `TcpUdpConnector`.
+Each payload callback on the datagram-facing side represents one UDP datagram. These nodes always carry
+UDP payloads; the source protocol metadata does not change their framing. Mixed listeners must route TCP
+traffic through a separate path before the client.
 
 ## Packet Size Limit
 
-The maximum payload accepted by the current implementation is:
+The maximum outbound UDP datagram size is:
 
 ```text
 65535 - 20 - 8 - 2 = 65505 bytes
 ```
 
-The `2` is the `UdpOverTcp` length header. Packets larger than this limit are logged and dropped. Empty payloads are
-treated as invalid in debug builds.
+Datagrams larger than this limit are dropped intact. Empty outbound payloads violate the existing Debug
+invariant; Release drops them. An incoming zero-length frame is invalid and closes the carrier.
 
 ## Buffering And Overflow
 
-Incoming stream bytes from the next node are buffered until at least one complete frame can be decoded.
+Incoming stream bytes from the next node are buffered until complete frames can be decoded.
 
-The current read-stream overflow threshold is:
+The incomplete read-stream overflow threshold is:
 
 ```text
-2 * kMaxAllowedUDPPacketLength
+2 * kMaxAllowedUDPPacketLength = 131010 bytes
 ```
 
-If the buffered stream grows beyond that threshold, the implementation logs a warning and empties the read stream. It
-does not close the line only because of this overflow.
+Complete frames drain before the incomplete suffix is checked. Retained buffer charge is capped at 4 MiB,
+with beneficial compaction attempted first. Malformed frames, allocation refusal or exhausted storage close
+the carrier through its owner. Decoder reentry shares a 2 MiB byte limit and 4 MiB charge limit with its
+retained stream. The parser never discards arbitrary stream bytes to continue.
 
 ## Lifecycle Behavior
 
-On upstream `Init`, the client:
+On upstream `Init`, the client initializes its per-line framing state and immediately forwards upstream
+`Init` to the next node. Transport Est, Pause and Resume are forwarded promptly.
 
-1. initializes its per-line read stream
-2. forwards upstream `Init` to the next node
-3. sends the optional protocol marker when needed
+On upstream payload, it frames the previous node's datagram and sends it to the next stream side.
+On downstream payload, it decodes framed bytes and forwards recovered datagrams back to the previous node.
 
-On upstream payload, it frames the previous node's packet and sends it to the next stream side.
-
-On downstream payload, it decodes framed bytes from the stream side and forwards recovered packets back to the previous
-node.
-
-On `Finish` from either direction, it destroys its local line state and forwards `Finish` in the matching WaterWall
-direction. It does not call `lineDestroy()`.
+On `Finish` from either direction, it destroys its local line state and forwards `Finish` away from the
+sender in the matching WaterWall direction. It does not call `lineDestroy()`.
 
 `UpStreamEst` and `DownStreamInit` are disabled in the current implementation.
+
+## Splice Support
+
+Both nodes accept ordinary buffers and private-pipe bodies. Each outbound UDP datagram keeps its body,
+gains a resident two-byte length prefix, and is forwarded in one callback. Oversized datagrams are dropped
+intact. The decoder caches only the two-byte length header and extracts each complete datagram as one owned
+buffer, with ordinary fallback when pipe resources are unavailable.
+
+UDP datagram boundaries remain intact, and the TCP carrier remains eligible for splice. Any UDP socket
+materialization fallback belongs to the UDP sender. Complete frames in an admitted stream input continue
+after Pause; Finish or admission refusal stops processing.
 
 ## Padding
 
@@ -208,7 +201,7 @@ Do not remove this padding requirement from chain calculations; the framing path
 - Do not place a packet-only node after the client; the next side receives framed stream bytes.
 - Do not expect this node to create a TCP connection by itself; use `TcpConnector` or another stream transport after it.
 - Do not treat the 2-byte header as part of the original UDP payload.
-- Do not send packets larger than `65505` bytes.
+- Do not send UDP datagrams larger than `65505` bytes.
 
 ## Node Metadata
 
@@ -216,7 +209,7 @@ Source-backed metadata:
 
 | Property | Value |
 | --- | --- |
-| node flags | `kNodeFlagNone` |
+| node flags | `kNodeFlagSupportsSplice` |
 | `can_have_prev` | `true` |
 | `can_have_next` | `true` |
 | `layer_group` | `kNodeLayer4` |

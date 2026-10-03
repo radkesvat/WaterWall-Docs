@@ -11,7 +11,7 @@ Documentation version: 152
 
 # UdpOverTcpClient
 
-`UdpOverTcpClient` packet‌های UDP-style را روی یک byte stream از نوع TCP-style حمل می‌کند. برای حفظ مرز packet‌ها، یک فیلد دو بایتی length به ابتدای هر payload اضافه می‌کند و نتیجه را به node stream-facing بعدی می‌فرستد.
+`UdpOverTcpClient` datagramهای UDP را روی یک byte stream از نوع TCP حمل می‌کند. برای حفظ مرز packet‌ها، یک فیلد دو بایتی length به ابتدای هر payload اضافه می‌کند و نتیجه را به node stream-facing بعدی می‌فرستد.
 
 این node معمولاً با `UdpOverTcpServer` در سمت مقابل استفاده می‌شود.
 
@@ -35,7 +35,7 @@ UDP بر پایه message است، اما TCP فقط یک stream پیوسته ا
 UdpListener -> UdpOverTcpClient -> TcpConnector
 UdpListener -> UdpOverTcpClient -> TlsClient -> TcpConnector
 UdpListener -> UdpOverTcpClient -> EncryptionClient -> TcpConnector
-TcpUdpListener -> UdpOverTcpClient -> TcpConnector
+TcpUdpListener -> Router (UDP branch) -> UdpOverTcpClient -> TcpConnector
 ```
 
 سمت server:
@@ -122,61 +122,57 @@ connector سمت stream متناظر:
 
 length prefix فقط برای framing مسیر transport است و جزئی از payload اصلی UDP نیست.
 
-## protocol Marker {#protocol-marker}
-
-frame عادی از length غیرصفر استفاده می‌کند. length `0` برای یک marker داخلی protocol رزرو شده است:
-
-```text
-00 00 <protocol-byte>
-```
-
-در upstream `Init`، client source protocol line را بررسی می‌کند:
-
-| source protocol | رفتار marker |
-| --- | --- |
-| UDP دقیق | marker فرستاده نمی‌شود؛ server با دیدن نخستین data frame، protocol مقصد را UDP در نظر می‌گیرد. |
-| TCP دقیق | marker با `IP_PROTO_TCP` ارسال می‌شود. |
-| حالت‌های دیگر یا protocol مبهم | marker با `IP_PROTO_UDP` فرستاده می‌شود. |
-
-این marker به `UdpOverTcpServer` اجازه می‌دهد پیش از مقداردهی node بعدی، protocol مقصد را مشخص کند؛ قابلیتی مفید برای chain‌های چندپروتکلی که به `TcpUdpConnector` ختم می‌شوند.
+هر payload callback در سمت datagram دقیقاً یک datagram از نوع UDP است. این nodeها همیشه UDP حمل
+می‌کنند و metadata مربوط به source protocol، framing را تغییر نمی‌دهد. listener چندپروتکلی باید ترافیک
+TCP را پیش از client به مسیر جداگانه‌ای هدایت کند.
 
 ## محدودیت اندازه packet {#محدودیت-اندازه-packet}
 
-حداکثر payload قابل قبول در پیاده‌سازی فعلی:
+حداکثر اندازه datagram خروجی در پیاده‌سازی فعلی:
 
 ```text
 65535 - 20 - 8 - 2 = 65505 bytes
 ```
 
-عدد `2` اندازه header مربوط به length در `UdpOverTcp` است. packet‌های بزرگ‌تر از این حد در log ثبت و دور ریخته می‌شوند. در build‌های debug، payload خالی هم نامعتبر است.
+datagram بزرگ‌تر از این حد به‌صورت کامل drop می‌شود. payload خروجی خالی invariant موجود در Debug را
+نقض می‌کند و در Release، drop می‌شود. frame ورودی با length صفر نامعتبر است و carrier را می‌بندد.
 
 ## Buffering و Overflow
 
-بایت‌های ورودی stream از node بعدی تا کامل شدن حداقل یک frame در read stream نگه داشته می‌شوند.
-
-آستانه overflow فعلی read stream:
+بایت‌های ورودی stream تا کامل شدن frameها نگه داشته می‌شوند. آستانه suffix ناقص read stream:
 
 ```text
-2 * kMaxAllowedUDPPacketLength
+2 * kMaxAllowedUDPPacketLength = 131010 bytes
 ```
 
-اگر buffer از این حد عبور کند، پیاده‌سازی یک warning در log می‌نویسد و read stream را خالی می‌کند؛ این overflow به‌تنهایی باعث بسته شدن line نمی‌شود.
+frameهای کامل پیش از بررسی suffix ناقص پردازش می‌شوند. charge نگهداری buffer حداکثر ۴ MiB است و
+پیش از رد ورودی، compaction سودمند امتحان می‌شود. frame نامعتبر، شکست تخصیص یا عبور از محدودیت، carrier
+را از طریق owner آن می‌بندد. ورودی reentrant decoder با stream نگهداری‌شده، محدودیت مشترک ۲ MiB بایت
+و ۴ MiB charge دارد. بایت‌های دلخواه stream برای ادامهٔ parsing حذف نمی‌شوند.
 
 ## رفتار lifecycle {#رفتار-lifecycle}
 
-در upstream `Init`، client:
+در upstream `Init`، client framing state خود را مقداردهی می‌کند و بی‌درنگ `Init` را به node بعدی
+می‌فرستد. Transport Est، Pause و Resume نیز بی‌درنگ عبور می‌کنند.
 
-1. read stream مربوط به line را مقداردهی اولیه می‌کند
-2. upstream `Init` را به node بعدی می‌فرستد
-3. در صورت نیاز protocol marker را می‌فرستد
+در upstream payload، datagram مربوط به node قبلی frame می‌شود و به stream side می‌رود.
+در downstream payload، frameهای stream خوانده می‌شوند و datagramهای بازسازی‌شده به node قبلی برمی‌گردند.
 
-در upstream payload، packet node قبلی را frame می‌کند و به stream side می‌فرستد.
-
-در downstream payload، frame‌های سمت stream را می‌خواند و packet‌های بازسازی‌شده را به node قبلی برمی‌گرداند.
-
-با دریافت `Finish` از هر سمت، per-line state محلی را از بین می‌برد و `Finish` را در جهت درست ادامه می‌دهد. این node `lineDestroy()` را فراخوانی نمی‌کند.
+با دریافت `Finish` از هر سمت، state محلی از بین می‌رود و `Finish` در جهت دور شدن از فرستنده ادامه
+پیدا می‌کند. این node `lineDestroy()` را فراخوانی نمی‌کند.
 
 `UpStreamEst` و `DownStreamInit` در پیاده‌سازی فعلی غیرفعال‌اند.
+
+## پشتیبانی از splice
+
+هر دو node، buffer عادی و body موجود در pipe خصوصی را می‌پذیرند. هر datagram خروجی، body خود را حفظ
+می‌کند، یک length prefix دو بایتی در padding واقعی می‌گیرد و با یک callback تحویل می‌شود. datagram بزرگ‌تر
+از حد مجاز به‌صورت کامل drop می‌شود. decoder فقط header دو بایتی length را cache می‌کند و هر datagram
+کامل را در یک buffer مستقل تحویل می‌دهد؛ هنگام کمبود منابع pipe، از buffer عادی استفاده می‌شود.
+
+مرز datagramهای UDP حفظ می‌شود و carrier TCP همچنان امکان splice دارد. fallback لازم برای ارسال UDP
+در خود UDP sender انجام می‌شود. frameهای کامل ورودی پذیرفته‌شده پس از Pause هم پردازش می‌شوند؛
+Finish یا رد پذیرش پردازش را متوقف می‌کند.
 
 ## padding {#padding}
 
@@ -194,12 +190,7 @@ required_padding_left = 2
 - بعد از client node packet-only نگذارید؛ سمت بعدی stream بایت‌های frameشده دریافت می‌کند.
 - انتظار نداشته باشید این node خودش TCP connection بسازد؛ بعد از آن `TcpConnector` یا transport stream دیگری بگذارید.
 - header دو بایتی را بخشی از payload اصلی UDP فرض نکنید.
-- packet بزرگ‌تر از `65505` بایت نفرستید.
-
-در حالت TCP مذاکره‌شده، payload بزرگ به فریم‌های متوالی با حداکثر ۶۵۵۰۵ بایت
-تقسیم می‌شود و همهٔ فریم‌های encodeشده در یک callback تحویل داده می‌شوند. ترتیب
-بایت‌های TCP حفظ می‌شود. در حالت UDP هر payload یک datagram است و datagram
-بزرگ‌تر از حد مجاز همچنان drop می‌شود؛ برای جا دادن آن نباید datagram را تقسیم کرد.
+- datagram UDP بزرگ‌تر از `65505` بایت نفرستید.
 
 ## متادیتای node {#متادیتای-نود}
 
@@ -207,7 +198,7 @@ required_padding_left = 2
 
 | ویژگی | مقدار |
 | --- | --- |
-| node flags | `kNodeFlagNone` |
+| node flags | `kNodeFlagSupportsSplice` |
 | `can_have_prev` | `true` |
 | `can_have_next` | `true` |
 | `layer_group` | `kNodeLayer4` |

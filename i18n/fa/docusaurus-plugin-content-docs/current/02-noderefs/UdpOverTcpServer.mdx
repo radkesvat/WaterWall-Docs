@@ -30,7 +30,7 @@ TcpListener -> EncryptionServer -> UdpOverTcpServer -> UdpConnector
 ```text
 UdpListener -> UdpOverTcpClient -> TcpConnector
 UdpListener -> UdpOverTcpClient -> TlsClient -> TcpConnector
-TcpUdpListener -> UdpOverTcpClient -> TcpConnector
+TcpUdpListener -> Router (UDP branch) -> UdpOverTcpClient -> TcpConnector
 ```
 
 node قبلی `UdpOverTcpServer` باید یک مسیر stream فراهم کند؛ node بعدی payload‌های بازسازی‌شده packet را دریافت می‌کند.
@@ -113,69 +113,58 @@ server انتظار دارد frame‌های عادی این قالب را داش
 
 پاسخ‌های node بعدی مسیر برعکس را طی می‌کنند: server یک length دو بایتی به ابتدا اضافه می‌کند و frame حاصل را در جهت downstream به node stream قبلی می‌فرستد.
 
-## Init با تأخیر برای node بعدی {#init-با-تأخیر-برای-نود-بعدی}
-
-با دریافت upstream `Init`، `UdpOverTcpServer` فقط per-line state خود را مقداردهی می‌کند و هنوز node بعدی را راه نمی‌اندازد. ابتدا باید protocol مقصد از stream ورودی مشخص شود.
-
-دو حالت وجود دارد:
-
-| اولین item فریم‌شده | رفتار server |
-| --- | --- |
-| protocol marker با length `0` | byte مربوط به protocol خوانده می‌شود، `line->routing_context.dest_ctx` روی TCP یا UDP قرار می‌گیرد و سپس node بعدی مقداردهی می‌شود. |
-| data frame عادی | protocol مقصد UDP در نظر گرفته می‌شود، node بعدی مقداردهی می‌شود و بعد packet بازسازی‌شده به آن می‌رود. |
-
-تا پیش از مقداردهی node بعدی، upstream `Pause` و `Resume` نادیده گرفته می‌شوند و upstream `Finish` هم به `next` نمی‌رود.
-
-## protocol Marker {#protocol-marker}
-
-protocol marker یک frame رزرو‌شده است:
-
-```text
-00 00 <protocol-byte>
-```
-
-فقط `IP_PROTO_TCP` و `IP_PROTO_UDP` معتبرند. marker نامعتبر در log ثبت و read stream خالی می‌شود؛ node نیز با آن marker، upstream line را مقداردهی نمی‌کند.
-
-`UdpOverTcpClient` این marker را زمانی می‌سازد که server باید metadata مربوط به protocol را برای یک chain چندپروتکلی حفظ کند. در حالت معمول UDP-only، marker فرستاده نمی‌شود و server با نخستین frame عادی UDP را انتخاب می‌کند.
+هر payload callback در سمت datagram دقیقاً یک datagram از نوع UDP است. این nodeها همیشه UDP حمل
+می‌کنند و metadata مربوط به source protocol، framing را تغییر نمی‌دهد. listener چندپروتکلی باید ترافیک
+TCP را پیش از client به مسیر جداگانه‌ای هدایت کند.
 
 ## محدودیت اندازه packet {#محدودیت-اندازه-packet}
 
-حداکثر payload قابل قبول در پیاده‌سازی فعلی:
+حداکثر اندازه datagram خروجی در پیاده‌سازی فعلی:
 
 ```text
 65535 - 20 - 8 - 2 = 65505 bytes
 ```
 
-packet‌های بزرگ‌تر از این حد هنگام framing پاسخ در log ثبت و دور ریخته می‌شوند. در build‌های debug، payload خالی هم نامعتبر است.
+datagram بزرگ‌تر از این حد به‌صورت کامل drop می‌شود. payload خروجی خالی invariant موجود در Debug را
+نقض می‌کند و در Release، drop می‌شود. frame ورودی با length صفر نامعتبر است و carrier را می‌بندد.
 
 ## Buffering و Overflow
 
-بایت‌های ورودی stream تا کامل شدن frame‌ها buffer می‌شوند. آستانه overflow فعلی read stream:
+بایت‌های ورودی stream تا کامل شدن frameها نگه داشته می‌شوند. آستانه suffix ناقص read stream:
 
 ```text
-2 * kMaxAllowedUDPPacketLength
+2 * kMaxAllowedUDPPacketLength = 131010 bytes
 ```
 
-اگر buffer از این حد عبور کند، پیاده‌سازی یک warning در log می‌نویسد و read stream را خالی می‌کند؛ این overflow به‌تنهایی باعث بسته شدن line نمی‌شود.
+frameهای کامل پیش از بررسی suffix ناقص پردازش می‌شوند. charge نگهداری buffer حداکثر ۴ MiB است و
+پیش از رد ورودی، compaction سودمند امتحان می‌شود. frame نامعتبر، شکست تخصیص یا عبور از محدودیت، carrier
+را از طریق owner آن می‌بندد. ورودی reentrant decoder با stream نگهداری‌شده، محدودیت مشترک ۲ MiB بایت
+و ۴ MiB charge دارد. بایت‌های دلخواه stream برای ادامهٔ parsing حذف نمی‌شوند.
 
 ## رفتار lifecycle {#رفتار-lifecycle}
 
-با upstream `Init`، server ابتدا read stream خود را مقداردهی می‌کند و سپس منتظر protocol marker یا نخستین data frame می‌ماند.
+در upstream `Init`، server framing state خود را مقداردهی می‌کند، protocol مقصد را روی UDP می‌گذارد
+و بی‌درنگ node بعدی را مقداردهی می‌کند. Transport Est، Pause و Resume نیز بی‌درنگ عبور می‌کنند.
 
-در upstream payload:
+در upstream payload، بایت‌ها به read stream اضافه می‌شوند و datagramهای کامل در جهت upstream به
+node بعدی می‌روند. در downstream payload، هر datagram پاسخ یک length prefix دو بایتی می‌گیرد و
+در جهت downstream به سمت stream قبلی می‌رود.
 
-1. بایت‌ها به read stream اضافه می‌شوند
-2. با مشخص شدن protocol، node بعدی مقداردهی می‌شود
-3. frame‌های کامل از stream بیرون کشیده می‌شوند
-4. payload‌های بازسازی‌شده در جهت upstream به node بعدی می‌روند
-
-در downstream payload، node یک length prefix دو بایتی به packet اضافه می‌کند و frame حاصل را به سمت stream قبلی می‌فرستد.
-
-با downstream `Finish`، per-line state محلی از بین می‌رود و `Finish` به سمت قبلی ادامه پیدا می‌کند.
-
-با upstream `Finish` نیز per-line state محلی از بین می‌رود. این `Finish` تنها زمانی به node بعدی می‌رسد که آن node قبلاً مقداردهی شده باشد.
+با دریافت `Finish` از هر سمت، state محلی از بین می‌رود و `Finish` در جهت دور شدن از فرستنده ادامه
+پیدا می‌کند. این node `lineDestroy()` را فراخوانی نمی‌کند.
 
 `UpStreamEst` و `DownStreamInit` در پیاده‌سازی فعلی غیرفعال‌اند.
+
+## پشتیبانی از splice
+
+هر دو node، buffer عادی و body موجود در pipe خصوصی را می‌پذیرند. هر datagram خروجی، body خود را حفظ
+می‌کند، یک length prefix دو بایتی در padding واقعی می‌گیرد و با یک callback تحویل می‌شود. datagram بزرگ‌تر
+از حد مجاز به‌صورت کامل drop می‌شود. decoder فقط header دو بایتی length را cache می‌کند و هر datagram
+کامل را در یک buffer مستقل تحویل می‌دهد؛ هنگام کمبود منابع pipe، از buffer عادی استفاده می‌شود.
+
+مرز datagramهای UDP حفظ می‌شود و carrier TCP همچنان امکان splice دارد. fallback لازم برای ارسال UDP
+در خود UDP sender انجام می‌شود. frameهای کامل ورودی پذیرفته‌شده پس از Pause هم پردازش می‌شوند؛
+Finish یا رد پذیرش پردازش را متوقف می‌کند.
 
 ## padding {#padding}
 
@@ -190,13 +179,8 @@ required_padding_left = 2
 - بدون `UdpOverTcpClient` در سمت مقابل از این node استفاده نکنید.
 - آن را مستقیماً بعد از node packet-only نگذارید؛ سمت قبلی باید stream بایت‌های frameشده فراهم کند.
 - انتظار نداشته باشید خودش TCP listen کند؛ قبل از آن `TcpListener` یا adapter stream-facing دیگری بگذارید.
-- بعد از آن stream-only node نگذارید مگر اینکه عمداً از protocol marker path استفاده می‌کنید و node بعدی آن metadata را می‌فهمد.
-- packet بزرگ‌تر از `65505` بایت نفرستید.
-
-در حالت TCP مذاکره‌شده، payload بزرگ به فریم‌های متوالی با حداکثر ۶۵۵۰۵ بایت
-تقسیم می‌شود و همهٔ فریم‌های encodeشده در یک callback تحویل داده می‌شوند. ترتیب
-بایت‌های TCP حفظ می‌شود. در حالت UDP هر payload یک datagram است و datagram
-بزرگ‌تر از حد مجاز همچنان drop می‌شود؛ برای جا دادن آن نباید datagram را تقسیم کرد.
+- سمت بعدی باید مرز datagramهای UDP را حفظ کند و مقصد UDP داشته باشد.
+- datagram UDP بزرگ‌تر از `65505` بایت نفرستید.
 
 ## متادیتای node {#متادیتای-نود}
 
@@ -204,7 +188,7 @@ required_padding_left = 2
 
 | ویژگی | مقدار |
 | --- | --- |
-| node flags | `kNodeFlagNone` |
+| node flags | `kNodeFlagSupportsSplice` |
 | `can_have_prev` | `true` |
 | `can_have_next` | `true` |
 | `layer_group` | `kNodeLayer4` |
