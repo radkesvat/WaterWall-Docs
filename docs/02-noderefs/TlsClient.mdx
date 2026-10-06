@@ -6,7 +6,7 @@ description: "Reference documentation for the TlsClient node."
 ---
 
 <!--
-Documentation version: 158
+Documentation version: 159
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/TlsClient/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/TlsClient.mdx, and all files must keep the same documentation version.
 -->
 
@@ -288,8 +288,9 @@ The TLS context is configured with:
 | --- | --- |
 | Minimum TLS version | TLS 1.2 |
 | Maximum TLS version | TLS 1.3 |
-| Session cache | client session cache enabled |
-| Session timeout | 7200 seconds |
+| Session cache | At most two sessions per node and worker |
+| TLS 1.2 session timeout | 3600 seconds |
+| TLS 1.3 session timeout | BoringSSL session lifetime, capped by the server ticket lifetime |
 | GREASE | enabled |
 | Extension permutation | enabled |
 | Certificate compression | Brotli decompression support |
@@ -380,6 +381,35 @@ permutation, while preserving the leading empty and trailing one-byte GREASE ext
 Key-share lengths and the permitted ECH GREASE framing and payload sizes are also checked. This is an initial-ClientHello
 comparison for that profile; it does not establish resumption, real ECH, later record sizes or timing, or application
 behavior matching Chrome.
+
+## Session Resumption
+
+Each `TlsClient` node keeps a separate, two-session cache in each worker's SSL context. The context fixes the configured
+SNI, ALPN and verification policy. Runtime connections check their SNI and verification mode before using the cache;
+constructor preflight, raw ClientHello generation and ECH-inner generation always remain fresh and neither consume
+nor add cached sessions. The cache belongs to the SSL context and is released with it.
+
+Ticket size is capped using the worst-case fresh ClientHello preflight, with space reserved for PSK framing.
+Oversized tickets are discarded, keeping later ClientHellos within their size limit even with large custom ALPN or
+ECH settings. If no usable session remains, the next connection starts with a fresh handshake.
+
+TLS 1.3 tickets are single-use: selecting one for a connection removes it from the cache, even if that connection fails
+before sending or the server declines resumption. TLS 1.2 ECDHE sessions can be reused. Expiry follows each stored
+session's creation time and timeout. TLS 1.2 sessions have a one-hour timeout; TLS 1.3 follows BoringSSL's session
+lifetime and the server's ticket lifetime. A server can always decline an offered session and perform a full handshake.
+
+With `verify: true`, the cached peer certificates are revalidated before a session is offered, using the current
+connection's roots, hostname and verification parameters. The pinned TAI intermediates remain untrusted candidates
+when rebuilding an elided chain. An invalid or expired cached identity is discarded; if no usable session remains,
+the connection performs a full handshake. `verify: false` retains its explicit server-authentication opt-out.
+
+This cache is partitioned by node and worker. Chrome's browser-wide port, proxy and privacy partitioning is outside
+that scope. Static-RSA TLS 1.2 sessions are excluded because Chrome binds them to the peer IP, and this generic TLS
+transform cannot establish that endpoint from mutable routing metadata.
+
+Tickets are collected as TLS input is processed, including tickets encountered during a Reality TLS 1.3 takeover
+drain. Takeover does not wait for a ticket, so resumption is opportunistic. 0-RTT remains disabled and application data
+waits for the handshake to complete.
 
 ## Bundled TLS Library
 
