@@ -653,10 +653,13 @@ the scan. Item creation exposes a handle only after both the map and expiration
 heap own it; heap-publication failure rolls the map insertion back.
 
 Worker-local and shared idle tables have different shutdown boundaries. Quiesce
-each `local_idle_table_t` timer on its exact owner worker before line drain, then
-drain the entire local table inline and destroy it while that worker's loop,
-callbacks, lines, and pools remain alive. Never transfer a local table or item
-handle to another worker. For `idle_table_t`, drain each owner WID's active
+each `local_idle_table_t` timer on its exact owner worker before line drain. An
+owning component drains the entire local table inline and destroys it while that
+worker's loop, callbacks, lines, and pools remain alive. A registry of borrowed
+lines instead remains available until the line owners remove its entries, then
+the empty table is destroyed on that same worker. Tunnel storage order cannot
+prove that a neighboring owner has already drained. Never transfer a local table
+or item handle to another worker. For `idle_table_t`, drain each owner WID's active
 inventory on that WID before final shared-table destruction. An item already
 owned by a posted expiration message is detached by owner drain rather than
 called back or freed there; the message callback or cleanup retains delivery and
@@ -702,17 +705,34 @@ creation remains a new-child selection action. Watchdog-retired parents close
 after their last child leaves without waiting for blocked final output. MuxServer
 responds through the bounded parent FIFO and obeys Pause, creating no timer or child.
 
-KeepAliveClient uses its existing per-worker timer and borrowed-line registry,
-with no per-line timer roots. Both modes schedule the first ping one `ping-interval`
+Each KeepAliveClient instance embeds a trailing worker-state array in its tunnel
+allocation, sized once at construction for the fixed event-worker count. Each
+slot contains a local idle table, a borrowed-line count, and its quiescence gate.
+The first transport Est on that worker creates the table through its existing
+fail-fast constructor. The table holds one recurring ping item per established
+line and a separate deadline item only while sensitive mode awaits a pong. Item
+keys use the addresses of their distinct owner handle slots. No deadline-shortening
+API, shared registry mutex, line-list scan, or snapshot allocation is needed.
+Ping callbacks retain their exact line across payload delivery; reentrant Finish
+removes either the current item or a sibling item before the heap visits it.
+Worker quiescence stops expiry and closes table admission, preserving active
+handles for owner drain. The last borrowed line releases the quiesced table on
+its worker; final instance destruction requires zero borrowed lines and no table
+in every slot. There are no per-line timer roots. Both modes schedule the first
+ping one `ping-interval`
 after downstream transport Est, without blocking application traffic. Repeated
 Est does not reset the schedule. Its optional reply watchdog starts only when a
 ping is sent, publishing one outstanding ping and its monotonic deadline before
 the payload callback, and acknowledges only an empty pong on that exact line.
-The timer scans held snapshot references; timeout destroys local state before
+The deadline item expires independently of the ping schedule. A valid pong removes
+only its deadline item. Timeout destroys local state before
 finishing upstream and then a still-live downstream owner. It never destroys or
 recreates the borrowed line. Either directional Pause leaves timer checks and
 elapsed reply deadlines running; expiry does not require Resume. New probes wait
-for outgoing permission, retaining one due timestamp rather than queued frames.
+for outgoing permission or an outstanding pong, retaining one due timestamp
+rather than queued frames. A blocked ping item retries after one second without
+extending the outstanding reply deadline. Idle-table checks may deliver a new
+earlier deadline about one second late; subsecond wakeup precision is not required.
 Both KeepAlive endpoints defer at most 1,024 Pong obligations during outgoing
 Pause. Resume forwards permission before draining, rechecks reentrant Pause and
 uses exact-line references across callbacks; Finish discards pending replies.
