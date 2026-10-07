@@ -59,10 +59,11 @@ buf[0]                curpos                        curpos+len             capac
 - **`len`** is how many payload bytes are valid starting at `curpos`.
 - **Left capacity** (`sbufGetLeftCapacity` = `curpos`) is how many bytes you can
   still prepend by shifting left.
-- **Writeable tail** (`sbufGetMaximumWriteableSize` = `capacity - curpos`) is how
-  much you can address forward from the cursor — note this is **not** the spare
-  room beyond the current payload; to append `extra` bytes compare against
-  `len + extra`.
+- **Writable capacity** (`sbufGetMaximumWriteableSize` = `capacity - curpos`)
+  is how much you can address forward from the cursor, including current payload.
+- **Tail capacity** (`sbufGetTailCapacity` = `capacity - curpos - len`) is the
+  spare room available to append bytes without growing an ordinary buffer.
+  It requires valid ordinary geometry; it is not available for splice buffers.
 
 ### Key Accessors
 
@@ -72,8 +73,9 @@ buf[0]                curpos                        curpos+len             capac
 | `sbufGetRawPtr(b)` / `sbufGetMutablePtr(b)` | pointer to the payload start (`buf + curpos`) |
 | `sbufGetLeftCapacity(b)` | bytes available to prepend (`curpos`) |
 | `sbufGetMaximumWriteableSize(b)` | bytes addressable from the cursor (`capacity - curpos`) |
+| `sbufGetTailCapacity(b)` | spare append space in an ordinary buffer (`capacity - curpos - len`) |
 | `sbufGetTotalCapacity(b)` | full allocation (constant) |
-| `sbufGetLeftPadding(b)` | the original `l_pad` value |
+| `sbufGetLeftPadding(b)` | the original aligned `l_pad` value |
 
 ### Reading and Writing
 
@@ -87,6 +89,10 @@ sbufWrite(b, src, n);              // raw copy of n bytes at the cursor
 sbufConsume(b, n);                 // drop n bytes from the payload tail count
 sbufShiftRight(b, n);              // advance cursor: consume n bytes from the front
 ```
+
+`sbufSlice(source, bytes)` consumes leading ordinary bytes into a new ordinary
+buffer with the source's full original aligned left padding. The caller owns
+both the result and the remaining source, including when the source becomes empty.
 
 ### Splice payloads: `kSbufFlagSplice`
 
@@ -831,6 +837,10 @@ Buffer lifetime bugs are as common as line lifetime bugs. The rules:
   `lineCallWithRef()` / `lineCallWithRefWithBuf()`), only recycle buffers you still hold; do not touch the dead
   line's state to do it.
 
+ContextQueue owns enqueued contexts until pop or destruction. `contextqueuePop()`
+returns `NULL` when empty; otherwise ownership transfers to the caller.
+`contextqueuePush()` terminates on deque insertion failure.
+
 ### BufferStream representation, inspection, and extraction contracts
 
 `buffer_stream_t` accepts **ordinary resident buffers only**. Use its views,
@@ -838,20 +848,20 @@ CRLF searches, exact/at-least/full reads, and `IdealRead()` only on ordinary
 input. Logical stream entries are storage boundaries, not protocol records.
 Push owns its input and preserves bounded ordinary coalescing: a positive input
 of at most 4 KiB may append to a tail with sufficient spare space. Exact reads
-preserve checked lengths and the explicit `use_left_padding` budget. Both stream
-implementations operate exclusively on bytes and owned buffers. Fragment
-assembly belongs to the device reader session; no claim, callback, sidecar token,
+preserve checked lengths and the explicit `use_left_padding` budget. Deque
+insertion failure terminates during push or exact-read remainder retention.
+Both stream implementations operate exclusively on bytes and owned buffers.
+Fragment assembly belongs to the device reader session; no claim, callback, sidecar token,
 or hidden padding metadata follows a packet through buffer transforms.
 
 `bufferstreamMoveExactBytesTo()` validates the source range and destination append
 space before consumption. It appends into sufficient caller-owned ordinary
 storage without growing/replacing it or spending additional headroom.
 
-Views and searches consume no bytes. Bounded searches examine only
-`[0, min(buffered, bound))`: a delimiter ending exactly at the bound matches;
-a delimiter crossing it does not. `FindCRLF` returns the CR offset and
-`FindDoubleCRLF` returns the offset after the delimiter. No-match leaves the
-output offset unchanged. `FindDoubleCRLFWithin` requires ordinary bytes.
+Views and searches consume no bytes. The delimiter searches inspect all buffered
+ordinary bytes, including delimiters split across entries. `bufferstreamFindCRLF()`
+returns the CR offset; `bufferstreamFindDoubleCRLF()` returns the offset after the
+delimiter. No match leaves the output offset unchanged.
 HTTP parsers remain ordinary-only. HttpClient and HttpServer do not advertise
 splice support. HttpProxyServer establishes an ordinary-memory boundary at
 payload admission: only a complete, immediately forwardable splice wrapper in
