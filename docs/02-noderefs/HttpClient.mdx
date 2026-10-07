@@ -6,7 +6,7 @@ description: "Reference documentation for the HttpClient node."
 ---
 
 <!--
-Documentation version: 152
+Documentation version: 153
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/HttpClient/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/HttpClient.mdx, and all files must keep the same documentation version.
 -->
 
@@ -155,6 +155,8 @@ In `http1-mode: "single"`, one HTTP/1.1 connection carries both directions:
 - upstream Waterwall payload becomes the request body
 - downstream response body becomes Waterwall payload
 - request payload is sent with `Transfer-Encoding: chunked`
+- each outgoing chunk contains at most 16,372 body bytes; its size prefix, body and trailing CRLF are sent together
+- empty payload buffers emit nothing; larger inputs are split without waiting for additional data
 - upstream `Finish` sends the final `0` chunk before the Waterwall finish is forwarded
 
 The response parser supports chunked responses, `Content-Length`, until-close response bodies, and response codes that must not have a body. Informational `1xx` responses are skipped internally.
@@ -246,11 +248,15 @@ In HTTP/2 mode, `HttpClient` opens one logical HTTP/2 request stream per Waterwa
 
 Important implementation details:
 
-- `MAX_CONCURRENT_STREAMS` is set to `1`
-- initial stream window is set to 1 MiB
-- maximum frame size is set to 32 KiB
+- the ordinary SETTINGS profile follows the pinned Chrome 154 desktop reference: header table 65,536 bytes, push disabled, initial stream receive window 6 MiB and header-list limit 262,144 bytes
+- the default maximum receive-frame size is 16 KiB, and the connection receive window is increased to 15 MiB
+- direct HTTP/2 sends the preface, initial SETTINGS and connection WINDOW_UPDATE together, followed by separate request HEADERS
+- outgoing DATA payloads are capped at 16,375 bytes, leaving nine bytes for the frame header within one 16 KiB TLS plaintext record; peer flow control may reduce them further
+- WebSocket mode additionally advertises `ENABLE_CONNECT_PROTOCOL = 1`; `h2c` uses the same SETTINGS profile
 - received DATA chunks are forwarded as Waterwall payload
 - upstream `Finish` sends an HTTP/2 `END_STREAM`
+
+There is no delayed batching. These choices reduce specific record-boundary differences when `TlsClient` follows directly; they do not reproduce browser headers, request scheduling or connection pooling. Explicit TLS shaping or other intervening transforms can change the final records.
 
 If you need many independent logical connections over one transport, use a Waterwall node such as `MuxClient` before `HttpClient` instead of expecting HTTP/2 stream multiplexing here.
 
