@@ -5,7 +5,7 @@ sidebar_label: "Part 2: Lines & Lifetime"
 description: "The connection lifecycle, re-entrancy hazards, line references, and the clean-finish patterns that keep WaterWall tunnels free of use-after-free bugs."
 ---
 <!--
-Documentation version: 180
+Documentation version: 181
 -->
 
 # Part 2: Lines, Callbacks & Lifetime Safety
@@ -997,8 +997,8 @@ finished child must not be attached or established afterward.
 MuxClient's `keepalive` defaults true in all modes, with `ping-interval` 15000 ms
 and `tolerance-ms` 45000 ms (integers in `1..INT_MAX`). Each parent schedules its
 first probe one `ping-interval` after downstream transport Est, sending on the
-first worker tick at or after that deadline. Waiting for this probe does not
-make the parent suspect or block child attachment; reply timing starts only
+first eligible local-idle expiry at or after that deadline. Waiting for this
+probe does not make the parent suspect or block child attachment; reply timing starts only
 when a probe is sent. A parent-local transport notification latch sets this
 schedule even if a downstream junction already marked the shared line established;
 repeated Est does not reset it. MuxServer's boolean
@@ -1011,26 +1011,39 @@ parents that never confirm support have no health-based recovery.
 
 One quarter of elapsed tolerance (at least 1 ms) makes a confirmed parent lower
 priority in fixed selection. Full tolerance permits soft retirement in every
-mode on the worker timer or new-child selection, including during Pause. Late
+mode on reply-deadline expiry or new-child selection, including during Pause. Late
 matching replies restore unretired parents.
 Retirement preserves attached children and the authoritative owner inventory,
 but never returns a parent to selection. Each worker retains at most one
 keepalive-retired parent per fixed slot, or one in timer/counter modes. Pending
 final output still counts; Unregister settles the count exactly once. At the
-bound, occupied unresponsive parents remain selectable. Empty unresponsive
-parents close through normal parent-loss cleanup without waiting for Resume.
+bound, occupied unresponsive parents remain selectable and the deadline item
+retries retirement after 1000 ms without changing the original probe time.
+Empty unresponsive parents close through normal parent-loss cleanup without
+waiting for Resume.
 A watchdog-retired parent closes when its last child leaves, discarding blocked
 final output. Ordinary timer/counter rotation still preserves output until drain.
-No active child is forcibly terminated and no timer creates replacement parents.
+No active child is forcibly terminated and no expiry callback creates replacement
+parents.
 
 Probe times use `wloopNowMonotonicMS()` on the owner worker. Parent transport
-Pause and child FlowPause do not suspend the timer or outstanding reply deadlines.
+Pause and child FlowPause do not suspend scheduled probes or outstanding reply
+deadlines.
 New probes wait for unpaused parent output, an idle output pump and an empty FIFO;
-only handoff starts the reply clock. Missed ticks coalesce into one due probe.
+only handoff starts the reply clock. Blocked probes retry after 1000 ms while
+retaining their original due timestamp; missed wakeups coalesce into one due probe.
+The local table's approximately one-second wakeup precision applies even to
+shorter configured intervals and tolerances. A separate item tracks the reply
+deadline, so matching Pong cancels that obligation without rescheduling the next
+probe. Discovery expiry clears the unanswered obligation and permits another due
+probe without penalizing a peer whose keepalive support remains unconfirmed.
 Pong replies share the ordinary parent FIFO, charge limit and Pause gate.
 Downstream buffering and transfer after handoff consume tolerance. Unconfirmed support still prevents
 health-based retirement. Quiet connections
-and one-way uploads need only the Mux peer's reply. See Part 7 for timer ownership.
+and one-way uploads need only the Mux peer's reply. Timer-mode parent age uses the
+same monotonic clock; wall-clock changes do not rotate transport connections.
+MuxServer's rejected-Open burst refill also uses its owner's monotonic clock.
+See Part 7 for table and parent ownership.
 
 ## Est, Pause, and Resume
 
