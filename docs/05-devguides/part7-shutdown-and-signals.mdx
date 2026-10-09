@@ -5,7 +5,7 @@ sidebar_label: "Part 7: Application Termination"
 description: "The shutdown controller, worker quiescence protocol, lifecycle-v2 component stages, task settlement, signals, devices, and destruction order."
 ---
 <!--
-Documentation version: 167
+Documentation version: 168
 -->
 
 # Part 7: Application Termination
@@ -343,9 +343,10 @@ the central traversal already owns it.
 ### External nodes
 
 Lifecycle v2 intentionally changed the external `tunnel_t` layout and callback
-signatures. The complete external-node ABI is now version 4, covering public line-task
-signatures and removal of generic buffer ownership callbacks. A dynamic node library must
-export the historical descriptor symbol:
+signatures. The complete external-node ABI is now version 5, covering public line-task
+signatures, removal of generic buffer ownership callbacks, and the by-value
+`socket_filter_option_t` layout without `shared_balance_table`. A dynamic node
+library must export the historical descriptor symbol:
 
 ```c
 uint32_t waterwallNodeLifecycleAbiVersion(void)
@@ -558,6 +559,15 @@ socket remain usable, while new bindings are refused. A regression test should s
 on a still-live sibling during the first Finish notification, not only verify that
 all lines are dead after close returns.
 
+The persistent SocketManager endpoint collection owns every static listening
+WIO and UDP side-data allocation exactly once, including shared sockets, listed
+ports, per-port ranges and redirect sockets. Its separately allocated endpoints
+keep WIO userdata and `udpsock_t.owner_slot = &endpoint->listen_io` stable when the
+pointer collection grows. Close each WIO on its owner loop while loop storage is
+alive. Successful earlier binds remain inventoried when a later setup fails;
+failed binds never publish a sharable endpoint. Initialize endpoint userdata and
+UDP side-data before enabling callbacks.
+
 Static UdpListener side-data survives through shutdown and carries an atomic
 retirement gate plus an immutable diagnostic FD snapshot. Socket-owner close
 clears its WIO and listener slot, then queues each worker's authoritative idle
@@ -567,7 +577,11 @@ If a notification is refused/canceled, the existing finite idle deadlines (at
 most the current five-minute peer timeout) or normal worker shutdown drain settle
 the lines; no new retry queue, peer, replacement socket or foreign-pool access is
 introduced. UdpStatelessSocket uses the same inventory settlement and retains its
-local-recycle versus detached-buffer-destruction distinction. Dynamic endpoints
+local-recycle versus detached-buffer-destruction distinction. Endpoint metadata,
+scope strings and UDP side-data must outlive queued ingress, writes, cancellation,
+worker-local idle drains and the owned peer lines. Final manager destruction
+releases them only after worker settlement; the existing shutdown ordering is
+the lifetime proof, without a new endpoint reference count. Dynamic endpoints
 remove their value handles and owned normal lines together on socket close;
 quiescence disables the close callback before detaching userdata and leaves line
 drain to the endpoint owner. Persistent packet lines are never destroyed here.
