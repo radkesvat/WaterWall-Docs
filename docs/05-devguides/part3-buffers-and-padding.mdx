@@ -1561,8 +1561,8 @@ carrier connection; its **children** are the streams multiplexed through it.
 | Incomplete incoming frame | **1 MiB + 8 bytes** | Logical bytes, including the cached header. Complete frames drain first; an oversized incomplete remainder closes the parent. |
 | `child-buffer-limit` | **128 MiB charge** | One child's queued decoded data. Reaching the limit closes that child. |
 | `parent-buffer-limit` | **512 MiB charge** | Incoming stream plus all attached child queues on one parent. At the limit, try beneficial incoming compaction, then shed largest queued children. Unrelieved pressure closes the parent. |
-| `parent-write-buffer-pause-threshold` | **16 MiB charge** | One outgoing parent FIFO. Reaching it pauses child producers while the FIFO drains. |
-| `parent-write-buffer-resume-threshold` | **12 MiB charge** | Release the outgoing producer gate at or below this charge while transport is writable. |
+| `parent-write-buffer-pause-threshold` | **128 MiB charge** | One outgoing parent FIFO. Reaching it pauses child producers while the FIFO drains. |
+| `parent-write-buffer-resume-threshold` | **4 MiB charge** | Release the outgoing producer gate at or below this charge while transport is writable. |
 | `parent-write-buffer-limit` | **512 MiB charge** | One outgoing parent FIFO, including admitted frame batches. Equality is allowed; exceeding it refuses the new output and closes that parent. |
 | `detached-buffer-limit` | **32–256 MiB charge**, by RAM profile | Per Mux instance/worker, for blocked child queues retained after parent loss. Reaching it closes the newly detached blocked child. L2 defaults to **256 MiB**. |
 | `detached-child-limit` | **4,096–12,000 children**, by RAM profile | Count of those detached blocked children on one Mux instance/worker. Reaching it closes the newly detached blocked child. L2 defaults to **12,000**. |
@@ -1601,9 +1601,10 @@ that parent through normal parent-loss cleanup. A zero parent limit disables
 this combined finite bound; it introduces no other aggregate cap.
 
 `child-buffer-limit` remains 128 MiB by default and rejects equality. Outgoing
-parent queues remain separate: their pause/resume thresholds are 16/12 MiB, hard limit is
-512 MiB, and hard-limit equality is permitted. Detached queues retain their
-per-worker settings and zero/unlimited meanings. The FlowResume threshold defaults
+parent queues remain separate: their default pause threshold is 128 MiB, resume
+threshold is 4 MiB, and hard limit is 512 MiB; hard-limit equality is permitted.
+Detached queues retain their per-worker settings and zero/unlimited meanings.
+The FlowResume threshold defaults
 to 512 KiB and counts logical payload bytes; FlowPause follows the local child pause state. Ordinary
 child candidates may still compact to a cheaper pooled tier; valid splice
 candidates are not individually materialized for queue pressure.
@@ -1764,14 +1765,16 @@ remainder; nested payload or
 reentrant child Close queues after it. Parent death discards undelivered frames.
 Quiescence admits no new stream work, child, batch or protocol output.
 
-`parent-write-buffer-pause-threshold` defaults to **16 MiB**,
-`parent-write-buffer-resume-threshold` to **12 MiB**, and
+`parent-write-buffer-pause-threshold` defaults to **128 MiB**,
+`parent-write-buffer-resume-threshold` to **4 MiB**, and
 `parent-write-buffer-limit` to **512 MiB** of queue-capacity charge. Pause and hard
 accept strict integers in `[1, INT_MAX]`; resume accepts `[0, INT_MAX]`.
-An omitted resume derives as `floor(effective_pause * 3 / 4)` using a wide
-intermediate. Require `0 <= resume < pause < hard` without clamping; diagnostics
-name all three effective values. Explicit zero retains empty-queue release. Every
-split splice batch must fit the hard limit even when the transport is writable;
+An omitted resume defaults to `4194304` (4 MiB) independently of the effective
+pause threshold; explicit values are honored.
+Require `0 <= resume < pause < hard` without clamping; diagnostics name all three
+effective values. Zero requires an empty outgoing queue and writable transport;
+a positive resume threshold permits release before the queue empties.
+Every split splice batch must fit the hard limit even when the transport is writable;
 unusually small limits can therefore reject a large splice delivery before any
 frame is sent. The existing fitting single-buffer direct path remains eligible
 for immediate delivery without FIFO admission. Gate release occurs at or below resume while writable, before selecting the
@@ -1794,7 +1797,7 @@ that raises charge above low water stops; writable draining supplies the next
 opportunity. An empty writable FIFO also releases ready held children.
 
 These are per-parent retained charges, not physical memory or transport capacity.
-The 4 MiB hysteresis gap does not promise continuous sender output or increased
+The thresholds do not promise continuous sender output or increased
 carrier bandwidth. Already-admitted Data is not withdrawn by peer FlowPause;
 the default 128 MiB child and 512 MiB aggregate receive budgets still apply.
 A zero-child ordinarily exhausted client parent waits for its final FIFO frames
