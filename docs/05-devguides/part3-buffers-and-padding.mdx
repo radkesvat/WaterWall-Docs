@@ -5,7 +5,7 @@ sidebar_label: "Part 3: Buffers & Padding"
 description: "The sbuf_t buffer model, worker buffer pools, left-padding budgets, and how to prepend protocol headers without breaking chain composition."
 ---
 <!--
-Documentation version: 171
+Documentation version: 172
 -->
 
 # Part 3: Buffers, Padding & Shift Buffers
@@ -97,37 +97,47 @@ both the result and the remaining source, including when the source becomes empt
 ### Splice payloads: `kSbufFlagSplice`
 
 A splice allocation keeps the common 32-byte `sbuf_t` header and exactly
-32 bytes of control storage plus reserved left padding. Named metadata at the
-fixed address `buf + l_pad` contains an exclusively owned `int pipefd[2]`, its
-last known kernel capacity, and a monotonic capacity-retry deadline.
-There is no source socket pointer or source-handle reference in the wrapper.
-Access metadata and representation-level materialization through
-`splice_buffer.h`; allocation/recycling lifecycle remains declared in
-`shiftbuffer.h` and `buffer_pool.h`. Ordinary buffers never contain this
-metadata.
+32 bytes of control storage plus reserved left padding. Metadata at `buf + l_pad`
+contains its `int pipefd[2]` and actual kernel capacity. A complete `sbuf_t *` is
+itself the master-pool entry: there is no separate pipe record or entry pointer.
+`kSbufFlagSplicePooled` identifies fixed inventory entries and remains set while
+cached or awaiting release after retirement. No source socket or WIO is retained.
 
-`sbufCreateSplice(pad_left)` initializes `{-1, -1}` pipe descriptors without a
-pipe syscall, including when pool refill allocates spare wrappers. Descriptor zero
-is valid. `sbufSpliceInitPipe(buf, preferred_capacity)` lazily creates a
-nonblocking, close-on-exec private pair with `pipe2`, publishing both ends only
-on success. For an empty buffer, a positive preferred capacity (at most
-`INT_MAX`) queries `F_GETPIPE_SZ` and requests `F_SETPIPE_SZ` if the known
-capacity is smaller. Zero skips capacity negotiation. Neither a failed query
-nor a rejected increase fails initialization or closes the pipe.
+`sbufSplicePoolInitialize(capacity_limit, pipe_capacity, max_pipe_count, padding)`
+runs during exclusive startup, after every configuration's chains have finalized
+padding and before any prepare/start hook or producer runs. It freezes the aligned
+padding and allocates complete buffers with nonblocking, close-on-exec pipes.
+Only pipes meeting the required capacity and remaining aggregate budget enter the
+inventory; account their actual kernel-reported capacity. The first allocation,
+creation or sizing refusal stops acquisition, retaining earlier successes. Zero
+entries is a valid ordinary-only runtime. Production requests 1 MiB pipes within
+the 512 MiB `SPLICE_TOTAL_SIZE_LIMIT`, independently of the RAM profile. Empty pipe
+capacity does not reserve all corresponding payload memory.
 
-Undersized or unknown-capacity pairs retry during a later empty initialization,
-at most once per second per pair. The capacity and retry deadline survive local
-and master pool reuse and exclusive transfers between workers. Expiry does not
-schedule background work: only a subsequent initialization can retry. A buffer
-holding payload is never resized. Once the recorded capacity satisfies the
-request, initialization skips both the clock check and capacity syscalls; larger
-pipes are never shrunk. Pipe close clears the capacity and retry state so a new
-pair starts fresh. Pipe creation failure returns `-1` with `errno`, leaving the
-pair uninitialized; unsupported builds use `ENOSYS`.
-The wrapper has one owner and serialized access. Copying metadata does not
-duplicate ownership. Ordinary and splice buffers carry no generic ownership callbacks.
+The shared inventory owns one `master_pool_t` with room for every startup entry.
+Each worker buffer pool caches at most eight complete empty splice buffers,
+independently of its ordinary cache width. A local miss takes up to four existing
+entries from the master; a partial batch is valid. `masterpoolTryGetItems()` never
+allocates missing entries. On local cache overflow, four entries return to the
+master before retaining the new return. These limits count unused cached buffers,
+not active buffers held by a worker. Local plus master plus active entries never
+exceed the acquired inventory, and no runtime replacement is created.
 
-Checkout sets `kSbufFlagSplice`, which identifies the splice representation.
+If both the requesting worker's cache and the master are empty, checkout returns
+`NULL` with `ENOBUFS`, even when another worker retains unused cached entries.
+Unsupported builds use `ENOSYS`. The caller chooses whether to defer reading or
+use ordinary storage; existing I/O paths use ordinary fallback where possible.
+There is no cross-worker cache stealing or waiting for a return.
+
+Every pooled buffer retains its original aligned `l_pad`. Inventory padding is
+shared through `GSTATE.splice_inventory`. Allocation, recycling, direct destruction
+and padding updates reject a mismatch with a fatal diagnostic in every build,
+before interpreting metadata using an altered offset. `curpos` may still move
+within advertised headroom. `sbufCreateSplice(pad_left)` only allocates an unmanaged
+empty representation; it cannot acquire or create an inventory pipe. Its separate
+geometry is useful for explicit representation fixtures, not inventory growth.
+
+`kSbufFlagSplice` identifies the splice representation and stays set while cached.
 Use the inline `sbufIsSplice(buf)` helper to query it on a valid buffer; it does
 not inspect payload bytes or require a pipe syscall.
 Any claimed body bytes must already be in the wrapper's private pipe. There is
@@ -174,16 +184,42 @@ policy after topology expansion, alongside platform support, absence of packet
 nodes, and splice support from every node. Enabling the option does not override
 those eligibility checks or change node capability flags.
 
-When splice is enabled on a supported Linux build, core startup also tries to
-raise `fs.pipe-user-pages-soft`. A finite `fs.pipe-user-pages-hard` supplies the
-target; an unlimited hard limit (`0`) uses 512 MiB converted to pages with the
-system's page size, rounding up if needed. These live system-wide settings govern
-each user's aggregate pipe-page allowance; they are not per-process resource
-limits. An unlimited soft limit (`0`), or a soft value already at or above the
-target, causes no change. Read/parse/write and page-size-query failures are
-nonfatal. The hard limit and `fs.pipe-max-size` are never changed, and no
-persistent sysctl configuration is written. A successful increase remains in
-effect after WaterWall exits. Disabled splice skips this startup operation.
+When splice is enabled on a supported Linux build, core startup first tries to
+raise `fs.pipe-user-pages-soft` to the smaller of the 512 MiB target converted
+to system pages and a finite `fs.pipe-user-pages-hard`. An unlimited hard limit
+(`0`) does not reduce the target. Page conversion rounds up if needed. These
+live system-wide settings govern each user's aggregate pipe-page allowance;
+they are not per-process resource limits. An unlimited soft limit (`0`), or a
+soft value already at or above the target, causes no change. Read/parse/write
+and page-size-query failures are nonfatal. The hard limit and `fs.pipe-max-size`
+are never changed, and no persistent sysctl configuration is written. A
+successful increase remains in effect after WaterWall exits.
+
+Core constructs global state and tunes pipe limits. `sbufSplicePoolPrepare()`
+publishes the small shared control object before imports can copy global state,
+without allocating buffers or pipes. Failure leaves startup ordinary-only; core
+does not retry after sharing a NULL pointer. It then builds all configurations
+with `nodemanagerBuildConfigFile()`. Chain finalization accumulates the maximum
+padding across configurations. The core preallocates the inventory with that
+padding, then `nodemanagerStartConfigs()` admits packet bootstrap, prepares all
+configurations, and starts producers. `GSTATE.splice_inventory` owns the master,
+live count/capacity, immutable padding and optional discard descriptor. State copies
+share this object even when taken before final padding is known. Final inventory
+allocation fills that same object; it never replaces it. Padding is unset during
+exclusive configuration and frozen when the inventory is filled. State copies do
+not copy counters or create another inventory.
+In addition to the capacity budget,
+the pipe count is capped at one eighth of the remaining descriptor allowance:
+subtract current open descriptors from the process's soft `RLIMIT_NOFILE`, then
+divide by eight. Its two descriptors per pipe therefore use at most one quarter
+of the allowance still available at startup. The Linux descriptor scan includes
+its own temporary descriptor conservatively; an unavailable limit or scan leaves
+the inventory empty. Kernel resource limits may reduce successful acquisition
+further. Startup reports the acquired count and aggregate capacity;
+`sbufSplicePoolCount()` and `sbufSplicePoolCapacity()` expose current usable
+inventory, including pipes leased to buffers. Retiring a failed pipe reduces
+these values; no replacement is created. Disabled splice skips both the sysctl
+operation and inventory allocation.
 
 `wioEnableSplice()` and `wioDisableSplice()` select the read mode on the WIO's
 owning worker. The WIO must be open. Selection may change before or after reads
@@ -237,18 +273,16 @@ There is no socket `FIONREAD` query before a
 successful splice delivery. The socket and pipe are nonblocking, and the transfer
 happens **before invoking the Payload callback**.
 
-The preferred pipe capacity is that same read limit, independent of the bytes
-currently ready: 1 MiB in every memory profile. Existing larger capacities are never reduced. A successful growth
-request is not a promise of a full-size splice: pipe layout and available input
-can still produce a shorter result. Rejected growth keeps the splice path active
-with the pipe's existing capacity. Larger pipes consume the per-user pipe-page
-allowance faster, including while their pairs remain cached.
+Production pipe capacity and the read limit are both 1 MiB. A full-sized pipe
+does not promise a full-sized transfer: pipe slot layout and available input
+can still produce a shorter result. Initialized pipes continue consuming their
+per-user capacity allowance and two descriptors while idle in the inventory.
 
 Only the actual positive splice result is published as the body length. Logical
 capacity becomes left padding plus that count; `kSbufFlagSplice` stays set.
 A positive short splice produces a smaller valid buffer; remaining socket bytes
 are handled by later reads. The requested count is an upper bound, not a promise
-of a full-size transfer; a pipe smaller than the requested count remains usable.
+of a full-size transfer.
 
 `EINTR` retries the transfer. On `EAGAIN` or a zero result, the empty wrapper is
 recycled and the loop attempts one ordinary nonblocking receive through the
@@ -261,9 +295,9 @@ result alone as proof that the stream has no remaining data.
 A successful fallback delivers ordinary bytes with the actual received length.
 Ordinary `EAGAIN`/`EINTR` returns to the event loop; ordinary zero closes the stream.
 Other splice errors recycle the wrapper and follow normal read-error closure.
-If private pipe creation fails, checkout recycles the unused wrapper internally
-and returns `NULL` with `errno`; the read loop also falls back to an ordinary
-receive. None of these fallbacks has consumed socket bytes in the splice attempt.
+If the fixed inventory has no free pipe, checkout recycles the unused wrapper
+internally and returns `NULL` with `ENOBUFS`; the read loop also falls back to an
+ordinary receive. None of these fallbacks has consumed socket bytes in the splice attempt.
 Splice mode stays enabled for later reads.
 
 Ordinary TCP receives, including these fallbacks, take the pool's large buffer
@@ -348,42 +382,50 @@ Unsupported conversion and partial reads abort.
 
 #### Recycling, discard, and physical destruction
 
-`bufferpoolReuseBuffer(pool, buf)` takes exclusive ownership and discards any
-remaining payload for ordinary and splice buffers. For a splice wrapper it calls
-`sbufSpliceDiscard()` before resetting the header or entering the pool-bypass
-branch in every build. When `BUFFER_POOL_DEBUG == 1`, it then verifies that the
-private pipe is empty, using `LOGF()` and `abortProgramNow(1)` on failure.
-WIO cleanup, BufferQueue destruction, `lineReuseBuffer()`, and `reuseBuffer()` share this behavior without
-caller-side splice cleanup.
+`bufferpoolReuseBuffer(pool, buf)` takes exclusive ownership and discards remaining
+payload. Healthy inventory entries retain both descriptors and return to the local
+cache or shared master; pool bypass returns directly to the master. Unmanaged
+wrappers are freed, and failed inventory entries are retired without replacement.
+WIO cleanup, BufferQueue destruction, `lineReuseBuffer()` and `reuseBuffer()` share
+this behavior. Ordinary cache overflow never controls splice inventory lifetime.
 
 A wrapper claiming zero length must already have an empty pipe. The pool uses
 `sbufSpliceIsReusable(buf)` to check kernel emptiness with `FIONREAD` only when
-`BUFFER_POOL_DEBUG == 1`, including when pooling is bypassed. This check is
-independent of `NDEBUG`. With pool debugging disabled, the verification and its
-syscall disappear; discard remains active and recycling trusts the consumption
-helpers' byte accounting. Resetting sbuf fields never empties a pipe. Normal reuse
-restores physical capacity and clears transient state while preserving healthy
-empty pipes. Unused empty wrappers can also be recycled directly.
+`BUFFER_POOL_DEBUG == 1`, including when pooling is bypassed. Failure uses
+`LOGF()` and `abortProgramNow(1)` before the pipe becomes available to another
+buffer. This check is independent of `NDEBUG`. With pool debugging disabled,
+recycling trusts the consumption helpers' byte accounting. Resetting sbuf
+fields never empties a pipe.
 
 `sbufSpliceDiscard()` requires exclusive ownership and leaves an empty wrapper
-for recycling without freeing it. For nonempty payloads it drops the real prefix
-and drains the private pipe with bounded scratch storage
-and nonblocking reads, retrying `EINTR` and accepting positive short reads.
-`EAGAIN` confirms emptiness. EOF or unexpected error closes both owned ends and
-marks the pair uninitialized; teardown never creates a replacement. A later
-transfer can recreate it.
+without freeing it or returning a healthy lease. For nonempty payloads it drops
+the real prefix and drains the private pipe with nonblocking `splice()` to
+`/dev/null`, retrying `EINTR` and accepting positive short transfers until
+`EAGAIN` confirms emptiness. Startup opens one optional discard descriptor after
+acquiring the pipes; it stays open and unchanged through all worker and foreign-thread
+buffer cleanup and closes at final inventory destruction. If opening the sink
+fails or a splice fails with an error other than `EINTR` or `EAGAIN`, discard
+falls back to nonblocking reads with bounded scratch storage for that call.
+The read fallback also retries `EINTR` and drains until `EAGAIN`. EOF or a failed
+read closes both owned ends and retires the inventory entry permanently.
+A later checkout may borrow another remaining pipe but must never recreate
+the retired one.
 
-The splice-specific destructor closes both ends exactly once and frees the
-allocation without accessing the source. Cached entries have reset flags, so
-local/master teardown, overflow, and geometry replacement use the known splice
-tier's destructor. Incompatible-pool returns and bypass returns also close the
-pair. Ordinary payload bytes must never be interpreted as descriptors.
+`sbufDestroySplice()` drains and returns a healthy complete inventory buffer to the
+global master without accessing a worker-local pool. It physically frees retired
+entries and unmanaged wrappers. This is also `sbufDestroy()`'s splice path, so
+foreign-thread cancellation safely returns scarce resources. There is a separate
+physical destructor for final inventory destruction; it cannot recursively recycle
+entries into the master being destroyed.
 
-Existing bounded local caches, bounded splice master, and four-item recharge
-policy remain in force. Local shrink transfers reusable allocations to the
-master; master overflow destroys them. Maximum idle pipe descriptors are bounded
-by twice the sum of local splice-cache capacities and splice master capacity;
-live wrappers add their own pairs.
+Local caches keep their splice flags and pipe metadata. Their entries count as
+checked out from the master until returned to it. Worker/device pool destruction
+flushes them into the global master. After workers, callbacks, active buffers and
+local caches have settled, `sbufSplicePoolDestroy()` requires zero outstanding
+entries, closes remaining pipes, destroys the master and discard descriptor, and
+frees and clears the owning global-state pointer. Imported state copies borrow the
+same inventory and must finish before owner destruction. Outstanding entries are
+a fatal lifecycle invariant violation.
 
 #### Writing splice payloads
 
@@ -454,12 +496,13 @@ Older Linux UDP sendpage implementations have a finite skb fragment limit, so a
 small logical body can still be unrepresentable when spread over many pipe slots.
 A pipe-capacity bound of at most 64 KiB limits its slot count conservatively;
 resident prefix pages reduce that budget, rounded down to a power-of-two number
-of pipe slots. For larger or unknown-capacity pipes, a temporary non-consuming
-`tee` into a pipe capped at that budget checks the bound before socket assembly. The probe pipe is closed on
-every outcome. A short/refused probe selects full materialization and one ordinary
-send before touching the socket. This is a layout/resource fallback; supported
-layouts splice their bodies without userspace reads. Kernel-internal copies are
-still possible, and no measured performance improvement is promised. The fragment
+of pipe slots. For larger or unknown-capacity pipes, select full materialization and one
+ordinary send before touching the socket. Runtime UDP sends never allocate or
+resize a probe pipe. This conservative layout fallback preserves datagram
+atomicity without exceeding the fixed inventory. Pipes whose capacity proves
+the fragment bound may splice their bodies without userspace reads.
+Kernel-internal copies are still possible, and no measured performance improvement
+is promised. The fragment
 bound follows Linux's [skb fragment limit](https://github.com/torvalds/linux/blob/v5.15/include/linux/skbuff.h)
 and [UDP sendpage assembly](https://github.com/torvalds/linux/blob/v5.15/net/ipv4/udp.c);
 newer kernels use [splice-to-socket](https://github.com/torvalds/linux/blob/master/fs/splice.c).
@@ -626,7 +669,7 @@ buffer_pool_t *pool = lineGetBufferPool(line);     // this line's worker pool
 sbuf_t *big   = bufferpoolGetLargeBuffer(pool);    // ordinary read/working buffer
 sbuf_t *medium = bufferpoolGetMediumBuffer(pool); // 32 KiB in S1/S2, 64 KiB in higher profiles
 sbuf_t *small = bufferpoolGetSmallBuffer(pool);    // small working buffer
-sbuf_t *splice_buf = bufferpoolGetSpliceBuffer(pool); // ready private pipe, or NULL on pipe failure
+sbuf_t *splice_buf = bufferpoolGetSpliceBuffer(pool); // leased private pipe, or NULL when exhausted
 
 // ... use the buffer ...
 
@@ -639,12 +682,13 @@ always use that line's pool — never a different worker's. Buffers from a pool
 already carry the chain's reserved left padding, so a pooled buffer is the correct
 place to build a payload you intend to prepend onto.
 
-Each buffer pool has large, medium, small, and splice caches backed by separate
-shared master pools. `bufferpoolCreate()` takes those four master pools in that
-order, followed by the cache width and explicit large, medium, and small payload
-capacities, then the independent splice payload limit and waiting-budget basis.
-Both independent values must be in `[1, INT_MAX]` and stay fixed after construction.
-Each pool stores its own settings; device pools inherit all five from their worker pool.
+Each buffer pool has large, medium and small ordinary caches backed by three
+shared ordinary masters. `bufferpoolCreate()` takes those masters in that order,
+then the ordinary cache width, large/medium/small payload capacities, the splice
+payload limit and the waiting-budget basis. The latter two values must be in
+`[1, INT_MAX]` and stay fixed after construction. Device pools inherit the sizes
+and limits from their worker pool. Splice caches use the shared fixed inventory
+without a separate wrapper master or a constructor argument for one.
 
 Device backends use `devicePoolCreate()` with an explicit, exclusively accessible
 worker pool and a backend-specific minimum small tier. Construction preserves
@@ -655,26 +699,35 @@ MTU as their minimum; Darwin receives its family prefix into separate storage.
 The worker GSO output allowance and its exact-sized fallback remain a separate
 calculation.
 
-Worker and device pools select their local width with `PROPER_BUFFER_POOL_WIDTH()`;
-it applies to all four local tiers. Ordinary masters use twice that width as their
-constructor argument, while the splice master uses twice the full RAM-profile
-value to retain reusable pipes. Master constructors double their argument, giving
+Worker and device pools select ordinary cache width with
+`PROPER_BUFFER_POOL_WIDTH()`. Ordinary masters use twice that width as their
+constructor argument. Splice caches have a fixed eight-entry limit; their global
+master is sized for the entire startup inventory, independently of the RAM profile.
+
+The master's mutex transfers ownership and visibility of cached item slots.
+Its atomic `len` uses relaxed loads/stores: reads outside the mutex are advisory
+empty/full probes, and slot access always holds the mutex. `checked_out` has a
+different role: terminal returns can finish outside that mutex, so their release
+decrements pair with acquire reads before teardown frees pool-family resources.
+Observing zero does not close checkout admission; the owner must prevent new
+checkouts and satisfy the existing lifecycle requirements before destruction.
+
+Master constructors double their argument, giving
 these actual entry capacities:
 
-| Profile | Local width | Each ordinary master | Splice master |
-| --- | --- | --- | --- |
-| S1 / `minimal` | 1 | 4 | 4 |
-| S2 | 4 | 16 | 16 |
-| M1 / `client` | 8 | 32 | 32 |
-| M2 / `client-larger` | 32 | 128 | 128 |
-| L1 | 64 | 256 | 512 |
-| L2 / `server` | 128 | 512 | 1024 |
+| Profile | Ordinary local width | Each ordinary master |
+| --- | --- | --- |
+| S1 / `minimal` | 1 | 4 |
+| S2 | 4 | 16 |
+| M1 / `client` | 8 | 32 |
+| M2 / `client-larger` | 32 | 128 |
+| L1 | 64 | 256 |
+| L2 / `server` | 128 | 512 |
 
-Local pointer arrays hold twice the selected width per tier. Recycling shrinks a
-tier once its cached count exceeds `floor(4 * width / 3)`, transferring up to one
-width of entries to its master; a full master destroys overflow. These are idle
-cache bounds, not limits on active allocations. The RAM-profile enum values,
-non-buffer pools, buffer sizes and independent limits retain their own sizing.
+Ordinary local pointer arrays hold twice their selected width. Recycling shrinks
+an ordinary tier once its cached count exceeds `floor(4 * width / 3)`, transferring
+up to one width of entries to its master; a full ordinary master destroys overflow.
+These are idle cache bounds, not limits on active allocations.
 
 Payload capacities, excluding reserved left padding, are:
 
@@ -684,7 +737,7 @@ Payload capacities, excluding reserved left padding, are:
 | Medium | 32 KiB in S1/S2; 64 KiB in M1/M2/L1/L2 | Framing, retained queues including paused Mux children, and best-fit UDP reads |
 | Large | 64 KiB in S1/S2; 128 KiB in M1/M2/L1/L2 | Ordinary event-loop read buffers and larger working payloads |
 | Splice storage | 32 bytes of control storage | Explicit splice wrappers; logical body size is independent of allocation size |
-| Splice payload limit | 1 MiB in every profile | Socket read limit and preferred pipe capacity; kernel growth is best effort |
+| Splice payload limit | 1 MiB in every profile | Socket read limit and required startup pipe capacity |
 
 S1 and S2 share buffer sizes but retain different profile-based local and master
 cache capacities; S1 caches fewer allocations. Higher profiles retain 64 KiB
@@ -747,27 +800,22 @@ not pin memory or guarantee a throughput improvement.
 the splice geometry. `bufferpoolUpdateAllocationPaddings()` accepts separate
 large, medium, small, and splice padding arguments. Global chain-padding updates cover
 all four tiers, and device pools inherit each tier's padding value from their
-worker pool. Set padding before populating the local caches.
+worker pool. Finalize padding before creating the splice inventory or populating
+local caches; splice padding cannot change after inventory initialization.
 
 The existing `lineGetBufferPool()`, `getWorkerBufferPool()`, and
 `getCurrentEventWorkerBufferPool()` accessors expose every tier through the same pool, including
 `bufferpoolGetMediumBuffer()` and `bufferpoolGetSpliceBuffer()`. `lineReuseBuffer()` and `reuseBuffer()` use the same
 recycling path as `bufferpoolReuseBuffer()`, subject to their existing worker
-ownership requirements. Recycling clears flags and length; for a splice wrapper,
-it first restores physical capacity from the 32-byte control storage and its
-reserved padding. Checkout restores `kSbufFlagSplice`.
+ownership requirements. Ordinary recycling clears flags and length. Splice
+recycling preserves its representation/ownership flags and pipe, clears payload,
+and restores control-storage capacity and the original padding cursor.
 
-`bufferpoolGetSpliceBuffer(pool)` initializes the selected wrapper's nonblocking,
-close-on-exec private pipe before returning it. It requests the pool's independent
-`bufferpoolGetSplicePayloadLimit()`, preserving the capacity
-retry policy above. Pipe creation failure returns `NULL` with the original
-`errno`, after internally recycling the unused wrapper; unsupported builds return
-`NULL` with `ENOSYS`. Callers must handle this result before accessing the buffer.
-A failed capacity query or increase still returns a usable buffer. This also
-applies when pooling is bypassed, where failure destroys the unused wrapper.
-
-Refill only allocates control storage; it never creates pipes for spare wrappers.
-Empty private pipe pairs survive pool reuse and close on physical destruction.
+`bufferpoolGetSpliceBuffer(pool)` returns a complete preallocated buffer from the
+local cache or shared master. A miss returns `NULL` with `ENOBUFS`; unsupported
+builds use `ENOSYS`. Handle this before accessing the buffer, normally by choosing
+ordinary storage. Bypass uses the same fixed global inventory without local caching.
+No checkout, refill or return creates a pipe or another inventory buffer.
 
 If you need a buffer bigger than the current one for an append, use
 `sbufReserveSpace()` (it reallocates and copies only when necessary) rather than
@@ -776,8 +824,9 @@ hand-rolling growth.
 `sbufCreateSplice(pad_left)` directly allocates an empty buffer with exactly
 32 bytes of payload capacity, plus left padding rounded up to a 32-byte
 boundary. Its payload capacity stays at 32 bytes regardless of the CPU cache
-line size. The buffer starts with zero length, only `kSbufFlagSplice` set; `sbufDestroy()` releases a live splice allocation and its private pipe.
-Cached splice-tier entries use `sbufDestroySplice()` even with reset flags.
+line size. The buffer starts with zero length and only `kSbufFlagSplice` set;
+`sbufDestroy()` physically frees this unmanaged allocation. Inventory entries
+are acquired through the pool APIs and preserve their flags while cached.
 
 ### Ordinary TCP and UDP receive sizing
 
@@ -1483,8 +1532,9 @@ sizeof(sbuf_t) + sbufGetTotalCapacity(buf) + kSbufAllocationAlignment
 
 Capacity includes reserved left padding. Ordinary entries therefore retain their
 allocation-based charge; splice entries charge logical sbuf capacity, without
-adding wrapper control storage or kernel pipe capacity. Unknown cached pipe
-capacity does not force a valid retained source into ordinary storage.
+adding wrapper control storage or kernel pipe capacity. Inventory accounting is
+independent of this queue charge and does not force a valid retained source into
+ordinary storage.
 
 The sbuf header and alignment overhead are each 32 bytes. For example, after a
 read delivers 100 body bytes into a splice wrapper with 64 bytes of left padding:
@@ -1604,7 +1654,7 @@ have their own ownership and are outside this Mux budget.
 | `splice_stream_t` and its eight-byte header cache | One allocation per parent, with the cache trailing the stream object. | Parent stream destruction; the cache is not a separate sbuf. |
 | Child state and pending queue | Child initialization. The queue requests initial room for eight entries and can grow. | Child cleanup, or completion of its detached drain. |
 | Ordinary sbuf or splice wrapper | Checked out from the owning worker's pool when data or framing needs it. | Forwarded to its next owner, recycled when consumed/discarded, or physically destroyed by pool policy. |
-| Private pipe pair | Created lazily when a checked-out splice wrapper needs it; an existing cached pair is reused. | Healthy empty pairs can remain pooled; physical wrapper destruction closes them. |
+| Private pipe pair | Created at startup and exclusively leased when a wrapper is checked out. | Consumption/discard returns the lease to the shared inventory. Healthy pipes close only at final inventory teardown. |
 
 Opening a child does not allocate a pipe for it. Queue-entry storage grows as
 needed; the initial eight-entry reservation is not a maximum number of buffered
@@ -1669,8 +1719,8 @@ frames. Each splice wrapper still owns its own pipe exclusively.
 
 | Situation | Result |
 | --- | --- |
-| Pipe creation fails at socket read | Checkout recycles the unused wrapper and ordinary socket reading takes over for that delivery. Splice mode remains available for later reads. |
-| Pipe capacity query/growth fails | An initialized pipe remains usable at its existing capacity. A shorter successful read is valid. |
+| Fixed inventory is exhausted at socket read | Checkout recycles the unused wrapper and ordinary socket reading takes over for that delivery. Splice mode remains available for later reads. |
+| Startup pipe creation or sizing fails | Reject the candidate and retain earlier full-sized acquisitions. Runtime creates no additional pipes; ordinary fallback handles exhaustion. |
 | Socket-to-pipe splice returns `EAGAIN` or zero | Recycle the empty wrapper and try an ordinary nonblocking receive. That receive distinguishes no-data-yet from EOF and handles TCP urgent-data boundaries. |
 | Destination pipe fills during frame assembly | Return a complete ordinary fallback, preserving bytes already moved and appending the remaining source bytes exactly once. |
 | A read of claimed private-pipe bytes is short or interrupted | Accumulate positive progress and retry `EINTR`. EOF, `EAGAIN`, or another failure before the claimed range is complete remains a fatal invariant. This is different from a short socket read. |
@@ -1683,7 +1733,7 @@ frames. Each splice wrapper still owns its own pipe exclusively.
 | Empty input or a zero-length Data frame | Empty incoming sbufs recycle without creating a frame. An actual zero-length Data frame remains valid and produces one delivery; an allocated empty result can still carry queue charge. |
 
 The queue-capacity formula and ownership transitions do not promise that physical
-RAM, descriptors, or cached pipe capacity fall when a charge is released. Runtime
+RAM, descriptors, or fixed inventory capacity fall when a charge is released. Runtime
 I/O failures and the fatal claimed-byte invariants remain separate from configured
 queue overflow and its connection-level cleanup.
 
@@ -1908,9 +1958,9 @@ allowance. Its reservation remains held through worker checksum completion and
 delivery, or settles without checksum work on refusal, cancellation or stale
 generation. Scratch remains reader-owned and reusable for the next read.
 
-A later startup configuration can increase shared worker-pool padding. Before
-allocating each segment, the worker checks the current best-fit charge against
-its prepaid allowance. If that tier no longer fits, it creates an exact-sized
+Before allocating each segment, the worker checks the current ordinary best-fit
+charge against its prepaid allowance. If custom ordinary pool geometry no longer
+fits that allowance, it creates an exact-sized
 ordinary buffer with this chain's original sufficient padding instead.
 
 Ordinary batches use the same per-worker FIFO and reserve their actual buffer
