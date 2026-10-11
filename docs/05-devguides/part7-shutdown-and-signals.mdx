@@ -262,7 +262,8 @@ entries. Initialization reserves one fewer entry than the intended slot count
 because STC rounds `capacity + 1` upward. This reserve is independent of the
 256-message drain batch; increasing initial storage does not enlarge callback
 batches. The deque can grow with backlog and retains its capacity during normal
-message delivery.
+message delivery. `workerMessagesInit()` has no recoverable allocation result;
+valid initial storage follows the fatal heap-allocation policy.
 
 Timed worker messages use `wtimerAdd()` and normal fail-fast allocation. Owner
 workers acquire timeout records from their existing generic pools backed by
@@ -672,11 +673,12 @@ If delivery is canceled while the item is still attached, cleanup clears the
 pending marker and restores the item to the expiration heap with its original
 deadline. Cleanup never substitutes for the worker-affine expiration callback.
 Explicit removal, worker detachment, or table destruction leaves the item
-message-owned so cancellation frees it once instead of restoring it. Expiration
-staging is also transactional: reservation failure leaves both indexes untouched,
-and later staging growth failure restores the exact popped item before stopping
-the scan. Item creation exposes a handle only after both the map and expiration
-heap own it; heap-publication failure rolls the map insertion back.
+message-owned so cancellation frees it once instead of restoring it. Capacity
+reserved for attached items permits restoration without allocating in cancellation
+cleanup. Staging and index growth follow the fatal heap-allocation policy; they
+have no OOM retry or rollback path. Item creation rejects duplicate keys or
+unrepresentable index geometry before publication and exposes a handle only
+after both the map and expiration heap own it.
 
 Worker-local and shared idle tables have different shutdown boundaries. Quiesce
 each `local_idle_table_t` timer on its exact owner worker before line drain. An
@@ -954,6 +956,11 @@ ownership. See Part 4 for policy, expiry and resource limits.
 
 Every failed join retains the native handle and resources the thread can access.
 Destroying them underneath a potentially live thread is never an orderly fallback.
+
+Worker-engine slot initialization and lazy engine control allocation use the
+WaterWall allocator. Heap exhaustion terminates at that boundary; engine lookup
+still refuses unavailable runtime, foreign ownership or closed admission. Bounded
+lwIP packet/protocol pools retain their ordinary exhaustion results.
 
 After stack work, the engine recomputes its next deadline and advances the owner
 wakeup only when needed. It preserves an existing earlier or already-pending
