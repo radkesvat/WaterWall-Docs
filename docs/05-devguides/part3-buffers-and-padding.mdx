@@ -108,8 +108,9 @@ runs during exclusive startup, after every configuration's chains have finalized
 padding and before any prepare/start hook or producer runs. It freezes the aligned
 padding and allocates complete buffers with nonblocking, close-on-exec pipes.
 Only pipes meeting the required capacity and remaining aggregate budget enter the
-inventory; account their actual kernel-reported capacity. The first allocation,
-creation or sizing refusal stops acquisition, retaining earlier successes. Zero
+inventory; account their actual kernel-reported capacity. The first pipe creation
+or sizing refusal stops acquisition, retaining earlier successes. Heap allocation
+follows the [fatal policy](./part5-tunnel-anatomy.mdx#heap-allocation-failure). Zero
 entries is a valid ordinary-only runtime. Production requests 1 MiB pipes within
 the 512 MiB `SPLICE_TOTAL_SIZE_LIMIT`, independently of the RAM profile. Empty pipe
 capacity does not reserve all corresponding payload memory.
@@ -197,8 +198,8 @@ successful increase remains in effect after WaterWall exits.
 
 Core constructs global state and tunes pipe limits. `sbufSplicePoolPrepare()`
 publishes the small shared control object before imports can copy global state,
-without allocating buffers or pipes. Failure leaves startup ordinary-only; core
-does not retry after sharing a NULL pointer. It then builds all configurations
+without allocating buffers or pipes. Its heap allocation follows the fatal policy;
+unsupported builds have no inventory. Core then builds all configurations
 with `nodemanagerBuildConfigFile()`. Chain finalization accumulates the maximum
 padding across configurations. The core preallocates the inventory with that
 padding, then `nodemanagerStartConfigs()` admits packet bootstrap, prepares all
@@ -544,9 +545,10 @@ continues to replace allocations to detect stale aliases.
 Successful insertion transfers ownership to the queue. Failed try-insertion
 leaves the pointer, buffer, private-pipe contents, queue entries, and byte/charge
 totals unchanged. Unrepresentable totals are refused before ownership transfers,
-including before ordinary Debug replacement. Pop transfers ownership back to the
-caller. Peek is borrowed: do not
-consume or modify a queued buffer through an alias. Pop first, consume through
+including before ordinary Debug replacement. Heap exhaustion while reserving
+deque storage is fatal; it does not produce a try-insertion refusal. Pop transfers
+ownership back to the caller. Peek is borrowed: do not consume or modify a queued
+buffer through an alias. Pop first, consume through
 the splice helpers, and reinsert any remainder so queue accounting stays correct.
 
 Destroying a nonempty queue discards remaining private bodies and recycles the
@@ -682,6 +684,12 @@ always use that line's pool — never a different worker's. Buffers from a pool
 already carry the chain's reserved left padding, so a pooled buffer is the correct
 place to build a payload you intend to prepend onto.
 
+Pool metadata and ordinary buffer allocation follow the
+[fatal heap-allocation policy](./part5-tunnel-anatomy.mdx#heap-allocation-failure).
+`bufferpoolCreate()` remains nullable for invalid construction inputs or
+unrepresentable geometry. Fixed splice-inventory exhaustion is separate from heap
+exhaustion and keeps its documented ordinary-buffer fallback.
+
 Each buffer pool has large, medium and small ordinary caches backed by three
 shared ordinary masters. `bufferpoolCreate()` takes those masters in that order,
 then the ordinary cache width, large/medium/small payload capacities, the splice
@@ -755,11 +763,10 @@ on return. `bufferpoolTryGetBestFit()` accepts a 64-bit computed length and retu
 `NULL` for unrepresentable geometry before using the same allocation path. Neither
 helper shrinks an existing buffer. Splice allocation stays explicit.
 
-`sbufTryCreateWithPadding()` makes a separate ordinary `sbuf_t` with the same
-capacity and alignment rules as `sbufCreateWithPadding()`, returning `NULL`
-for unrepresentable geometry or allocation failure. It bypasses the pool's
-fail-fast refill path, so optional startup storage can fall back without
-changing ordinary pooled allocation behavior. Destroy this direct buffer with
+`sbufCreateWithPadding()` makes a separate ordinary `sbuf_t` and follows the same
+fatal heap-allocation policy as pool refill. Validate computed geometry with
+`sbufTryComputeCapacity()` before creating storage when an unrepresentable request
+must be refused locally. Destroy this direct buffer with
 `sbufDestroy()` after its last user has stopped.
 
 The 128 KiB tier is not a maximum payload or total-memory limit. Smaller pooled
@@ -963,9 +970,10 @@ senders initialize ordinary bodies to zero; verified senders generate the determ
 pattern. JSON summaries expose `verification_enabled`, and unverified payloads do not
 increment `valid_packets`. UDP keeps its per-datagram path.
 
-`splicestreamPush()` takes ownership on every result. It reserves fallible FIFO
-metadata before consuming any new header bytes; refusal recycles the submitted
-input while preserving existing bytes and costs. Empty inputs recycle immediately.
+`splicestreamPush()` takes ownership on every result. It checks accounting and
+reserves FIFO metadata before consuming any new header bytes; representability
+refusal recycles the submitted input while preserving existing bytes and costs.
+Heap exhaustion is fatal. Empty inputs recycle immediately.
 Ordinary bytes, real resident splice prefixes and private pipe bodies maintain
 FIFO order. Push physically removes only missing header bytes from sources and
 recycles exhausted sources. The header cache owns only bytes.
@@ -1440,8 +1448,8 @@ preserve their distinct 65,535-byte backend-body maximum and prepend at most 263
 TrojanServer retains only cached address metadata while awaiting a UDP body.
 It constructs a routing context only for a new backend or a TCP target; reusing a
 backend needs no transient domain ownership. Each remote separately owns its
-immutable lookup key. Failure to allocate a new destination's domain settles the
-affected flow before protected Init. Address encoding checks its complete extent
+immutable lookup key. New destination-domain storage follows the fatal
+heap-allocation policy. Address encoding checks its complete extent
 before writing and leaves splice bodies untouched.
 
 A necessary association reply FIFO accounts encoded wire bytes and datagram entries
@@ -1843,8 +1851,8 @@ attempting beneficial compaction before charge refusal. Parser reentry shares
 Complete frames in the synchronous dispatch continue after Pause; hard
 admission refusal, zero data length or Finish stops dispatch and closes a
 borrowed normal carrier through its owner. Neither node discards arbitrary
-stream bytes to resume parsing. Stream allocation refusal before next Init
-finishes only the owner-facing side.
+stream bytes to resume parsing. Their fixed-header stream allocation follows the
+fatal heap-allocation policy.
 
 Stream admission limits belong to the node and do not derive from the pool
 large tier, splice read target or actual pipe capacity. HttpProxyServer keeps a

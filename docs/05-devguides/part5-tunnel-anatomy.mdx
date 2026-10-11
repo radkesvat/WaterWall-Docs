@@ -125,10 +125,8 @@ Choose the check according to what can actually cause the condition:
 | --- | --- |
 | Caller-owned precondition or programmer-only invariant | Use `assert()` to document and check it in Debug, or remove a redundant check when the surrounding contract already establishes it. |
 | Critical internal invariant requiring release-build protection, such as corrupted resource ownership | Keep a runtime check, emit `LOGF`, then call `abortProgramNow()`. Do not disguise corruption as a recoverable protocol failure or request orderly shutdown and continue. |
-| Expected failure, external input or supported state | Keep ordinary runtime validation and the documented failure/cleanup path. Examples include allocation/I/O refusal, malformed peer data, exhausted budgets, incomplete frames and optional NULL arguments. |
-
-Shared credential-copy allocation refusal follows its explicit
-[fail-fast policy](./part2-lines-and-callbacks.mdx#authenticated-identity-publication).
+| WaterWall memory-manager heap allocation failure | The memory manager calls `abortProgramNow(1)` without normal logging or orderly cleanup; see [heap allocation failure](#heap-allocation-failure). |
+| Expected failure, external input or supported state | Keep ordinary runtime validation and the documented failure/cleanup path. Examples include unrepresentable sizes, I/O refusal, malformed peer data, exhausted budgets or fixed resource inventories, incomplete frames and optional NULL arguments. |
 
 Trace callers before classifying a condition. A NULL callback context after
 detachment, a stale association, a canceled timer, or state released during a
@@ -144,6 +142,37 @@ while still returning failure if TLS output fails or a callback releases its
 state. Document nullable parameters explicitly. Keep operations with side effects
 outside `assert()` so Release builds perform them too; assertions disappear under
 `NDEBUG`.
+
+### Heap allocation failure
+
+WaterWall's memory manager does not support recovery from heap-allocation failure.
+A valid heap allocation returns usable storage or terminates the process at that
+boundary with `abortProgramNow(1)`. This applies to initial allocation, growth and
+duplication, including startup and optional facilities.
+Do not add nullable OOM APIs, caller-side OOM checks, retries, fallback modes or
+per-line cleanup solely to recover from heap exhaustion.
+
+Zero-sized allocation/calloc requests return at least one freeable byte.
+`memoryReAllocate(ptr, 0)` instead frees `ptr` and returns `NULL`. Invalid aligned
+allocation geometry and overflowing `memoryCalloc()` multiplication return `NULL`
+before the backend allocator is called. Preserve checks for these documented
+results when the caller can supply such requests.
+
+The OOM path must not use the normal logger, allocate more memory, acquire
+application locks or call cleanup callbacks. It does not request orderly
+shutdown: `requestProgramShutdown()` returns to its caller, while an allocation
+caller cannot continue without usable storage. `abortProgramNow()` immediately
+terminates through the independent fatal path and deliberately skips orderly
+cleanup; see [Part 7](./part7-shutdown-and-signals.mdx).
+
+Validate external sizes, integer arithmetic and configured admission limits
+before allocating. Keep documented refusal for unrepresentable geometry,
+exhausted byte/entry budgets, empty fixed inventories, OS operations and
+third-party or standalone allocator interfaces that retain their own contracts.
+Keep optional-null and explicitly free-only operation results.
+Those results do not imply that a WaterWall heap allocator can return after OOM.
+Split checks with mixed causes and preserve ownership on every supported refusal;
+removing allocation recovery never authorizes removing bounds or lifetime checks.
 
 ### Typed internal capabilities versus runtime messages
 
@@ -439,9 +468,9 @@ the lifecycle callback semantics themselves are unchanged.
    tunnel, return `NULL`.
 
 `tunnelCreate()`, `adapterCreate()`, and `packettunnelCreate()` are nullable by
-contract. They return `NULL` on invalid or overflowing state sizes or allocation
-failure. Never assign a callback or call `tunnelGetState()` until the result has
-been checked.
+contract. They return `NULL` on invalid or overflowing state sizes. Heap
+allocation follows the [fatal policy](#heap-allocation-failure). Never assign a
+callback or call `tunnelGetState()` until the result has been checked.
 
 The cleanup discipline is real and worth following. The distilled shape is:
 
@@ -711,8 +740,8 @@ pointer grants no independent lifetime or permission after a callback. Never cop
 or reset a complete live direction object. Trailer cleanup detaches the owner
 pointer before wiping and freeing the header and owner, leaving the header deadline
 independent. Completion, canceled upload on an early final response, errors and
-terminal cleanup settle the owner. Acquisition happens before outward callbacks;
-allocation refusal leaves the raw header with its caller. Exchange and terminal
+terminal cleanup settle the owner. Acquisition happens before outward callbacks
+and follows the fatal heap-allocation policy. Exchange and terminal
 cleanup preserve the existing member-specific resets, including receive counters
 that unwind after reentrant close. Child close
 resets only upstream `paused` and downstream `read_paused` within the directions.
@@ -901,8 +930,9 @@ Continue to **[Part 6: Building, Testing & Reviewing](./part6-build-test-review.
 
 `initTcpIpStack()` is an idempotent construction-time shared-bootstrap facade;
 it creates no thread. Global startup initializes shared storage before spawning
-workers. The runtime lazily constructs an engine on its ordinary owner worker;
-a failed allocation leaves the slot empty and the affected packet/flow refused.
+workers. The runtime lazily constructs an engine on its ordinary owner worker.
+The standalone engine constructor retains its nullable contract: a failed
+construction leaves the slot empty and the affected packet/flow refused.
 A tunnel constructor must not create foreign engines or publish partial netifs.
 
 PTC and CTP attach separate netifs to the owner's shared engine. Their
