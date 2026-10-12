@@ -38,6 +38,77 @@ the neighbor. Packet constructors preserve both-direction lifecycle forwarding.
 For example, an encryptor overrides `Payload` in both directions but can leave
 `Pause`/`Resume` at default.
 
+### Dispatch Through Helpers
+
+All inter-tunnel flow events must use `tunnelNextUpStream*`,
+`tunnelPrevDownStream*`, `tunnelUpStream*`, or `tunnelDownStream*`. This applies to
+all six events in both directions, including delivery to a selected branch.
+The helpers enforce the line's active-tunnel mask at delivery time.
+
+Treat the `fnInit*`, `fnEst*`, `fnPayload*`, `fnFin*`, `fnPause*`, and `fnResume*`
+fields as handler-registration slots. Tunnel constructors may assign their
+handlers. Outside handler assignments, production tunnel code must not access
+these fields, including invocation, caching, copying or passing callbacks
+elsewhere; only the framework's dispatch implementation
+may invoke them directly. Keep `tunnel_t` visible in the header so the dispatch
+helpers can remain inline. Struct visibility does not authorize direct dispatch.
+
+For a known target, use `tunnelUpStream*` or `tunnelDownStream*`; these include
+that target in bypass resolution. Pass the helper itself to reference guards
+and line-task schedulers, so the mask is checked when delivery actually occurs:
+
+```c
+lineCallWithRef(line, tunnelUpStreamInit, target);
+lineCallWithRefWithBuf(line, tunnelUpStreamPayload, target, payload);
+```
+
+Do not pass `target->fnInitU` or `target->fnPayloadU` instead. The existing
+reference, buffer-transfer and scheduling contracts still apply. This rule
+covers flow delivery, not the separate framework lifecycle hooks such as
+`onChain`, `onIndex` and `onStop`.
+
+`tests/tunnel_callback_dispatch_policy_test.py` checks tunnel C sources and
+headers for callback-field reads, including direct calls and captures, while
+allowing handler assignments and ignoring comments and literals. Run it through
+the production `source-policy` selection; it does not require a compiled binary.
+
+## Permanent Per-Line Tunnel Bypass
+
+Every new or recycled line starts with `active_tunnels_mask == UINT64_MAX`.
+Bit `t->chain_index` enables that tunnel's flow callbacks. On the line's owner
+worker, `tunnelBypassLine(t, line)` permanently clears that bit; there is no
+re-enable operation. `tunnelIsActiveForLine(t, line)` queries it.
+
+Bypass covers all six events in both directions, including `Init` and `Finish`.
+The direct `tunnelUpStream*` / `tunnelDownStream*` helpers include their supplied
+target in the search. The `tunnelNextUpStream*` / `tunnelPrevDownStream*` helpers
+start at the neighbour. Both follow actual `next`/`prev` links until an active
+tunnel is found; chain-index order does not determine the path. Forwarding
+defaults, context delivery, pipe delivery and packet-anchor publication use
+these helpers. Raw callback-pointer calls do not perform bypass resolution.
+
+A tunnel may bypass itself only when it is fully transparent along those links
+for that exact line. **It must call its `LinestateDestroy` routine before
+`tunnelBypassLine()`.** Destruction must settle retained buffers, timers, queued
+work, references and other cleanup obligations, then zero the entire aligned
+`t->lstate_size` reservation, including padding. Merely zeroing pointers does
+not replace releasing the resources they own. `tunnelBypassLine()` asserts every
+byte of that region is zero in Debug before clearing the bit; it performs no
+cleanup itself. The tunnel will not receive a later `Finish`.
+Line owners, endpoints, branch selectors and any tunnel
+still needed for routing, transformation or flow control must remain active.
+Every valid dispatch path must reach an active endpoint. Skipping a tunnel does
+not authorize callbacks into an uninitialized target or change buffer ownership.
+
+Publish bypass before calling outward if a reentrant callback should skip the
+tunnel. Bypass does not cancel an already-running callback, and ordinary line
+reference/aliveness rules still apply. A newly created companion line starts
+with every bit enabled independently of its source line. For persistent worker
+packet lines, clearing a bit affects every packet using that worker's line.
+An immediate certified packet enqueue sink must remain active for inline
+delivery to be eligible; bypass must not redirect that privileged delivery to
+an uncertified neighbour.
+
 ## How a Line Starts
 
 A normal connection begins with `Init`, originated by an adapter:
