@@ -619,6 +619,13 @@ Practical consequences:
   look like the requested protocol.
 - After a route is selected, later payloads are not reclassified.
 
+Branch initialization and initial replay preserve FIFO order: input received
+reentrantly during those callbacks waits behind the already accepted first bytes.
+That additional input shares one ordinary buffer with a 2 MiB logical-byte limit;
+exceeding it closes the line. The limit does not reject a previously accepted
+complete first delivery merely because it exceeds the sniff window. Once startup
+replay finishes, later payloads pass through without a Router output queue.
+
 ## GeoIP
 
 `geoip:<cc>` works in `source-ips` and `destination-ip`.
@@ -766,17 +773,28 @@ Source-backed behavior:
 
 | Callback | Behavior |
 | --- | --- |
-| upstream `Init` | Initializes Router line state and clears old destination optional flags. Does not initialize any branch yet. |
-| first upstream `Payload` | Buffers payload, sniffs as needed, evaluates rules, initializes selected branch, replays buffered bytes. |
+| upstream `Init` | Initializes Router line state and clears observed-protocol bits, preserving route-control metadata. Metadata-only rules select and initialize their branch here. |
+| first upstream `Payload` | If routing needs payload inspection, buffers and sniffs bytes, evaluates rules, initializes the selected branch and replays buffered bytes. Otherwise forwards to the branch selected during Init. |
 | later upstream `Payload` | Goes directly to the selected target or default `next`. |
-| upstream `Pause` / `Resume` | Forwarded only after a route has been selected. |
+| upstream `Pause` / `Resume` | Forwarded to the selected branch, including duplicates; ignored before selection. They do not gate payload replay. |
 | upstream `Finish` | Destroys Router line state and finishes the selected target/default branch if one exists. |
 | downstream `Payload` / `Pause` / `Resume` / `Est` | Forwarded back to the previous node. |
 | downstream `Finish` | Destroys Router line state before forwarding finish to the previous node. |
 
-Router deliberately clears `dest_ctx.optional_flags` on upstream `Init` so that
-protocol bits detected by one Router do not leak into a later Router on the same
-line.
+Router clears only observed-protocol bits in `dest_ctx.optional_flags` on upstream
+`Init`, so protocol observations do not leak into a later Router on the same line.
+Separate one-shot route-control metadata remains available to its intended
+adapter and does not count as a `protocol` match.
+
+Pause/Resume are advisory in both directions. Router keeps no consumer-pause state
+and does not wait for Resume to finish branch startup or deliver ready input.
+
+After branch Init returns and initial replay settles, Router destroys and zeros
+its line state and permanently bypasses itself when the selected branch entry is
+its actual `next` link. This covers the default route and a rule that selects the
+same entry. A different target keeps Router active to dispatch future upstream
+callbacks to that branch. Bypass does not change the selected destination or
+remove downstream nodes from the chain.
 
 ## Recipes
 
