@@ -5,7 +5,7 @@ sidebar_label: "Part 3: Buffers & Padding"
 description: "The sbuf_t buffer model, worker buffer pools, left-padding budgets, and how to prepend protocol headers without breaking chain composition."
 ---
 <!--
-Documentation version: 172
+Documentation version: 175
 -->
 
 # Part 3: Buffers, Padding & Shift Buffers
@@ -1337,6 +1337,54 @@ worker. Private-pipe bytes survive source closure; canceled messages destroy the
 wrapper without borrowing a foreign worker's pool. No permanent ordinary-read
 preference is needed for either HalfDuplex node.
 
+### Reverse activation prefix
+
+ReverseServer sends one ordinary prefix per pair: a four-byte big-endian total
+length followed by random padding. Length includes the header, ranges from 4 to
+65,536 bytes, and is selected afresh with the fast CSPRNG family. Server-only
+`activation-min-size` and `activation-max-size` default to 64 and 1,024 inclusive;
+strict integer validation enforces wire bounds and `min <= max`. ReverseClient
+uses only the received length and protocol bounds, never the configured range.
+No fixed magic bytes or recurring application framing are added. Random sizing
+is not a guarantee against fingerprinting; a plaintext length and timing remain
+observable without an enclosing encrypted transport.
+
+The server builds the prefix in a separate padded buffer and hands it off exactly
+once even if the reverse consumer is paused. This startup exception applies only
+to activation, with no buffered user bytes attached. Publish a reentry barrier in
+both halves before inherited Pause notifications and keep it through the prefix
+handoff; nested Payload or Resume cannot release application data ahead of it.
+Finish cancels any unsent prefix. Receiver hard limits still apply, and the next
+transport may queue activation until it can physically write.
+
+Retained application replay preserves FIFO through reentry and waits for output
+Resume. Each server half has one budgeted application FIFO with inclusive limits
+of 2 MiB logical bytes and 1,024 buffers, independent of RAM profile. Waiting data
+and startup retention share that budget; pop releases its cost before handoff.
+Nested admission during one prefix handoff or backlog-drain dispatch has the same
+finite byte and buffer bounds, preventing callbacks from endlessly refilling it.
+Empty TCP input is recycled without an entry. Refusal closes the waiting half or
+both paired halves through their owners. The separate activation buffer is at most
+65,536 bytes. Reverse handshake fragments are compared incrementally and recycled;
+only a matched offset is retained. Cross-worker replay coalesces the admitted FIFO
+behind a synthetic handshake, without outward callbacks during preparation.
+
+ReverseClient caches four header bytes and discards padding incrementally through
+`sbufReadRangeToMemory()` using at most 256 bytes of scratch. Never interpret pipe
+metadata as header/body memory, allocate the announced length, or forward padding
+to the destination. Validate length before consuming its body. Preserve an
+accompanying application's ordinary/private-pipe remainder and forward it after
+destination Init; later deliveries transfer intact. Nested application input
+while destination Init/initial handoff is active stays behind older data in one
+owned FIFO. The original initial body has an active reservation in the same budget
+as queued input: 2 MiB logical bytes and 1,024 buffers, with empty input consuming
+no entries. Release the reservation or pop cost before handoff. Preserve the first
+body's identity and queued private pipes. Nested admission across one initial
+dispatch separately has those finite byte and buffer bounds. Close releases the
+initial body, its reservation and all queued entries exactly once. These logical
+budgets are not allocation-charge or physical-memory guarantees; ready direct
+payloads do not enter them.
+
 ### Client first-payload requests
 
 TrojanClient and VlessClient assemble their initial request and the entire first
@@ -1882,21 +1930,21 @@ distinct. Multiple valid records delivered together are not an oversized record;
 process them when possible while preserving bounded admission and Pause. Changing
 a pool or pipe target must not silently change these node policies.
 
-Waiting caps instead use `bufferpoolGetWaitingBudgetBasis()`, a separate immutable
-pool setting: 64 KiB in S1/S2 and 1 MiB in higher profiles. ReverseServer keeps
-`65535 * max(1, ceil(basis / 32768))`; HalfDuplexServer and HttpServer split
-waiting keep `131070 * max(1, ceil(basis / 32768))`. Their S1/S2 limits remain
-131,070 and 262,140 bytes, and their higher-profile limits remain 2,097,120 and
-4,194,240 bytes respectively. Enlarging splice targets does not enlarge these
+HalfDuplexServer and HttpServer split waiting caps use
+`bufferpoolGetWaitingBudgetBasis()`, a separate immutable pool setting: 64 KiB in
+S1/S2 and 1 MiB in higher profiles. They keep
+`131070 * max(1, ceil(basis / 32768))`: 262,140 bytes in S1/S2 and 4,194,240 bytes
+in higher profiles. Enlarging splice targets does not enlarge these
 waiting caps. Device pools inherit both the splice limit and waiting-budget
 basis from their worker pool; custom pools provide each explicitly.
 
 ReverseServer also materializes complete splice deliveries in both directions
-while a half is unpaired. Handshake validation/removal, waiting-buffer merges
+while a half is unpaired. Handshake validation/removal, waiting FIFOs
 and cross-worker handshake replay use ordinary buffers. Handshake completion
 does not permit opaque retention while waiting; only pairing enables unchanged
-splice forwarding. Materialization preserves onward padding, and waiting caps
-remain independent of splice read sizes. PipeTunnel transfers paired opaque
+splice forwarding after startup FIFO replay. Materialization preserves onward
+padding; application retention follows the default 2 MiB / 1,024-buffer budget,
+independent of pool geometry and splice read sizes. PipeTunnel transfers paired opaque
 buffers across workers under its existing ownership and cancellation contract.
 
 ### Payload length versus retained allocation charge

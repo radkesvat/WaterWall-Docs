@@ -6,7 +6,7 @@ description: "Reference documentation for the ReverseServer node."
 ---
 
 <!--
-Documentation version: 153
+Documentation version: 156
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/ReverseServer/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/ReverseServer.mdx, and all files must keep the same documentation version.
 -->
 
@@ -183,6 +183,8 @@ Top-level fields:
 
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
+| `activation-min-size` | integer | `64` | Minimum total activation size, including its four-byte header; `4..65536`. |
+| `activation-max-size` | integer | `1024` | Maximum total activation size; `4..65536`, and `min <= max`. |
 | `reverse-secret-length` | integer | `640` | Length of the reverse-link handshake. Must be in `1..1024`. |
 | `reverse-secret` | ASCII string | unset | XORs the default expected handshake bytes with this secret, repeated over the handshake length. Must be non-empty ASCII when set. |
 
@@ -203,8 +205,8 @@ Default expected handshake:
 When `reverse-secret` is configured, the same XOR transformation used by
 `ReverseClient` is applied before comparison.
 
-`ReverseServer` buffers incoming reverse-link bytes until enough data exists to
-validate the full handshake:
+`ReverseServer` compares handshake bytes incrementally, retaining only the matched
+offset until the full handshake is validated:
 
 - if the handshake matches, the handshake bytes are stripped
 - any payload after the handshake is kept as buffered data
@@ -221,16 +223,19 @@ validate the full handshake:
 
 When payload arrives on an unpaired reverse-link half:
 
-1. buffered bytes are merged with the new payload if needed
-2. the reverse handshake is validated
-3. the half is added to the reverse waiting list
-4. if a local/user half is waiting, the two halves are paired
+1. handshake bytes are compared incrementally
+2. a complete valid handshake admits the half to the reverse waiting list
+3. any following application data enters the bounded FIFO before callbacks
+4. the source is held while unpaired and local or cross-worker matching is attempted
 
-When payload arrives on an unpaired local/user half:
-
-1. buffered bytes are merged with the new payload if needed
-2. the half is added to the local/user waiting list
-3. if a reverse-link half is waiting, the two halves are paired
+A local/user half is registered during Init, which attempts pairing immediately.
+It does not wait for a first payload. Early application bytes are buffered while
+the peer is unavailable. An existing application backlog remains queued after
+pairing while its consumer is paused.
+After Est, an unpaired user source is paused. A fully authenticated reverse source
+is also held while unpaired. Pairing sends activation and drains eligible older
+bytes before releasing these holds. Consumer Pause keeps its source held; clearing
+a waiting hold never overrides it. Holds and consumer pressure survive migration.
 
 After pairing:
 
@@ -241,6 +246,35 @@ After pairing:
 | finish from one side | closes the peer half |
 | pause/resume | reflected to the paired peer half |
 
+## Variable-Size Activation
+
+A pair sends exactly one activation prefix before any user application bytes:
+
+```text
+4-byte big-endian total length | random padding | direct application stream
+```
+
+The total length includes the four-byte header and is in `4..65536`. Each pair
+chooses a fresh random length between `activation-min-size` (default `64`) and
+`activation-max-size` (default `1024`), inclusive. Both settings belong only to
+ReverseServer; ReverseClient reads the advertised length without knowing the
+configured range. Values must be integers in `4..65536`, with `min <= max`.
+
+ReverseClient consumes the complete prefix, then opens its destination line.
+No user payload is required, so a destination greeting can reach a silent user.
+The prefix is also sent for users that send immediately; it always precedes
+application data and never reaches the destination. There are no later activation
+headers. Fragmentation and a prefix coalesced with application data are supported.
+
+ReverseServer hands off activation once even if the reverse side is paused, in a
+separate buffer containing no application data. Buffered application bytes still
+wait for Resume. The receiving transport may queue activation until it can write.
+FIFO ordering holds through startup callbacks; ready payloads use direct forwarding.
+
+Random lengths avoid one fixed activation size. The plaintext length field and
+traffic timing remain visible without an enclosing encrypted transport; this is
+not a guarantee against traffic fingerprinting.
+
 ## Direction Model
 
 Source-backed callback behavior:
@@ -249,7 +283,7 @@ Source-backed callback behavior:
 | --- | --- |
 | upstream `Init` | Initializes a reverse-link half and immediately reports downstream establishment to the previous side. |
 | upstream `Payload` | Processes the `ReverseClient` handshake before pairing; after pairing forwards to the local/user side with `tunnelNextUpStreamPayload()`. |
-| downstream `Init` | Initializes a local/user half and immediately reports upstream establishment to the next side. |
+| downstream `Init` | Initializes and registers the local/user half, reports upstream establishment, and attempts pairing without payload. |
 | downstream `Payload` | Waits for or pairs with a reverse-link half; after pairing forwards to the reverse side with `tunnelPrevDownStreamPayload()`. |
 | `Pause` / `Resume` | Forwarded only after a pair exists. |
 | `Finish` | Removes unpaired waiting halves or finishes the paired peer half. |
@@ -259,6 +293,8 @@ The immediate establishment callback means the half has been accepted by
 forwarding useful payload.
 
 ## Cross-Worker Pairing
+
+A new user can notify the owner worker of an idle reverse peer. Either arrival order therefore initiates pairing without further payload. Notifications carry no foreign line pointer.
 
 Waiting lists are per worker. If a reverse-link half arrives on one worker and a
 local/user half is waiting on another worker, `ReverseServer` can move the
@@ -270,21 +306,13 @@ by the same worker thread.
 
 ## Buffering Limits
 
-Each unpaired half may buffer data while waiting for its peer.
+Each half has one application FIFO with inclusive limits of **2 MiB logical bytes
+and 1,024 buffers**, independent of the RAM profile. Waiting data and retained
+startup replay share that budget. Empty TCP input consumes no entries; handshake
+comparison state and the separate activation prefix are protocol metadata.
 
-Current limit:
-
-```text
-65535 * max(1, ceil(L / 32768)) bytes per waiting half
-```
-
-Here `L` is the line pool waiting-budget basis (64 KiB in S1/S2, 1 MiB in higher profiles),
-independent of ordinary buffer sizes and the splice limit. The limit is 131,070
-bytes in S1/S2 and 2,097,120 bytes in higher profiles. Validate the handshake and try
-available pairing before applying this waiting-only bound.
-
-If a waiting half exceeds that limit, it is dropped and its peer-side finish is
-propagated as appropriate.
+A refused admission closes the waiting half, or both halves if already paired.
+Ready direct payloads do not acquire a backlog or inherit its size limit.
 
 ## Practical Notes
 
@@ -301,9 +329,10 @@ propagated as appropriate.
 
 ReverseServer materializes each complete splice payload into ordinary memory in
 both directions while the half is unpaired. This covers handshake validation,
-handshake removal, waiting-buffer merges and replay when pairing moves to another
+handshake removal, waiting FIFOs and replay when pairing moves to another
 worker. Handshake completion alone does not end materialization: waiting storage
-remains ordinary until pairing completes. After pairing, payloads pass through
+remains ordinary until pairing completes. Initial replay and input queued behind
+startup backlog also use ordinary storage. Ready paired payloads pass through
 unchanged in both directions.
 
 The internal PipeTunnel shares ReverseServer's splice capability and transfers

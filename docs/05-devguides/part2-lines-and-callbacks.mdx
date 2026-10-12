@@ -5,7 +5,7 @@ sidebar_label: "Part 2: Lines & Lifetime"
 description: "The connection lifecycle, re-entrancy hazards, line references, and the clean-finish patterns that keep WaterWall tunnels free of use-after-free bugs."
 ---
 <!--
-Documentation version: 182
+Documentation version: 185
 -->
 
 # Part 2: Lines, Callbacks & Lifetime Safety
@@ -465,6 +465,40 @@ explicit downstream Init handler changes ownership. Trace special/internal
 creation paths before applying the ordinary stream close sequence. A physical
 reference keeps allocation memory available; it does not keep a destroyed line
 logically alive.
+
+### Reverse activation and pairing
+
+ReverseServer borrows both normal halves. The local/user half enters its owner
+worker's waiting list in downstream Init, before establishment can reenter;
+pairing must not require a first application Payload. Reverse handshake validation
+still precedes admission of the reverse half. Either arrival order initiates
+local or cross-worker matching; notifications resolve live peer lists on their
+owner worker and never carry a foreign line pointer. PipeTunnel owns any normal
+companion it creates for migration.
+
+After Est returns, hold an unpaired user source with Pause. After validating the
+complete reverse handshake and owning its accompanying application tail, hold
+that reverse source while matching. Never pause an incomplete handshake. Publish
+the combined source-notification latch before callbacks; waiting/startup FIFO
+holds and peer-consumer pressure are distinct reasons. Activation does not clear
+consumer pressure. Drain eligible older application buffers before releasing a
+source with Resume, and preserve both the waiting hold and consumer pressure
+through PipeTunnel migration. A source may pair, close or admit bounded input
+reentrantly from any notification.
+
+A pair emits exactly one length-bearing activation prefix before user bytes.
+ReverseClient owns both of its normal lines and opens its destination only after
+consuming the complete prefix, independently of application input. The unused
+pair's existing idle deadline covers partial activation. Publish pair state and
+retained FIFO ownership before Init/Payload/Est/Pause/Resume callbacks. Hold and
+recheck both exact halves when continuing initial replay; a close releases all
+pending buffers before propagating Finish away from its sender. The server hands
+off activation exactly once even when its consumer is paused, separately from
+application backlog. This bounded startup exception does not bypass receiver hard
+limits or Finish, and a paused transport may defer the physical write. Retained
+application output waits for its consumer's Resume. After activation and initial replay,
+application forwarding remains direct. See [the wire and storage contract in
+Part 3](./part3-buffers-and-padding.mdx#reverse-activation-prefix).
 
 ### Shutdown-complete owners and adapters
 
@@ -1166,6 +1200,11 @@ checking an elapsed deadline and perform timeout cleanup during Pause; that does
 not authorize new Payload. Mux and KeepAlive Ping/Pong obey the output Pause gate.
 A due unsent probe is bounded deferred work and has no reply deadline until
 handoff. Receiver hard limits and Finish boundaries still apply.
+
+The [reverse activation prefix](./part3-buffers-and-padding.mdx#reverse-activation-prefix)
+has a narrow startup exception: ReverseServer hands off that single bounded
+control buffer through Pause to open the destination. It never attaches retained
+application bytes to the exception; their independent drain still waits for Resume.
 
 #### Completing an admitted input batch
 

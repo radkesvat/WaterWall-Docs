@@ -6,7 +6,7 @@ description: "راهنمای node ReverseServer در WaterWall."
 ---
 
 <!--
-Documentation version: 153
+Documentation version: 156
 -->
 
 # ReverseServer
@@ -165,10 +165,14 @@ flowchart LR
 
 | گزینه | نوع | پیش‌فرض | توضیح |
 | --- | --- | --- | --- |
+| `activation-min-size` | integer | `64` | حداقل طول کل پیام فعال‌سازی با header چهار بایتی؛ `4..65536`. |
+| `activation-max-size` | integer | `1024` | حداکثر طول کل پیام؛ `4..65536` و `min <= max`. |
 | `reverse-secret-length` | integer | `640` | طول handshake داخلی. باید در بازه `1..1024` باشد. |
 | `reverse-secret` | ASCII string | unset | بایت‌های handshake مورد انتظار را با secret به‌صورت تکرارشونده XOR می‌کند. وقتی تنظیم شود باید ASCII غیرخالی باشد. |
 
-`ReverseServer` و `ReverseClient` و هر `SniffRouter` که reverse link را تشخیص می‌دهد باید مقدارهای یکسانی برای این گزینه‌ها داشته باشند.
+`ReverseServer` و `ReverseClient` و هر `SniffRouter` که reverse link را تشخیص می‌دهد
+باید برای `reverse-secret-length` و `reverse-secret` مقدارهای یکسانی داشته باشند.
+بازه فعال‌سازی فقط در ReverseServer تنظیم می‌شود.
 
 ## handshake داخلی {#handshake-داخلی}
 
@@ -182,7 +186,8 @@ handshake پیش‌فرض مورد انتظار:
 
 اگر `reverse-secret` تنظیم شده باشد، همان XOR transformation که توسط `ReverseClient` استفاده می‌شود قبل از مقایسه اعمال می‌شود.
 
-`ReverseServer` بایت‌های ورودی reverse link را تا زمانی که داده کافی برای اعتبارسنجی کامل handshake برسد در buffer نگه می‌دارد:
+`ReverseServer` بایت‌های handshake را به‌صورت تدریجی مقایسه می‌کند و فقط offset
+بایت‌های تأییدشده را تا کامل شدن handshake نگه می‌دارد:
 
 - اگر handshake match باشد، بایت‌های آن حذف می‌شوند
 - هر payload پس از handshake به‌عنوان داده ذخیره‌شده در buffer نگه داشته می‌شود
@@ -199,16 +204,19 @@ handshake پیش‌فرض مورد انتظار:
 
 وقتی payload روی یک reverse-link half غیر-paired برسد:
 
-1. در صورت نیاز، بایت‌های bufferشده با payload جدید ترکیب می‌شوند
-2. reverse handshake اعتبارسنجی می‌شود
-3. half به لیست انتظار reverse اضافه می‌شود
-4. اگر local/user half در انتظار باشد، دو half pair می‌شوند
+1. بایت‌های handshake به‌صورت تدریجی مقایسه می‌شوند
+2. handshake کامل و معتبر، half را وارد لیست انتظار reverse می‌کند
+3. دادهٔ برنامهٔ همراه آن پیش از callbackها وارد FIFO محدود می‌شود
+4. source در حالت انتظار Pause می‌شود و matching محلی یا بین workerها انجام می‌شود
 
-وقتی payload روی یک local/user half غیر-paired برسد:
-
-1. در صورت نیاز، بایت‌های bufferشده با payload جدید ترکیب می‌شوند
-2. half به لیست انتظار local/user اضافه می‌شود
-3. اگر reverse-link half در انتظار باشد، دو half pair می‌شوند
+local/user half در Init وارد لیست انتظار می‌شود و همان موقع pair شدن را امتحان
+می‌کند؛ ارسال نخستین payload لازم نیست. داده زودهنگام تا آماده شدن peer در
+buffer نگه داشته می‌شود. داده‌های منتظر برنامه پس از pair شدن هم در حالت Pause
+مصرف‌کننده در صف می‌مانند.
+پس از Est، source کاربرِ بدون peer Pause می‌شود. source سمت reverse هم پس از
+handshake کامل و معتبر تا pair شدن نگه داشته می‌شود. پس از فعال‌سازی و تخلیهٔ
+داده‌های قدیمیِ مجاز، این hold آزاد می‌شود؛ Pause مصرف‌کننده همچنان مانع Resume
+source مربوطه است. hold و فشار مصرف‌کننده در انتقال بین workerها حفظ می‌شوند.
 
 بعد از pair شدن:
 
@@ -219,13 +227,42 @@ handshake پیش‌فرض مورد انتظار:
 | finish از هر سمت | سمت مقابل را می‌بندد. |
 | pause/resume | به paired peer half منعکس می‌شود. |
 
+## پیام فعال‌سازی با طول متغیر
+
+هر pair دقیقاً یک پیام فعال‌سازی پیش از بایت‌های برنامه می‌فرستد:
+
+```text
+4-byte big-endian total length | random padding | direct application stream
+```
+
+طول کل شامل header چهار بایتی است و در بازه `4..65536` قرار دارد.
+`activation-min-size` با پیش‌فرض `64` و `activation-max-size` با پیش‌فرض `1024`
+فقط در ReverseServer تنظیم می‌شوند. طول هر پیام به‌صورت تصادفی و شامل دو سر بازه
+انتخاب می‌شود. هر دو مقدار باید integer در بازه `4..65536` باشند و `min <= max` باشد.
+ReverseClient طول را از خود پیام می‌خواند و به تنظیم بازه یکسان نیازی ندارد.
+
+ReverseClient پیام را کامل مصرف می‌کند و سپس line مقصد را باز می‌کند؛ در نتیجه
+کاربر بدون ارسال داده هم می‌تواند greeting مقصد را دریافت کند. این prefix برای
+کاربری که فوراً داده می‌فرستد هم فقط یک بار و پیش از داده‌های برنامه ارسال می‌شود.
+header و padding به مقصد نمی‌رسند و پس از آن stream مستقیم است. پیام تکه‌تکه یا
+پیامی که با داده برنامه در یک read برسد هم پشتیبانی می‌شود.
+
+ReverseServer پیام فعال‌سازی را دقیقاً یک بار، حتی در حالت Pause سمت reverse،
+در buffer جداگانه و بدون دادهٔ برنامه تحویل می‌دهد. داده‌های ذخیره‌شدهٔ برنامه
+همچنان تا Resume منتظر می‌مانند و ترتیب FIFO در callbackهای شروع حفظ می‌شود.
+transport دریافت‌کننده ممکن است پیام فعال‌سازی را تا امکان نوشتن در صف نگه دارد.
+payload آماده پس از شروع به‌صورت مستقیم عبور می‌کند.
+
+طول تصادفی اندازه ثابت پیام فعال‌سازی را حذف می‌کند، اما بدون transport رمزگذاری‌شده،
+فیلد طول و زمان‌بندی ترافیک قابل مشاهده‌اند؛ این روش تضمین عدم fingerprint نیست.
+
 ## مدل جهت‌ها
 
 | callback | رفتار |
 | --- | --- |
 | upstream `Init` | یک reverse-link half را مقداردهی اولیه می‌کند و فوراً برقراری downstream را به previous side گزارش می‌دهد. |
 | upstream `Payload` | پیش از جفت شدن، handshake مربوط به `ReverseClient` را پردازش می‌کند؛ پس از جفت شدن نیز payload را با `tunnelNextUpStreamPayload()` به سمت local/user می‌فرستد. |
-| downstream `Init` | یک local/user half را مقداردهی اولیه می‌کند و فوراً برقراری upstream را به next side گزارش می‌دهد. |
+| downstream `Init` | local/user half را مقداردهی اولیه و ثبت می‌کند، برقراری upstream را گزارش می‌دهد و بدون payload جفت‌سازی را آغاز می‌کند. |
 | downstream `Payload` | منتظر reverse-link half می‌ماند یا با آن جفت می‌شود؛ پس از جفت شدن نیز payload را با `tunnelPrevDownStreamPayload()` به سمت reverse می‌فرستد. |
 | `Pause` / `Resume` | فقط پس از جفت شدن دو half عبور داده می‌شوند. |
 | `Finish` | half‌های جفت‌نشده منتظر را حذف می‌کند یا peer half جفت‌شده را با `Finish` می‌بندد. |
@@ -234,21 +271,23 @@ callback فوری establishment فقط به این معناست که `ReverseSer
 
 ## Cross-worker Pairing {#cross-worker-pairing}
 
+ورود user جدید به worker یک reverse peer منتظر اطلاع داده می‌شود؛ هر دو ترتیب ورود بدون payload تازه pair شدن را شروع می‌کنند. پیام worker حاوی line pointer خارجی نیست.
+
 لیست‌های انتظار per-worker هستند. اگر یک reverse-link half روی یک worker برسد و یک local/user half روی worker دیگری منتظر باشد، `ReverseServer` می‌تواند reverse-link half را از یک pipe tunnel layer داخلی عبور دهد و pair را روی target worker کامل کند.
 
 به همین دلیل reverse setup حتی زمانی کار می‌کند که دو half را worker thread یکسانی نپذیرفته باشد.
 
 ## محدودیت buffer {#محدودیت-buffer}
 
-هر half که هنوز جفت نشده است می‌تواند مقدار محدودی داده را در buffer نگه دارد:
+هر half یک FIFO برای دادهٔ برنامه با سقف شامل **2 MiB بایت منطقی و 1024 buffer**
+دارد که مستقل از RAM profile است. دادهٔ انتظار و بازپخش اولیه از همین بودجه
+استفاده می‌کنند. ورودی TCP خالی entry مصرف نمی‌کند؛ offset handshake و پیام
+فعال‌سازی جداگانه، metadata پروتکل هستند.
 
-```text
-65535 * max(1, ceil(L / 32768)) bytes per waiting half
-```
+رد شدن admission، half منتظر یا هر دو half یک pair را می‌بندد. payload آماده
+مستقیم عبور می‌کند و سقف backlog روی آن اعمال نمی‌شود.
 
-اگر داده از این مقدار فراتر برود، آن half کنار گذاشته و `Finish` به شکل مناسب به سمت peer فرستاده می‌شود.
-
-`ReverseServer` پس از پردازش handshake، header تازه‌ای به ابتدای payload اضافه نمی‌کند و به left padding نیاز ندارد.
+`ReverseServer` پیام فعال‌سازی را در buffer جداگانه می‌سازد و به left padding اضافی نیاز ندارد.
 
 ## نکته‌های عملی
 
@@ -265,8 +304,9 @@ callback فوری establishment فقط به این معناست که `ReverseSer
 را در هر دو جهت به حافظهٔ عادی تبدیل می‌کند. اعتبارسنجی و حذف handshake، ادغام
 buffer‌های انتظار و بازپخش handshake هنگام انتقال به worker دیگر روی buffer‌های
 عادی انجام می‌شوند. کامل‌شدن handshake به‌تنهایی این تبدیل را متوقف نمی‌کند؛
-buffer‌های انتظار تا پایان pairing عادی می‌مانند. پس از pairing، payload‌ها در
-هر دو جهت بدون تغییر عبور می‌کنند.
+buffer‌های انتظار تا پایان pairing عادی می‌مانند. بازپخش اولیه و ورودی که پشت
+داده‌های منتظر شروع در صف قرار می‌گیرد هم از حافظهٔ عادی استفاده می‌کند.
+payload آمادهٔ pair در هر دو جهت بدون تغییر عبور می‌کند.
 
 `PipeTunnel` داخلی همان قابلیت splice node `ReverseServer` را دارد و buffer‌های
 payload را بین worker‌ها منتقل می‌کند. محدودیت‌های انتظار، نگاشت callback‌ها و
@@ -287,4 +327,4 @@ chain نهاییِ واجد شرایط و تنظیم `misc.splice` وابسته 
 | `layer_group_next_node` | `kNodeLayer4` |
 | `required_padding_left` | `0` بایت |
 
-`L` مبنای مستقل بودجهٔ انتظار در pool مربوط به line است: ۶۴ KiB در S1/S2 و ۱ MiB در پروفایل‌های بالاتر. این مبنا از اندازهٔ buffer‌های عادی و سقف splice مستقل است. حد انتظار در S1/S2 برابر ۱۳۱۰۷۰ و در پروفایل‌های بالاتر برابر ۲۰۹۷۱۲۰ بایت است؛ فقط عبور از حد موجب بستن می‌شود. اعتبارسنجی handshake و جفت‌شدن با peer موجود پیش از بررسی حد انتظار انجام می‌شوند.
+دادهٔ برنامهٔ نگه‌داشته‌شده در همهٔ RAM profileها سقف 2 MiB / 1024 buffer دارد.
