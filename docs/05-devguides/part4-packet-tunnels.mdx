@@ -872,13 +872,36 @@ Examples and what they anchor:
 | Bridge | Role |
 | --- | --- |
 | `PacketsToStream` | packet line to a worker-local stream-facing line; stores that line and a read buffer |
-| `StreamToPackets` | a stream line to the packet line; stores the active stream line and read buffer per worker |
+| `StreamToPackets` | borrowed stream lines to packet lines; each stream has a parser, with a shared source registry and per-flow return-carrier selection |
 | `PacketsToConnection` | packet traffic to lwIP to normal WaterWall connection lines behind the packet side |
 | `PacketSplitStream` | splits packet traffic across stream paths |
 
-State stored here is worker-local bridge state — still not per-connection state.
+State stored on a packet line is worker-local bridge state, not per-connection state.
 If you need closable per-connection behavior behind packet traffic, create or
 manage normal lines behind the packet line instead of closing the packet line.
+
+### Stream/packet bridge flow control
+
+`PacketsToStream` owns its normal stream lines and keeps its bridge state on each
+worker packet line. `StreamToPackets` borrows normal stream lines and stores its
+parser state on those lines; its packet lines are forwarding targets. Both are
+endpoints for the exact lines they join. Neither may use permanent tunnel bypass:
+payload still requires IPv4 boundary parsing, worker-affinity dispatch and
+mapping between different line identities.
+
+Keep their endpoint Pause state. `PacketsToStream` maps stream pressure to the
+packet source and drops additional packets while paused. `StreamToPackets`
+excludes a paused carrier from return selection and drops return packets if no
+eligible carrier remains. Repeated notifications are idempotent, not counted
+holds. Sensitive-mode Ping and Pong may cross Pause; they do not release ordinary
+packet admission or suspend the Pong deadline.
+
+After creating a live, unpaused stream line, `PacketsToStream` sends packet-side
+Resume so a Pause from an earlier carrier cannot strand the packet producer.
+Replacement Init must settle first; a Pause during Init prevents that release.
+If creation happened while handling a packet or heartbeat, settle that buffer
+before Resume can reenter and release more input. Reset, failed Init and shutdown
+do not send a recovery Resume.
 
 ### Obfuscator stream and packet roles
 
