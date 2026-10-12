@@ -1081,16 +1081,19 @@ relays promptly while an admitted synchronous batch can complete. In both client
 modes, the first ping is due one `ping-interval` after downstream transport Est;
 waiting for it does not block application data or start a reply deadline. Repeated
 Est does not reset this schedule. Timer checks and outstanding monotonic reply
-deadlines continue during either directional Pause. These nodes maintain a local
-Pause gate for Ping/Pong output; it is not a general requirement for middle-node
-timers. An unsent ping leaves one due obligation without starting
-a reply deadline. Each endpoint retains at most 1,024 pending Pong obligations
-without allocating their frames until output is permitted. Excess obligations
-close through the normal owner. Resume drains replies with a reentrancy guard,
-stopping on renewed Pause or Finish; Finish discards them. The optional reply
-watchdog uses ordinary empty control frames and leaves body representation unchanged. Missing or
-late empty pongs close through the borrowed normal line's owner; the framing
-node does not recreate the line. KeepAliveServer remains the responder.
+deadlines continue during either directional Pause. Both nodes relay repeated
+Pause/Resume through the default callbacks. Due pings and pong replies do not
+wait for Resume. An unsent ping blocked by an active encoder or an outstanding
+pong leaves one due obligation without starting another reply deadline.
+Each parsed Ping sends its Pong directly; the decoder's existing reentry guard
+keeps nested input behind older frames under the same input bounds. No separate
+pending-Pong queue is needed. Finish stops the drain and discards retained input.
+The optional reply watchdog uses ordinary empty control frames and leaves body
+representation unchanged. Missing or late empty pongs close through the borrowed
+normal line's owner; the framing node does not recreate the line. KeepAliveServer
+remains the responder.
+Both nodes remain active throughout the line because every payload still needs
+framing and control processing; neither is eligible for permanent bypass.
 
 ### Protocol storage and admitted batches
 
@@ -1196,9 +1199,18 @@ single coalesced input can produce, including empty datagrams.
 
 TlsClient's pre-handshake application queue and RealityClient's early application
 queue follow the default 2 MiB / 1,024-entry bound. They represent a real protocol wait,
-including application data admitted before TCP Est. Their later plaintext release
-uses a local Pause gate in its independent FIFO drain; it is not part of the final
-handshake input's synchronous batch. Keep ciphertext-shaping budgets separate.
+including application data admitted before TCP Est. Once protocol-ready, their
+plaintext drains progress without waiting for consumer Resume. Reentrant input
+stays behind the active plaintext remainder, and active reservations retain their
+byte/entry charge until consumed and released. Local backlog pressure has its own
+release path. Keep ciphertext-shaping budgets separate.
+
+TlsClient and TlsServer relay advisory Pause/Resume without gating due record
+output. Configured record delays, FIFO order, local shaping watermarks and hard
+limits still apply. TlsClient's plaintext drain can wait for its own shaping
+backlog to clear; that local scheduling obligation is independent of consumer
+notifications. RealityServer already relays notifications through the selected
+live branch while retaining its authentication, branch-cutoff and Finish guards.
 
 TlsClient and TlsServer use owned-buffer ciphertext BIOs. Feeding ordinary input
 transfers its complete `sbuf_t` on every result, including admission refusal;
@@ -1297,6 +1309,12 @@ ordinary middle-node output needs no consumer-pause gate.
 
 ### HalfDuplex setup and direct forwarding
 
+Both HalfDuplex nodes remain exact-line endpoints after pairing. The client maps
+a borrowed main line to two owned transport lines; the server maps two borrowed
+transports to its owned main line. Permanent bypass would lose that mapping and
+Finish cleanup. Their aggregate producer holds and startup replay gates retain
+the endpoint flow-control responsibilities described in Part 2.
+
 HalfDuplexClient must combine its 17-byte upload intro and complete first input
 into one ordinary buffer. It advertises 17 bytes of headroom and reuses ordinary input
 when those bytes fit. Insufficient headroom uses a best-fit allocation with full onward padding. Consume splice input
@@ -1306,6 +1324,10 @@ separate download intro is ordinary. Both intros and the publication guard exist
 before callbacks. Empty input retains the same first-Payload timing. The existing
 Init/intro FIFO may own splice wrappers and retains its inclusive 2 MiB / 1,024
 buffer policy. Later payload in both directions transfers the original wrapper.
+Application Pause/Resume maps directly to the initialized download child,
+including repeats. Before that child exists, the client remembers only a pending
+Pause; an intervening Resume cancels it. Child write pressure remains aggregated
+separately to control the application source.
 
 HalfDuplexServer must materialize whole deliveries in unknown and waiting-upload
 states before parsing or retention. Its buffering slot is always ordinary,

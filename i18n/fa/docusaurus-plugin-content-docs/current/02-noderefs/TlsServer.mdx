@@ -127,7 +127,7 @@ fallback فقط تا پیش از قطعی شدن مسیر TLS قابل انتخ�
 | `session-cache-size` | `20480` | اندازه cache داخلی OpenSSL. |
 | `session-tickets` | `true` | TLS session ticket‌ها را فعال می‌کند. |
 | `fallback-node-name` | تنظیم نشده | branch جایگزین برای ورودی‌ای که پیش از قطعی شدن مسیر TLS، آشکارا غیر TLS است. نام‌های `fallback-node` و `fallback` هم پذیرفته می‌شوند. |
-| `fallback-intentional-delay-ms` | `7` | تأخیر عمدی برای payload‌های upstream در fallback؛ در delay غیرصفر jitter اعمال می‌شود. در `0`، fallback فعال و بدون pause که FIFO قدیمی یا drain زمان‌بندی‌شده ندارد payload را inline می‌گیرد؛ بایت‌های paused یا پشت FIFO قدیمی می‌مانند و Resume drain را پیش از payload‌های بعدی زمان‌بندی می‌کند تا سبقت نگیرند. |
+| `fallback-intentional-delay-ms` | `7` | تأخیر عمدی برای payload‌های upstream در fallback؛ در delay غیرصفر jitter اعمال می‌شود. در `0`، fallback مقداردهی‌شده که FIFO قدیمی یا drain زمان‌بندی‌شده ندارد حتی هنگام Pause، payload را inline می‌گیرد؛ بایت‌های نگه‌داشته‌شده بدون انتظار برای Resume و به‌ترتیب FIFO تخلیه می‌شوند. |
 | `fallback-intentional-delay-jitter-ms` | `1` | jitter تصادفی برای زمان‌بندی payload‌های fallback؛ اگر delay صفر باشد نادیده گرفته می‌شود. |
 | `tls13-record-shaping` | تنظیم نشده | تنظیم آزمایشی padding و delay سمت فرستنده برای TLS 1.3. |
 | `verbose` | `false` | جزئیات بیشتری از lifecycle مربوط به TLS را log می‌کند. |
@@ -173,20 +173,20 @@ padding از بایت‌های صفر استاندارد TLS 1.3 در `TLSInnerP
 می‌افزاید، البته تا ظرفیت قانونی باقی‌مانده در TLS record. Delay پس از رمزنگاری اعمال می‌شود و latency انتخاب‌شده را
 اضافه می‌کند. ترتیب record‌ها روی wire با رابطه
 `release_at = max(now + delay, previous_release_at)` حفظ می‌شود. ciphertext صف‌شده برای هر line حداکثر ۸ MiB است؛ در
-۶ MiB به producer backpressure داده می‌شود و در ۳ MiB دوباره آزاد می‌شود. انتقال Pause و Resume از state فعلی wire
-پیروی می‌کند: اگر تخلیه هنگام Resume به‌صورت re-entrant یک Pause دیگر از wire دریافت کند، Resume قدیمی تا رسیدن Resume
-واقعی بعدی ارسال نمی‌شود. پس از آنکه `close_notify` همتا سمت cleartext را پایان داد، `TlsServer` هیچ payload، Pause یا
+۶ MiB یک Pause محلی برای producer و در ۳ MiB یک Resume محلی ارسال می‌شود. Pause و Resume دریافتی، حتی اگر تکراری
+باشند، شفاف عبور می‌کنند. خروجی ciphertext در زمان مقرر و با ترتیب FIFO بدون انتظار برای Resume تخلیه می‌شود؛
+Pause تایمر تخلیه را لغو نمی‌کند. پس از آنکه `close_notify` همتا سمت cleartext را پایان داد، `TlsServer` هیچ payload، Pause یا
 Resume‌ای به آن سمت نمی‌فرستد؛ application بایت‌هایی که بعداً دریافت شوند یا پیش‌تر توسط یک callback بیرونی رمزگشایی شده
 باشند دور ریخته می‌شوند. اگر سمت cleartext پایان یابد، ciphertext پذیرفته‌شده server و یک `close_notify` بدون padding پیش
 از downstream `Finish` تخلیه می‌شوند. پایان سمت wire خروجی صف‌شده را لغو و دور می‌ریزد و فقط به سمت cleartext منتقل می‌شود.
 اگر ساخت timer شکست بخورد، record‌ها فوراً و به‌ترتیب تخلیه می‌شوند.
 
 پس از مصرف کامل scope تنظیم‌شده برای application record‌ها، ابتدا صف فعلی shaping به‌طور کامل تخلیه می‌شود تا هیچ TLS
-record بعدی از ciphertext تأخیردار سبقت نگیرد. تا زمانی که این مانع ترتیب‌دهی فعال است، producer سمت cleartext حتی
-پایین‌تر از low watermark معمول نیز در حالت pause می‌ماند. وقتی صف خالی باشد و write-BIO در یک مرز کامل قرار
+record بعدی از ciphertext تأخیردار سبقت نگیرد. تا زمانی که این مانع ترتیب‌دهی فعال است، درخواست توقف محلی shaping
+حتی پایین‌تر از low watermark باقی می‌ماند؛ Resume عبوری همچنان مشورتی است. وقتی صف خالی باشد و write-BIO در یک مرز کامل قرار
 داشته باشد، timer و صف shaping مربوط به line آزاد می‌شوند؛ خروجی‌های بعدی TLS بدون parse کردن record یا نگه‌داری metadata
-شکل‌دهی، مستقیم forward می‌شوند. Pause معمول سمت wire در این فاز مستقیم همچنان اعمال می‌شود. بنابراین محدودیت ۸ MiB و
-watermark‌های ۶/۳ MiB فقط پنجره محدود و فعال shaping را مقید می‌کنند.
+شکل‌دهی، حتی هنگام Pause مستقیم forward می‌شوند. بنابراین محدودیت ۸ MiB و watermark‌های ۶/۳ MiB فقط پنجره محدود و
+فعال shaping را مقید می‌کنند. رمزنگاری و رمزگشایی TLS ادامه دارد؛ پایان shaping به معنی bypass دائمی tunnel نیست.
 
 record shaping می‌تواند اندازه و زمان‌بندی record‌های ابتدایی را کمتر قابل پیش‌بینی کند، اما نمی‌تواند یک round trip
 داخلی handshake را حذف کند، burst را کوچک‌تر کند یا همه ویژگی‌های جهت و زمان‌بندی را پنهان کند. وقتی multiplexing برای
@@ -295,17 +295,20 @@ classifier، بایت‌های ابتدایی upstream را بررسی می‌ک
 
 با شروع fallback، `TlsServer` منابع TLS مربوط به line را آزاد و branch جایگزین را مقداردهی اولیه می‌کند. در عملیات عادی
 و delay غیرصفر، بایت‌های ذخیره‌شده و batch‌های upstream بعدی با delay و jitter تنظیم‌شده فرستاده می‌شوند. در delay صفر،
-fallback فعال و بدون pause که FIFO قدیمی یا drain زمان‌بندی‌شده ندارد payload را inline می‌گیرد؛ بایت‌های paused یا قدیمی
-به‌ترتیب FIFO می‌مانند و Resume drain آن‌ها را پیش از payload‌های بعدی زمان‌بندی می‌کند تا سبقت نگیرند. از آن به بعد
+fallback مقداردهی‌شده که FIFO قدیمی یا drain زمان‌بندی‌شده ندارد حتی هنگام Pause، payload را inline می‌گیرد.
+بایت‌های نگه‌داشته‌شده بدون انتظار برای Resume و با ترتیب FIFO تخلیه می‌شوند؛ ورودی جدید از آن‌ها سبقت نمی‌گیرد. از آن به بعد
 payload‌ها بدون رمزنگاری یا رمزگشایی TLS از fallback عبور می‌کنند.
 
 handshake‌هایی که ظاهر TLS دارند اما malformed، بیش‌ازحد بزرگ، ناقص یا کند هستند در همان مسیر TLS بسته می‌شوند؛ پس از
 تشخیص اولیه دیگر به fallback فرستاده نخواهند شد.
 
 تأخیر fallback فقط روی payload‌های upstream در عملیات عادی اعمال می‌شود و FIFO آن تا 1 MiB برای هر line محدود است. پاسخ‌های
-downstream عمداً به تأخیر نمی‌افتند. اگر upstream `Finish` برسد، بایت‌های صف‌شده فقط وقتی fallback payload می‌پذیرد
-هم‌زمان و به‌ترتیب FIFO پیش از `Finish` fallback flush می‌شوند؛ اگر fallback از قبل pause شده باشد، batch محلی دور ریخته
-و fallback بدون دور زدن backpressure بسته می‌شود. delay باقی‌مانده پس از `Finish` زنده نگه داشته نمی‌شود.
+downstream عمداً به تأخیر نمی‌افتند. اگر upstream `Finish` برسد، بایت‌های صف‌شده حتی هنگام Pause به‌صورت همگام و به‌ترتیب
+FIFO پیش از `Finish` fallback تخلیه می‌شوند. اگر Init هنوز روی stack باشد، batch دور ریخته می‌شود. delay باقی‌مانده پس از
+`Finish` زنده نگه داشته نمی‌شود. این node برای انتخاب branch خارج از مسیر عادی `next` فعال می‌ماند و bypass نمی‌شود.
+
+پیش از Init branch منتخب، آخرین Pause دریافتی فقط برای بازپخش پس از Init نگه داشته می‌شود و Resume آن را لغو می‌کند.
+پس از Init همه Pause و Resumeها به branch منتخب می‌رسند و خروجی منتظر آن‌ها نمی‌ماند.
 
 برای camouflage روی یک پورت عمومی، بهتر است fallback یک سرویس واقعی TLS، معمولاً nginx، با certificate، SNI، ALPN،
 cipher، ticket و نسخه protocol مشابه `TlsServer` باشد. قرار دادن HTTP ساده پشت یک پورت عمومی TLS معمولاً خیلی راحت‌تر
