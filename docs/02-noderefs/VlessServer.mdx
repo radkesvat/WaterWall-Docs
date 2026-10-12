@@ -225,7 +225,7 @@ In database mode, do not configure `uuid`, `id`, `uuids`, `users`, or `clients`.
 | `udp` | `true` | Enables VLESS UDP command `0x02`. |
 | `verbose` | `false` | Enables extra rejection and diagnostic logging. |
 | `fallback-node-name` | not set | Fallback branch for unauthenticated invalid probes. Aliases: `fallback-node`, `fallback`. |
-| `fallback-intentional-delay-ms` | `7` | Delay for upstream payloads sent to fallback. Nonzero delay uses configured jitter. At `0`, an active fallback with no older FIFO batch or scheduled drain forwards inline; independently retained bytes remain FIFO and Resume drains them before later payload can overtake. |
+| `fallback-intentional-delay-ms` | `7` | Delay for upstream payloads sent to fallback. Nonzero delay uses configured jitter. At `0`, an active fallback with no older FIFO batch or scheduled drain forwards inline; independently retained bytes remain FIFO and their scheduled drain runs when due without waiting for Resume. |
 | `fallback-intentional-delay-jitter-ms` | `1` | Random jitter around delayed fallback payload scheduling. Ignored when delay is `0`. |
 
 At least one of `connect` or `udp` must be enabled.
@@ -266,16 +266,17 @@ without a backend reply sends no VLESS response bytes. Later replies keep the no
 This avoids a deliberate header-only write, but does not guarantee TCP packet or TLS record boundaries.
 
 Authenticated TCP permanently bypasses this node after the first response header/body
-handoff, once initialization, retained input/replies and pending permission notifications
-have settled. Local line state is destroyed before bypass. UDP and fallback remain
-active for framing, owned-line cleanup and branch routing.
+handoff, once initialization and retained input/replies have settled. Local line state is destroyed before bypass.
+UDP and fallback remain active for framing, owned-line cleanup and branch routing.
 
-An independent retained reply drain waits while the client output is paused; an admitted first reply may complete its
-combined header and body synchronously. Response/Est reentry cannot reorder older replies. The retained response FIFO
-is bounded to 2 MiB logical bytes plus 1,024 buffers, with transactional admission and per-association close on
-overflow. Client receiver Pause recorded before branch Init is replayed onto the initialized TCP backend and every new
-or recreated owned UDP backend. Nested application input during branch Init/replay stays behind the original input in a temporary FIFO with
-the same limits. Authentication, fallback selection and the exact owned UDP backend remain unchanged.
+TCP and fallback relay every Pause/Resume, including duplicates. TCP response-ordering storage and due fallback
+replay drain without waiting for Resume. UDP associations retain producer control: their independent reply drain
+waits while client output is paused, while an admitted reply may complete synchronously. Response/Est reentry cannot
+reorder older replies. The retained response FIFO is bounded to 2 MiB logical bytes plus 1,024 buffers, with transactional
+admission and per-association close on overflow. Client receiver Pause recorded before branch Init is replayed onto
+the initialized selected branch and every new or recreated owned UDP backend. Before branch selection, Resume clears
+that pending Pause. Nested application input during branch Init/replay stays behind the original input in a temporary
+FIFO with the same limits. Authentication, fallback selection and the exact owned UDP backend remain unchanged.
 
 ## TCP Runtime Behavior
 
@@ -328,10 +329,10 @@ When fallback is configured:
 - saved initial bytes and later upstream payloads are forwarded to fallback
 - normal live upstream fallback payloads observe `fallback-intentional-delay-ms` plus jitter when delay is nonzero
 - at delay `0`, an active fallback with no older FIFO batch or scheduled drain forwards inline; independently retained
-  bytes remain FIFO and Resume schedules their drain before later payload can overtake them
+  bytes remain FIFO and their scheduled drain runs when due without waiting for Resume
 - the delayed fallback FIFO is bounded to the shared upstream 2 MiB / 1,024-buffer budget
-- on upstream `Finish`, queued bytes flush synchronously in FIFO order before fallback `Finish` when fallback can still
-  accept payload outside branch Init; a paused or initializing fallback instead discards the still-local batch and closes
+- on upstream `Finish`, an initialized branch receives one accepted FIFO batch synchronously before fallback `Finish`,
+  including during Pause; a branch still inside Init discards the still-local batch and closes
 - downstream fallback responses are not intentionally delayed
 
 The remaining intentional delay is not kept alive after upstream close.

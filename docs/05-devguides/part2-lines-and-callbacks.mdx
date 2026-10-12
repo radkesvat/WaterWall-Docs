@@ -1101,11 +1101,12 @@ For an initialized fallback branch, use this close order:
    synchronously finish the initialized branch immediately.
 2. For a non-empty bounded FIFO, capture the branch and line pool, detach the
    queue from line state, range-check its total, and coalesce it in FIFO order
-   into one buffer. One callback prevents a synchronous `Pause` from being
-   followed by another newly initiated payload from the same batch.
-3. If the branch was already paused, it cannot receive even that one payload.
-   Recycle the still-local batch and finish it, or move it to a genuinely detached
-   owner; do not bypass backpressure to preserve close-time bytes.
+   into one buffer. One callback bounds the final handoff and its reentrant
+   teardown window.
+3. Never flush while branch Init is unfinished. TrojanServer and VlessServer may
+   deliver this final batch through advisory Pause; receiver limits still apply.
+   TlsServer's local close policy also discards an already-paused batch. Recycle
+   any batch disallowed by the node's close gate before finishing the branch.
 4. While the final callback runs, absorb supported `Init`, `Est`, `Pause`, and
    `Resume` callbacks, and recycle any returned `Payload`. A callback explicitly
    forbidden by the receiving node remains fatal; for example, `TlsServer`
@@ -1124,9 +1125,10 @@ becomes a harmless reference release. Preserving the exact remaining delay after
 timer state, and branch resources without any `line_t` or line-state reference.
 That is a different design, not an excuse to keep a borrowed line alive.
 
-With delay zero, the safe referenced inline path is available only when fallback is
-unpaused and has no older FIFO batch or scheduled drain. Retained bytes resume
-through the scheduled drain, so later payload cannot overtake them.
+With delay zero, the safe referenced inline path requires completed branch Init
+and no older FIFO batch or scheduled drain. TrojanServer and VlessServer do not
+gate it on Pause; TlsServer retains its local Pause gate. Retained bytes keep their
+ordered drain path, so later payload cannot overtake them.
 
 ### Adapters Flush On Their Own
 
@@ -1735,10 +1737,11 @@ buffer; later TCP forwarding is opaque. Direct TCP transport Est is forwarded
 promptly, including repeats; UDP carrier Est maps once to its application. The
 first transport Est starts an idle first-payload deadline only if the request has
 not already been sent; repeated Est does not restart that deadline. The
-current header-only timer retains a due flag while next is paused rather than
-starting a new send. This is local scheduling, not a core Payload precondition.
-An admitted application Payload can still complete its combined-buffer handoff
-under the batch contract.
+header-only timer sends when due on direct TCP, including during advisory Pause.
+TCP Pause/Resume notifications are forwarded transparently, including duplicates.
+The owned UDP carrier retains its output-pressure gate: its due header waits for
+carrier Resume. An admitted application Payload can still complete its combined
+handoff under the batch contract.
 
 Ordinary TCP forwarding and one-datagram upstream wrapping do not gain separate
 Pause queues. Downstream UDP retains framing input and completes the current
@@ -1749,7 +1752,7 @@ contract; use explicit directional handlers and focused helpers for actual work.
 For direct TCP, assembling the complete first request ends this node's setup work.
 Destroy and zero its line state, including cancellation of the first-payload timer,
 then permanently bypass the node before handing off that buffer. Reentrant
-callbacks use the transparent path; suspended Est/Resume callbacks must check
+callbacks use the transparent path; suspended Est callbacks must check
 the active bit before accessing their retired state. No transport Est or protocol
 reply is required for this transition. UDP application and owned carrier lines
 remain active for framing, association mapping and cleanup.
@@ -1777,8 +1780,10 @@ all ready datagrams in its active accepted batch and preserves an incomplete suf
 
 Record request admission before the first outward callback so nested data cannot
 send a second request or overtake it. Protocol/reentry storage is bounded; an
-otherwise-ready TCP buffer is not retained merely for Pause or Est. The current
-first-payload timer follows the local Pause gate described for TrojanClient.
+otherwise-ready TCP buffer is not retained merely for Pause or Est. Direct TCP
+Pause/Resume is transparent, including duplicates, and its first-payload timer
+sends when due without waiting for Resume. The owned UDP carrier retains its
+output-pressure gate and exact-line signal mapping as described for TrojanClient.
 Close clears timer/parser/ordering state and both links before outward Finish,
 never reflects toward its sender, and leaves an owned carrier logically dead.
 
@@ -1786,8 +1791,8 @@ Direct TCP permanently bypasses VlessClient only after request admission and
 complete response metadata consumption, once the outer receive batch has drained
 all retained and reentrant body input. Either protocol direction may complete
 first; neither alone permits bypass. Destroy and zero local state before clearing
-the active bit, including canceling the first-payload timer. Suspended Est and
-Resume callbacks must recognize state retired by nested callbacks. UDP application
+the active bit, including canceling the first-payload timer. Suspended Est
+callbacks must recognize state retired by nested callbacks. UDP application
 and carrier lines remain active for framing, signal mapping and owned-line cleanup.
 
 ### TrojanServer associations and fallback replay
@@ -1812,8 +1817,10 @@ not permission to maintain permanent TCP transport queues. A local fallback may
 send Payload and Finish within Init without ever sending Est.
 
 Authenticated TCP on the normal next branch permanently bypasses TrojanServer at
-the pump's quiescent exit: onward Init has returned, retained body and reentrant
-input have drained, and Pause/Resume notifications match the current permissions.
+the pump's quiescent exit: onward Init has returned and retained body and reentrant
+input have drained. TCP Pause/Resume is forwarded transparently, including
+duplicates. A receiver Pause before branch selection is remembered and replayed
+onto the initialized branch; it does not gate TCP output.
 Destroy and zero the server's state before clearing its active bit. Credentials
 already published on the line remain available to later nodes. This transition
 does not wait for Est or require either direction to be unpaused. UDP stays active
@@ -1848,13 +1855,13 @@ account entries before callbacks, and stop its independent drain at consumer Pau
 Already-admitted immutable replies belong to the client FIFO and do not need a
 borrowed backend pointer kept alive merely as an Est waiter.
 
-Intentional fallback delay owns a real backlog and scheduled drain. That drain
-honors Pause and preserves FIFO; Resume permits older ready work before releasing
-new producers. Source Finish retains the existing narrow final-batch exception:
-at most one synchronous batch, outside branch Init, while unpaused, with the
-finished side closed before any callback. Returned callbacks cannot revive parsing
-or reopen the finished direction. A zero-delay inline fallback transform follows
-the ordinary admitted-batch rule; a deferred release follows the backlog rule.
+Intentional fallback delay owns a bounded FIFO and scheduled drain. Due replay
+does not wait for Resume; both directions relay advisory Pause/Resume, including
+duplicates, along the selected branch. Source Finish permits at most one
+synchronous final batch outside branch Init, including during advisory Pause,
+with the finished side closed before any callback. Returned callbacks cannot
+revive parsing or reopen the finished direction. Init, delay and reentry still
+preserve the same FIFO order.
 
 Retain the client across association callbacks and each exact backend across its
 own Init/Payload/permission calls. Close detaches membership and selected-input
@@ -1878,29 +1885,30 @@ notification. Resume may close the client or install a paused replacement; never
 write stale association state afterward. Client teardown and shutdown suppress
 source restart.
 
-Update the receiver-pressure state before forwarding Pause or Resume on both
-protected and fallback paths, so a Resume during fallback Init prevents stale
-Pause replay afterward.
+TCP and fallback forward every Pause/Resume transparently. Before branch selection,
+remember the latest receiver signal for replay onto the initialized branch; update
+that startup state during Init reentry so a newer Resume cancels stale Pause.
+UDP retains receiver pressure for backend recreation and response draining.
 
 Every same-line TCP and fallback Est is forwarded promptly, including repeats; an owned UDP backend still maps
 readiness to its application once. Est does not emit a standalone VLESS response header. The header accompanies the first nonempty
 backend reply in one ordinary buffer, including replies arriving before Est. Empty input, Resume and Finish do not
-trigger a header-only send, and there is no header-only timer. A synchronous admitted reply may complete after Pause;
-an independently retained response FIFO waits for Resume. Publish header ownership before callbacks so Est and reply
+trigger a header-only send, and there is no header-only timer. TCP reply draining proceeds through advisory Pause;
+UDP retains its response-pressure gate. Publish header ownership before callbacks so Est and reply
 reentry cannot duplicate the header or reorder replies.
 
 TCP Init and unauthenticated fallback selection secure all older body/replay ownership before outward callbacks.
 Fallback restores inspected metadata before its untouched tail and gates every drain during branch Init. Delayed replay
-honors Pause; the narrow source-Finish batch runs only outside Init and while unpaused, with the previous side already
+does not wait for Resume; the narrow source-Finish batch runs only outside Init, with the previous side already
 closed. Source-owner shutdown settles parser storage, delayed work and the owned backend while pools remain alive;
 VlessServer adds no inventory of borrowed lines. See Part 3 for representation and retention limits.
 
 Authenticated TCP on the normal next branch permanently bypasses VlessServer after
 the first response header/body handoff, once branch initialization, retained input
-and response queues, and pending permission notifications have settled. Destroy
+and response queues have settled. Destroy
 and zero local state before clearing the active bit. Est alone or an empty reply
-does not complete this transition. Callbacks that still owe an onward Resume must
-settle it without overriding a newer nested Pause before retiring their state.
+does not complete this transition. Transparent TCP Resume forwarding does not
+start a reply drain or require a later permission-reconciliation step.
 Credentials already published on the line remain available to later nodes. UDP
 and fallback remain active for framing, owned-backend cleanup, branch selection
 and delayed replay.
