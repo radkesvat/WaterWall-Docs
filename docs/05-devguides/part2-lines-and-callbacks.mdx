@@ -69,6 +69,37 @@ Rules for `Init`:
   touch the line afterward, protect it (see [Line References](#protecting-a-line-across-re-entrant-callbacks)).
   If your `Init` just forwards and returns, you do not need to hold a reference.
 
+### Resolve Context Before Propagating Init
+
+For a **normal line**, a node that selects, changes, or validates source or
+destination context must complete its own context decision, including any
+admission or branch decision that determines that handoff, **before propagating
+`Init` to the next stage**. Publish the resulting address/domain, port, protocol,
+source identity, selected branch, and required association state before calling
+out. The next stage may immediately consume or snapshot that context in `Init`;
+changing it afterward cannot repair an earlier routing or connection decision.
+
+Initialize this node's local per-line state as soon as `Init` arrives. Holding
+propagation does not defer local initialization. If the necessary information is
+already available, complete the decision and propagate during `Init`. If it
+requires incoming bytes or asynchronous work, process that work locally and
+withhold outward `Init` until the decision is complete. Retained input must stay
+ordered and bounded. Do not forward Payload into a stage that has not received
+`Init`; preserve the startup FIFO and re-entrancy rules when releasing input.
+If the decision rejects the line, close only the stages already initialized,
+following the ordinary Finish and line-ownership rules.
+
+This requirement concerns **this node's own decision for the exact line and
+branch being initialized**. A later node may legitimately perform its own
+context rewrite. A separately created child or carrier line has its own context
+handoff and ownership; initializing that transport does not require completing
+protocol negotiation that needs the transport to exist. `Est` remains transport
+readiness and follows [its separate forwarding rules](#est-is-transport-readiness).
+
+Examples include DomainResolver waiting for destination DNS, HeaderServer waiting
+for its port or PROXY header, and protocol servers publishing their selected
+target and association before backend `Init`.
+
 ## Line Lifetime: refcount and `alive`
 
 A `line_t` carries an exactly 32-bit atomic `refc` and a boolean `alive` (see `ww/net/line.h`).
@@ -1765,6 +1796,8 @@ reflected past a side that has already finished.
 Before you call a flow change done:
 
 - Does `Init` initialize this tunnel's line state before any callback can use it?
+- Does a normal-line context selector or rewriter complete and publish its own
+  context/admission decision before propagating `Init` to the selected stage?
 - Are upstream callbacks forwarded only with `tunnelNextUpStream*`, and downstream
   only with `tunnelPrevDownStream*`?
 - Does every re-entrant call either return immediately or protect the line with
