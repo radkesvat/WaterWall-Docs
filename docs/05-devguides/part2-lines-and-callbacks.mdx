@@ -1668,7 +1668,7 @@ Publish receipt and the timed deadline before forwarding Est promptly, retaining
 the startup gate across notification and checking exact-line life afterward.
 Nested Payload, Resume or Est cannot bypass that gate. Duplicate Est continues
 forwarding without restarting eligibility or scheduling. Pressure notifications
-remain active before Est, and paused time counts once scheduling starts.
+remain transparent before Est and do not gate fragment scheduling.
 Disabled shaping does not disable the startup wait. Explicit false permits
 pre-Est scheduling and starts timed eligibility in Init. Finish settles the same
 FIFO without waiting for Est. This is a node-specific scheduling policy,
@@ -1678,30 +1678,42 @@ transport packet boundaries.
 One per-line FIFO owns original payload jobs and the active remainder. Each job's
 first delay starts at the active head; subsequent delays start after the previous
 fragment is forwarded. Bypassed and no-longer-eligible arrivals retain their FIFO
-position. After eligibility and the FIFO are both exhausted, writable traffic
-uses direct forwarding. New arrivals during an active drain append behind its
-remainder, including from Pause, Resume, or Payload callbacks.
+position. New arrivals during an active drain append behind its remainder,
+including from Pause, Resume, or Payload callbacks.
+
+Once shaping eligibility is exhausted, or TLS handling reaches its terminal opaque
+phase, retire the node only after the startup wait is open, its FIFO and candidate
+are empty, no timer or drain is active, and its own source pressure is released.
+Destroy and zero the full line-state region before permanent bypass. Subsequent
+callbacks skip the node, including Finish. A collecting TLS candidate remains
+active after scope expiry. Generic timed expiry is observed on input or drain;
+there is no extra timer solely to retire an idle line. Disabled shaping may
+retire during Init when `wait-for-est` is false, or after the first Est and queued
+work settle when it is true.
 
 The incomplete TLS candidate also occupies that FIFO, but its parser can
-advance through bounded admitted input while Est or Pause closes the output
-gate. The separate assembly deadline starts with the first selected non-empty
-input, counts Est and Pause time, and may arm the line's one timer before Est.
-It is canceled on successful commitment. After completion, the first fragment
+advance through bounded admitted input while the startup Est wait closes the
+output gate. The separate assembly deadline starts with the first selected
+non-empty input, includes time waiting for Est, and may arm the line's one timer
+before Est. It is canceled on successful commitment. After completion, the first fragment
 delay starts only when the ready job reaches the head and the startup gate is
-open. Expiry makes original bytes ready without bypassing Est or Pause; Finish
-discards them. An empty callback during collection needs no extra parser job.
+open. Expiry makes original bytes ready without bypassing the startup Est wait
+or older FIFO work; Finish discards them. An empty callback during collection
+needs no extra parser job.
 
-Consumer Pause stops this independent producer. A running fragment-delay timer keeps
-elapsed time; expiry while paused records due work without output or timer
-polling. Resume releases due work rather than restarting that delay. Monotonic
-deadline checks prevent the event loop's coarse timer rounding from sending early.
-Downstream bytes and Est retain ordinary immediate forwarding.
+Pause/Resume use transparent default forwarding in both directions, including
+duplicates. Due fragments, completed TLS candidates, and ready FIFO work do not
+wait for Resume. Monotonic deadline checks prevent the event loop's coarse timer
+rounding from sending early. Downstream bytes and Est retain ordinary immediate
+forwarding.
 
 Retained jobs, including the active head, share fixed inclusive limits of 8 MiB
 logical bytes, 8 MiB canonical buffer-capacity charge, and 1,024 jobs. Local source
 pressure starts at 6 MiB charge or 768 jobs and clears only at/below both 3 MiB and
-384 jobs. Combine it with consumer pressure before notifying the source. Publish
-ownership and updated accounting before callbacks. Ordinary allocation charge
+384 jobs. Release this local hold automatically with Resume when retention reaches
+those low watermarks. Forwarded Pause/Resume are independent advisory signals:
+they neither settle this hold nor prevent its release. Publish ownership and
+updated accounting before callbacks. Ordinary allocation charge
 remains held until its remainder transfers; splice charge can shrink with body
 consumption. One transient output fragment is additional extraction workspace,
 not another retained FIFO. Neither charge nor the entry limit promises physical
