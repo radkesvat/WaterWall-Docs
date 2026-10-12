@@ -1672,28 +1672,55 @@ neighboring tunnels. Determine ownership from the exact line's creation site.
 
 ### SOCKS transport readiness and protocol ordering
 
-Socks5Client forwards transport Est before negotiation, mapping a UDP control
-carrier to its application once. Authentication, command success and relay
-readiness retain their distinct application-data gates. Its pending application
+Socks5Client forwards every direct TCP transport Est before or after negotiation,
+including repeats, while starting its greeting only once. A UDP control carrier
+maps transport establishment to its application once. Authentication, command
+success and relay readiness retain their distinct application-data gates. Its pending application
 FIFO uses the default 2 MiB / 1,024-buffer backlog budget described in
 [Part 3](./part3-buffers-and-padding.mdx#protocol-storage-and-admitted-batches).
-It releases independently, honors Pause and keeps nested input behind older bytes.
-The first retained application input pauses its source; protocol backlog pressure
-and transport pressure share one notification latch, and Resume waits until both
-clear. Protocol-wait pressure must not stop handshake progress.
+Direct TCP releases this FIFO when protocol-ready, without waiting for Resume,
+and keeps nested input behind older bytes. It forwards every Pause/Resume in both
+directions, including during negotiation. The first retained application input
+originates an advisory source Pause; draining that local backlog releases its hold
+without waiting for transport Resume. UDP retains combined control/relay output
+pressure and its protocol backlog hold at the association boundary. Its control
+handshake remains separate from application receive pressure.
 Proxy reply parsing has one synchronous owner. Nested downstream Payload cannot
 advance the parser recursively or overtake the accepted reply tail. A retained
-response backlog observes application receive Pause; Resume drains it before
-releasing read pressure and rechecks permission after callbacks. Ready direct TCP
-forwarding keeps its synchronous path. UDP control tails are discarded after
-association acceptance.
-Socks5Server forwards Est before generating its success reply; that reply still
-precedes backend response bodies, including under Init/Est reentry and Pause.
+TCP response backlog drains in FIFO order without a consumer-Pause gate. Ready
+direct TCP forwarding keeps its synchronous path. UDP application receive pressure
+maps to the owned relay, including replay when that relay is created; control tails
+are discarded after association acceptance.
+
+Direct TCP permanently bypasses Socks5Client after the successful command reply
+has been consumed, all parser/reentrant input and application FIFOs have drained,
+and its local source hold has been released. Destroy and zero its complete line
+state before clearing the active bit. A source-pressure or Est callback may finish
+setup reentrantly; suspended continuations check the active bit before using that
+state again. UDP application, control and relay lines remain active for protocol
+framing, signal mapping and owned-line cleanup.
+
+Socks5Server forwards every CONNECT transport Est, including repeats, and generates
+its success reply only once. That reply still precedes backend response bodies,
+including under Init/Est reentry and Pause. CONNECT success and ready ordering
+queues do not wait for Resume. Repeated TCP Pause/Resume forwards transparently;
+before outgoing Init, retain the latest receiver Pause for replay to the initialized
+branch, with an early Resume canceling that pending request. UDP control, client
+and remote line roles retain their explicit mapping and endpoint behavior.
 Its control-input scope serializes parser progression: nested Payload joins the
 upstream FIFO behind the active input. Method, authentication and UDP-association
 transitions and identity are committed before reply callbacks. Failure replies
 close input admission before calling prev; reentrant Finish still completes local
 cleanup before the borrowed-line owner destroys its line.
+
+CONNECT TCP permanently bypasses Socks5Server after its success-reply handoff,
+outgoing Init and startup pressure replay, and both directional ordering queues
+have settled. Drain work added by a response callback in the opposite direction
+before retiring. Input and control-dispatch guards keep state alive for older
+parser/Init callbacks; a suspended Est continuation recognizes nested retirement.
+Destroy and zero local state first; credentials already published on the line
+remain available. UDP control/client/remote lines stay active for their endpoint
+and association responsibilities.
 
 DomainResolver accepts upstream Init and delays next Init until destination DNS
 completes. Its prepare hook runs before resolution and has no direction argument.
