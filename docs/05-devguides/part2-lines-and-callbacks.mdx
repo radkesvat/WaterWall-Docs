@@ -25,7 +25,7 @@ Every connection is driven by six events, each in two directions (upstream towar
 | Event | Meaning | Direction notes |
 | --- | --- | --- |
 | `Init` | A line is starting; initialize this tunnel's per-line state. | Flows upstream from the creating adapter. |
-| `Est` | An adapter's transport is established (e.g. the remote socket connected); protocol negotiation is separate. | Normally relayed downstream, back toward the originating adapter. |
+| `Est` | Repeatable notification that an adapter's transport is established (e.g. the remote socket connected); protocol negotiation is separate. | Normally relayed downstream, back toward the originating adapter. |
 | `Payload` | A chunk of data (`sbuf_t`) to transform and forward. | Either direction. |
 | `Pause` | Stop new source work and independent drains; bounded admitted synchronous input may finish. | Either direction. |
 | `Resume` | Backpressure released: you may send again. | Either direction. |
@@ -1220,8 +1220,9 @@ See Part 7 for table and parent ownership.
 
 ## Est, Pause, and Resume
 
-- **`Est`** reports adapter transport establishment. Middle tunnels must relay it
-  promptly; their own protocol readiness must not delay or replace that signal.
+- **`Est`** is a repeatable notification of adapter transport establishment.
+  Continuing middle tunnels must relay it promptly, including repeats; their own
+  protocol readiness must not delay or replace that signal.
 - **`Pause` / `Resume`** are backpressure signals. Emit them only when
   semantically correct and directionally consistent, and never reflect them back
   toward a finished direction (see above). Do not emit them casually; spurious
@@ -1230,10 +1231,16 @@ See Part 7 for table and parent ownership.
 ### Est Is Transport Readiness
 
 Adapters originate and consume transport establishment for their connection.
-On a continuing normal-line path, an intermediate node must forward a received
-`Est` in its supported callback direction without waiting for its request header,
-first application payload, authentication, protocol reply, handshake completion,
-timer or consumer Resume. In the ordinary upstream-created chain, next-side
+`Est` may arrive more than once for the same live, initialized line. It reports
+transport readiness; it does not initialize or restart the connection. Every
+supported recipient must tolerate repeated notifications. `Est` does not clear
+Pause or authorize a paused producer to send.
+
+On a continuing same-line path, an intermediate node must forward every received
+`Est`, including repeats, in its supported callback direction without waiting for
+its request header, first application payload, authentication, protocol reply,
+handshake completion, timer or consumer Resume. Do not keep a notification latch
+solely to suppress forwarding. In the ordinary upstream-created chain, next-side
 `Est` continues toward prev with `tunnelPrevDownStreamEst()`.
 
 Transport establishment and protocol readiness are different facts. A middle
@@ -1244,8 +1251,11 @@ or another negotiation. Use explicit protocol state and, where two cooperating
 nodes need notification, a dedicated protocol-completion hook. Do not send a
 second transport `Est` when that protocol work completes.
 
-Publish local establishment/notification state before forwarding: the previous
-node can synchronously submit Payload, Pause, Resume or Finish. Keep accepted
+Middle nodes may still use `Est` for their own logic. Guard work that must happen
+once separately from forwarding: repeated notifications must not resend a
+greeting, recreate resources, restart a deadline or repeat an accounting
+transition. Publish that local state before forwarding, because the previous
+node can synchronously submit Payload, Est, Pause, Resume or Finish. Keep accepted
 payloads ordered and bounded until their protocol can carry them. Preserve the
 required wire order, including control messages before application bodies, even
 when application data arrives from the Est callback. Pause controls new producer
@@ -1269,13 +1279,14 @@ transport is connecting; the transport owner handles connection-time writes.
 This does not permit Payload before Init, unauthenticated forwarding, application
 bytes before required wire headers, or callbacks into a finished direction.
 
-A continuing transform deduplicates with its own notification latch when needed;
-a downstream endpoint may mark the shared line before forwarding Est. The shared
-marker alone does not prove that the notification reached this transform.
-
 `lineIsEstablished()` / `lineMarkEstablished()` describe line establishment,
-not protocol readiness. This rule does not enable otherwise unsupported upstream
-Est callbacks on ordinary tunnels, change disabled adapter edges, or replace the
+not protocol readiness. `lineMarkEstablished()` is idempotent: marking an already
+established live line leaves it established and does not dispatch a callback.
+A downstream endpoint may mark the shared line before forwarding Est, so the
+shared marker does not prove that this transform has performed its own one-time
+work and must not suppress forwarding. Retain a local guard when that work needs
+one. This rule does not enable otherwise unsupported upstream Est callbacks on
+ordinary tunnels, change disabled adapter edges, or replace the
 [packet lifecycle rules](./part4-packet-tunnels.mdx).
 
 ### Flow-Control Roles and Admission
@@ -1665,8 +1676,10 @@ and checking logical life and association afterwards.
 
 A valid first application payload can submit the request after next Init, without
 waiting for transport Est. The request and complete first payload share one ordinary
-buffer; later TCP forwarding is opaque. Transport Est is forwarded once and starts
-an idle first-payload deadline only if the request has not already been sent. The
+buffer; later TCP forwarding is opaque. Direct TCP transport Est is forwarded
+promptly, including repeats; UDP carrier Est maps once to its application. The
+first transport Est starts an idle first-payload deadline only if the request has
+not already been sent; repeated Est does not restart that deadline. The
 configurable header-only timeout is an independent producer: while next is paused,
 it retains a due flag rather than starting a new send. An admitted application
 Payload can still complete its combined-buffer handoff under the batch contract.
@@ -1910,9 +1923,9 @@ CONNECT response timing starts at header handoff; incomplete header timing start
 at its first byte. Paused time counts after these deadlines start.
 Init snapshots the origin before next Init can replace destination context, then
 hands off its complete request header when permitted. An Init/header guard keeps
-reentrant application data behind that header. Est forwards promptly once,
-independently of HTTP readiness. CONNECT releases application input only after a
-2xx reply; normal HTTP uploads need not wait for the response.
+reentrant application data behind that header. Est forwards promptly, including
+repeats, independently of HTTP readiness. CONNECT releases application input only
+after a 2xx reply; normal HTTP uploads need not wait for the response.
 
 Fixed/bodyless request completion leaves the response live. A complete framed
 response closes both directions and cancels upload, including a suspended chunk
