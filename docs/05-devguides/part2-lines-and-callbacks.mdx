@@ -27,8 +27,8 @@ Every connection is driven by six events, each in two directions (upstream towar
 | `Init` | A line is starting; initialize this tunnel's per-line state. | Flows upstream from the creating adapter. |
 | `Est` | Repeatable notification that an adapter's transport is established (e.g. the remote socket connected); protocol negotiation is separate. | Normally relayed downstream, back toward the originating adapter. |
 | `Payload` | A chunk of data (`sbuf_t`) to transform and forward. | Either direction. |
-| `Pause` | Stop new source work and independent drains; bounded admitted synchronous input may finish. | Either direction. |
-| `Resume` | Backpressure released: you may send again. | Either direction. |
+| `Pause` | Repeatable advisory request to stop production; ordinary middle nodes relay it transparently. | Either direction; adapters, exact-line endpoints and SpeedLimit handle producer control. |
+| `Resume` | Repeatable advisory request to resume production; it does not prove all pressure has cleared. | Either direction; ordinary middle nodes relay it transparently. |
 | `Finish` | This direction is closing. | Directional and destructive. See below. |
 
 A tunnel implements only the handlers whose behavior differs from its constructor
@@ -52,6 +52,13 @@ these fields, including invocation, caching, copying or passing callbacks
 elsewhere; only the framework's dispatch implementation
 may invoke them directly. Keep `tunnel_t` visible in the header so the dispatch
 helpers can remain inline. Struct visibility does not authorize direct dispatch.
+
+Pause/Resume defaults forward every notification, including duplicates. Dispatch
+does not store a paused bit, count holds, gate Payload, or infer a node's role from
+its chain position. Registered handlers still run, including handlers that map
+different lines or implement the SpeedLimit exception. Ordinary middle nodes use
+the forwarding defaults. This transparency is separate from permanent per-line
+bypass: a node that still transforms payload or owns state must remain active.
 
 For a known target, use `tunnelUpStream*` or `tunnelDownStream*`; these include
 that target in bypass resolution. Pass the helper itself to reference guards
@@ -1223,10 +1230,11 @@ See Part 7 for table and parent ownership.
 - **`Est`** is a repeatable notification of adapter transport establishment.
   Continuing middle tunnels must relay it promptly, including repeats; their own
   protocol readiness must not delay or replace that signal.
-- **`Pause` / `Resume`** are backpressure signals. Emit them only when
-  semantically correct and directionally consistent, and never reflect them back
-  toward a finished direction (see above). Do not emit them casually; spurious
-  pause/resume can deadlock a stream.
+- **`Pause` / `Resume`** are repeatable advisory backpressure signals. Ordinary
+  middle nodes forward them transparently, including duplicates. They are not
+  counted holds or proof that no more payload will arrive. Emit them in the
+  intended direction and never toward a finished side. See
+  [Flow-Control Roles and Admission](#flow-control-roles-and-admission).
 
 ### Est Is Transport Readiness
 
@@ -1234,7 +1242,8 @@ Adapters originate and consume transport establishment for their connection.
 `Est` may arrive more than once for the same live, initialized line. It reports
 transport readiness; it does not initialize or restart the connection. Every
 supported recipient must tolerate repeated notifications. `Est` does not clear
-Pause or authorize a paused producer to send.
+Pause or release a producer controlled by an adapter, exact-line endpoint or
+SpeedLimit.
 
 On a continuing same-line path, an intermediate node must forward every received
 `Est`, including repeats, in its supported callback direction without waiting for
@@ -1258,11 +1267,12 @@ transition. Publish that local state before forwarding, because the previous
 node can synchronously submit Payload, Est, Pause, Resume or Finish. Keep accepted
 payloads ordered and bounded until their protocol can carry them. Preserve the
 required wire order, including control messages before application bodies, even
-when application data arrives from the Est callback. Pause controls new producer
-admission and independent drains, not the establishment signal or the bounded
-completion of an already-admitted synchronous input batch. Continuing after any callback still requires the exact
-line references and logical-life checks described above. Never forward into a
-finished direction or on a logically dead line.
+when application data arrives from the Est callback. Pause is independent of the
+establishment signal. Adapters, exact-line endpoints and SpeedLimit retain
+producer control; ordinary middle-node scheduled output need not wait for Resume.
+Continuing after any callback still requires the exact line references and
+logical-life checks described above. Never forward into a finished direction or
+on a logically dead line.
 
 On their owned normal lines, TesterClient and SpeedTestClient consume the first
 Est to start sending. Record that first notification before scheduling work;
@@ -1296,28 +1306,57 @@ ordinary tunnels, change disabled adapter edges, or replace the
 
 ### Flow-Control Roles and Admission
 
-Flow-control responsibility follows the work a node owns, not its protocol name
-or whether its line is borrowed. A node can have different roles in its two
-directions or before and after a protocol transition.
+**Pause/Resume are advisory and repeatable.** Ordinary middle nodes must relay
+both signals transparently, including repeated Pause while already paused and
+repeated Resume while already resumed. Do not keep consumer-pause state solely
+to suppress duplicates or gate ordinary middle-node output. A timer becoming due
+or a protocol backlog becoming ready may produce output without waiting for
+Resume. FIFO order, protocol readiness, ownership, hard limits and line lifetime
+still apply; Pause transparency does not remove those obligations.
+
+Classify the role for the **exact line**, rather than the node's position in the
+configured chain. A node may be a middle transform on one line and the head or
+tail of a carrier, child or paired line on another. Those boundaries must keep
+their explicit signal mapping; blindly following next/prev with the wrong line
+is never transparent forwarding.
 
 | Role | Responsibility |
 | --- | --- |
-| Source or transport adapter | Control new reads/emissions, accept bounded in-flight output, serialize writes and own the necessary transport queue. |
-| Synchronous transform | Forward Pause/Resume promptly and transform already-admitted input inline. Do not add an output queue solely because the next consumer paused. |
-| Protocol parser | Retain incomplete headers/bodies and ordering-critical input under explicit bounds. Parsing storage is not an extra transport-output queue. |
-| Independent producer or retained-backlog drain | Stop starting new output when its consumer is paused; resume its own ordered work when permission returns. Timers, handshake releases and delayed replay belong here. |
-| Association or multiplexing junction | Map exact lines, combine pressure reasons, and own only the queues needed to order or schedule its independent producers. |
+| Transport adapter or exact-line head/tail | Handle repeated notifications idempotently, control new reads/emissions and independent drains, serialize writes and enforce local queue limits. |
+| Ordinary middle transform or parser | Relay every Pause/Resume. Transform admitted input and retain only necessary framing/protocol/ordering state under explicit bounds. |
+| Ordinary middle node with scheduled output | Relay every Pause/Resume. Due timers and ready backlogs may send without Resume, in FIFO and protocol order. |
+| Association or multiplexing boundary | Map exact lines and combine pressure reasons for the producers it controls. Being in the middle of a configured chain does not remove its endpoint responsibilities. |
+| SpeedLimit | Explicit middle-node exception: combine local throttling with external pressure; handle or absorb notifications so neither reason is released by the other. |
 
-Pause tells a source or independent drain to stop admitting new work toward that
-consumer. It does not revoke ownership already transferred into an active
-synchronous input batch. A regular transform forwards the signal toward the
-source, then may finish that batch, checking logical life after every callback.
-It must not read more input, start a timer-generated application send, or append
-unrelated queued work to the active batch merely to evade Pause. A timer may keep
-checking an elapsed deadline and perform timeout cleanup during Pause; that does
-not authorize new Payload. Mux and KeepAlive Ping/Pong obey the output Pause gate.
-A due unsent probe is bounded deferred work and has no reply deadline until
-handoff. Receiver hard limits and Finish boundaries still apply.
+An ordinary middle node may originate advisory Pause/Resume toward either live,
+initialized side. After originating Pause, it must arrange its own eventual
+Resume or close even if no further input arrives. Do not wait for another Payload
+to release the source that was just asked to stop. Repeated Pause is not a counted
+hold requiring an equal number of Resume calls.
+
+These advisory requests do not carry the identity of every outstanding issuer.
+An advisory Resume may override another node's Pause; it does not promise that
+all receivers are writable or all queues empty. Endpoints and SpeedLimit retain
+the combination of pressure reasons that they explicitly own. Ordinary middle
+nodes do not recreate that machinery merely to relay notifications.
+
+The accepted overload policy is bounded retention and closure on refusal, rather
+than a guarantee that all middle producers stop during congestion. A receiver
+can receive both in-flight data and later scheduled output after requesting
+Pause. Each buffering node must enforce its own limits; an adapter cannot bound
+data still held inside another node. Limits are node-specific, not a universal
+2 MiB allowance, and several upstream queues may converge on one receiver.
+
+Time deadlines are separate from storage limits. They continue according to the
+node's timeout policy. If a protocol starts its reply deadline at Payload handoff,
+that deadline can include time spent queued behind congestion; timeout closure
+before actual wire transmission is an accepted consequence. Handoff is not proof
+of transmission. No generic timer or payload gate belongs in `ww` dispatch.
+
+Node-specific descriptions below also document scheduling gates implemented by
+individual nodes. Those gates do not establish a general requirement that an
+ordinary middle node wait for Resume. Endpoint and SpeedLimit flow control remains
+required independently of those local scheduling choices.
 
 The [reverse activation prefix](./part3-buffers-and-padding.mdx#reverse-activation-prefix)
 has a narrow startup exception: ReverseServer hands off that single bounded
@@ -1338,9 +1377,9 @@ stop header parsing solely because Pause arrived during an earlier delivery.
 They retain only an incomplete suffix or input held for a genuine protocol or
 reentrancy barrier. Reentrant input has its own FIFO position and bound; serialize already-admitted
 nested batches after older input within the outer synchronous dispatch. They must
-not be relabeled as one ever-growing batch. Work deferred beyond that dispatch,
-or released by a later protocol-completion/task callback, is an independent
-backlog whose drain respects Pause.
+not be relabeled as one ever-growing batch. Work deferred beyond that dispatch
+remains a bounded, ordered backlog. An ordinary middle node may release ready
+work without Resume; endpoint and SpeedLimit drains retain their flow control.
 
 Finish, logical death, protocol rejection and hard-limit refusal are terminal:
 stop immediately and release the untransferred remainder. Batch completion never
@@ -1350,9 +1389,10 @@ the Resume that allows its producer to complete it.
 
 #### Receiver tolerance and FIFO ownership
 
-A receiver requesting Pause must retain finite admission headroom for output
-already in flight. Specify the supported batch envelope, transformation expansion,
-queue high/low watermarks, hard limits and overflow policy. Count retained bytes
+A receiver requesting Pause must retain finite admission headroom and tolerate
+further delivery up to its hard limits. Pause does not guarantee that scheduled
+middle-node output stops. Specify the supported batch envelope, transformation
+expansion, queue high/low watermarks, hard limits and overflow policy. Count retained bytes
 and entries or allocation charge; tiny and empty datagrams must consume a finite
 budget. One coalesced stream input can decode into many datagrams, so a payload-byte
 limit alone is not a complete resource bound.
@@ -1373,17 +1413,16 @@ publish consumption before callbacks and release when that responsibility ends. 
 ordering obligation; a guarded admission/drain can serialize reentry without
 adding permanent queues to every middle node.
 
-Resume releases a producer according to the consumer's current policy. It does
-not prove that every queue is empty. A junction forwards Resume only after all
-pressure reasons for that producer have cleared. Transparent transforms relay
-Pause/Resume without inventing their own thresholds or permanent permission queues.
-A node that also owns a timer or backlog may record permission for that role
-without gating its synchronous forwarding path on the same flag.
+At an endpoint or SpeedLimit, Resume releases a producer according to the reasons
+that endpoint or limiter owns; it does not prove that every queue in the chain is
+empty. Ordinary middle nodes relay notifications without consumer-permission
+queues or a Resume prerequisite for due output. Locally originated advisory
+pressure still needs its own release path.
 
 BGP and other protocol engines can retain queues for their own negotiation,
 control generation and independent drains. Those obligations require explicit
-bounds and permission handling; they do not establish a requirement that every
-ordinary encoder/decoder own a transport queue.
+bounds, ordering and exact-line role handling; they do not establish a requirement
+that every ordinary encoder/decoder own a transport queue.
 
 MuxClient and MuxServer are examples of explicit local buffering: parent transport
 Pause forbids parent-bound Payload, including Open, Close, flow controls and
@@ -1696,9 +1735,10 @@ buffer; later TCP forwarding is opaque. Direct TCP transport Est is forwarded
 promptly, including repeats; UDP carrier Est maps once to its application. The
 first transport Est starts an idle first-payload deadline only if the request has
 not already been sent; repeated Est does not restart that deadline. The
-configurable header-only timeout is an independent producer: while next is paused,
-it retains a due flag rather than starting a new send. An admitted application
-Payload can still complete its combined-buffer handoff under the batch contract.
+current header-only timer retains a due flag while next is paused rather than
+starting a new send. This is local scheduling, not a core Payload precondition.
+An admitted application Payload can still complete its combined-buffer handoff
+under the batch contract.
 
 Ordinary TCP forwarding and one-datagram upstream wrapping do not gain separate
 Pause queues. Downstream UDP retains framing input and completes the current
@@ -1737,8 +1777,8 @@ all ready datagrams in its active accepted batch and preserves an incomplete suf
 
 Record request admission before the first outward callback so nested data cannot
 send a second request or overtake it. Protocol/reentry storage is bounded; an
-otherwise-ready TCP buffer is not retained merely for Pause or Est. Independent
-release of an older deferred backlog still respects its consumer's permission.
+otherwise-ready TCP buffer is not retained merely for Pause or Est. The current
+first-payload timer follows the local Pause gate described for TrojanClient.
 Close clears timer/parser/ordering state and both links before outward Finish,
 never reflects toward its sender, and leaves an owned carrier logically dead.
 
@@ -1950,9 +1990,10 @@ Before you call a flow change done:
   then return?
 - If you send final protocol bytes during `Finish`, do you mark the sender side
   finished before the send and block reflected `Pause`/`Resume`?
-- Does Pause stop new source admission and independent drains while allowing only
-  the bounded completion of admitted synchronous input? Are receiver tolerance,
-  FIFO publication, tiny/empty entries and overflow/close behavior explicit?
+- Are Pause/Resume repeatable and transparent in ordinary middle nodes, with due
+  output independent of Resume? Do adapters, exact-line endpoints and SpeedLimit
+  retain producer control? Are local advisory holds released without relying on
+  more input, and are FIFO, receiver limits and overflow/close behavior explicit?
 - Does retained data have a parser, protocol, ordering or producer obligation,
   rather than an unnecessary output queue copied into a transparent transform?
 - Does only the line **owner** ever call `lineDestroy()`?

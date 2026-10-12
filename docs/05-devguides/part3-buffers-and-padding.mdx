@@ -1073,8 +1073,9 @@ relays promptly while an admitted synchronous batch can complete. In both client
 modes, the first ping is due one `ping-interval` after downstream transport Est;
 waiting for it does not block application data or start a reply deadline. Repeated
 Est does not reset this schedule. Timer checks and outstanding monotonic reply
-deadlines continue during either directional Pause; Ping/Pong output obeys the
-consumer's Pause gate. An unsent ping leaves one due obligation without starting
+deadlines continue during either directional Pause. These nodes maintain a local
+Pause gate for Ping/Pong output; it is not a general requirement for middle-node
+timers. An unsent ping leaves one due obligation without starting
 a reply deadline. Each endpoint retains at most 1,024 pending Pong obligations
 without allocating their frames until output is permitted. Excess obligations
 close through the normal owner. Resume drains replies with a reentrancy guard,
@@ -1090,6 +1091,13 @@ wait, an initialization/reentrancy ordering barrier, delayed replay, or an
 association's independent producers. An otherwise-ready synchronous TCP buffer
 must not acquire another output queue solely for Pause or Est. See
 [Part 2's admission contract](./part2-lines-and-callbacks.mdx#flow-control-roles-and-admission).
+
+Ordinary middle-node timers and deferred drains may submit due output through
+advisory Pause while preserving FIFO and protocol readiness. Retained data still
+belongs to that node's hard budget: a receiving adapter's limit cannot protect
+storage that has not reached it. Pause requests and eventual Resume do not reserve
+capacity, and overload may close the affected connection. Node-specific gates
+described below are local implementation behavior, not a generic scheduling rule.
 
 Middle tunnels that need an application-data backlog use a default budget of
 **2 MiB logical bytes and 1,024 buffers per retention budget**. Count queued buffers
@@ -1177,7 +1185,7 @@ single coalesced input can produce, including empty datagrams.
 TlsClient's pre-handshake application queue and RealityClient's early application
 queue follow the default 2 MiB / 1,024-entry bound. They represent a real protocol wait,
 including application data admitted before TCP Est. Their later plaintext release
-is an independent FIFO drain that honors Pause; it is not part of the final
+uses a local Pause gate in its independent FIFO drain; it is not part of the final
 handshake input's synchronous batch. Keep ciphertext-shaping budgets separate.
 
 TlsClient and TlsServer use owned-buffer ciphertext BIOs. Feeding ordinary input
@@ -1271,7 +1279,9 @@ Decode and transfer each complete frame in order, continuing after Pause for the
 remainder of this accepted input while the exact lines remain live. Hold only an
 incomplete suffix or data genuinely blocked by protocol/reentrancy. Stop on Finish,
 malformed input or receiver closure; never exceed a receiver's hard limit just to
-finish the batch. A separately scheduled or deferred backlog drain honors Pause.
+finish the batch. Separately scheduled or deferred work follows the exact node's
+role in [Part 2](./part2-lines-and-callbacks.mdx#flow-control-roles-and-admission);
+ordinary middle-node output needs no consumer-pause gate.
 
 ### HalfDuplex setup and direct forwarding
 
@@ -1404,11 +1414,12 @@ and waits for Resume if its consumer is paused. Zero disables deliberate waiting
 An already-available eligible payload is still combined; expiry never forces it
 into a second send if the request has not yet been submitted.
 
-The timer is an independent producer. A synchronous admitted input can complete
-its combined handoff under the in-flight contract even when a timer-generated send
-would have to wait. Publish request admission before forwarding, cancel the timer,
-and never send a second header. Empty TCP input does not trigger a request or
-restart the deadline. UDP eligibility follows the protocol's own datagram rules.
+Both clients use a local Pause gate for their timer-generated request. A synchronous
+admitted input can complete its combined handoff while that timer waits; this gate
+is not a general requirement for middle-node timers. Publish request admission
+before forwarding, cancel the timer, and never send a second header. Empty TCP
+input does not trigger a request or restart the deadline. UDP eligibility follows
+the protocol's own datagram rules.
 
 Keep full onward padding in new allocations. TrojanClient advertises **331** bytes:
 the 68-byte UDP association request plus the largest 263-byte datagram header; its largest
@@ -1927,8 +1938,9 @@ A pool tier is not a universal maximum callback size: frame assembly and other
 transforms can produce larger ordinary buffers even in chains without splice.
 Keep protocol record limits, pending-data budgets and allocation geometry
 distinct. Multiple valid records delivered together are not an oversized record;
-process them when possible while preserving bounded admission and Pause. Changing
-a pool or pipe target must not silently change these node policies.
+process them when possible while preserving bounded admission, FIFO and the exact
+node's flow-control role. Changing a pool or pipe target must not silently change
+these node policies.
 
 HalfDuplexServer and HttpServer split waiting caps use
 `bufferpoolGetWaitingBudgetBasis()`, a separate immutable pool setting: 64 KiB in
@@ -2114,7 +2126,7 @@ uses a separate checked best-fit ordinary buffer with onward padding. A chunk's
 size prefix stays with its original body wrapper; an ordinary two-byte CRLF
 suffix is published before handing off the body and sent immediately afterward.
 Nested upload input waits behind that suffix. Pause permits completion of this
-bounded admitted frame, while independent backlog drains wait for Resume.
+bounded admitted frame; HttpProxyClient's local backlog gates wait for Resume.
 
 HttpProxyClient does not request ordinary reads by default: uploads and body-only
 response deliveries can preserve splice buffers. Preferences set by other nodes
