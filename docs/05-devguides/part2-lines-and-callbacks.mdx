@@ -1507,8 +1507,17 @@ must release ready waiters rather than depend on a future transport event.
 TcpListener also preserves a Pause received during accepted-line Init: it enables
 initial reads only if Init returns alive and the source is still unpaused.
 
-Mux's fixed header cache owns consumed header bytes until the exact body is
-extracted. No callback observes detached stream ownership. Large splice encoding
+Mux's fixed header cache owns consumed header bytes until the declared body has
+been consumed. Data body bytes reach a writable child incrementally, with no
+Payload boundary guarantee and no callback for empty Data. Paused children keep
+available chunks in their bounded FIFO; Mux remains an endpoint for its separate
+parent and child lines, so this queue still waits for that child's Resume.
+The parser publishes the remaining body length before callbacks and serializes
+reentrant parent input behind existing bytes. A child closing during a partial
+Data frame makes its remaining body discard-only; only after consuming that suffix
+may the next header be parsed. Parent loss cannot retract an already delivered
+prefix, and accepted queued chunks keep their detached-drain policy. No callback
+observes detached stream ownership. Large splice encoding
 publishes the complete frame batch and Open state before any callback. A Pause
 during its first delivery leaves all later frames in the parent FIFO; nested Data
 or child Close follows that remainder. Parent death discards it, while child death
@@ -1526,7 +1535,8 @@ configured resume threshold.
 Submitting a Mux control frame can close its child during queue-pressure
 callbacks while leaving the parent alive. The receive path distinguishes
 those outcomes: it retains the parent across callbacks, stops using the closed
-child, and continues processing complete sibling frames on the surviving parent.
+child, discards any remaining body for it, and continues parsing sibling traffic
+on the surviving parent.
 Remaining incoming child queues still undergo the normal parent memory-limit check.
 
 UdpConnector rechecks both line life and read-pause state after its fallback

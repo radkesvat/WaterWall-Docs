@@ -1007,6 +1007,18 @@ After the body completes, the stream clears its cache and gathers only the next
 header. N=0 consumes one zero-body frame. With header size zero, extraction is an
 exact body move with no header discard or look-ahead.
 
+`splicestreamMoveFrameChunk(stream, destination, N, finish_frame)` moves exactly
+N available body bytes using the same ownership, representation and padding
+rules. The caller tracks the declared remaining body length. With `finish_frame`
+false, the complete header stays cached and no next header is gathered; only the
+final body chunk may set it true. `splicestreamDiscardFrameChunk()` follows the
+same header-completion rule without producing a buffer. A zero-byte final discard
+consumes an empty frame without allocating a payload. Stream length continues to
+include the cached header until completion; body bytes already consumed do not
+remain in its logical length. Source capacity and charge follow the ordinary and
+splice consumption rules below. Mux uses these APIs for incremental delivery and
+discard; complete-frame users retain their existing extraction APIs.
+
 Pipe-backed extraction can split one source pipe or combine several independently
 owned sources into a new private pipe. Whole suitable wrappers transfer directly.
 Ordinary ranges and real prefixes copy/write in order; pipe bodies use nonblocking
@@ -1201,9 +1213,9 @@ Equality is accepted. Overflow or failed queue admission settles only the affect
 flow/association; private-pipe pressure instead uses the shared ordinary fallback.
 Remove consumed metadata before applying a remaining-body/backlog budget. The
 incomplete-initial limit must not reject a complete header coalesced with body.
-These logical limits do not measure RSS or descriptor use. Receiving adapters and
-Mux additionally bound entries or allocation/queue charge for the many outputs a
-single coalesced input can produce, including empty datagrams.
+These logical limits do not measure RSS or descriptor use. Receiving adapters
+additionally bound entries or allocation charge for decoded datagrams, including
+empty ones. Mux bounds queue charge for retained stream chunks.
 
 TlsClient's pre-handshake application queue and RealityClient's early application
 queue follow the default 2 MiB / 1,024-entry bound. They represent a real protocol wait,
@@ -1609,29 +1621,45 @@ type, independent of RAM profile, buffer sizes and requested or granted pipe
 capacity. A maximum frame occupies 1,048,584 wire bytes; a preceding Open adds
 another eight bytes (1,048,592 total). Decoding rejects a larger declaration as
 soon as all eight header bytes arrive, even for unknown CIDs or types, and closes
-only that parent through normal parent-loss cleanup. Permitted frames wait for
-the complete body; unknown frames consume their declared body and empty Data
-still produces one delivery. Complete frames drain before the incomplete
-remainder is checked against **1,048,584 bytes**, including its cached header.
+only that parent through normal parent-loss cleanup. After a valid Data header,
+the decoder delivers available body bytes incrementally; it does not wait for the
+whole frame. Data for an unknown or closed CID is discarded incrementally. Empty
+Data is consumed without a child Payload callback. Other frame bodies are also
+consumed incrementally, but control effects wait until their declared bodies end.
+Available body bytes and completed controls drain before retained incomplete
+input is checked against **1,048,584 bytes**, including its cached header.
+Bytes not yet received do not count as retained input.
 
 Open=0, Close=1, FlowPause=2, FlowResume=3 and Data=4 retain their meanings; child CID
-uses the full 32-bit range. Ping=5 and Pong=6 are parent controls handled before
+uses the full 32-bit range. Ping=5 and Pong=6 are parent controls independent of
 child lookup. Their payload is empty and CID bytes carry a 32-bit probe token,
 echoed unchanged by the responder. Each control occupies eight wire bytes;
 Data framing and splice representation remain unchanged. Disabled keepalive
 consumes controls without responding or acknowledging. The serializer uses `mux_wire_header_t`; decoded
 `mux_frame_t` has a 32-bit length and must never be copied as wire bytes.
-Both Mux decoders wait for the complete permitted body. Extraction
-returns only the body: do not shift away another eight bytes. Control/unknown-CID
-frames consume their declared bodies too. Data delivers once per wire frame,
-including empty Data. Paused children retain one queue entry per frame. After
-callbacks, physical references protect allocation life and logical life/state
-checks decide whether sibling parsing may continue.
+Each child is an ordered byte stream with arbitrary Payload boundaries. Both Mux
+decoders track the current Data CID and remaining body length, publishing progress
+before child callbacks. Extraction returns only available body bytes: do not shift
+away another eight bytes. One Data frame may produce several callbacks and paused
+children may retain several queue entries for it. Empty Data creates no callback
+or child queue entry. Data for a missing or closing child is discarded as bytes
+arrive. If delivery closes the child partway through a frame, discard the remaining
+body before decoding the next header. Look up the child again for each chunk;
+do not cache its state pointer in the frame state. Parent receive reentry appends behind current input
+and observes the already-published frame progress. After callbacks, physical
+references protect allocation life and logical life/state checks decide whether
+parsing may continue.
 
 MuxClient owns normal parent lines and borrows children. MuxServer borrows parents
 and owns children created on Open. Splice support changes neither direction nor
-Finish/lifetime rules. Complete frames in a large delivery drain before checking
-the logical incomplete-carrier overflow limit.
+Finish/lifetime rules. Available Data chunks and complete controls drain before
+checking the logical incomplete-carrier overflow limit. If a parent fails halfway
+through Data, already delivered bytes stay delivered and accepted queued chunks
+retain their usual detached drain; the missing suffix is not reconstructed.
+Later frames still follow the current frame's body on the shared carrier, so
+incremental delivery does not eliminate transport head-of-line blocking.
+MuxServer treats each accepted nonempty Data chunk as child idle activity; no
+whole-frame wait delays the initial-to-active timeout transition or its refresh.
 
 #### Queue-capacity budgets
 
@@ -1669,7 +1697,7 @@ carrier connection; its **children** are the streams multiplexed through it.
 | --- | --- | --- |
 | Splice socket read request | **1 MiB in every profile** | Upper bound per read attempt. A positive short transfer produces a shorter valid buffer; remaining bytes wait for a later read. |
 | Payload in one Mux frame | **1 MiB** | Independent protocol maximum. A larger declaration closes that parent as soon as its complete eight-byte header is decoded. |
-| Incomplete incoming frame | **1 MiB + 8 bytes** | Logical bytes, including the cached header. Complete frames drain first; an oversized incomplete remainder closes the parent. |
+| Retained incomplete input | **1 MiB + 8 bytes** | Received logical bytes, including the cached header. Available Data chunks and complete controls drain first; an oversized remainder closes the parent. Unreceived body bytes do not count. |
 | `child-buffer-limit` | **128 MiB charge** | One child's queued decoded data. Reaching the limit closes that child. |
 | `parent-buffer-limit` | **512 MiB charge** | Incoming stream plus all attached child queues on one parent. At the limit, try beneficial incoming compaction, then shed largest queued children. Unrelieved pressure closes the parent. |
 | `parent-write-buffer-pause-threshold` | **128 MiB charge** | One outgoing parent FIFO. Reaching it pauses child producers while the FIFO drains. |
@@ -1690,10 +1718,16 @@ remain separate from these buffer boundaries.
 
 `parent-buffer-limit` (512 MiB by default) covers incoming frame assembly plus
 all attached child queues. The stream counter remains separate from the child
-aggregate, and their sum is checked at stable return boundaries. Complete frames
-in a coalesced delivery drain first, even if its temporary charge exceeds the
-limit. Cached header bytes count toward the independent 1,048,584-byte incomplete
-frame bound, but the header cache and stream/queue metadata carry no sbuf charge.
+aggregate, and their sum is checked at stable return boundaries. Available Data
+chunks and complete controls in a coalesced delivery drain first, even if its
+temporary charge exceeds the limit. A paused child retains chunks as they arrive,
+so one Data frame may create several charged queue entries. Cached header bytes
+count toward the independent 1,048,584-byte incomplete-input bound until the body
+ends, but the header cache and stream/queue metadata carry no sbuf charge.
+The declared body bytes still missing from the transport carry no retention charge.
+After an ordinary receive pass drains available input, a partial Data frame needs
+only its cached header and remaining-length state between arrivals. Any accepted
+chunks for paused children belong to their queues, not to frame assembly.
 Active splice-head body consumption reduces logical capacity and its charge;
 prefix consumption and ordinary cursor movement do not reduce capacity.
 
@@ -1733,8 +1767,9 @@ pipes after recycling; lower charge does not prove those resources were closed.
 performs the explicit beneficial pressure operation. Queue entries are immutable;
 the mutable active head reconciles its charge after every consumption. Extraction
 settles source charge before a result is forwarded or charged to a child queue.
-Parser depth defers combined enforcement across nested complete-frame delivery;
-pressure cleanup prevents recursive enforcement and requires progress after Close.
+Parser depth defers combined enforcement across nested delivery until available
+body bytes and completed controls have drained. Pressure cleanup prevents
+recursive enforcement and requires progress after Close.
 
 ### Mux allocation and data flow
 
@@ -1745,14 +1780,18 @@ carrier socket follows this path:
 flowchart TD
     A["Mux TCP socket"] --> B["Ordinary buffer or splice wrapper with private pipe"]
     B --> C["Incoming stream: gather eight-byte header"]
-    C --> D{"Complete frame body available?"}
+    C --> D{"Data body bytes available?"}
     D -- No --> W["Wait for more socket data"]
     W -. Next delivery .-> B
-    D -- Yes --> E["Extract one complete frame body"]
+    D -- Yes --> E["Extract an available chunk; publish remaining length"]
     E --> F{"Child writable?"}
     F -- Yes --> G["Forward to child and its write path"]
-    F -- No --> H["Retain in child queue"]
-    H -- Resume --> G
+    F -- No --> H["Retain chunk in child FIFO"]
+    H -- Resume --> J["Forward queued chunks to child"]
+    G --> I{"Current frame body consumed?"}
+    H --> I
+    I -- No --> D
+    I -- Yes --> C
 ```
 
 Incoming-stream sbufs and all attached child queues share the parent's receive
@@ -1770,7 +1809,7 @@ have their own ownership and are outside this Mux budget.
 
 Opening a child does not allocate a pipe for it. Queue-entry storage grows as
 needed; the initial eight-entry reservation is not a maximum number of buffered
-frames. Each splice wrapper still owns its own pipe exclusively.
+chunks. Each splice wrapper still owns its own pipe exclusively.
 
 1. **Read into an owned buffer.** The event loop checks out a wrapper containing
    the normal 32-byte sbuf header, left padding, and 32 bytes of control storage.
@@ -1784,20 +1823,23 @@ frames. Each splice wrapper still owns its own pipe exclusively.
    without requiring the body to become resident. An exhausted source is
    recycled; any remaining body stays in its buffer or pipe while waiting.
 
-3. **Extract a complete body.** A suitable whole source buffer can transfer
-   directly. A body spanning several inputs, or using only part of one input,
+3. **Extract available Data bytes.** A complete header is required, but the whole
+   body need not have arrived. Consume at most the current frame's remaining
+   length and publish the new remainder before callbacks. A suitable whole source
+   buffer can transfer directly. A chunk spanning inputs or using part of an input
    gets an independent result assembled in order. Pipe bodies can move
-   pipe-to-pipe; resident prefixes and ordinary sources are copied or written
-   as needed. The caller must use the returned buffer because ordinary fallback
-   can replace its proposed destination.
+   pipe-to-pipe; resident prefixes and ordinary sources copy or write as needed.
+   Use the returned buffer because ordinary fallback can replace the proposed
+   destination. Keep the current header cached until its last body chunk is consumed.
 
 4. **Deliver or retain for the child.** Writable children receive the result
-   immediately. Paused children retain one entry per decoded frame. Source
+   immediately. Paused children retain the chunks in FIFO order; a wire frame
+   can occupy several queue entries. Source
    charges settle before the result is forwarded or added to a child queue.
    A split source remainder and a retained output each contribute their own
    charge; a whole-buffer handoff is not charged twice.
 
-5. **Enforce receive retention after complete frames drain.** Mux adds incoming
+5. **Enforce receive retention after available input drains.** Mux adds incoming
    stream charge to attached child queue charge. Under pressure, only a strictly
    cheaper ordinary representation justifies combining incoming fragments.
    After any compaction, remaining pressure follows the largest-child/oldest-tie
@@ -1837,12 +1879,12 @@ frames. Each splice wrapper still owns its own pipe exclusively.
 | Destination pipe fills during frame assembly | Return a complete ordinary fallback, preserving bytes already moved and appending the remaining source bytes exactly once. |
 | A read of claimed private-pipe bytes is short or interrupted | Accumulate positive progress and retry `EINTR`. EOF, `EAGAIN`, or another failure before the claimed range is complete remains a fatal invariant. This is different from a short socket read. |
 | One small splice buffer would become a larger pooled ordinary buffer | Skip pressure compaction when it would not strictly reduce total incoming charge. Kernel pipe capacity alone does not justify conversion. |
-| One delivery contains many complete frames | Drain complete frames before checking combined retained receive charge. The limit is not an instantaneous ceiling on the current delivery. |
-| A configured parent budget cannot fit the incomplete frame | After beneficial compaction and available child shedding, close only that parent; do not loop indefinitely or abort the process for ordinary limit pressure. |
+| One delivery contains complete frames and a partial Data body | Drain available Data bytes and complete controls before checking combined retained receive charge. The limit is not an instantaneous ceiling on the current delivery. |
+| A configured parent budget cannot fit retained incomplete input and child queues | After beneficial compaction and available child shedding, close only that parent; do not loop indefinitely or abort the process for ordinary limit pressure. |
 | A child dies while its encoded data is queued to the parent | The parent still owns the admitted output and preserves its ordering until sent or discarded by parent cleanup. |
-| Parent loss leaves decoded data for blocked children | Eligible queues detach and can drain independently, subject to their existing per-worker charge/count limits. The parent's unparsed input and outgoing data are discarded. |
+| Parent loss interrupts Data after some chunks were accepted | Delivered prefixes remain delivered. Eligible queued chunks detach and can drain independently, subject to their per-worker charge/count limits. The parent's remaining input and outgoing data are discarded. |
 | A callback closes a child or parent during delivery or pressure recovery | Hold the required temporary line reference and recheck logical life/state before continuing. A reference protects allocation life, not permission to use destroyed state. |
-| Empty input or a zero-length Data frame | Empty incoming sbufs recycle without creating a frame. An actual zero-length Data frame remains valid and produces one delivery; an allocated empty result can still carry queue charge. |
+| Empty parent input or a zero-length Data frame | Empty incoming sbufs recycle. A zero-length Data frame is consumed without a child Payload callback or child queue entry; it is neither EOF nor Close. |
 
 The queue-capacity formula and ownership transitions do not promise that physical
 RAM, descriptors, or fixed inventory capacity fall when a charge is released. Runtime
@@ -1916,8 +1958,10 @@ to leave before orderly close; crossing resume is not a terminal drain barrier.
 Watchdog-expired idle parents instead discard blocked final output and close
 without waiting for Resume, including after their last attached child leaves.
 
-MUX boundaries are wire-frame boundaries, not original callback or general UDP
-datagram boundaries. Use explicit UdpOverTcp framing for UDP byte-stream transport.
+MUX children carry ordered bytes; neither callback nor wire-frame boundaries are
+preserved. Put UdpOverTcpClient before MuxClient and UdpOverTcpServer after
+MuxServer when carrying UDP datagrams. UdpOverTcp currently requires nonempty
+datagrams.
 
 ### Stream delivery headroom and datagram framing
 
