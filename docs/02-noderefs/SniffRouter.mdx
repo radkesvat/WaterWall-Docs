@@ -273,9 +273,11 @@ This mode is useful before TLS termination:
 TcpListener -> SniffRouter -> TlsServer
 ```
 
-The TLS ClientHello must arrive within the bounded sniff window. If no SNI is
-found, or the SNI does not match any route, the connection uses top-level
-`next`.
+The sniffer accepts ClientHellos split across TLS records, including splits
+inside the handshake header or SNI. Fragmented handshakes use at most 8192 bytes
+of reassembly storage; incomplete input still uses the sniff-window cutoff.
+Complete single-record ClientHellos use direct parsing. If no SNI is found, or
+the SNI does not match any route, the connection uses top-level `next`.
 
 ## First-Payload Buffering
 
@@ -289,19 +291,27 @@ ClientHello is incomplete. The shared sniff window is bounded:
 ```
 
 Exact classification and buffering rules:
-- Complete ClientHellos are parsed and classified first, even if larger than 8192 bytes.
+
+- Complete single-record ClientHellos are parsed and classified first, even if larger than 8192 bytes. Fragmented handshakes have an 8192-byte reassembly limit.
 - If an input is incomplete and the accumulated prefix reaches 8192 bytes, SniffRouter stops waiting and selects the default `next` branch.
 - Incomplete ClientHellos below 8192 bytes remain unassigned; SniffRouter has no classification timer, so listener idle timeouts (e.g. `TcpListener`) govern the unassigned timeout.
-- Initial bytes buffered during sniffing are replayed intact to the selected branch in FIFO stream order (callback and TCP packet segmentation are not preserved).
+- Initial stream bytes buffered during sniffing are replayed intact to the selected branch in FIFO order; callback and TCP packet segmentation are not preserved. UDP replay preserves each datagram, including empty datagrams.
 
 After a route is selected, later payloads are forwarded directly to the selected
 target or to the default `next`. The connection is not reclassified.
 
 Branch initialization and initial replay preserve FIFO order: input received
 reentrantly during those callbacks waits behind the already accepted first bytes.
-That additional input shares one ordinary buffer with a 2 MiB logical-byte limit;
-exceeding it closes the line. The limit does not reject a previously accepted
-complete first delivery merely because it exceeds the sniff window. Once startup
+For streams, that additional input shares one ordinary buffer with a 2 MiB
+logical-byte limit; exceeding it closes the line. The limit does not reject a
+previously accepted complete first delivery merely because it exceeds the sniff
+window. SniffRouter records whether incoming payloads are UDP during `Init`,
+before the selected branch can rewrite the destination context. UDP input retains
+each datagram separately and supplies the sniffer with a separate byte view.
+Its pending FIFO admits at most 2 MiB of payload, 4 MiB of buffer capacity charge,
+and 1,024 datagrams. Empty datagrams consume entry and capacity allowance.
+Exceeding any limit closes only initialized sides. Replay preserves each
+datagram's contents, boundaries and order, including startup reentry. Once startup
 replay finishes, later payloads pass through without a SniffRouter output queue.
 
 ## TLS SNI Routing and Nginx Camouflage
@@ -356,6 +366,9 @@ Target rules:
 - the target node must exist
 - the target cannot be the SniffRouter itself
 - the target branch must not already be bound to an incompatible previous node
+- sharing a chain does not make a node inside another configured branch a valid
+  target; the default branch and repeated explicit targets remain valid,
+  including their private inserted helpers
 - the target may be the same node as top-level `next`
 
 Use a `Bridge` target when the branch lives elsewhere in the config.

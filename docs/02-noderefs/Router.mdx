@@ -548,8 +548,16 @@ HTTP versions:
 
 HTTP/2 sniffing is domain sniffing only: Router detects cleartext HTTP/2
 prior-knowledge requests on TCP destination contexts and reads `:authority`
-from the first request HEADERS. h2c upgrade requests are still handled through
-HTTP/1 Host sniffing.
+from the first completed request HEADERS, falling back to that request's `host`.
+Later request streams cannot replace the first request's domain, including when
+several requests arrive in one payload. h2c upgrade requests are still handled
+through HTTP/1 Host sniffing.
+
+TLS protocol detection and SNI sniffing accept a ClientHello split across TLS
+records, including a split inside the handshake header or hostname. Fragmented
+handshakes use at most 8192 bytes of reassembly storage; incomplete input still
+uses the sniff-window cutoff below. Complete single-record ClientHellos retain
+their existing direct parsing path.
 
 HTTP/2 sniffing is available when WaterWall is built with
 `router_enable_http2_sniffing=ON` (default `ON`). QUIC/HTTP3 sniffing is
@@ -621,9 +629,14 @@ Practical consequences:
 
 Branch initialization and initial replay preserve FIFO order: input received
 reentrantly during those callbacks waits behind the already accepted first bytes.
-That additional input shares one ordinary buffer with a 2 MiB logical-byte limit;
-exceeding it closes the line. The limit does not reject a previously accepted
-complete first delivery merely because it exceeds the sniff window. Once startup
+For stream input, that additional input shares one ordinary buffer with a 2 MiB
+logical-byte limit; exceeding it closes the line. The limit does not reject a
+previously accepted complete first delivery merely because it exceeds the sniff
+window. UDP input retains each datagram separately, including empty datagrams,
+and uses a separate byte view for sniffing. Its pending FIFO is limited to 2 MiB
+of payload, 4 MiB of buffer capacity charge, and 1,024 datagrams. Exceeding any
+limit closes the line. Replay preserves every datagram's contents and boundaries,
+including input received during branch initialization or replay. Once startup
 replay finishes, later payloads pass through without a Router output queue.
 
 ## GeoIP
@@ -756,6 +769,9 @@ Target rules:
 - A target must exist.
 - A target cannot be the Router itself.
 - A target branch must not already be bound to an incompatible previous node.
+- Sharing a chain does not make a node inside another configured branch a valid
+  target. Router accepts its own default branch and explicitly bound targets,
+  including their private inserted helpers.
 - Several rules may reference the same target.
 
 Use a `Bridge` target when the branch you want to reach lives in a separate
