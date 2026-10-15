@@ -5,7 +5,7 @@ sidebar_label: "Part 3: Buffers & Padding"
 description: "The sbuf_t buffer model, worker buffer pools, left-padding budgets, and how to prepend protocol headers without breaking chain composition."
 ---
 <!--
-Documentation version: 177
+Documentation version: 180
 -->
 
 # Part 3: Buffers, Padding & Shift Buffers
@@ -376,6 +376,17 @@ record headers for byte-identical replay on unsupported framing or deadline
 expiry. The replacement is reserved alongside the accumulator before record
 headers are rewritten; an already-admitted opaque suffix remains in the normal
 FIFO budget. Later opaque splice wrappers retain their direct forwarding path.
+
+Its candidate allocation requests start at 4 KiB and grow to at most 393,216
+bytes; rewriting adds at most 320 bytes. A pool may supply a larger buffer, whose
+actual capacity still counts against the budget. Generic fragments come from
+jobs already admitted under the 8 MiB logical-byte limit. With the pool's
+validated, aligned padding, these requested sizes
+have representable allocation geometry on supported targets. Keep budget and
+timer refusals, but do not add recoverable heap or geometry failures to these
+bounded allocations. At rewrite commitment, allocating the computed rewrite
+length guarantees the helper's output capacity; assert that result while keeping
+the rewrite call outside the assertion and the helper's checked capacity API intact.
 
 Both read helpers require `kSbufFlagSplice` and read only
 from the wrapper's private pipe. A nonempty body requires an initialized pair.
@@ -770,6 +781,14 @@ on return. `bufferpoolTryGetBestFit()` accepts a 64-bit computed length and retu
 `NULL` for unrepresentable geometry before using the same allocation path. Neither
 helper shrinks an existing buffer. Splice allocation stays explicit.
 
+A successful best-fit allocation already satisfies the requested payload capacity
+and left padding; callers need no undersized-success recovery branch. Use
+`bufferpoolGetBestFit()` when caller-established bounds guarantee representable
+geometry, including padding and alignment; otherwise preserve
+`bufferpoolTryGetBestFit()`'s geometry refusal. These guarantees describe the
+returned buffer at allocation time. Incoming or subsequently shifted buffers
+still need the applicable capacity and prepend checks.
+
 `sbufCreateWithPadding()` makes a separate ordinary `sbuf_t` and follows the same
 fatal heap-allocation policy as pool refill. Validate computed geometry with
 `sbufTryComputeCapacity()` before creating storage when an unrepresentable request
@@ -982,6 +1001,15 @@ senders initialize ordinary bodies to zero; verified senders generate the determ
 pattern. JSON summaries expose `verification_enabled`, and unverified payloads do not
 increment `valid_packets`. UDP keeps its per-datagram path.
 
+Their private frame encoders receive DATA sizes already bounded to 16 MiB by
+client settings or the accepted HELLO; control bodies are fixed and at most 72
+bytes. The 48-byte prefix and validated pool padding therefore have representable
+allocation geometry. Assert these caller bounds instead of adding nullable frame
+allocation or duplicate UDP-size checks. The shared header readers still validate
+external input, and report/HELLO dispatch establishes their exact body sizes before
+private readers run. Sender pacing preserves wide byte counts when converting
+them to elapsed microseconds and caps unrepresentable delays before narrowing.
+
 `splicestreamPush()` takes ownership on every result. It checks accounting and
 reserves FIFO metadata before consuming any new header bytes; representability
 refusal recycles the submitted input while preserving existing bytes and costs.
@@ -1045,12 +1073,19 @@ descriptors remain fatal invariants. Exact transfer primitives live in
 ### SoftIpLimiter identity and SpeedLimit shaping
 
 SoftIpLimiter materializes each complete delivery through `sbufEnsureOrdinary()`
-only while identity admission is undecided. Its BufferStream stays ordinary and
+only while identity admission is undecided. Empty deliveries contribute no identity
+bytes and are recycled before buffering. Its BufferStream stays ordinary and
 replays the original identity bytes and coalesced tail intact. The committed phase
 is published before next Init; nested input retains its private pipe in the
 existing bounded FIFO behind initial replay. Established and passthrough payloads
 in both directions are opaque. Temporary inspection never sets permanent
 ordinary-read preferences.
+
+Each admitted line records its IP row's generation. Pruning and recreating the
+same identity/IP pair creates a new generation; an old line must neither refresh
+nor release the replacement row. Concurrent lines admitted to the same live row
+share its generation and reference count. Generation allocation and table changes
+stay under the existing instance write lock.
 
 SpeedLimit retains ordinary and splice entries in its existing directional FIFOs.
 Whole grants forward the original wrapper; partial grants pop the source, extract
@@ -1061,7 +1096,10 @@ onward pool padding. Each FIFO has explicit logical-byte, queue-capacity-charge 
 entry budgets, including empty entries. Failed admission recycles the rejected
 buffer and settles both queues before closing the borrowed normal line through
 its owner. Queue pop/extraction/reinsertion invokes no callbacks; remaining ownership
-and accounting are published before a slice is transferred. Finish deletes both
+and accounting are published before a slice is transferred. Reinserting a split
+remainder reuses the popped slot and no greater byte/charge cost, with no callback
+in between; evaluate the insertion and assert success. Initial admission still
+retains its ordinary refusal path. Finish deletes both
 timers and destroys both queues before asserting their budgets empty.
 
 ### HeaderServer and KeepAlive framing
@@ -1074,11 +1112,13 @@ the original tail. Constant-port mode and established payloads in both direction
 preserve splice buffers. Temporary parsing does not set permanent ordinary-read
 preferences.
 
-HeaderClient destroys and zeros its line state after prepending the one-time
-header, then permanently bypasses itself before handing off that buffer.
-HeaderServer does the same after publishing constant-port context, before next
-Init. Parsed-header modes wait until next Init and the ordered initial replay
-finish. This keeps nested input behind the original tail before retirement.
+HeaderClient keeps no per-line state. After prepending the one-time header,
+it permanently bypasses itself before handing off that buffer; the active-node
+mask prevents another header. Its Init and Finish use the forwarding defaults.
+In constant-port mode, HeaderServer publishes the destination context, destroys
+and zeros its line state, and bypasses itself before next Init. Parsed-header
+modes wait until next Init and the ordered initial replay finish. This keeps
+nested input behind the original tail before retirement.
 Both nodes relay repeated Pause/Resume once the destination side is initialized;
 neither retains consumer permission to gate output.
 
@@ -1096,11 +1136,14 @@ Each encoder publishes its active suffix before callbacks and serializes nested
 inputs behind it. Active suffix plus queued nested input share an 8 MiB logical
 reentry limit and at most 1,024 buffers, including the active suffix. Decoders serialize nested input
 under an 8 MiB logical reentry bound. Complete frames drain before checking the
-1 MiB + 5 byte incomplete remainder and the 16 MiB retained allocation charge;
-beneficial compaction precedes charge refusal. Nested admission also checks that
-charge bound. Body lengths outside `1..1,048,577` or refusal close through the normal
-line owner instead of silently losing TCP bytes. Both nodes borrow their normal
-lines, and Finish settles the stream, active suffix and reentry queue. Pause
+16 MiB retained allocation charge; beneficial compaction precedes charge refusal.
+Validated frame lengths and draining guarantee that the incomplete remainder is
+smaller than 1 MiB + 5 bytes, including the cached header. Check this derived bound
+with a Debug assertion. Nested admission also checks the charge bound.
+Body lengths outside `1..1,048,577` or refusal close through the normal
+line owner instead of silently losing TCP bytes. Both nodes require L4 on both
+edges and borrow normal lines; a mixed chain does not send its worker packet line
+through them. Finish settles the stream, active suffix and reentry queue. Pause
 relays promptly while an admitted synchronous batch can complete. In both client
 modes, the first ping is due one `ping-interval` after downstream transport Est;
 waiting for it does not block application data or start a reply deadline. Repeated
@@ -1147,22 +1190,24 @@ retain their own explicit bounds. Explicit node-specific application-backlog
 limits take precedence over the default. For example,
 [Socks5Server](../02-noderefs/Socks5Server.mdx) retains its 1 MiB /
 1,024-buffer ordering limit per direction, including active retained tails and
-nested input together. Its separate 4,096-byte incomplete-handshake limit excludes
-application bytes after a complete CONNECT header. Fragmented metadata extraction
-copies only the protocol prefix. Empty TCP deliveries consume no staging entries;
+nested input together. Each negotiation message contains at most 513 metadata
+bytes; complete messages are consumed before waiting for more input. Fragmented
+metadata extraction copies only the protocol prefix, excluding application bytes
+after a complete CONNECT header. Empty TCP deliveries consume no staging entries;
 UDP-control tails are discarded after association acceptance.
 Socks5Client follows the default application-data limit
 for its upstream negotiation FIFO and, independently, downstream input retained
 for parser reentry or an older response backlog. The latter counts active stream
-bytes and queued sources together. Its 4,096-byte limit applies only to incomplete
-reply metadata; prefix extraction does not merge an arbitrary coalesced body.
+bytes and queued sources together. Its 4,096-byte limit bounds input waiting for
+the first transport Est or incomplete reply metadata; prefix extraction does not
+merge an arbitrary coalesced body.
 Ready direct payloads are not subject to a backlog cap, and empty TCP input does
 not consume retention entries.
 
 Socks5Client and Socks5Server materialize complete negotiation deliveries with
 `sbufEnsureOrdinary()` before parser or reentrant-input admission. BufferStream
-stays ordinary; complete coalesced application tails are replayed without changing
-the incomplete-metadata limits. Client upstream application storage can retain
+stays ordinary; complete coalesced application tails are replayed without charging
+them as incomplete metadata. Client upstream application storage can retain
 splice buffers opaquely. After TCP setup, direct payload and necessary FIFO
 forwarding preserve original buffers. Server input conversion continues through
 CONNECT-wait until its TCP-established phase; success-reply ordering is unchanged.
@@ -1211,15 +1256,18 @@ A parser's active head, cached header and queued sources are charged exactly onc
 | --- | --- |
 | Protocol/order/replay or output backlog in these four nodes | 2,097,152 bytes; 1,024 output/backlog entries |
 | Trojan UDP input, including partial-frame/header state | 2,105,607 bytes: 2 MiB plus the 8,455-byte maximum incoming frame |
-| TrojanServer initial request assembly | 2,105,607 wire bytes; incomplete-initial policy remains 4,096 bytes |
+| TrojanServer initial request assembly | 2,105,607 wire bytes |
 | VlessClient TCP response assembly | 2,097,409 bytes: 2 MiB plus 257 response metadata bytes |
-| VlessServer request/UDP input, including active head and cached metadata | 2,162,689 bytes; incomplete-initial policy remains 4,096 bytes |
+| VlessServer request/UDP input, including active head and cached metadata | 2,162,689 bytes: 2 MiB plus the 65,537-byte maximum UDP frame |
 | VlessClient UDP input, including pending response/frame metadata | 2,162,689 bytes: 2 MiB plus the 65,537-byte maximum frame |
 
 Equality is accepted. Overflow or failed queue admission settles only the affected
 flow/association; private-pipe pressure instead uses the shared ordinary fallback.
-Remove consumed metadata before applying a remaining-body/backlog budget. The
-incomplete-initial limit must not reject a complete header coalesced with body.
+Remove consumed metadata before applying a remaining-body/backlog budget.
+TrojanServer needs at most 320 request-header bytes and VlessServer at most 278
+before accepting or rejecting the request. Incomplete request metadata fits within
+each node's header cache; a complete header coalesced with body is parsed before
+the remaining-body budget applies.
 These logical limits do not measure RSS or descriptor use. Receiving adapters
 additionally bound entries or allocation charge for decoded datagrams, including
 empty ones. Mux bounds queue charge for retained stream chunks.
@@ -1231,6 +1279,10 @@ plaintext drains progress without waiting for consumer Resume. Reentrant input
 stays behind the active plaintext remainder, and active reservations retain their
 byte/entry charge until consumed and released. Local backlog pressure has its own
 release path. Keep ciphertext-shaping budgets separate.
+
+TlsServer also bounds pre-handshake backend plaintext to 2 MiB / 1,024 entries.
+Equality is admitted; overflow closes the affected line and releases its queued
+buffers. This limit applies even when the handshake deadline is disabled.
 
 TlsClient and TlsServer relay advisory Pause/Resume without gating due record
 output. Configured record delays, FIFO order, local shaping watermarks and hard
@@ -1247,6 +1299,10 @@ writes normally copy directly into padded pooled output buffers. Taking output t
 the allocation, which remains valid after later SSL calls or TLS-state release.
 BIO callbacks must never invoke another tunnel: drain owned output only after
 the SSL operation returns, with the usual line-reference and reentry checks.
+Successful per-line TLS initialization attaches both BIOs to its SSL object
+before returning. Later startup failures, including TlsClient's inner ClientHello
+generation, can then use normal line-state teardown. Only partial initialization
+before that attachment frees BIOs separately.
 
 Each ciphertext BIO admits at most 8 MiB of unread bytes and 1,024 nonempty
 buffers. Equality is accepted; refusal consumes new input and closes the affected
@@ -1525,7 +1581,12 @@ incomplete suffix or a genuine protocol/ordering barrier is retained.
 ### VlessClient response transition and UDP framing
 
 The initial request is 26 bytes for IPv4, 38 for IPv6, or 23 plus domain length,
-at most 278. UDP frames contain a two-byte big-endian body length and no address.
+at most 278. Target preparation establishes a valid address and nonzero port;
+Init saves a private copy that remains unchanged until cleanup. The request
+encoder can assert those preconditions. Keep its checked allocation for the
+combined request and first body: an arbitrary TCP delivery can still exceed
+representable buffer geometry after adding headers and padding.
+UDP frames contain a two-byte big-endian body length and no address.
 Bodies are 0 through 65,535 bytes. Local oversized datagrams are dropped without triggering the initial request.
 An empty datagram emits a `00 00` length prefix and triggers the initial request when it is the first application
 payload. A received zero length consumes its two-byte prefix and delivers exactly one empty UDP datagram; keep the
@@ -2005,9 +2066,13 @@ next Init immediately; the server sets the destination protocol to UDP first.
 There is no protocol-selection marker. Transport Est, Pause and Resume are
 forwarded promptly, without an encoder queue or pending control output.
 
-Each receive stream drains complete admitted frames before bounding its
-incomplete suffix to 131,010 logical bytes and 4 MiB retained buffer charge,
-attempting beneficial compaction before charge refusal. Parser reentry shares
+Each receive stream drains complete admitted frames before checking its
+4 MiB retained buffer charge, attempting beneficial compaction before refusal.
+The decoder accepts nonzero 16-bit wire lengths through 65,535 bytes. Its drain
+can stop only on an incomplete header or body, leaving at most 65,536 bytes
+including the two-byte header. Assert this derived bound instead of adding an
+unreachable overflow path. It does not bound allocation charge: a small suffix
+can retain a large backing buffer, so charge checks remain necessary. Parser reentry shares
 2 MiB of retained logical bytes and 4 MiB of charge with the older stream.
 Complete frames in the synchronous dispatch continue after Pause; hard
 admission refusal, zero data length or Finish stops dispatch and closes a

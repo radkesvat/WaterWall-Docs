@@ -102,6 +102,8 @@ work, references and other cleanup obligations, then zero the entire aligned
 not replace releasing the resources they own. `tunnelBypassLine()` asserts every
 byte of that region is zero in Debug before clearing the bit; it performs no
 cleanup itself. The tunnel will not receive a later `Finish`.
+A node with zero per-line state and no cleanup obligations needs no destroy
+routine; it can bypass directly once its one-time work is complete.
 Line owners, endpoints, branch selectors and any tunnel
 still needed for routing, transformation or flow control must remain active.
 Every valid dispatch path must reach an active endpoint. Skipping a tunnel does
@@ -1149,8 +1151,10 @@ For an initialized fallback branch, use this close order:
    final branch `Payload` callback. An empty queue can destroy local state and
    synchronously finish the initialized branch immediately.
 2. For a non-empty bounded FIFO, capture the branch and line pool, detach the
-   queue from line state, range-check its total, and coalesce it in FIFO order
-   into one buffer. One callback bounds the final handoff and its reentrant
+   queue from line state, and establish that its total fits the destination
+   buffer before coalescing it in FIFO order. An admission limit that already
+   proves this bound needs only an assertion at the drain, provided no path can
+   bypass the limit. One callback bounds the final handoff and its reentrant
    teardown window.
 3. Never flush while branch Init is unfinished. TrojanServer, VlessServer and
    TlsServer may deliver this final batch through advisory Pause; receiver limits
@@ -1608,6 +1612,10 @@ Their timers and protocol state prevent permanent bypass. Incoming Pause/Resume
 already relay transparently, including repeats, with directional Finish guards;
 they do not stop KCP updates or due output.
 
+KCP/FEC output callbacks enqueue owned datagrams in contexts. Neighboring tunnel
+callbacks run only after the KCP/FEC call returns, because they may destroy the
+protocol state. Preserve this output staging and the subsequent line/handle checks.
+
 Their separate source-pressure latch represents locally queued and unacknowledged
 KCP segments. Reconcile it after KCP update and packet delivery, outside KCP's
 output callback, with the exact line referenced. Publish the latch before sending
@@ -1616,7 +1624,9 @@ existing state. ACK-only input must be able to release the local hold. Admit the
 complete source payload before any pressure callback so reentrant input cannot
 overtake it. After notification, recheck both line life and the KCP handle: Finish
 may have destroyed this borrowed node's state without destroying the line.
-The send-buffer setting remains an advisory threshold, not a hard admission cap.
+The automatically derived threshold saturates at `INT_MAX`, matching KCP's signed
+queue-count interface. The send-buffer setting remains an advisory threshold,
+not a hard admission cap.
 
 ### SpeedLimit independent drains
 
@@ -1626,7 +1636,9 @@ cleared, without a temporary Resume followed by Pause. Consumer Pause stops that
 direction's timer/backlog output; a due timer leaves the bounded queue intact and
 does not poll while blocked. Consumer Resume rearms queued work, including an
 empty-queue local-release tick, before any outward notification. Timer admission
-refusal settles local buffers/timers and closes through the normal line owner.
+refusal, including a refused reset of an existing timer, settles local buffers/timers
+and closes through the normal line owner. Keep the reset result; an existing timer
+pointer does not guarantee rearm admission.
 Each notification path returns without touching line state after the callback,
 which may synchronously close or reenter the connection. Token availability never
 overrides consumer pressure, and empty queued input cannot stall a drain.
@@ -1744,6 +1756,12 @@ destination's socket options and outbound IP range in the resolver's prepare-hoo
 storage. Its own Init initializes the ordinary connector line state and consumes
 the prepared settings directly during socket creation, before connect can trigger
 callbacks. Keep destination selection and its settings together across DNS.
+
+TcpConnector and UdpConnector check constant domains against the address context's
+1–255-byte length before narrowing, for both single and weighted destinations.
+TcpConnector's constant CIDRs use the strict shared parser at construction:
+IPv4 accepts prefixes 0–32 and IPv6 accepts 64–128. Randomization replaces only
+host bits, including the complete IPv4 `/0` and IPv6 `/64` ranges.
 
 TrojanClient, VlessClient and Socks5Client apply their configured address, port
 and TCP/UDP selection to the line's destination context before local DNS
@@ -1919,7 +1937,11 @@ remain alive. No duplicate borrowed-line inventory is needed.
 
 VlessClient borrows direct TCP and UDP application lines and owns only each UDP
 application's dependent TCP carrier on the same worker. Both links are attached
-before next Init. Its first-payload batching, idle deadline, signal mapping and
+before next Init. The line role determines the VLESS command: direct lines use
+TCP, while UDP application lines route requests through their UDP carrier role.
+Keep the configured protocol selection in tunnel state; per-line state need not
+store a second copy of the role's protocol. Its first-payload batching, idle
+deadline, signal mapping and
 opaque TCP paths follow the same ownership/admission rules as TrojanClient.
 Every direct TCP Est is forwarded, including repeats; UDP carrier Est maps once
 to its application. Repeated Est does not restart the first-payload deadline.

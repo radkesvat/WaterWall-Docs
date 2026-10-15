@@ -146,6 +146,35 @@ state. Document nullable parameters explicitly. Keep operations with side effect
 outside `assert()` so Release builds perform them too; assertions disappear under
 `NDEBUG`.
 
+### Avoiding redundant checks and state
+
+A check is redundant only when an established precondition, earlier validation or
+API postcondition guarantees it on every path reaching that check, and intervening
+operations cannot invalidate that guarantee. Trace error paths, reentry and
+teardown as well as ordinary progress. A branch being rare or absent from tests
+does not make it impossible.
+
+- Use a helper's actual guarantees. For example, `addresscontextIsDomain()` already
+  establishes a non-null domain and nonzero stored length; it does not validate
+  protocol-specific hostname syntax or agreement with the C-string length.
+  Keep checks for properties the helper does not establish.
+- Preserve a shared checked API's documented invalid-input, incomplete-input and
+  capacity-refusal outcomes even when one caller prevalidates its input. A local
+  cleanup may narrow an internal helper's contract only when its complete caller
+  set establishes the preconditions. Document a non-obvious size bound or ordering
+  guarantee where future callers need it.
+- Store independent facts rather than flags that merely duplicate a phase or
+  another flag. Check every assignment and transition for the exact line role
+  before removing state; similar client and server implementations need not have
+  identical reachable states. Whether a neighbor received `Init`, for example,
+  remains a separate fact when local setup can fail before dispatch.
+
+When a redundant branch is removed, also remove private fields or helper results
+that lose their last purpose. Use the assertion policy above for programmer-only
+invariants; retain real input, admission and callback-lifetime failures. For
+allocation postconditions and incoming-buffer checks, see
+[Part 3](./part3-buffers-and-padding.mdx#buffer-pools).
+
 ### Heap allocation failure
 
 WaterWall's memory manager does not support recovery from heap-allocation failure.
@@ -180,6 +209,13 @@ create native resources remain fallible for those reasons. Tests must not simula
 recoverable OOM by returning `NULL` above the allocator gate; exercise actual
 admission/resource refusal there and test fatal heap failure below the gate.
 
+Runtime cJSON uses the same fatal allocator. Creating an object or array and
+adding fresh items with valid keys and values needs no OOM rollback. Keep parse,
+serialization-size and invalid-argument failures; a nullable JSON result is not
+necessarily an allocation failure. Likewise, inserting an absent key into an
+already-reserved map needs no allocation recovery when admission proves it fits.
+Keep duplicate-key and capacity refusals wherever callers can reach them.
+
 The standalone launcher does not link the runtime allocator. Shared configuration
 validation follows the existing `WW_CJSON_CRT_ALLOCATOR` build selection: runtime
 builds use WaterWall allocation, while standalone launcher builds retain CRT
@@ -189,8 +225,10 @@ the launcher solely to share its allocator.
 Zero-sized allocation/calloc requests return at least one freeable byte.
 `memoryReAllocate(ptr, 0)` instead frees `ptr` and returns `NULL`. Invalid aligned
 allocation geometry and overflowing `memoryCalloc()` multiplication return `NULL`
-before the backend allocator is called. Preserve checks for these documented
-results when the caller can supply such requests.
+before the backend allocator is called. `OPENSSL_memory_alloc()` likewise returns
+`NULL` before allocation when adding its bookkeeping header would overflow.
+Preserve checks for these documented results when the caller can supply such
+requests.
 
 The OOM path must not use the normal logger, allocate more memory, acquire
 application locks or call cleanup callbacks. It does not request orderly
@@ -327,6 +365,9 @@ Outgoing datagrams and callbacks from the chain arrive downstream from `next`.
 Tail placement and downstream peer initialization are intentionally disabled;
 this is the supported topology contract, not a temporary workaround. WireGuard
 layouts using this socket place its transport side toward `prev`.
+No runtime role flag is needed; upstream callbacks retain the adapter's disabled
+defaults. The idle handle distinguishes owned peer lines from borrowed transport
+or packet lines, whose downstream lifecycle callbacks have no peer state to manage.
 
 | Flag | Meaning |
 | --- | --- |
@@ -673,6 +714,10 @@ line-state alignment; clearing a larger region can overwrite the next slot.
 
 ## `line_state.c`: Initialize and Destroy
 
+Nodes that reserve zero line-state bytes need no placeholder lstate type or
+unused initialization/destruction helpers. Omit those declarations and source
+files, and keep any line-state size constant consistent with the constructor.
+
 Line state is initialized in `Init` and destroyed exactly once. The destroy
 function must zero the **aligned** region so the line-free debug assertion
 (`debugAssertZeroBuf`, see [Part 2](./part2-lines-and-callbacks.mdx)) is satisfied:
@@ -864,15 +909,19 @@ required to drain the other. Their owned child's Finish settles that child
 immediately and drains already accepted replies under current client permission
 before finishing the borrowed client.
 
-ReverseServer, HalfDuplexServer, and HttpServer split derive waiting budgets from
+HalfDuplexServer and HttpServer split derive waiting budgets from
 `scale = max(1, ceil(basis / 32768))`, where
 `basis = bufferpoolGetWaitingBudgetBasis()` is 64 KiB in S1/S2 and 1 MiB in higher
 profiles, independently of allocation sizes and the splice limit.
-ReverseServer closes above `65535 * scale`;
 HalfDuplexServer closes at or above `131070 * scale`, including initial upload
 publication; HttpServer split closes above `131070 * scale` unless its explicit
 buffering-limit bypass is enabled. Handshake/header validation and available-peer
 pairing precede waiting checks. The 32 KiB divisor is a fixed budget reference. Wire and HTTP framing limits remain independent.
+
+ReverseServer uses fixed per-half application FIFO limits of 2 MiB and 1,024
+buffers, shared by waiting and startup retention and independent of pool profile.
+Its activation prefix has a separate protocol bound; see
+[Part 3](./part3-buffers-and-padding.mdx#reverse-activation-prefix).
 
 If you work on `HttpClient` or `HttpServer`, these source-backed constraints
 apply:
@@ -914,6 +963,12 @@ apply:
   state, then forward the real `Finish` — the general final-bytes pattern from
   [Part 2](./part2-lines-and-callbacks.mdx). Do not keep HTTP line state alive
   after a clean finish unless you intentionally held a line reference for that purpose.
+- **HttpClient split teardown**: retain the borrowed main line and both owned
+  transport lines before final-byte or close callbacks. A callback on one
+  transport can close its sibling and clear main state while the borrowed main
+  line remains alive. After callbacks, check logical life and the existing main
+  split role before cleaning or notifying it again. Honor the main line's
+  `prev_finished` flag even when closure arrives through the other transport.
 - **Custom raw upgrade**: a successful non-WebSocket, non-h2c HTTP/1.1 upgrade
   makes the single-line client and server transparent after the opening header,
   coalesced input and retained output settle. Serialize reentrant input behind

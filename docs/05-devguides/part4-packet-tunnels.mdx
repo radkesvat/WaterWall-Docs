@@ -201,8 +201,11 @@ the close really is the whole job. A body that is nothing but `discard` statemen
 does not distinguish the last case from a bug.
 
 The legitimate absorbers today are `BlackHole` (a chain-end sink that borrows
-every line), `PacketReceiver` (a chain end that reports by timer and file) and
-`PacketSender` downstream (Category 3 above).
+every line), `PacketReceiver` (a chain end that reports by timer and file),
+`PacketSender` downstream (Category 3 above), and `UdpStatelessSocket` downstream
+on borrowed transport or packet lines. UdpStatelessSocket owns no peer resources
+on those borrowed lines and has no previous node to notify. Its owned normal
+peer lines remain distinct: Finish removes their idle entries and destroys them.
 
 Review each `tunnels/*/{upstream,downstream}/fin.c` against its exact line role.
 An intentional no-op needs a written rationale in the handler; runtime tests
@@ -255,6 +258,13 @@ sense as one of:
 - per-worker state,
 - packet-pipeline scratch state,
 - bridge state anchored to the worker packet side.
+
+A final checksum boundary must take and clear the current packet's request with
+`packettunnelTakeChecksumRequest()` before any drop or inter-tunnel callback.
+Keep the returned value with that locally owned packet until repair; never
+restore it to the shared line after a callback. Stream creation can reenter
+packet delivery, so deferring consumption until after `Init` can apply one
+packet's request to another.
 
 If you need real per-flow or per-connection lifecycle behind packet traffic,
 **create normal lines behind the packet side** — do not try to make the packet
@@ -1072,6 +1082,11 @@ server data: PingClient <-- Echo Request -- PingServer
   buffers. The generated reply clone travels back toward the request sender,
   while the decoded original continues in the received direction. With it
   disabled, only the decoded original is published.
+- The shared codec keeps its checked input APIs. At the nodes' reply and strip
+  call sites, the validated envelope, exact independent clone and locally retained
+  original already establish success. Assert those caller guarantees rather than
+  adding packet-drop or acknowledgement fallback paths. Execute the codec calls
+  outside assertions so Release builds still perform them.
 - Consequently, PingServer's upstream request handler sends an enabled reply
   clone with `tunnelPrevDownStreamPayload()` and the decoded original with
   `tunnelNextUpStreamPayload()`. PingClient's downstream request handler sends
