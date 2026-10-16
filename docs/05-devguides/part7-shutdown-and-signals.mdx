@@ -860,8 +860,8 @@ bootstrap queued before delivery can be posted. See [Part 4's startup ordering a
 foreign-thread reader rules](./part4-packet-tunnels.mdx#external-readers-and-packet-startup).
 
 TUN, raw, and capture devices split stop into request and wait operations. The
-request phase closes local delivery/rearm admission and signals reader or writer
-threads without joining. The wait phase joins external callback roots while
+request phase closes local delivery/rearm admission and signals external readers
+without joining. The wait phase joins or quiesces external callback roots while
 device and tunnel state remain valid. Final stop releases remaining interface,
 writer, route, DNS, and platform resources after worker line drain.
 
@@ -951,16 +951,32 @@ access; it never forces cleanup of storage reachable by a live reader.
 Device delivery uses local generation/session gates. A producer entering before
 gate closure may finish; a later entrant is refused and releases its retained
 ownership. An old reader generation is joined before restart opens a new one.
-Raw-device writer publication is exchanged to null before its channel closes;
-retired generations remain allocated until no producer can retain their immutable
-publication. TUN instead owns bounded per-worker output FIFOs. Its published
+TUN and raw devices own bounded per-worker output FIFOs. Their published
 writer generation is detached before admission closes. Native writes hold that
 generation's operation gate; close waits for them without serializing writes
-against one another. After quiescence, queued buffers are destroyed and the
-native device/session can close. Late callbacks or cancellation retain only a
+against one another. After admitted callbacks and pending native operations
+retire, queued buffers are destroyed and the native device/session can close. Late callbacks or cancellation retain only a
 generation reference and cannot write into a reopened device or access reclaimed
 device state. Cancellation never borrows an event worker's pool. Destroy still
 requires external producer contexts to have quiesced.
+
+Raw Linux output retains an active batch and its unsent suffix across worker
+callbacks. Each native callback attempts at most one `sendmmsg()`. `EINTR` yields
+through an ordinary worker message; `EAGAIN` schedules one 1 ms retry that checks
+`poll(POLLOUT, 0)` before sending. Lack of readiness schedules another timed
+callback; terminal readiness failures publish device failure. None of these
+callbacks blocks the event loop. Closing the writer generation makes pending
+retry tokens inert, and the coordinator discards their retained buffers after
+admitted callbacks finish. NOTRACK removal follows this settlement.
+
+The Windows raw backend uses overlapped WinDivert writes with a one-shot native
+completion notification. The notification only posts to the recorded worker;
+that worker reads completion results and recycles finished buffers. Stop first
+closes writer admission and waits for admitted callbacks, then disables and
+quiesces completion notifications and cancels/completes outstanding native
+operations. Only afterward may the helper destroy queued buffers or close the
+WinDivert handle. Cancellation is not evidence that the kernel has released its
+buffer. These native roots require no dedicated application writer thread.
 
 Device fragment storage is session-local. Close admission, wait for admitted
 delivery, join the producer, reset exclusive pool ownership, and retire assembly
