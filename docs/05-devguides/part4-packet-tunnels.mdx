@@ -727,7 +727,13 @@ immediate enqueue-only TunDevice sink may receive it inline on the exact packet
 worker; other neighbours stay deferred. The same rule covers fake-DNS fragments.
 Normal-line callbacks retain their deferred reentry boundary.
 
-On an active direct trusted Linux pair with active TCPv4 GSO, the writer
+TUN output is deferred onto the submitting event worker, with one pending flush
+per worker FIFO. Workers may write the native device concurrently; no application
+mutex covers native writes. FIFO order is preserved within each worker, and
+direct PTC flows stay on their owning packet worker. There is no total order between
+independent workers. Admission remains bounded across the whole device.
+
+On an active direct trusted Linux pair with active TCPv4 GSO, each worker
 collects only already-available FIFO entries, without a fill timer or per-flow
 cache. It combines only adjacent exact IPv4 TCP data packets with IHL 20, valid
 headers, original lengths within MTU, identical flow/ACK/window/options/DF/TTL/TOS
@@ -743,8 +749,9 @@ Ten-byte little-endian virtio metadata requests TCPv4 GSO and checksum completio
 at TCP offset 16. The native `writev()` receives that header and original payload
 slices as one record. EINTR retries retain ownership; a short result is never
 replayed. Linux TUN's pre-injection `EINVAL` rejection falls back to originals and
-latches off writer aggregation with one diagnostic, leaving framing and checksum
-trust unchanged. Checksum-only writers never collect GSO batches; trusted
+atomically disables aggregation for that device generation with one diagnostic,
+leaving framing and checksum trust unchanged. Already-admitted writes on other
+workers may complete. Checksum-only writers never form GSO records; trusted
 ordinary TCP/UDP writes retain partial seeds and `NEEDS_CSUM` with `GSO_NONE`,
 while untrusted ordinary writes use zero metadata and complete IP bytes.
 Invalid generated metadata remains a defect. Other I/O errors
@@ -1000,7 +1007,8 @@ immediately enqueue packet delivery.** Creating an inactive device handle is
 different from bringing it up and launching its reader. If a creation/open API
 also starts reading, call that API from the later startup callback instead of
 `createHandle`. TunDevice keeps device creation and `tundeviceBringUp()` in
-`onStart`; the latter starts its reader and writer threads.
+`onStart`; the latter starts its reader thread and opens worker-output admission.
+Native output remains deferred onto event workers.
 
 The risk is initialization order, even when workers have not started dispatching.
 `createHandle` runs before chain finalization establishes packet lines, line-state

@@ -285,15 +285,22 @@ When payload reaches `TunDevice` from upstream or downstream:
 
 Both upstream and downstream payload handlers write to the same TUN device.
 
-Payload callbacks validate and try the existing thread-safe writer FIFO without
-waiting for capacity or performing native I/O. This enqueue-only guarantee allows
-an immediately adjacent PTC on the packet worker to deliver its final sbuf directly.
+Payload callbacks validate and append to the current event worker's output FIFO
+without waiting for capacity or performing native I/O. One deferred flush per
+worker performs native writes and recycles buffers through that worker's existing
+pool. TUN has no dedicated writer thread or writer pool. Workers can write
+concurrently; each worker preserves its FIFO order. Direct PTC flows remain on
+their owning packet worker; output on different workers has no shared FIFO order.
+Device-wide admission bounds queued and active output.
+This enqueue-only guarantee allows an immediately adjacent PTC on the packet
+worker to deliver its final sbuf directly.
 
-On an active GSO device with a direct trusted Linux pair, the writer combines compatible adjacent
-TCP data packets into bounded scatter/gather GSO records. It takes only packets
-already available, never waits to fill a batch, and retains packet order. At most
-64 packets and 256 KiB of allocation charge form a batch, with one lookahead;
-each GSO record stays within 65,535 IPv4 bytes. Original packets must still fit
+On an active GSO device with a direct trusted Linux pair, each worker combines
+compatible adjacent TCP data packets into bounded scatter/gather GSO records. It
+takes only packets already available, never waits to fill a batch, and retains
+packet order. A flush processes at most 64 packets and 256 KiB of allocation
+charge; a larger single allocation progresses alone. Remaining packets schedule
+another deferred flush. Each GSO record stays within 65,535 IPv4 bytes. Original packets must still fit
 MTU. UDP, fragments, controls, incompatible TCP packets, interposed nodes and
 `gso:false` keep individual packet writes. Checksum-only writes still include the
 virtio header: ordinary untrusted packets use zero metadata and complete bytes;

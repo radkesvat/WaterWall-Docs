@@ -897,10 +897,11 @@ pipes are nonblocking and close-on-exec; `EINTR` is retried, a full pipe means a
 wake is already armed, and bounded reader polling prevents a hard wake failure
 from turning join into an unbounded wait. Every opened reader generation follows
 the same close, signal, `EndWait`, join, pool-owner reset, generation-retire
-order during rollback, restart, and shutdown. Writer generation retirement
-follows reader retirement, and `Down` is published only after required ownership
-is gone. `UdpStatelessSocket` has no external producer session: its worker
-messages and async DNS requests settle before the owning workers acknowledge
+order during rollback, restart, and shutdown. TUN output admission closes in the
+same request phase. BringDown waits for admitted worker writes and discards queued
+output before native device/session resources can close; no writer thread is
+joined. `Down` is published only after required ownership is gone.
+`UdpStatelessSocket` has no external producer session: its worker messages and async DNS requests settle before the owning workers acknowledge
 `Quiesced`, and it closes its WIO only from `onWorkerQuiesce` on the recorded
 `io_wid`.
 
@@ -950,9 +951,16 @@ access; it never forces cleanup of storage reachable by a live reader.
 Device delivery uses local generation/session gates. A producer entering before
 gate closure may finish; a later entrant is refused and releases its retained
 ownership. An old reader generation is joined before restart opens a new one.
-Writer publication is exchanged to null before its channel closes; retired
-generations remain allocated until no producer can retain their immutable
-publication.
+Raw-device writer publication is exchanged to null before its channel closes;
+retired generations remain allocated until no producer can retain their immutable
+publication. TUN instead owns bounded per-worker output FIFOs. Its published
+writer generation is detached before admission closes. Native writes hold that
+generation's operation gate; close waits for them without serializing writes
+against one another. After quiescence, queued buffers are destroyed and the
+native device/session can close. Late callbacks or cancellation retain only a
+generation reference and cannot write into a reopened device or access reclaimed
+device state. Cancellation never borrows an event worker's pool. Destroy still
+requires external producer contexts to have quiesced.
 
 Device fragment storage is session-local. Close admission, wait for admitted
 delivery, join the producer, reset exclusive pool ownership, and retire assembly
@@ -1088,8 +1096,11 @@ retains one detached sbuf through run-or-cancel worker delivery. Cleanup destroy
 that sbuf without dereferencing the tunnel or borrowing a worker pool. Both paths
 leave normal-line drain, Finish propagation and engine teardown unchanged.
 
-The Linux writer checks device stop state before collecting or emitting further
-records. It owns dequeued batches and at most one lookahead buffer until write or
-local discard, and releases all of them before returning. Only channel-owned
-leftovers are drained by the coordinator after writer join. A GSO refusal latch
-is writer-local and never changes published checksum capabilities during traffic.
+Each TUN worker flush checks its writer generation before entering native I/O.
+The Linux batch callback also checks device stop state before emitting each
+record, and releases every dequeued buffer before returning. The lifecycle owner
+closes admission and waits from outside those callbacks; a callback must never
+close or wait on its own writer gate. A fatal native result marks the device
+failed, then requests shutdown only after the writer gate is released. The shared
+atomic GSO-refusal latch disables later aggregation for the device generation
+without changing published checksum capabilities; BringUp resets it.

@@ -2417,10 +2417,21 @@ that same sbuf. Deferred refusal/cancellation calls `sbufDestroy()` without tunn
 line, engine or pool access; accepted owner delivery may recycle a stopped output.
 No pbuf storage crosses the device callback boundary.
 
-The Linux trusted TUN writer may retain at most 64 available packet buffers and
-256 KiB of allocation charge per batch, plus one explicitly owned lookahead
-buffer. A singleton exceeding that charge target still progresses ordinarily.
-GSO records copy only a private IPv4/TCP header; iovecs borrow original payload
-spans until the complete write attempt and EINTR retries finish. No aggregate
-payload allocation/copy occurs. Every exit settles locally owned batch/lookahead
-buffers before the writer returns; channel leftovers belong to post-join drain.
+TUN output has one FIFO per event worker and uses that worker's existing buffer
+pool; there is no device writer pool. The device-wide packet allowance covers
+both queued buffers and the active flush batches across all workers. The queue
+limit is separate from the flush quantum: each deferred callback removes at most
+64 packets and 256 KiB of allocation charge, leaving the next packet queued when
+it would exceed the quantum. A singleton exceeding that charge target still
+progresses ordinarily. No timer waits for more packets; remaining output schedules
+another deferred flush.
+
+Linux trusted GSO records copy only a private IPv4/TCP header; iovecs borrow
+original payload spans until the complete write attempt and EINTR retries finish.
+No aggregate payload allocation/copy occurs. Every native batch callback settles
+all of its buffers through its event worker's pool. Cancellation marks the queue
+for discard; lifecycle queue drain destroys retained buffers without borrowing a
+worker pool. A refused `tundeviceWrite()` leaves the buffer with its caller;
+acceptance transfers it to writer settlement. Generation references keep late
+flush-token cleanup safe after device destruction; see
+[Part 7](./part7-shutdown-and-signals.mdx#10-external-devices-and-lwip).
