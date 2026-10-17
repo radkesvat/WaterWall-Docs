@@ -6,7 +6,7 @@ description: "چرخه‌ی عمر اتصال، خطرهای re-entrancy، نگ�
 ---
 
 <!--
-Documentation version: 164
+Documentation version: 165
 -->
 
 # بخش ۲: line‌ها، callback‌ها و ایمنی طول عمر
@@ -124,6 +124,47 @@ credentials آن release sequence را acquire می‌کند. هر کدی که �
 count را کم می‌کند باید همین قرارداد را حفظ کند؛ lock صف پیام یا readiness flag
 نامرتبط جای این publication را نمی‌گیرد.
 
+### انتشار هویت احراز‌شده
+
+#### پذیرش از cache محلی
+
+پس از نخستین همگام‌سازی معتبر جدول و مبنای ساعت، `authenticationclientCanAuthenticate()` در قطع شبکه و
+احراز هویت دوباره از آخرین cache حافظه استفاده می‌کند؛ cache مهلت کهنگی ندارد. enabled، انقضا، سهمیه ترافیک و
+reservation محلی اتصال/IP همچنان اعمال می‌شوند. نبود cache، توقف، خطای نهایی continuity یا رد صریح اعتبارنامه
+خود کلاینت، پذیرش جدید را می‌بندد. فقط پاسخ موفق و معتبر Session رد صریح را پاک می‌کند؛ timeout، قطع اتصال،
+پاسخ خراب و `authentication-required` چنین اثری ندارند. اتصال‌های قبلاً مجاز به ثبت مصرف و اجرای محدودیت‌های
+محلی ادامه می‌دهند. هر درخواست HTTP روی اتصال reused پذیرش تازه است؛ exchange جاری و CONNECT ادامه می‌یابند.
+ویرایش مدیر پس از refresh معتبر می‌رسد. دو کلاینت قطع‌شده با مصرف شناخته‌شده ۸۰ از سهمیه ۱۰۰ گیگابایت می‌توانند
+هر کدام ۲۰ مصرف کنند و مجموع نهایی ۱۲۰ شود؛ سهمیه و reservation محلی، تضمین سراسری نیستند.
+
+#### ساعت و اولین استفاده محلی
+
+پاسخ GetAllUsers باید هر دو فیلد canonical و دقیق `server-time-ms` و `accounting-time-ms` مثبت را داشته باشد؛
+metadata نامعتبر refresh را بدون جایگزینی cache معتبر رد می‌کند و fallback به ساعت دیواری کلاینت وجود ندارد.
+سرور یک بار `C0 = max(wall-ms, 1)` و monotonic `M0` را ثبت می‌کند و با جمع saturating زمان سپری‌شده monotonic
+ساعت حسابداری را پیش می‌برد. اصلاح بعدی ساعت دیواری آن را reset نمی‌کند و anchor در فایل ذخیره نمی‌شود.
+
+اولین upload یا download غیرصفر درون قفل write کاربر، نمونه تازه monotonic، origin محلی معتبر حتی در صفر و
+برآورد مثبت و تغییرناپذیر اولین استفاده برای گزارش را ثبت می‌کند. login، reservation، فراخوانی صفر بایت و rebase
+شروع مصرف نیستند. ثبت مشاهده، شمارنده و تصمیم انقضا در transaction با ترتیب user سپس stats انجام می‌شود؛ نبود
+خروجی notification مانع مشاهده نیست. سن سپری‌شده حتی با مدت صفر حفظ می‌شود؛ ACK، reconnect، pull تکراری یا نبود
+فیلد canonical آن را پاک یا جوان نمی‌کنند. مشاهده زودتر کلاینت دیگر می‌تواند سن را بیشتر کند. origin واردشده
+در آینده تا رسیدن زمانش آینده می‌ماند؛ مصرف محلی واقعی می‌تواند origin زودتری بسازد.
+
+انقضای تاریخ مطلق با ساعت دیواری سرور و مدت پس از اولین استفاده با سن monotonic جدا محاسبه می‌شوند. تاریخ
+بدون تغییر deadline زودتر را حفظ می‌کند؛ ویرایش/پاک‌کردن هر سیاست فقط جزء خودش را دوباره محاسبه می‌کند. deadline
+زودتر حاکم است؛ انقضای گذشته در monotonic صفر هرگز به unlimited تبدیل نمی‌شود. state زمان/مشاهده/ACK و reservation
+با ID پایدار، حتی هنگام تغییر credential همان ID، منتقل می‌شوند؛ policy و timestamp مرجع جدید حفظ می‌شوند.
+کپی عمومی و JSON این state محلی را ندارند. تبدیل بین ماشین‌ها برآوردی با خطای تأخیر شبکه/serialization و drift
+است. رفتار suspend ساعت runtime عوض نمی‌شود؛ CLOCK_MONOTONIC لینوکس زمان تعلیق میزبان را حساب نمی‌کند.
+
+ترتیب قفل lookup/admission برابر `control_mutex -> users_lock -> collection/user` است؛ precheck عمومی فقط
+snapshot است و تصمیم واقعی باید زیر قفل دوباره availability را بسنجد. lookupهای password، SHA224، SHA256، UUID
+و WireGuard-key همین قرارداد را دارند. مسیر accounting/release اتصال موجود این gate پذیرش تازه را ندارد.
+انتقال state زمان و reservation دو collection lock، سپس هر دو user lock و سپس هر دو stats lock را با ترتیب
+قطعی می‌گیرد. snapshot گزارش، مشاهده و شمارنده را با هم و به‌صورت valueهای owned ثبت می‌کند. flag زمان‌بندی
+مدرک مصرف یا marker ACK نیست و reset آن نباید مشاهده را پاک کند.
+
 ### مالکیت تنظیم حساب و حسابداری
 
 `usersPatchConfigByIdentifier()` از زمان lookup تا commit، کاربر را با write lock مجموعه زنده نگه می‌دارد.
@@ -144,13 +185,18 @@ expected-revision یا reset remote وجود ندارد. تغییر صرف نا�
 زمان اولین استفاده را حفظ می‌کند.
 
 گزارش مصرف remote فقط `PushUserStats` deduplicated با ریشه `epoch`، `sequence`، `users` و ورودی `id`، `up`،
-`down` است؛ همه اجباری‌اند و فیلد دیگری پذیرفته نمی‌شود. همین قواعد strict lexical برقرارند. replay دقیق با
+`down`، `first-usage-at-ms` است؛ همه اجباری‌اند و فیلد دیگری پذیرفته نمی‌شود. همین قواعد strict lexical برقرارند. replay دقیق با
 بایت‌های اصلی پیش از بررسی وجود فعلی حساب ACK می‌شود، حتی پس از ویرایش/حذف داخلی حساب. batch جدید پیش از هر
 mutation همه ورودی‌ها را اعتبارسنجی می‌کند. ترافیک تجمعی و اولین استفاده وضعیت حسابداری سرور، زمان ایجاد metadata
 ایجاد/import و limit/enabled/expiry تنظیمات‌اند. reservation IP/connection محلی است؛ آمار ذخیره/import شده IP،
 device، connection و speed اشغال زنده global یا منبع admission نیستند. جدول مالکیت آمار و نیازهای telemetry
 آینده در [مرجع AuthenticationServer](../02-noderefs/AuthenticationServer.mdx) آمده است. گزارش gauge زنده، reset
 و بازیابی مصرف پس از crash از این قرارداد نتیجه نمی‌شوند.
+هر ورودی حتی پس از ACK همان timestamp تولیدکننده را دارد. برای مشاهده ACKنشده، deltaهای صفر مجازند؛ ACK فقط
+markerهای included را تسویه می‌کند و origin/سن باقی می‌ماند. سرور همه ورودی‌های batch جدید را پیش از mutation
+بررسی می‌کند، ساعت حسابداری را یک بار می‌خواند، آینده را clamp و کمترین مقدار غیرصفر را merge می‌کند. یک افزایش
+stats_revision همراه checkpoint منتشر می‌شود و config_revision ثابت است. APIهای missing-only قبلی تغییر نمی‌کنند.
+
 
 ### زمان‌بندی task وابسته به line
 

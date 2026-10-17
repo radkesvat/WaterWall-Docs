@@ -6,12 +6,33 @@ description: "راهنمای node AuthenticationServer در WaterWall."
 ---
 
 <!--
-Documentation version: 154
+Documentation version: 155
 -->
 
 # AuthenticationServer
 
 `AuthenticationServer` node‌ای منطقی در انتهای chain برای مدیریت دیتابیس کاربران WaterWall است. این node socket باز نمی‌کند و مستقیماً I/O شبکه انجام نمی‌دهد؛ در عوض، یک دیتابیس در حافظه از نوع `users_t` نگه می‌دارد، آن را در قالب JSON بارگذاری و ذخیره می‌کند و به درخواست‌های فریم‌بندی‌شده `AuthenticationClient` پاسخ می‌دهد.
+
+## ساعت و اولین استفاده محلی
+
+پاسخ GetAllUsers باید هر دو فیلد canonical و دقیق `server-time-ms` و `accounting-time-ms` مثبت را داشته باشد؛
+metadata نامعتبر refresh را بدون جایگزینی cache معتبر رد می‌کند و fallback به ساعت دیواری کلاینت وجود ندارد.
+سرور یک بار `C0 = max(wall-ms, 1)` و monotonic `M0` را ثبت می‌کند و با جمع saturating زمان سپری‌شده monotonic
+ساعت حسابداری را پیش می‌برد. اصلاح بعدی ساعت دیواری آن را reset نمی‌کند و anchor در فایل ذخیره نمی‌شود.
+
+اولین upload یا download غیرصفر درون قفل write کاربر، نمونه تازه monotonic، origin محلی معتبر حتی در صفر و
+برآورد مثبت و تغییرناپذیر اولین استفاده برای گزارش را ثبت می‌کند. login، reservation، فراخوانی صفر بایت و rebase
+شروع مصرف نیستند. ثبت مشاهده، شمارنده و تصمیم انقضا در transaction با ترتیب user سپس stats انجام می‌شود؛ نبود
+خروجی notification مانع مشاهده نیست. سن سپری‌شده حتی با مدت صفر حفظ می‌شود؛ ACK، reconnect، pull تکراری یا نبود
+فیلد canonical آن را پاک یا جوان نمی‌کنند. مشاهده زودتر کلاینت دیگر می‌تواند سن را بیشتر کند. origin واردشده
+در آینده تا رسیدن زمانش آینده می‌ماند؛ مصرف محلی واقعی می‌تواند origin زودتری بسازد.
+
+انقضای تاریخ مطلق با ساعت دیواری سرور و مدت پس از اولین استفاده با سن monotonic جدا محاسبه می‌شوند. تاریخ
+بدون تغییر deadline زودتر را حفظ می‌کند؛ ویرایش/پاک‌کردن هر سیاست فقط جزء خودش را دوباره محاسبه می‌کند. deadline
+زودتر حاکم است؛ انقضای گذشته در monotonic صفر هرگز به unlimited تبدیل نمی‌شود. state زمان/مشاهده/ACK و reservation
+با ID پایدار، حتی هنگام تغییر credential همان ID، منتقل می‌شوند؛ policy و timestamp مرجع جدید حفظ می‌شوند.
+کپی عمومی و JSON این state محلی را ندارند. تبدیل بین ماشین‌ها برآوردی با خطای تأخیر شبکه/serialization و drift
+است. رفتار suspend ساعت runtime عوض نمی‌شود؛ CLOCK_MONOTONIC لینوکس زمان تعلیق میزبان را حساب نمی‌کند.
 
 ## جایگاه رایج
 
@@ -358,7 +379,7 @@ ACK فقط پذیرش در حافظه سرور است، نه تأیید ذخیر
 | `5` | `GetUserByPassword` | `allow-user-pull` | کلید جستجوی password plaintext | نوع `2`، user JSON |
 | `6` | `AddNewUser` | `allow-user-write` | یک user JSON object | نوع `0`، `user-added` |
 | `7` | `UpdateUser` | `allow-user-write` | patch تنظیمات با `id` پایدار | نوع `0`، `user-updated` |
-| `9` | `GetAllUsers` | `allow-user-pull` | خالی | نوع `3`، users JSON به اضافه `server-time-ms` |
+| `9` | `GetAllUsers` | `allow-user-pull` | خالی | نوع `3`، users JSON به اضافه `server-time-ms` و `accounting-time-ms` |
 | `10` | `Authenticate` | عمومی | JSON با `name` و `secret` | نوع `4`، token 64 بایتی |
 | `11` | `PushUserStats` | `allow-stats-push` | batch دلتا با epoch/sequence و ID | نوع `0`، ACK دارای digest |
 | `12` | `GetUserBySHA224Hex` | `allow-user-pull` | 56 کاراکتر hex | نوع `2`، user JSON |
@@ -389,10 +410,10 @@ ACK فقط پذیرش در حافظه سرور است، نه تأیید ذخیر
 
 ### GetAllUsers
 
-`GetAllUsers` به payload خالی نیاز دارد. در صورت موفقیت، JSON استانداردشده کاربران را همراه با فیلد `server-time-ms` که فقط در پاسخ وجود دارد برمی‌گرداند:
+`GetAllUsers` به payload خالی نیاز دارد. در صورت موفقیت، JSON استانداردشده کاربران را همراه با دو فیلد پاسخ `server-time-ms` و `accounting-time-ms` برمی‌گرداند:
 
 ```json
-{"users":[],"server-time-ms":1767225600000}
+{"users":[],"server-time-ms":1767225600000,"accounting-time-ms":1767225600000}
 ```
 
 `server-time-ms` در دیتابیس نوشته نمی‌شود. این مقدار به `AuthenticationClient` کمک می‌کند زمان‌های انقضای متعلق به سرور را به ساعت محلی کلاینت تبدیل کند.
@@ -457,7 +478,7 @@ decodeشده تکراری در هر سطح رد می‌شود. کل بازه ب�
 | مقدار | مالک و قاعده فعلی |
 | --- | --- |
 | بایت upload/download تجمعی | مجموع سرور؛ گزارش remote فقط با batch deduplicated؛ patch تنظیمات آن را حفظ می‌کند |
-| زمان اولین استفاده | مشاهده حسابداری سرور؛ مصرف غیرصفر پذیرفته‌شده فقط در صورت خالی بودن آن را ثبت می‌کند |
+| کمترین مشاهده غیرصفر اولین استفاده | کمترین مشاهده غیرصفر تولیدکننده مجاز، پس از clamp به زمان حسابداری پذیرش؛ patch آن را حفظ می‌کند |
 | زمان ایجاد | metadata ایجاد/import؛ ویرایش عادی آن را حفظ می‌کند |
 | limit، enabled و سیاست expiry | تنظیم حساب، قابل تغییر فقط با leaf صریح patch |
 | اتصال خروجی فعال و reservation IP | وضعیت admission محلی، قابل نگهداری/آزادسازی در runtime؛ تعداد global نیست |
@@ -474,19 +495,20 @@ decodeشده تکراری در هر سطح رد می‌شود. کل بازه ب�
 تنها مسیر remote گزارش مصرف، `PushUserStats` و صرفاً برای بایت ترافیک است. شکل دقیق payload:
 
 ```json
-{"epoch":"<64 hexadecimal bytes>","sequence":1,"users":[{"id":42,"up":10,"down":0}]}
+{"epoch":"<64 hexadecimal bytes>","sequence":1,"users":[{"id":42,"up":10,"down":0,"first-usage-at-ms":1792252800000}]}
 ```
 
-ریشه فقط `epoch`، `sequence` و `users` و هر ورودی فقط `id`، `up` و `down` دارد؛ همه اجباری‌اند.
-فیلد ناشناخته/تکراری، آمار غیرترافیکی، timestamp یا مجموع مطلق، کل درخواست را رد می‌کند. قواعد strict JSON/UTF-8،
+ریشه فقط `epoch`، `sequence` و `users` و هر ورودی دقیقاً `id`، `up`، `down` و `first-usage-at-ms` دارد؛ همه اجباری‌اند.
+فیلد ناشناخته/تکراری، آمار غیرترافیکی، timestamp دیگر یا مجموع مطلق، کل درخواست را رد می‌کند. قواعد strict JSON/UTF-8،
 NUL، عمق هشت container و مصرف کامل ورودی مانند patch برقرار است. digest از بایت‌های اصلی payload محاسبه می‌شود.
-هر batch بین ۱ تا ۴۰۹۶ ID یکتا و غیرصفر دارد. هر ورودی هر دو مقدار دلتا `up` و `down` را دارد و دست‌کم یکی
-غیرصفر است. tokenهای integer ساده تا INT64_MAX و رشته decimal تا UINT64_MAX دقیق‌اند؛ decimal/exponent عددی،
+هر batch بین ۱ تا ۴۰۹۶ ID یکتا و غیرصفر دارد. هر ورودی هر دو delta و timestamp غیرصفر دارد؛ هر دو delta برای گزارش فقط metadata می‌توانند صفر باشند. tokenهای integer ساده تا INT64_MAX و رشته decimal تا UINT64_MAX دقیق‌اند؛ decimal/exponent عددی،
 مقادیر کسری، منفی، nonfinite و overflow برای استخراج عدد صحیح رد می‌شوند.
 
 checkpoint با هویت احراز‌شده انتخاب می‌شود. زیر یک write lock، replay آخرین sequence با digest یکسان پیش از
 بررسی دوباره حساب‌ها ACK می‌شود. برای sequence دقیقاً بعدی، همه ورودی‌ها پیش از mutation بررسی می‌شوند؛ سپس
-مصرف saturating، زمان اولین استفاده و checkpoint یکجا منتشر می‌شوند. ID ناشناخته، تکرار ID، epoch قدیمی، gap،
+ساعت حسابداری یک بار نمونه‌گیری می‌شود؛ مشاهده به حداکثر همان زمان clamp و کمترین مقدار غیرصفر با canonical
+merge می‌شود. مصرف saturating، اولین استفاده و checkpoint با یک افزایش stats_revision منتشر می‌شوند؛
+config_revision تغییر نمی‌کند. گزارش بعدی همان timestamp محلی را حفظ می‌کند؛ receipt-time fallback وجود ندارد. ID ناشناخته، تکرار ID، epoch قدیمی، gap،
 sequence قدیمی یا محتوای متفاوت همان sequence، بدون mutation رد می‌شود. sequence wrap مجاز نیست.
 
 ACK موفق نوع `0` و JSON دارای `epoch`، `sequence`، `digest` شصت‌وچهارکاراکتری SHA-256 و `needs-pull: true`

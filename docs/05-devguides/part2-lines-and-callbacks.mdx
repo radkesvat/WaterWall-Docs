@@ -5,7 +5,7 @@ sidebar_label: "Part 2: Lines & Lifetime"
 description: "The connection lifecycle, re-entrancy hazards, line references, and the clean-finish patterns that keep WaterWall tunnels free of use-after-free bugs."
 ---
 <!--
-Documentation version: 188
+Documentation version: 189
 -->
 
 # Part 2: Lines, Callbacks & Lifetime Safety
@@ -271,11 +271,20 @@ a zero or maximum reference count is a fatal invariant violation.
 
 ### Authenticated identity publication
 
-AuthenticationClient credential eligibility and handle liveness check enabled state,
-expiry and cumulative traffic quota. Persisted IP, connection, device and speed gauges
-must not reject credentials. Live IP/connection admission remains the atomic runtime
-reservation operation; lookup does not reserve capacity. Pulls migrate reservations
-by durable user ID and rebuild local expiry projections.
+AuthenticationClient separates cached admission from control-session readiness. Every credential family and new
+connection admission checks `started && !stopping`, a valid installed table/clock basis, no terminal continuity error,
+and no sticky explicit Authenticate rejection under `control_mutex -> users_lock -> collection/user locks`.
+A public availability precheck is only a snapshot; the actual lookup/reservation must recheck it under those locks.
+After initial synchronization ordinary outages/re-authentication and malformed refreshes keep the last usable RAM cache
+without an age timeout. Only a correlated `authentication-failed` for the current Authenticate sets rejection; only a
+validated successful Session clears it. Session expiry/timeout does not fabricate credential rejection. Existing
+connections retain accounting, cached enforcement and reservation release during rejection. Reused HTTP requests
+perform new admission; in-flight exchanges and CONNECT streams continue.
+
+Credential eligibility and handle liveness check cached enabled state, expiry and cumulative traffic quota. Persisted
+IP/connection/device/speed gauges must not reject credentials. Live capacity is the separate atomic local reservation
+operation. Local allowances can overshoot global quotas across disconnected clients; administrative changes arrive
+with a valid refresh, and already-produced usage remains acceptable after policy changes.
 
 Shared credential copying in `lineAddUser()`,
 `lineAddAuthenticatedCredentials()` (including `lineSetAuthenticatedCredentials()`),
@@ -322,17 +331,43 @@ For example, a name-only patch after a 100-byte account receives 10 more bytes
 leaves 110 bytes and its first-use timestamp intact.
 
 Remote usage reporting uses only deduplicated `PushUserStats` batches with root
-`epoch`, `sequence`, `users` and entry `id`, `up`, `down`, all required and no other
+`epoch`, `sequence`, `users` and entry `id`, `up`, `down`, `first-usage-at-ms`, all required and no other
 fields. The same strict lexical rules apply. Recognize an exact replay using its
 original payload bytes before consulting current account existence; a subsequent
 account edit/removal must not prevent that ACK. New batches validate all entries
-before any mutation. Server aggregate bytes and missing first-use timestamps are
+before any mutation. Server aggregate bytes and the earliest accepted first-use observation are
 accounting state; creation is import metadata, while limits/enabled/expiry are
 configuration. Connection/IP reservations remain local runtime state. Stored or
 imported IP/device/connection/speed gauges are not live global occupancy or an
 admission source. See the [statistics ownership table](../02-noderefs/AuthenticationServer.mdx#statistics-ownership)
 for the current boundaries and requirements for future telemetry. No live gauge
 reporting, reset, or crash-recovery behavior is implied.
+
+First nonzero client traffic captures a valid local monotonic origin (zero is allowed) and immutable positive
+accounting-clock estimate inside the user write lock, then updates counters/expiry under stats write lock. Generic
+server/import helpers without a client clock never invent observations. Both client traffic APIs use this transaction;
+zero-byte calls, login, reservation and refresh rebasing do not start use. Scheduling latches are separate from evidence.
+
+GetAllUsers requires exact canonical `server-time-ms` and positive `accounting-time-ms`, with no local-wall fallback.
+The server initializes one wall/monotonic accounting anchor per instance, then advances it only with fresh monotonic
+elapsed time and saturation. Clients sample receipt before parsing and retain maximum elapsed first-use age across
+local observations, prior age and canonical estimates. Checked differences never rewind an anchor. Future imported
+origins remain future until reached or superseded by real earlier use. Duration and absolute-date policy project
+separately; unchanged pulls keep the earlier absolute deadline and never extend relative lifetime. Explicit edits
+recompute only their component. Already expired at monotonic zero must remain expired, not become unlimited.
+
+Runtime clock/evidence/ACK state migrates by durable ID with reservations, including same-ID credential changes, under
+ordered collection locks, both user locks, then both stats locks. Keep new authoritative policy/timeinfo and rebuild
+projections before table publication. Generic user/users copies and JSON exclude these process-local fields. Explicit
+accounting snapshots capture counters and observations together and retain only owned values across replacement.
+
+Every batch entry includes the producer's same immutable observation, even after its ACK. Zero-delta metadata-only
+entries report unacknowledged observations at saturation; matching ACK settles only included totals/observation markers
+and keeps origins/age. New batches validate all entries before mutation, sample accounting time once, clamp future
+estimates and merge the smallest nonzero canonical observation, then publish checkpoint and one stats revision.
+Configuration patches cannot write these fields; unrelated missing-only first-use APIs retain their contract.
+Cross-host estimates include network/serialization delay and rate drift; local monotonic suspend semantics remain
+unchanged. This introduces no crash recovery, remote reset, live telemetry or global reservation coordinator.
 
 ### WIO Descriptor Ownership
 
