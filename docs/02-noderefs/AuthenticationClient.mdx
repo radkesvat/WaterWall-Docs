@@ -6,55 +6,34 @@ description: "Reference documentation for the AuthenticationClient node."
 ---
 
 <!--
-Documentation version: 152
-Sync note: Any change to this file must also be applied to WaterWall/tunnels/AuthenticationClient/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/AuthenticationClient.mdx, and all files must keep the same documentation version.
+Documentation version: 153
+Sync note: Keep synchronized with tunnels/AuthenticationClient/description.md and the Persian node reference.
 -->
 
 # AuthenticationClient
 
-`AuthenticationClient` is the frontend side of the WaterWall authentication
-database protocol. It creates and owns one internal control line on worker `0`,
-sends that line upstream to its `next` node, authenticates with an
-`AuthenticationServer`, pulls the authoritative users table, and periodically
-keeps the session alive and pushes local traffic counters.
+`AuthenticationClient` is the frontend side of the Waterwall authentication database protocol. It is a chain-head control
+node: when the tunnel starts it creates one internal control `line_t` on worker 0, sends that line upstream to its next
+node, authenticates with `AuthenticationServer`, pulls the authoritative users table, and periodically keeps the session
+alive and pushes local traffic counters.
 
-`AuthenticationClient` is not a data pass-through tunnel. Traffic-serving nodes
-use its internal API to read users and account local usage against the pulled
-users table.
+It is not a data pass-through tunnel. Other tunnels use its internal API from
+`include/AuthenticationClient/interface.h` to read users or add traffic to the local table.
 
-Typical placement:
+## Expected Chain
 
-```text
-AuthenticationClient -> ... -> AuthenticationServer
-```
-
-For a remote server, the client-side chain commonly looks like:
+Typical client-side chain:
 
 ```text
 AuthenticationClient -> TcpConnector
 ```
 
-The connector path must reach a server-side chain that ends in
-`AuthenticationServer`.
+The connector path should reach an `AuthenticationServer`. The client sends protocol bytes upstream with
+`tunnelNextUpStreamPayload()`. Responses come back through the normal downstream direction into
+`AuthenticationClient`.
 
-## What It Does
-
-- Creates one long-lived internal control line on worker `0`.
-- Sends `Authenticate` to `AuthenticationServer` using configured client
-  credentials.
-- Stores the returned 64-byte session token.
-- Pulls the full users table with `GetAllUsers` after authentication.
-- Keeps a local, lock-protected users table for other tunnels.
-- Preserves unsynced local traffic counters across full table refreshes.
-- Sends periodic authenticated `Ping` requests.
-- Sends periodic `PushUserStats` requests with traffic-counter hints.
-- Sends periodic or revision-driven `GetAllUsers` requests.
-- Reconnects and reauthenticates if the downstream transport closes.
-- Exposes user lookup, JSON copy-out, traffic accounting, and admission helpers
-  through `AuthenticationClient/interface.h`.
-
-Because it creates the control line, `AuthenticationClient` is also responsible
-for destroying that line.
+`AuthenticationClient` owns the control line it creates. Because it is the line creator, it is also the only tunnel that
+destroys that line.
 
 ## Configuration Example
 
@@ -105,8 +84,8 @@ Remote authentication server chain:
 }
 ```
 
-The `settings.name` and `settings.secret` pair must match one
-`AuthenticationServer` `settings.auth-clients` entry:
+The `settings.name` and `settings.secret` pair must match one entry in the upstream `AuthenticationServer`
+`settings.auth-clients` array:
 
 ```json
 {
@@ -118,49 +97,8 @@ The `settings.name` and `settings.secret` pair must match one
 }
 ```
 
-## Required Fields
-
-Top-level fields:
-
-| Field | Type | Description |
-| --- | --- | --- |
-| `name` | string | User-chosen node name. Other nodes use this value to reference the auth client. |
-| `type` | string | Must be exactly `"AuthenticationClient"`. |
-| `next` | string | Required. The next node must lead to an `AuthenticationServer`. |
-| `settings` | object | Authentication credentials and timer settings. |
-
-Required `settings` fields:
-
-| Field | Type | Description |
-| --- | --- | --- |
-| `name` | non-empty string | Control-plane client name sent to `AuthenticationServer`. |
-| `secret` | non-empty string | Control-plane client secret sent with `settings.name`. |
-
-The control-plane `name` and `secret` are not traffic-user credentials.
-
-## Optional Settings
-
-| Setting | Type | Default | Description |
-| --- | --- | --- | --- |
-| `ping-interval-ms` | zero or positive integer | `60000` | Sends authenticated `Ping`; also retries `Authenticate` while connected but unauthenticated. |
-| `pull-interval-ms` | zero or positive integer | `300000` | Periodic `GetAllUsers` cadence. `0` disables timer-driven pulls. |
-| `push-interval-ms` | zero or positive integer | `300000` | Periodic `PushUserStats` cadence. `0` disables periodic pushes. |
-| `reconnect-interval-ms` | zero or positive integer | `5000` | Delay before reconnecting after the control transport closes. |
-| `request-timeout-ms` | zero or positive integer | `120000` | Reconnects if a pending request waits longer than this. `0` disables request timeout checks. |
-| `max-pending-requests` | positive integer | `64` | Maximum number of in-flight protocol requests. |
-| `verbose` | boolean | `false` | Enables focused control-line, timer, request, and response debug logs. |
-
-`pull-interval-ms` only disables timer-driven pulls. The client still pulls once
-after successful authentication, and it pulls again when the server response says
-the local copy needs refresh.
-
-`push-interval-ms` only disables periodic pushes. Other tunnels can still ask
-for a push through the internal API.
-
-## Using It From Other Nodes
-
-`AuthenticationClient` is usually referenced by node name. For example,
-`Socks5Server` can use an existing `AuthenticationClient` like this:
+Traffic-serving nodes reference the client by node name. For example, `Socks5Server` uses the already configured
+`AuthenticationClient` like this:
 
 ```json
 {
@@ -175,213 +113,111 @@ for a push through the internal API.
 }
 ```
 
-`AuthenticationClient` is not placed in the `Socks5Server` data path. It keeps
-its own control connection and exposes the pulled user table through its
-internal API.
+`AuthenticationClient` is not placed in the data path for `Socks5Server`. It runs its own control connection and exposes
+the pulled users table through its internal API.
+
+## Required JSON Fields
+
+### Top-level fields
+
+- `name` `(string)`
+  A user-chosen name for this node. Other nodes, such as `Socks5Server`, use this value when they reference the
+  authentication client.
+
+- `type` `(string)`
+  Must be exactly `"AuthenticationClient"`.
+
+- `next` `(string)`
+  Required. The next node must lead to an `AuthenticationServer`, either directly or through transport/client tunnels
+  such as `TcpConnector`, `TlsClient`, or other chain components.
+
+### `settings`
+
+- `name` `(string)`
+  Authentication client name sent to `AuthenticationServer`. This is a control-plane credential name and must match one
+  entry in the server's `settings.auth-clients` array.
+
+- `secret` `(string)`
+  Authentication client secret sent with `settings.name`. This is not a traffic user's password.
 
 ## Communication Model
 
-The client uses one long-lived control line, not one line per request.
+`AuthenticationClient` uses one long-lived control line, not one line per request or per job.
 
-On startup, worker `0` creates a single internal `line_t` and sends upstream
-`init` to the next tunnel. In a chain such as
-`AuthenticationClient -> TcpConnector`, that one WaterWall line becomes one
-outbound transport connection to the server-side chain.
+On startup, worker 0 creates a single internal `line_t` and sends `Init` to the next tunnel. In a normal chain such as
+`AuthenticationClient -> TcpConnector`, that one WaterWall line becomes one outbound transport connection to the
+server-side chain. All authentication, ping, pull, and push requests are framed as protocol messages over that same line.
 
-All authentication, ping, pull, and push requests are framed over the same line.
-Responses are matched to requests by correlation ID.
+Separate operations do not open separate connections. Timer-driven sync, explicit `authenticationclientRequestPull()`,
+explicit `authenticationclientRequestPush()`, and the initial authentication flow all enqueue request messages on the
+same control line. Responses are matched to requests by `correlation_id`, so multiple replies can be recognized even when
+more than one request is pending on the same transport.
 
-If the transport closes, downstream `finish` closes and destroys the owned
-control line, clears the active token, clears pending request state, and
-schedules reconnect unless the tunnel is stopping. The next connection starts
-with a new `Authenticate` request; the old token is not reused.
+The client keeps the control line open while the downstream transport stays alive. If that transport closes, downstream
+`Finish` closes and destroys the owned control line, clears the active session token, clears pending request state, and
+schedules reconnect. The next connection starts with a new `Authenticate` request; the old token is not reused by the
+client, even though the server may keep the old session record until its idle timeout expires.
 
-While disconnected or unauthenticated, new protocol requests are not sent. The
-local users table remains available as a cache, but synchronization resumes only
-after reconnect, transport `est`, and successful authentication.
+While disconnected or not yet authenticated, new protocol requests are not sent. The local users table remains available
+to callers as a cache, but server synchronization resumes only after reconnect, transport `Est`, and successful
+authentication.
 
-## Startup Flow
+## Settings Reference
 
-On `onStart`, the tunnel queues startup work to worker `0`.
+Required settings:
 
-Worker `0` then:
-
-1. Marks the client as started.
-2. Arms the ping timer when enabled.
-3. Starts the sync timer when pull or push is enabled.
-4. Creates the owned control line.
-5. Initializes this tunnel's per-line state.
-6. Sends `tunnelNextUpStreamInit()`.
-
-When the next side establishes the transport and sends downstream `est`, the
-client marks the control line connected and sends `Authenticate` with a zero
-session token.
-
-When `Authenticate` returns a session response, the 64-byte token becomes the
-active token for later requests, and the client immediately sends `GetAllUsers`.
-
-## Timers
-
-All protocol timers live on worker `0`, the same worker as the owned control
-line.
-
-| Timer | Behavior |
-| --- | --- |
-| `ping_timer` | Sends `Ping` while authenticated and retries `Authenticate` while connected but unauthenticated. |
-| `sync_timer` | Drives user-table pull and stats push using the shortest enabled pull/push interval. |
-| `reconnect_timer` | Opens a new control line after downstream transport close. |
-
-Each sync tick attempts `PushUserStats` first when due, then sends
-`GetAllUsers` when revisions differ or when the pull cadence is due and no newer
-equal-revision response has already confirmed the local table is current.
-
-Timers are deleted from `onWorkerStop` for worker `0`, because timer deletion
-must happen on the same worker event loop that owns the timer.
-
-## Local Users Table
-
-The client keeps one active local users table protected by a tunnel-level
-`wrwlock_t`.
-
-`GetAllUsers` replacement is atomic from the point of view of other tunnels:
-
-1. Response JSON is parsed into a fresh `users_t`.
-2. The fresh table is validated, including rejecting overlapping `wireguard-allowed-ips` ranges.
-3. Unsynced local traffic deltas and process-local runtime counters are carried
-   forward by durable user id when present, with SHA-256 as a legacy fallback.
-4. Each user's local expiry deadline is projected from server-owned time fields
-   and response `server-time-ms`.
-5. The active table pointer is swapped under the write side of the rwlock.
-6. The generation counter is incremented.
-7. The old table is destroyed after the swap.
-
-Readers hold the read side of the same rwlock while copying JSON, copying stats,
-or updating traffic by SHA-256. This prevents a pointer inside the current
-`users_t` from becoming invalid during an operation.
-
-The local table is a cache plus local counter accumulation. The server remains
-the source of truth for full user configuration, including optional
-`wireguard-allowed-ips`, and for `first-usage-at-ms`.
-
-## Internal API
-
-Other tunnels include:
-
-```c
-#include "AuthenticationClient/interface.h"
+```json
+{
+  "name": "edge-a",
+  "secret": "shared-secret"
+}
 ```
 
-This internal WaterWall API is separate from the external `api.c` tunnel API.
+Optional settings:
 
-Other tunnels must not receive or cache raw `user_t *` pointers from
-`AuthenticationClient`. Instead they use `user_handle_t`, which is a value
-identifier containing:
-
-```text
-sha256(password)
-users_generation
-user_id
+```json
+{
+  "ping-interval-ms": 60000,
+  "pull-interval-ms": 300000,
+  "push-interval-ms": 300000,
+  "reconnect-interval-ms": 5000,
+  "request-timeout-ms": 120000,
+  "max-pending-requests": 64,
+  "verbose": false
+}
 ```
 
-`user_id` is copied from the synced user record and may be `0` for legacy users.
-When it is present, live enforcement helpers resolve by durable user id, with
-SHA-256 as a fallback.
+`ping-interval-ms` sends authenticated `Ping` requests and also retries `Authenticate` while the transport is connected
+but not authenticated.
 
-Common state helpers:
+`pull-interval-ms` enables periodic revision checks for `GetAllUsers`. A value of `0` disables timer-driven pulls, but
+the client still pulls once after successful authentication and when the server reports `needs-pull`.
 
-```c
-authenticationclientGetState(t)
-authenticationclientIsReady(t)
-authenticationclientUsersGeneration(t)
-```
+`push-interval-ms` enables periodic `PushUserStats`. A value of `0` disables periodic pushes. Other tunnels can still
+ask for a push through the internal API.
 
-Lookup helpers:
+When pull or push is enabled, one `sync_timer` runs at the shortest enabled pull/push interval. Each sync tick checks
+which jobs are due and attempts `PushUserStats` first. `GetAllUsers` is sent when revisions differ, or when the pull
+cadence is due and no fresher response has already confirmed that the server and local table revisions match.
 
-```c
-authenticationclientGetUserByPassword(t, password, &handle)
-authenticationclientGetUserByPasswordWithResult(t, password, &handle)
-authenticationclientGetUserBySHA224(t, sha224, &handle)
-authenticationclientGetUserBySHA256(t, sha256, &handle)
-authenticationclientGetUserByUUID(t, uuid, &handle)
-authenticationclientGetUserByWireGuardPublicKey(t, publickey, &handle)
-authenticationclientGetUserByPasswordWithProfile(t, password, &handle, &profile)
-authenticationclientGetUserBySHA224WithProfile(t, sha224, &handle, &profile)
-authenticationclientGetUserByUUIDWithProfile(t, uuid, &handle, &profile)
-authenticationclientGetUserByWireGuardPublicKeyWithProfile(t, publickey, &handle, &profile)
-authenticationclientUserProfileClear(&profile)
-```
+`reconnect-interval-ms` controls reconnect delay after the control transport closes. A value of `0` queues a retry for a later loop turn. Repeated retry requests preserve the first positive deadline.
 
-Copy-out and stats helpers:
+`request-timeout-ms` closes and reconnects the control line if any request stays pending longer than the configured
+time using an independent worker-0 deadline timer, even with ping/pull/push disabled. A value of `0` disables it.
 
-```c
-authenticationclientUserHandleIsLive(t, &handle)
-authenticationclientUserToJson(t, &handle)
-authenticationclientUsersToJson(t)
-authenticationclientUserGetStats(t, &handle, &stats)
-authenticationclientUserAddTraffic(t, &handle, upload, download)
-```
-
-Live enforcement helpers:
-
-```c
-authenticationclientUserTryAdmitConnection(t, &handle, &ip_key, now_ms)
-authenticationclientUserReleaseConnection(t, &handle, &ip_key)
-authenticationclientUserAccountTraffic(t, &handle, upload, download, now_ms)
-authenticationclientUserShouldClose(t, &handle, now_ms)
-```
-
-Manual sync helpers:
-
-```c
-authenticationclientRequestPull(t)
-authenticationclientRequestPush(t)
-```
-
-`authenticationclientUserToJson()` and `authenticationclientUsersToJson()`
-return new `cJSON` objects owned by the caller. Stats are copied into caller
-storage. Traffic-serving nodes should never mutate a `user_t` directly.
-
-The `now_ms` arguments for live enforcement helpers are in the client's local
-monotonic clock domain. Server expiry fields are projected into that domain when
-`GetAllUsers` is installed.
-
-## Client States
-
-`authenticationclientGetState()` returns:
-
-| State | Meaning |
-| --- | --- |
-| `kAuthenticationClientStateStopped` | The client is stopped or unavailable. |
-| `kAuthenticationClientStateConnecting` | The client has started but has no authenticated control session yet. |
-| `kAuthenticationClientStateAuthenticating` | The transport is connected or token is present, but users are not fully loaded yet. |
-| `kAuthenticationClientStateReady` | The client is authenticated and has installed a users table. |
-
-`authenticationclientIsReady()` is true only in `kAuthenticationClientStateReady`.
-
-Password lookup with result can return:
-
-| Result | Meaning |
-| --- | --- |
-| `ok` | Lookup succeeded. |
-| `invalid password lookup` | Bad arguments, empty password, or missing output handle. |
-| `password hash failed` | SHA-256 calculation failed. |
-| `users table unavailable` | The local users table is not loaded. |
-| `user not found` | No user matches the password. |
-| `password mismatch` | Hash matched but plaintext password check failed. |
-| `user disabled` | The matching user is disabled. |
-| `user expired` | The matching user is expired in the local client-time view. |
-| `user limit reached` | The matching user has reached a configured limit. |
+`verbose` enables focused debug logs for the control-line lifecycle, reconnect decisions, timer ticks, and
+request/response correlation flow. It does not log secrets, session tokens, passwords, or raw users JSON.
 
 ## Wire Protocol
 
-The protocol matches `AuthenticationServer`.
+The protocol intentionally matches `AuthenticationServer`.
 
 Request message:
 
 ```text
 u32 body_len
 u8[64] session_token
-request_frame
+request_frame...
 ```
 
 Request frame:
@@ -411,55 +247,186 @@ u32 response_data_len
 u8[response_data_len] response_data
 ```
 
-All integer fields are big-endian. The client sends one request frame per
-message. The parser accepts any number of response frames in one response
-message and matches each frame by correlation ID.
+All integer fields on the wire are big-endian. The client sends one request frame per message. The parser accepts any
+number of response frames in a response message and matches each frame by correlation id. The response revisions are
+remembered as the latest server revisions and compared with the local users-table revisions before timer-driven pulls.
 
-The response revisions are remembered as the latest server revisions and
-compared with local users-table revisions before timer-driven pulls.
+## Startup Flow
+
+On `onStart`, the tunnel queues startup work to worker 0.
+
+Worker 0 then:
+
+1. Arms the periodic ping and sync timers.
+2. Creates the owned control line.
+3. Initializes this tunnel's per-line state before calling the next tunnel.
+4. Sends `tunnelNextUpStreamInit()`.
+
+When the next side establishes the transport and sends downstream `Est`, the client marks the control line connected and
+sends `Authenticate` with a zero session token.
+
+`Authenticate` accepts `name`, `secret`, and an optional `epoch` for resumption. A Session response contains 128 bytes:
+a 64-byte token followed by a 64-byte accounting epoch, both hexadecimal OS-secure random values. The client stores
+the token, resolves any retained batch first, then pulls with `GetAllUsers`. A stale response cannot replace an enrolled epoch.
+
+## Local Users Table
+
+The client keeps one active local users table. It is protected by a tunnel-level `wrwlock_t`.
+
+`GetAllUsers` replacement is atomic from the point of view of other tunnels:
+
+1. The response JSON is parsed into a fresh `users_t`.
+2. The fresh table is validated, including requiring every user to have a non-zero durable id and rejecting overlapping
+   `wireguard-allowed-ips` ranges.
+3. Local unsynced traffic deltas and process-local runtime counters are carried forward by durable user id.
+4. Each user's local expiry deadline is projected from the server-owned time fields and response server-time metadata.
+5. The active table pointer is swapped under the write side of the rwlock.
+6. The generation counter is incremented.
+7. The old table is destroyed after the swap.
+
+Readers hold the read side of the same rwlock while copying JSON, copying stats, or updating traffic by user id. This
+prevents a user pointer returned by `users_t` from becoming invalid during the operation.
+
+The table is local cache plus local counter accumulation. The server remains the source of truth for full user config,
+including optional `wireguard-allowed-ips`, and for `first-usage-at-ms`. The client never invents or pushes that
+timestamp; it only converts server expiry state into a process-local deadline used by admission and close checks.
+
+## Internal API
+
+The internal Waterwall API is exposed through:
+
+```c
+#include "AuthenticationClient/interface.h"
+```
+
+This is intentionally separate from `api.c`, which is the external program API pattern used by all tunnels.
+
+Other tunnels must not receive or cache raw `user_t *` pointers from `AuthenticationClient`. Instead they use
+`user_handle_t` from `ww/objects/user_handle.h`, which contains:
+
+```text
+users_generation
+user_id
+```
+
+The handle is a value identifier, not an owned object. `user_id` is copied from the synced user record and must be
+non-zero for the handle to be valid. A full users-table replacement increments the generation, so generation-gated read
+helpers may reject old handles. Callers can either look up a fresh handle or check with
+`authenticationclientUserHandleIsLive()`. `authenticationclientGetUserBySHA224()`,
+`authenticationclientGetUserBySHA256()`, `authenticationclientGetUserByUUID()`, and
+`authenticationclientGetUserByWireGuardPublicKey()` are alternate lookup entry points; successful lookups still return
+the normal id-backed handle.
+
+Available internal operations:
+
+```c
+authenticationclientGetState(t)
+authenticationclientIsReady(t)
+authenticationclientUsersGeneration(t)
+authenticationclientGetUserByPassword(t, password, &handle)
+authenticationclientGetUserBySHA224(t, sha224, &handle)
+authenticationclientGetUserBySHA256(t, sha256, &handle)
+authenticationclientGetUserByUUID(t, uuid, &handle)
+authenticationclientGetUserByWireGuardPublicKey(t, publickey, &handle)
+authenticationclientUserHandleIsLive(t, &handle)
+authenticationclientUserToJson(t, &handle)
+authenticationclientUsersToJson(t)
+authenticationclientUserGetStats(t, &handle, &stats)
+authenticationclientUserAddTraffic(t, &handle, upload, download)
+authenticationclientUserTryAdmitConnection(t, &handle, &ip_key, now_ms)
+authenticationclientUserReleaseConnection(t, &handle, &ip_key)
+authenticationclientUserAccountTraffic(t, &handle, upload, download, now_ms)
+authenticationclientUserShouldClose(t, &handle, now_ms)
+authenticationclientRequestPull(t)
+authenticationclientRequestPush(t)
+```
+
+`authenticationclientUserToJson()` and `authenticationclientUsersToJson()` return new `cJSON` objects owned by the
+caller. Stats are copied into caller storage. Traffic updates are applied through the handle's durable id; the caller
+never mutates a `user_t` directly.
+
+The live enforcement helpers resolve handles by durable id instead of rejecting them solely because a `GetAllUsers`
+refresh bumped the local users generation. A miss means the user disappeared from the refreshed table. The `now_ms`
+argument for these helpers is in the client's local monotonic clock domain, because expiry has already been projected
+onto that clock when the users table was installed.
+
+`authenticationclientRequestPull()` and `authenticationclientRequestPush()` use the current control line. Foreign
+callers queue work to worker 0. Desired jobs coalesce while disconnected, paused or blocked by another synchronization
+operation. A pull cannot replace the baseline during an unresolved push, and a push cannot overtake an active pull.
+Credential eligibility checks enabled state, expiry and traffic quota; saved connection, IP, device and speed gauges do
+not block lookup. Live capacity is reserved separately by the atomic runtime admission helper.
 
 ## Stats Push
 
-`PushUserStats` is a partial hint update. The client sends only the fields the
-server needs:
+The client sends immutable deltas keyed by durable user ID:
 
 ```json
-{
-  "users": [
-    {
-      "password": "user-password",
-      "stats": {
-        "traffic": {
-          "up": "12345",
-          "down": "67890"
-        }
-      }
-    }
-  ]
-}
+{"epoch":"<64 hexadecimal bytes>","sequence":1,"users":[{"id":42,"up":10,"down":0}]}
 ```
 
-Users without changed traffic counters are skipped for that push.
+It retains the exact payload and its subset snapshot for the tunnel lifetime until an ACK matches epoch, sequence
+and SHA-256 digest. Send refusal, timeout, malformed replies and transport/session loss preserve both owners.
+Retries use the same bytes with a fresh correlation ID and the current token. Batches contain at most 4096 entries;
+only represented users/directions advance on ACK. Sequence numbers never wrap, and empty batches are not sent.
+Plain integer tokens through INT64_MAX and decimal strings through UINT64_MAX are exact; integer readers reject
+fractional, decimal/exponent, negative, nonfinite and overflowing input.
 
-The server compares these counters against the session baseline created by
-`GetAllUsers` and applies only deltas. The client does not send
-`time.first-usage-at-ms`; when the first non-zero traffic delta arrives for a
-user whose authoritative first-usage time is still missing, the server stamps
-that field using its own clock.
+If `A` is current local traffic, `B` its acknowledged baseline and `S` the batch snapshot, ACK advances `B` to `S`
+for that subset. New traffic stays in `A`. A subsequent pull installs global counters `G + (A - B)` with baseline `G`.
+Every ACK, including a duplicate, requires a full pull so server-owned first-use time and other clients' usage arrive.
+First-use work and blocked desired pushes/pulls remain pending until they can run.
 
-`authenticationclientUserAccountTraffic()` also marks a runtime-only per-user
-flag on the first non-zero local traffic accounting while first usage is still
-missing. The client queues a worker-0 `PushUserStats` attempt, defers one
-follow-up push if a stats push is already in flight, and coalesces later payload
-calls until the pushed usage is followed by a fresh `GetAllUsers` view or the
-send attempt fails.
+Reconnect order is Authenticate/resume epoch, replay retained batch if present, validate ACK, then full pull.
+The server retains a bounded checkpoint per configured client beyond session expiry/replacement. Independent client
+processes need different configured names. A lost/superseded epoch with an unresolved batch enters
+`kAuthenticationClientStateContinuityError`, keeps the batch, closes the transport and stops automatic synchronization
+for operator reconciliation. With no uncertain batch, fresh enrollment and pull can resume. This guarantee covers
+connection loss while both processes run; it does not provide accounting recovery across process crashes/restarts.
 
-If the server says `needs-pull: true`, the client requests `GetAllUsers` again
-to refresh the local cache and server-side session baseline.
+## Timers
 
-## Lifecycle and Direction
+All protocol timers live on worker 0, the same worker as the owned control line:
 
-`AuthenticationClient` is a chain-head control node. It sends requests upstream:
+`ping_timer` sends `Ping` while authenticated and retries `Authenticate` while connected but unauthenticated.
+
+`sync_timer` drives both user-table pull and stats push using the shortest enabled pull/push interval. Each tick checks
+the independent pull/push cadence, queues `PushUserStats` first when due, then queues `GetAllUsers` when revisions
+differ or the pull cadence is due without a fresher equal-revision response.
+
+`reconnect_timer` preserves the first positive retry deadline, rechecking actual monotonic due time. Zero-delay
+retries use queued work, never recursive opening from Finish. A mutex-protected latch is published before queue
+submission; run or cancellation settles it once. Cancellation touches no worker-owned line, pool or timer.
+
+`request_timer` tracks the earliest outstanding request independently of the optional jobs, publishing its deadline
+before Payload so synchronous replies/Finish are safe. Matching replies settle only their own requests.
+
+Timers are detached in `onWorkerQuiesce` for worker 0, before owner drain, because timer deletion must happen on the same
+worker event loop that owns the timer.
+
+## Lifecycle And Line Safety
+
+The control line's `AuthenticationClient` line state contains the downstream response read stream and its parser reentry guard. It is initialized
+before `tunnelNextUpStreamInit()` and destroyed before the client propagates an upstream finish or destroys the owned
+line.
+
+Downstream `Finish` means the next side closed the transport. The client:
+
+1. Removes the active control-line pointer under the control mutex.
+2. Clears session token, authenticated state, in-flight flags, and pending requests.
+3. Destroys this tunnel's line state.
+4. Destroys the owned line.
+5. Preserves an unresolved usage batch and schedules reconnect unless stopping or in continuity error.
+
+When the client itself closes the control line, such as during worker-0 shutdown or malformed response handling, it
+destroys its local line state first, then sends `tunnelNextUpStreamFinish()`, then destroys the owned line if it is still
+alive.
+
+Response payload parsing holds a temporary line reference. If a re-entrant callback closes the line, the parser stops and
+returns without touching destroyed line state.
+
+## Direction Ownership
+
+The client sends all requests upstream:
 
 ```c
 tunnelNextUpStreamInit()
@@ -467,50 +434,23 @@ tunnelNextUpStreamPayload()
 tunnelNextUpStreamFinish()
 ```
 
-It receives server responses through downstream callbacks:
+It receives server responses from downstream callbacks:
 
-```text
-DownStreamEst
-DownStreamPayload
-DownStreamPause
-DownStreamResume
-DownStreamFinish
+```c
+AuthenticationClient::DownStreamEst
+AuthenticationClient::DownStreamPayload
+AuthenticationClient::DownStreamPause
+AuthenticationClient::DownStreamResume
+AuthenticationClient::DownStreamFinish
 ```
 
-Pause and resume are not reflected to a previous tunnel because
-`AuthenticationClient` has no previous data producer. They only track whether
-new protocol requests may be sent immediately.
+Pause and resume are not reflected to a previous tunnel because `AuthenticationClient` is a chain head and has no
+previous data producer. They only update whether new protocol requests may be sent immediately.
 
-The control line's line state contains the downstream response read stream. It
-is initialized before `tunnelNextUpStreamInit()` and destroyed before the client
-propagates upstream finish or destroys the owned line.
+## Packet-Line Semantics
 
-On downstream `finish`, the client:
-
-1. Removes the active control-line pointer under the control mutex.
-2. Clears session token, authenticated state, in-flight flags, and pending
-   requests.
-3. Destroys this tunnel's line state.
-4. Destroys the owned control line.
-5. Schedules reconnect unless the tunnel is stopping.
-
-When the client closes the control line itself, such as during worker-0 shutdown
-or malformed response handling, it destroys local line state first, sends
-`tunnelNextUpStreamFinish()`, and then destroys the owned line if it is still
-alive.
-
-## Notes and Caveats
-
-- `AuthenticationClient` requires a `next` node.
-- It is a control-plane node, not a data pass-through node.
-- It owns and destroys only the internal control line it created.
-- It does not use packet lines and is not a packet tunnel.
-- The request data, response payload, and outer message payload limits are
-  `16 MiB`.
-- Secrets, session tokens, passwords, and raw users JSON are intentionally not
-  printed by verbose logging.
-- The module name `UpdateUserTraficStatsDiff` intentionally follows the current
-  source spelling.
+`AuthenticationClient` is not a packet tunnel. It does not use packet lines and does not call `lineDestroy()` on any line
+except the normal control line that it created itself.
 
 ## User Database Performance
 
@@ -535,3 +475,6 @@ Source-backed metadata:
 | `layer_group_prev_node` | `kNodeLayerNone` |
 | `layer_group_next_node` | `kNodeLayer4` |
 | `required_padding_left` | `0` bytes |
+
+Response input retains at most 16 MiB plus its 20-byte envelope, 1024 entries and 32 MiB allocation charge.
+One extracted active response is separate bounded parsing scratch.

@@ -6,7 +6,7 @@ description: "راهنمای node AuthenticationClient در WaterWall."
 ---
 
 <!--
-Documentation version: 152
+Documentation version: 153
 -->
 
 # AuthenticationClient
@@ -163,46 +163,25 @@ chain اتصال به سرور احراز هویت راه دور:
 
 ## مدل ارتباطی
 
-کلاینت یک line کنترلی بلندمدت دارد؛ برای هر درخواست line جداگانه‌ای نمی‌سازد.
+کلاینت یک line کنترلی تحت مالکیت خود روی worker صفر دارد. Init state را پیش از callback بعدی منتشر می‌کند و
+Est باعث ارسال Authenticate با token صفر می‌شود. درخواست‌ها upstream و پاسخ‌ها downstream هستند؛ هر درخواست
+correlation مستقل دارد. Session موفق شامل token و epoch است: ۶۴ بایت hexadecimal برای هر کدام، مجموع ۱۲۸ بایت.
+Authenticate نخست `name` و `secret` دارد؛ reconnect فیلد `epoch` را نیز برای resume می‌فرستد.
 
-هنگام راه‌اندازی، worker شماره `0` یک `line_t` داخلی می‌سازد و callback مربوط به `init` را در جهت upstream به تونل بعدی می‌فرستد. در chain‌ای مانند `AuthenticationClient -> TcpConnector`، همین line در WaterWall به یک اتصال transport خروجی به chain سمت سرور تبدیل می‌شود.
-
-همه درخواست‌های احراز هویت، ping، دریافت و ارسال روی همان line فریم‌بندی می‌شوند. پاسخ هر درخواست نیز با correlation ID متناظر آن تشخیص داده می‌شود.
-
-اگر transport بسته شود، callbackِ downstream `finish` line کنترلی تحت مالکیت کلاینت را می‌بندد و آزاد می‌کند، token فعال و وضعیت درخواست‌های pending را پاک می‌کند و، مگر هنگام توقف تونل، اتصال دوباره را زمان‌بندی می‌کند. اتصال بعدی با یک `Authenticate` تازه آغاز می‌شود و token قبلی دوباره به کار نمی‌رود.
-
-تا وقتی اتصال قطع است یا احراز هویت انجام نشده، درخواست تازه‌ای در پروتکل فرستاده نمی‌شود. جدول کاربران محلی همچنان به‌عنوان cache در دسترس است، اما همگام‌سازی تنها پس از اتصال مجدد، دریافت `est` از transport و احراز هویت موفق از سر گرفته می‌شود.
-
-## جریان Startup
-
-در `onStart`، تونل کارهای راه‌اندازی را در صف worker شماره `0` می‌گذارد.
-
-سپس worker `0`:
-
-1. کلاینت را در حالت started قرار می‌دهد.
-2. اگر ping timer فعال باشد، آن را راه می‌اندازد.
-3. اگر دریافت یا ارسال دوره‌ای فعال باشد، sync timer را شروع می‌کند.
-4. line کنترلی تحت مالکیت خود را می‌سازد.
-5. state مخصوص این تونل را برای line مقداردهی اولیه می‌کند.
-6. تابع `tunnelNextUpStreamInit()` را فراخوانی می‌کند.
-
-وقتی سمت بعدی transport را برقرار کند و `est` را در جهت downstream بفرستد، کلاینت line کنترلی را متصل در نظر می‌گیرد و `Authenticate` را با یک session token صفر ارسال می‌کند.
-
-وقتی `Authenticate` پاسخ session را برگرداند، token شصت‌وچهاربایتی به token فعال درخواست‌های بعدی تبدیل می‌شود و کلاینت بلافاصله `GetAllUsers` را می‌فرستد.
+قطع transport، token و درخواست‌های موقت را پاک می‌کند اما batch مصرف حل‌نشده و snapshot آن باقی می‌مانند.
+ترتیب reconnect: authenticate/resume، replay همان batch، ACK معتبر و سپس GetAllUsers. پاسخ قدیمی نمی‌تواند epoch
+مستقرشده را عوض کند. درخواست‌های pull/push هنگام قطع، Pause یا تداخل عملیات برای اجرای بعدی ادغام می‌شوند.
 
 ## Timerها
 
-همه timer‌های پروتکل روی worker شماره `0` اجرا می‌شوند؛ همان worker که line کنترلی را در اختیار دارد.
+همه timerها روی worker صفر هستند. ping و sync اختیاری‌اند. `request_timer` مستقل، نزدیک‌ترین deadline درخواست
+را پیش از Payload منتشر می‌کند و حتی با خاموش بودن ping/pull/push timeout را اجرا می‌کند؛ timeout صفر آن را خاموش
+می‌کند. پاسخ فقط deadline درخواست خودش را حذف می‌کند و محاسبات در یک ساعت monotonic هستند.
 
-| timer | رفتار |
-| --- | --- |
-| `ping_timer` | پس از احراز هویت `Ping` می‌فرستد؛ اگر اتصال برقرار باشد اما احراز هویت نشده باشد، `Authenticate` را دوباره امتحان می‌کند. |
-| `sync_timer` | دریافت جدول کاربران و ارسال آمار را با کوتاه‌ترین بازه فعال میان pull و push زمان‌بندی می‌کند. |
-| `reconnect_timer` | پس از بسته شدن transport در جهت downstream، یک line کنترلی تازه باز می‌کند. |
-
-در هر tick همگام‌سازی، ابتدا اگر زمان ارسال `PushUserStats` رسیده باشد این درخواست امتحان می‌شود. سپس، اگر revision‌ها متفاوت باشند، یا زمان pull رسیده باشد و پاسخ تازه‌تری با revision برابر، به‌روز بودن جدول محلی را تأیید نکرده باشد، `GetAllUsers` فرستاده می‌شود.
-
-timer‌ها در `onWorkerStop` مربوط به worker شماره `0` حذف می‌شوند، زیرا حذف هر timer باید در همان event loopای انجام شود که مالک آن است.
+retry مثبت اولین deadline را حفظ می‌کند و tickهای ping آن را عقب نمی‌اندازند. callback زمان واقعی due را دوباره
+بررسی می‌کند. interval صفر یک کار در صف برای turn بعدی loop است، نه فراخوانی بازگشتی یا timer صفر. latch پیش از
+queue submission منتشر می‌شود؛ run یا cancellation آن را یک بار تسویه می‌کند. cancellation به line، pool یا timer
+worker دست نمی‌زند. timerها در `onWorkerQuiesce` جدا می‌شوند و `onWorkerStop` line تحت مالکیت را تخلیه می‌کند.
 
 ## جدول کاربران محلی
 
@@ -305,6 +284,7 @@ authenticationclientRequestPush(t)
 | `kAuthenticationClientStateStopped` | کلاینت متوقف است یا در دسترس نیست. |
 | `kAuthenticationClientStateConnecting` | کلاینت راه افتاده، اما هنوز session کنترلی با احراز هویت موفق ندارد. |
 | `kAuthenticationClientStateAuthenticating` | transport متصل است یا token وجود دارد، اما جدول کامل کاربران هنوز بارگذاری نشده است. |
+| `kAuthenticationClientStateContinuityError` | پیوستگی حسابداری از دست رفته و رسیدگی اپراتور لازم است. |
 | `kAuthenticationClientStateReady` | کلاینت احراز هویت شده و جدول کاربران را بارگذاری کرده است. |
 
 `authenticationclientIsReady()` فقط در `kAuthenticationClientStateReady` مقدار true دارد.
@@ -368,31 +348,31 @@ revision‌های پاسخ به‌عنوان آخرین revision‌های سرو
 
 ## Stats Push
 
-`PushUserStats` اطلاعات اولیه را برای به‌روزرسانی بخشی از آمار می‌فرستد؛ کلاینت تنها فیلدهایی را می‌فرستد که سرور لازم دارد:
+مصرف با ID پایدار و دلتاهای صریح ارسال می‌شود:
 
 ```json
-{
-  "users": [
-    {
-      "password": "user-password",
-      "stats": {
-        "traffic": {
-          "up": "12345",
-          "down": "67890"
-        }
-      }
-    }
-  ]
-}
+{"epoch":"<64 hexadecimal bytes>","sequence":1,"users":[{"id":42,"up":10,"down":0}]}
 ```
 
-کاربرانی که شمارنده ترافیکشان تغییری نکرده، در آن ارسال قرار نمی‌گیرند.
+کلاینت یک batch immutable و snapshot آن را تا ACK دارای epoch، sequence و SHA-256 digest مطابق نگه می‌دارد.
+refusal، timeout، پاسخ malformed و قطع اتصال آن را حذف نمی‌کنند. retry همان بایت‌ها را با correlation تازه و token
+فعلی می‌فرستد. batch خالی ارسال نمی‌شود، هر batch حداکثر ۴۰۹۶ ورودی دارد و sequence از ۱ بدون wrap جلو می‌رود.
+فقط کاربران/directionهای subset تأییدشده baseline را جلو می‌برند. اعداد صحیح ساده تا INT64_MAX و رشته decimal
+تا UINT64_MAX دقیق هستند؛ tokenهای decimal/exponent یا مقادیر کسری، منفی، nonfinite و overflow رد می‌شوند.
 
-سرور این شمارنده‌ها را با baseline همان session که `GetAllUsers` ساخته مقایسه می‌کند و فقط deltaها را اعمال می‌کند. کلاینت `time.first-usage-at-ms` را نمی‌فرستد. با رسیدن نخستین delta غیرصفر برای کاربری که زمان مرجع اولین استفاده‌اش ثبت نشده، سرور آن فیلد را با ساعت خودش مقداردهی می‌کند.
+اگر A مجموع محلی، B baseline تأییدشده و S snapshot باشد، ACK معتبر B را برای همان subset به S می‌رساند. pull
+بعدی مجموع `G + (A - B)` را با baseline برابر G نصب می‌کند. هنگام batch حل‌نشده pull نصب نمی‌شود و push از pull
+در حال اجرا جلو نمی‌زند. هر ACK، حتی replay، `needs-pull: true` دارد تا زمان اولین استفاده سرور و مجموع دیگر
+کلاینت‌ها دریافت شود. کار اولین استفاده و درخواست‌های مسدودشده برای اجرای بعدی باقی می‌مانند.
 
-اگر زمان اولین استفاده هنوز ثبت نشده باشد، `authenticationclientUserAccountTraffic()` با اولین ثبت مصرف محلی غیرصفر یک flag مخصوص runtime برای همان کاربر می‌گذارد. کلاینت تلاش برای `PushUserStats` را روی worker شماره `0` در صف قرار می‌دهد. اگر ارسال آمار دیگری در جریان باشد، ارسال بعدی را به تعویق می‌اندازد و فراخوانی‌های بعدی payload را با هم ادغام می‌کند تا پس از ارسال آمار، نسخهٔ تازه‌ای از جدول با `GetAllUsers` دریافت شود یا تلاش برای ارسال شکست بخورد.
+checkpoint سرور با هویت احراز‌شده مرتبط است و expiry یا جایگزینی session آن را پاک نمی‌کند. processهای مستقل
+نام تنظیم‌شده مستقل لازم دارند. از دست رفتن epoch با batch نامطمئن، وضعیت
+`kAuthenticationClientStateContinuityError` ایجاد می‌کند: batch حفظ می‌شود، transport بسته می‌شود و تلاش خودکار
+برای رسیدگی اپراتور متوقف می‌شود. بدون batch نامطمئن، ثبت تازه و pull مجاز است. این تضمین برای قطع اتصال در زمان
+اجرای دو process است و بازیابی مصرف پس از crash/restart ارائه نمی‌دهد.
 
-اگر سرور `needs-pull: true` برگرداند، کلاینت دوباره `GetAllUsers` را درخواست می‌کند تا cache محلی و baseline مربوط به session در سمت سرور به‌روز شوند.
+lookup فقط enabled، expiry و quota ترافیک را می‌سنجد. gaugeهای ذخیره‌شده IP، connection، device و speed ظرفیت
+زنده را اشغال نمی‌کنند؛ reservation واقعی IP و connection با helper اتمی runtime انجام می‌شود.
 
 ## رفتار Lifecycle و جهت‌ها
 
@@ -424,7 +404,7 @@ state مربوط به line کنترلی، stream خواندن پاسخ‌های 
 2. session token، وضعیت احراز هویت، flag‌های in-flight و درخواست‌های pending را پاک می‌کند.
 3. state این تونل برای line را از بین می‌برد.
 4. line کنترلی تحت مالکیت خود را آزاد می‌کند.
-5. مگر هنگام توقف تونل، اتصال دوباره را زمان‌بندی می‌کند.
+5. batch حل‌نشده را حفظ می‌کند و مگر هنگام توقف یا خطای continuity، retry را زمان‌بندی می‌کند.
 
 وقتی کلاینت خودش line کنترلی را می‌بندد، برای مثال هنگام خاموش شدن worker شماره `0` یا پردازش یک پاسخ malformed، ابتدا state محلی line را از بین می‌برد، `tunnelNextUpStreamFinish()` را می‌فرستد و سپس، اگر line هنوز زنده باشد، آن را آزاد می‌کند.
 
@@ -456,3 +436,5 @@ metadata برگرفته از کد منبع:
 | `layer_group_prev_node` | `kNodeLayerNone` |
 | `layer_group_next_node` | `kNodeLayer4` |
 | `required_padding_left` | `0` bytes |
+
+ورودی پاسخ حداکثر `16 MiB + 20 bytes`، ۱۰۲۴ entry و `32 MiB` allocation charge نگه می‌دارد؛ یک پاسخ استخراج‌شده scratch جداست.
