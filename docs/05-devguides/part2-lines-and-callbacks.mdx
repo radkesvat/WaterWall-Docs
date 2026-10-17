@@ -5,7 +5,7 @@ sidebar_label: "Part 2: Lines & Lifetime"
 description: "The connection lifecycle, re-entrancy hazards, line references, and the clean-finish patterns that keep WaterWall tunnels free of use-after-free bugs."
 ---
 <!--
-Documentation version: 187
+Documentation version: 188
 -->
 
 # Part 2: Lines, Callbacks & Lifetime Safety
@@ -294,6 +294,45 @@ source follows the fatal allocation policy, including node-local copies.
 Recoverable shared-copy results, transactional staging and caller rollback are
 an explicit policy redesign requiring a maintainer request. Do not introduce
 them as incidental hardening of these shared APIs.
+
+### Account configuration and accounting ownership
+
+`usersPatchConfigByIdentifier()` pins an existing user with the collection write
+lock through validation and commit. Its typed `user_config_patch_t` has a presence
+bit per editable leaf and carries no credentials, counters, runtime state or
+creation/first-use timestamps. It reuses the existing string/CIDR preparation and
+index transaction. Finish every expected duplicate/overlap/capacity precondition
+before publishing fields, then apply only selected leaves under `user->lock`.
+Never merge a previously copied whole `timeinfo` or limits structure into a patch:
+that can overwrite concurrent first-use accounting or omitted policy fields.
+Collection-to-user lock order remains unchanged; first-use updates share that
+user lock. Configuration edits preserve live reservations and client refreshes
+migrate them by durable ID while rebuilding the expiry projection.
+
+AuthenticationServer `UpdateUser` selects a nonzero exact durable ID and accepts
+only explicit configuration leaves. It rejects protected/unknown/duplicate keys,
+empty containers, null, invalid UTF-8/NUL, excessive nesting and trailing input.
+The checked lexical parser consumes the full authentication payload with depth
+limit eight, without applying host-config file-size limits. Successful nonempty
+patches bump config_revision once, even for a same-value assignment, inside the
+server state write lock; stats_revision and producer checkpoint are unchanged.
+Competing patches serialize: omitted fields survive and the latest accepted edit
+to the same field wins. There is no expected-revision precondition or remote reset.
+For example, a name-only patch after a 100-byte account receives 10 more bytes
+leaves 110 bytes and its first-use timestamp intact.
+
+Remote usage reporting uses only deduplicated `PushUserStats` batches with root
+`epoch`, `sequence`, `users` and entry `id`, `up`, `down`, all required and no other
+fields. The same strict lexical rules apply. Recognize an exact replay using its
+original payload bytes before consulting current account existence; a subsequent
+account edit/removal must not prevent that ACK. New batches validate all entries
+before any mutation. Server aggregate bytes and missing first-use timestamps are
+accounting state; creation is import metadata, while limits/enabled/expiry are
+configuration. Connection/IP reservations remain local runtime state. Stored or
+imported IP/device/connection/speed gauges are not live global occupancy or an
+admission source. See the [statistics ownership table](../02-noderefs/AuthenticationServer.mdx#statistics-ownership)
+for the current boundaries and requirements for future telemetry. No live gauge
+reporting, reset, or crash-recovery behavior is implied.
 
 ### WIO Descriptor Ownership
 

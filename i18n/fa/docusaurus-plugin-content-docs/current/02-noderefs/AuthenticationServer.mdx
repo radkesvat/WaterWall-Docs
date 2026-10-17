@@ -6,7 +6,7 @@ description: "راهنمای node AuthenticationServer در WaterWall."
 ---
 
 <!--
-Documentation version: 153
+Documentation version: 154
 -->
 
 # AuthenticationServer
@@ -123,7 +123,7 @@ AuthenticationClient -> AuthenticationServer
 | Permission | مجاز می‌کند |
 | --- | --- |
 | `allow-user-pull` | `GetAllUsers`، user lookup با password، SHA-224 یا SHA-256. |
-| `allow-stats-push` | `PushUserStats` و `UpdateUserTraficStatsDiff`. |
+| `allow-stats-push` | `PushUserStats`. |
 | `allow-user-write` | `AddNewUser` و `UpdateUser`. |
 
 `Authenticate` برای همه قابل استفاده است. تمام ماژول‌های دیگر به یک session token معتبر نیاز دارند.
@@ -299,7 +299,12 @@ batch حل‌نشده، اعتبارسنجی ACK و سپس pull کامل. ID پ�
 تضمین حسابداری فقط قطع اتصال در زمان زنده‌بودن دو process را پوشش می‌دهد. اگر نتیجه batch نامطمئن باشد و epoch
 از دست برود، کلاینت batch را حفظ می‌کند، وارد `kAuthenticationClientStateContinuityError` می‌شود و همگام‌سازی
 خودکار را برای رسیدگی اپراتور متوقف می‌کند. اگر batch نامطمئن ندارد، ثبت تازه و pull مجاز است. بازیابی مصرف پس از
-crash/restart ارائه نمی‌شود. ماژول مدیریتی `UpdateUserTraficStatsDiff` همچنان raw delta و فاقد تضمین retry است.
+crash/restart ارائه نمی‌شود.
+
+ACK فقط پذیرش در حافظه سرور است، نه تأیید ذخیره روی دیسک. ذخیره دوره‌ای/نهایی دیتابیس checkpoint را ذخیره نمی‌کند.
+راه‌اندازی دوباره کلاینت ممکن است مصرف گزارش‌نشده را از بین ببرد؛ راه‌اندازی دوباره سرور ممکن است مصرف ACKشده
+پس از آخرین ذخیره موفق را از دست بدهد و checkpointها را پاک می‌کند. shutdown تضمین تحویل نهایی مصرف نیست.
+بازیابی مصرف پس از crash و عملیات remote reset وجود ندارد.
 
 ## فریم‌بندی درخواست و پاسخ
 
@@ -352,11 +357,10 @@ crash/restart ارائه نمی‌شود. ماژول مدیریتی `UpdateUserT
 | `4` | `GetUserBySHA256` | `allow-user-pull` | raw 32-byte SHA-256 digest | نوع `2`، user JSON |
 | `5` | `GetUserByPassword` | `allow-user-pull` | کلید جستجوی password plaintext | نوع `2`، user JSON |
 | `6` | `AddNewUser` | `allow-user-write` | یک user JSON object | نوع `0`، `user-added` |
-| `7` | `UpdateUser` | `allow-user-write` | full user JSON object | نوع `0`، `user-updated` |
-| `8` | `UpdateUserTraficStatsDiff` | `allow-stats-push` | full user JSON object | نوع `0`، `user-traffic-stats-updated` |
+| `7` | `UpdateUser` | `allow-user-write` | patch تنظیمات با `id` پایدار | نوع `0`، `user-updated` |
 | `9` | `GetAllUsers` | `allow-user-pull` | خالی | نوع `3`، users JSON به اضافه `server-time-ms` |
 | `10` | `Authenticate` | عمومی | JSON با `name` و `secret` | نوع `4`، token 64 بایتی |
-| `11` | `PushUserStats` | `allow-stats-push` | stats hints JSON | نوع `0`، compact status JSON |
+| `11` | `PushUserStats` | `allow-stats-push` | batch دلتا با epoch/sequence و ID | نوع `0`، ACK دارای digest |
 | `12` | `GetUserBySHA224Hex` | `allow-user-pull` | 56 کاراکتر hex | نوع `2`، user JSON |
 | `13` | `GetUserBySHA224Base64` | `allow-user-pull` | padded base64 SHA-224 digest | نوع `2`، user JSON |
 | `14` | `GetUserBySHA224` | `allow-user-pull` | raw 28-byte SHA-224 digest | نوع `2`، user JSON |
@@ -405,26 +409,77 @@ crash/restart ارائه نمی‌شود. ماژول مدیریتی `UpdateUserT
 
 ### UpdateUser
 
-`UpdateUser` یک object کامل کاربر در قالب JSON می‌خواهد. فیلد password فقط برای پیدا کردن کاربر موجود با hashِ SHA-256 آن به کار می‌رود؛ این ماژول خود password یا hash آن را تغییر نمی‌دهد.
+درخواست فقط patch تنظیمات است و `id` دقیق، غیرصفر و unsigned 64-bit برای انتخاب حساب لازم دارد:
 
-`id` یا `user-id` ارسالی باید وجود داشته باشد، غیرصفر باشد و با کاربری که از طریق hashِ password پیدا شده مطابقت کند. اطلاعات قابل تغییر، محدودیت‌ها، اطلاعات زمانی، آمار و فاصله ثبت آمار را می‌توان در حافظه به‌روز کرد. ماندگار کردن این تغییرات با timer عادی ذخیره دوره‌ای انجام می‌شود.
+```json
+{"id":42,"name":"Alice"}
+```
 
-پاسخ `capacity-rejected` یعنی ظرفیت درخواستی ایندکس قابل نمایش نیست؛ به‌روزرسانی ردشده اعمال نمی‌شود.
+اگر مدیر در ۱۰۰ بایت حساب را خوانده و سپس ۱۰ بایت مصرف ثبت شده باشد، این تغییر نام، مجموع ۱۱۰ بایت را حفظ
+می‌کند. password یا object کامل صادرشده کاربر ارسال نمی‌شود. حذف هر فیلد از درخواست یعنی حفظ مقدار فعلی آن،
+حتی برای siblingهای object تو در تو:
 
-### UpdateUserTraficStatsDiff
+```json
+{"id":42,"limit":{"traffic":{"total":1073741824}},"time":{"expire-after-first-usage-ms":86400000}}
+```
 
-`UpdateUserTraficStatsDiff` یک object کامل کاربر در قالب JSON می‌خواهد. Password و id فقط برای شناسایی و اعتبارسنجی کاربر موجود استفاده می‌شوند. سپس فقط مقادیر `stats.traffic.up` و `stats.traffic.down` به‌عنوان delta اضافه می‌شوند و هیچ فیلد دیگری تغییر نمی‌کند.
+در این مثال فقط quota کل و مدت انقضا پس از اولین استفاده تغییر می‌کنند؛ limitهای دیگر، انقضای مطلق، زمان ایجاد،
+اولین استفاده و تمام شمارنده‌ها حفظ می‌شوند.
 
-اگر یک delta غیرصفر ترافیک پذیرفته شود و کاربر هنوز مقدار مرجع `first-usage-at-ms` نداشته باشد، سرور این فیلد را با زمان فعلی خودش مقداردهی می‌کند.
+| leaf مجاز | نوع |
+| --- | --- |
+| `name`، `email`، `notes`، `wireguard-allowed-ips` | string؛ رشته خالی برای پاک‌کردن طبق قواعد index/CIDR |
+| `gid` | unsigned 64-bit دقیق |
+| `enabled` | boolean واقعی JSON |
+| `record-stat-interval-ms` | عدد صحیح نامنفی تا INT_MAX؛ scheduler تازه‌ای اضافه نمی‌کند |
+| `limit.traffic.up`، `.down`، `.total` | unsigned 64-bit دقیق |
+| `limit.bandwidth.up`، `.down` | unsigned 64-bit دقیق |
+| `limit.ips`، `.devices`، `.connections-in`، `.connections-out` | unsigned 64-bit دقیق |
+| `time.expire-at-ms`، `.expire-after-first-usage-ms` | unsigned 64-bit دقیق |
+
+نقطه‌ها مسیر object تو در تو هستند. صفر limit/expiry مربوط را پاک می‌کند. token صحیح ساده تا INT64_MAX و رشته
+decimal تا UINT64_MAX پذیرفته می‌شود؛ منفی، کسر، decimal/exponent عددی و overflow رد می‌شوند.
+حداقل یک leaf لازم است؛ patch صرفاً دارای id، container خالی، null، کلید ناشناخته/alias/با case متفاوت و کلید
+decodeشده تکراری در هر سطح رد می‌شود. کل بازه بایت‌ها بررسی می‌شود: UTF-8 نامعتبر، NUL خام یا escaped، داده اضافی
+و بیش از هشت container تو در تو مجاز نیست. بودجه پیام authentication برقرار است، نه محدودیت اندازه فایل config.
+`stats`، password/hash/credential، ID جایگزین، runtime/client-view و زمان ایجاد/اولین استفاده، از جمله aliasهای
+سطح بالا، مجاز نیستند. وجود یک فیلد معتبر کنار فیلد ممنوع باعث اعمال جزئی نمی‌شود.
+
+حساب ناشناخته، نام تکراری، CIDR نامعتبر/هم‌پوشان یا رد ظرفیت، هیچ فیلد، index منطقی، revision یا checkpoint را
+تغییر نمی‌دهد. موفقیت نوع `0` و `user-updated` است و زیر write lock فقط config_revision را یک بار افزایش می‌دهد؛
+حتی اگر مقدار برابر مقدار فعلی باشد. این ویرایش در حافظه است و ذخیره فوری ندارد. patchهای مستقل فیلدهای حذف‌شده
+از درخواست را حفظ می‌کنند؛ برای یک فیلد، آخرین ویرایش پذیرفته‌شده برنده است. expected-revision لازم نیست.
+`allow-user-write` و `allow-stats-push` مستقل‌اند؛ یکی مجوز دیگری نیست. opcode شماره `8` پشتیبانی نمی‌شود و
+`unknown-request-type` می‌دهد.
+
+### مالکیت آمار
+
+| مقدار | مالک و قاعده فعلی |
+| --- | --- |
+| بایت upload/download تجمعی | مجموع سرور؛ گزارش remote فقط با batch deduplicated؛ patch تنظیمات آن را حفظ می‌کند |
+| زمان اولین استفاده | مشاهده حسابداری سرور؛ مصرف غیرصفر پذیرفته‌شده فقط در صورت خالی بودن آن را ثبت می‌کند |
+| زمان ایجاد | metadata ایجاد/import؛ ویرایش عادی آن را حفظ می‌کند |
+| limit، enabled و سیاست expiry | تنظیم حساب، قابل تغییر فقط با leaf صریح patch |
+| اتصال خروجی فعال و reservation IP | وضعیت admission محلی، قابل نگهداری/آزادسازی در runtime؛ تعداد global نیست |
+| آمار ذخیره/import شده IP، device، connection و speed | نمای قابل اعتماد از اشغال زنده global یا ورودی admission نیست؛ گزارش تازه‌ای اضافه نشده است |
+
+گزارش آینده connection باید snapshot هر producer با ترتیب نمونه و expiry داشته باشد؛ نمونه بعدی جای قبلی را
+می‌گیرد و مثل ترافیک جمع نمی‌شود. speed به بازه/زمان اندازه‌گیری و freshness نیاز دارد؛ نمونه مفقود/قدیمی صفر
+اندازه‌گیری‌شده نیست و تجمیع producerها به بازه‌های سازگار نیاز دارد. IP متمایز به مجموعه هویت، پنجره مشاهده و
+حذف تکرار بین producerها نیاز دارد؛ جمع تعدادهای کلاینت، تعداد IP متمایز global نمی‌سازد. device به تعریف هویت و
+روش جمع‌آوری نیاز دارد. reset نیازمند تصمیم جدا درباره مصرف با تأخیر و cutoff توزیع‌شده است و اینجا عملیاتی ندارد.
 
 ### PushUserStats
 
-شکل پشتیبانی‌شده payload:
+تنها مسیر remote گزارش مصرف، `PushUserStats` و صرفاً برای بایت ترافیک است. شکل دقیق payload:
 
 ```json
 {"epoch":"<64 hexadecimal bytes>","sequence":1,"users":[{"id":42,"up":10,"down":0}]}
 ```
 
+ریشه فقط `epoch`، `sequence` و `users` و هر ورودی فقط `id`، `up` و `down` دارد؛ همه اجباری‌اند.
+فیلد ناشناخته/تکراری، آمار غیرترافیکی، timestamp یا مجموع مطلق، کل درخواست را رد می‌کند. قواعد strict JSON/UTF-8،
+NUL، عمق هشت container و مصرف کامل ورودی مانند patch برقرار است. digest از بایت‌های اصلی payload محاسبه می‌شود.
 هر batch بین ۱ تا ۴۰۹۶ ID یکتا و غیرصفر دارد. هر ورودی هر دو مقدار دلتا `up` و `down` را دارد و دست‌کم یکی
 غیرصفر است. tokenهای integer ساده تا INT64_MAX و رشته decimal تا UINT64_MAX دقیق‌اند؛ decimal/exponent عددی،
 مقادیر کسری، منفی، nonfinite و overflow برای استخراج عدد صحیح رد می‌شوند.
@@ -468,7 +523,6 @@ pullهای عادی دوره‌ای یا صریح اولویت دارد تا pul
   تحویل همگام فعلی خارج از سقف ورودی نگهداری‌شده است.
 - این node به left padding نیاز ندارد و چیزی را درجا prepend نمی‌کند.
 - این node packet tunnel نیست و از قواعد packet line استفاده نمی‌کند.
-- املای نام ماژول `UpdateUserTraficStatsDiff` عمداً همان املای فعلی در کد منبع است.
 
 ## عملکرد پایگاه داده کاربران
 
