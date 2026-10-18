@@ -350,6 +350,21 @@ rotation does not forcibly terminate them. Public reads omit credentials, so an
 unknown password-change outcome requires a fresh read and an explicit decision to
 resubmit the desired password with its current token, without automatic retries.
 
+AuthenticationClient's `traffic-multiplier` converts measured upload/download bytes at its two public traffic
+entry points, before counters and quota enforcement, using fixed-point integer arithmetic with scale 1000.
+The startup-fixed JSON number defaults to 1, accepts 0.001 through 1000 and at most three effective decimal places.
+Callers must supply raw measured bytes without pre-scaling. Store a separate fractional charge remainder per user
+and direction; rounding each payload independently changes the charge with fragmentation. Update remainders,
+charged counters and first-use evidence in the same user/stats transaction. Migrate the remainders by durable ID
+on refresh, including same-ID credential changes; reconnect/ACK must not clear them. Generic copies, database JSON
+and sync batches exclude these process-local remainders. Removal/destruction discards them, with no crash recovery.
+Apply checked saturation to charged counters without unsigned wraparound.
+
+Existing and pulled counters, batch deltas, baselines, immutable retries and catch-up debt already use charged quota
+bytes; never scale them again. AuthenticationServer and other producer/import paths accept charged bytes as supplied.
+Traffic limits and API usage/accounting totals use the same units. Bandwidth, speed, reservations and timestamps keep
+their existing meanings. Start first-use expiry from a positive raw measurement even when its charged increment is zero.
+
 Remote usage reporting uses only deduplicated `PushUserStats` batches with root
 `epoch`, `sequence`, `users` and entry `id`, `up`, `down`, `first-usage-at-ms`, all required and no other
 fields. The same strict lexical rules apply. Recognize an exact replay using its
@@ -363,7 +378,7 @@ admission source. See the [statistics ownership table](../02-noderefs/Authentica
 for the current boundaries and requirements for future telemetry. No live gauge
 reporting, reset, or crash-recovery behavior is implied.
 
-First nonzero client traffic captures a valid local monotonic origin (zero is allowed) and immutable positive
+First nonzero measured client traffic, including a discounted increment below one charged byte, captures a valid local monotonic origin (zero is allowed) and immutable positive
 accounting-clock estimate inside the user write lock, then updates counters/expiry under stats write lock. Generic
 server/import helpers without a client clock never invent observations. Both client traffic APIs use this transaction;
 zero-byte calls, login, reservation and refresh rebasing do not start use. Scheduling latches are separate from evidence.
@@ -376,7 +391,7 @@ origins remain future until reached or superseded by real earlier use. Duration 
 separately; unchanged pulls keep the earlier absolute deadline and never extend relative lifetime. Explicit edits
 recompute only their component. Already expired at monotonic zero must remain expired, not become unlimited.
 
-Runtime clock/evidence/ACK state migrates by durable ID with reservations, including same-ID credential changes, under
+Runtime clock/evidence/ACK state and fractional charge remainders migrate by durable ID with reservations, including same-ID credential changes, under
 ordered collection locks, both user locks, then both stats locks. Keep new authoritative policy/timeinfo and rebuild
 projections before table publication. Generic user/users copies and JSON exclude these process-local fields. Explicit
 accounting snapshots capture counters and observations together and retain only owned values across replacement.
