@@ -1,0 +1,213 @@
+---
+sidebar_position: 2
+title: "Administer accounts from the command line"
+sidebar_label: "Administration CLI"
+description: "Use the Python administration client to read, create, edit, disable and change passwords with explicit conflict handling."
+---
+
+# Administer accounts from the command line
+
+The WaterWall checkout includes
+[`tunnels/APIServer/client/ww_admin.py`](https://github.com/radkesvat/WaterWall/blob/main/tunnels/APIServer/client/ww_admin.py).
+It provides account commands using Python 3.10 or newer and the standard library.
+Keep it beside `ww_api.py` when copying the client directory; no package
+installation is needed. The generic example and this CLI share the TCP framing
+and envelope implementation in `ww_api.py`.
+
+Start with the [local server configuration](client.mdx), then add the separate
+`creator`, `editor`, and `password-admin` roles from the
+[account workflow example](authentication-users.mdx#grant-each-operator-its-own-permissions).
+The commands below run from that example's `api-demo` directory, with
+`WATERWALL_REPO` set to the checkout's absolute path. Permission configuration
+still belongs to APIServer; the CLI grants no extra access.
+
+## Select the server and operator
+
+A full command looks like this:
+
+```bash
+python3 "$WATERWALL_REPO/tunnels/APIServer/client/ww_admin.py" \
+  --host 127.0.0.1 --port 9080 \
+  --client monitor --token-file monitor-token \
+  --config central --node auth-db status
+```
+
+All connection and authentication options precede `status` or `users`. Defaults
+are host `127.0.0.1`, port `9080`, timeout 10 seconds and maximum response envelope
+1 MiB. Use `--timeout` and `--max-response-bytes` to change those bounds.
+The response cap accepts 1 byte through 64 MiB. The timeout covers one complete
+request, but Python's blocking hostname lookup can exceed it before control
+returns; use an IP address when that resolver limitation is unsuitable.
+`--client` and `--node` are required. Choose either `--token-file PATH` or
+`--token-env NAME`; the latter names an environment variable holding the token.
+There is no plaintext token command-line option.
+
+`--config central` selects a logical configuration name, not a filename. It may
+be omitted only when the node name is unique across loaded configurations. This
+CLI speaks TCP; a local TCP entry can use the existing
+[reliable UDP bridge](transports.mdx#reliable-stream-over-udp). It does not construct
+HTTP requests or add encryption. Remote use needs an appropriately protected
+transport.
+
+For the remaining Bash examples, define this shortcut:
+
+```bash
+wwadmin() {
+  local operator="$1"
+  shift
+  python3 "$WATERWALL_REPO/tunnels/APIServer/client/ww_admin.py" \
+    --client "$operator" --token-file "${operator}-token" \
+    --config central --node auth-db "$@"
+}
+```
+
+## Read an account or traverse its summaries
+
+```bash
+wwadmin monitor status
+wwadmin monitor users list --limit 50
+wwadmin monitor users get 42
+```
+
+`get` returns `not_found` until that ID exists. IDs and unsigned account values
+remain decimal strings, including values above JavaScript's exact integer range.
+Results are the public redacted API schemas; the CLI does not expose passwords or
+derived credentials.
+
+`users list` defaults to 50 summaries and accepts a limit from 1 through 100. To
+read one subsequent page, pass its exact `next_cursor` with `--cursor`. To follow
+pages automatically:
+
+```bash
+wwadmin monitor users list --all --limit 50 --max-pages 100 > pages.jsonl
+```
+
+This writes **one complete page per JSON line**, including page metadata and its
+`users` array. It streams pages rather than building one unbounded array.
+`--max-pages` defaults to 100 and accepts 1 through 10000. Reaching that cap while another cursor remains is
+an error, not a complete traversal. A repeated cursor, invalid reply, failed
+request or `stale_cursor` also stops the command. Check its exit status: earlier
+lines are incomplete results when a later page fails.
+
+Configuration edits invalidate cursors. The CLI does not silently restart and
+append duplicate pages; explicitly start a new traversal and replace the old
+output after a stale cursor. Usage totals can change between valid pages, so a
+successful traversal is not a frozen usage snapshot. Summaries may abbreviate
+names; `users get` provides full permitted details.
+
+## Create an account
+
+```bash
+wwadmin creator users create 42 --set name=alice --set enabled=false
+```
+
+The CLI asks for the initial password twice without echoing it. You choose the
+permanent nonzero numeric ID. Creation requires `create-user` permission and no
+edit token; an existing ID is never overwritten.
+
+Repeat `--set FIELD=VALUE` for the intended initial policy. Omitted `--set` options
+use the server's defaults, including **enabled with unlimited/unset zero limits**.
+The explicit `enabled=false` above stages the account. Field names use the public
+API's snake_case and dotted nesting:
+
+```text
+--set limit.traffic.total=1000000000
+--set time.expire_after_first_usage_ms=2592000000
+--set wireguard_allowed_ips=10.44.0.1/32
+--set notes=
+```
+
+Numeric values are canonical unsigned decimal strings; booleans must be `true`
+or `false`. String values are literal, including an empty value to clear a field.
+Unknown or repeated fields are refused. See the
+[18 editable configuration leaves](../../02-noderefs/AuthenticationServer.mdx#update-user)
+for units, ranges, zero meanings and restrictions. Storing a policy does not add
+enforcement support to other nodes.
+
+## Read, review and edit
+
+Read with the editor's token:
+
+```bash
+wwadmin editor users get 42 > account.json
+```
+
+Continue only if that command succeeds. Inspect `account.json`, then extract the
+token from that same read:
+
+```bash
+EDIT_TOKEN="$(python3 -c 'import json; print(json.load(open("account.json"))["edit_token"])')"
+wwadmin editor users update 42 --if-match "$EDIT_TOKEN" \
+  --set enabled=true --set limit.traffic.total=1000000000
+```
+
+The CLI sends only the selected fields. Usage, first-use history and credentials
+cannot be patched. Enable and disable are shortcuts for a one-field update:
+
+```bash
+wwadmin editor users get 42 > account.json
+# After a successful read, inspect it and obtain its current token again.
+EDIT_TOKEN="$(python3 -c 'import json; print(json.load(open("account.json"))["edit_token"])')"
+wwadmin editor users disable 42 --if-match "$EDIT_TOKEN"
+```
+
+Use `users enable` in the same way. `--if-match` is required for these commands
+and for password changes. The token contains a server-instance identity and the
+server-wide configuration revision; edits to other accounts can invalidate it.
+A `conflict` means this invocation did not commit. Reread and reconsider the
+change. The CLI never reads a fresh token and replays a write automatically.
+
+## Change a password
+
+Read with the password administrator's own permission and review the account:
+
+```bash
+wwadmin password-admin users get 42 > account.json
+# Continue only after a successful read and review.
+EDIT_TOKEN="$(python3 -c 'import json; print(json.load(open("account.json"))["edit_token"])')"
+wwadmin password-admin users change-password 42 --if-match "$EDIT_TOKEN"
+```
+
+The default is a hidden confirmation prompt. For automation, creation and password
+changes accept either `--password-file PATH` or `--password-stdin`. Neither
+accepts a password as a command-line value. File and stdin input must be nonempty
+UTF-8 without NUL and is preserved exactly: **a trailing newline becomes part of
+the password**. Use a secret source that writes the desired bytes; ordinary
+`echo` appends a newline. Token files have separate handling: exactly 64
+hexadecimal characters, optionally followed by LF or CRLF.
+
+Password changes preserve the account's ID, policy, usage and first-use history.
+They do not forcibly disconnect existing sessions. Consult the
+[password operation reference](../../02-noderefs/AuthenticationServer.mdx#change-user-password)
+for derived credential and UUID identity semantics.
+
+## Interpret the result before another write
+
+Successful commands print JSON to stdout. Errors and recovery guidance go to
+stderr; arbitrary server error messages and supplied secrets are not echoed.
+
+| Exit status | Meaning |
+| --- | --- |
+| `0` | Success. For `--all`, the final page was reached. |
+| `1` | A validated node operation failure, such as `conflict` or `stale_cursor`. |
+| `2` | Local validation, a failed read, a definite gateway refusal, or a local pagination bound/consistency failure. |
+| `3` | A write may have committed but its outcome could not be established. |
+
+The client makes no automatic retries. If a write's reply is lost, malformed or
+times out after possible dispatch, keep its intended inputs and reread. Compare
+the account before explicitly deciding whether another configuration change is
+needed. For creation, retain the original ID: its existence does not prove who
+created it or which password it holds. Do not automatically choose another ID.
+
+A public read cannot confirm the installed password. After an uncertain password
+change, explicitly decide whether to resubmit the desired password with a fresh
+edit token. An acknowledged resubmission establishes that password at its own
+commit point. Revision changes alone cannot prove that a particular earlier
+request succeeded.
+
+An acknowledgement confirms an in-memory server change, not a disk save or an
+AuthenticationClient refresh. Offline clients continue with their cached policy
+and credentials until a valid refresh. This CLI adds no crash recovery or server
+retry records. See the [wire-level account workflows](authentication-users.mdx)
+and [protocol delivery rules](../../05-devguides/api/protocol.mdx) for the underlying
+API guarantees.
