@@ -1,0 +1,245 @@
+---
+sidebar_position: 1
+title: "پروتکل API"
+sidebar_label: "پروتکل"
+description: "قالب پیام، احراز هویت، انتخاب هدف، envelope درخواست و پاسخ، محدودیت‌ها و معنای تحویل برای کلاینت‌های APIServer."
+---
+<!--
+Documentation version: 1
+Sync note: Keep synchronized with the English API protocol guide.
+-->
+
+# پروتکل API
+
+APIServer دسترسی به operationهای صریحاً ثبت‌شدهٔ nodeها را روی stream بایتی قابل
+اعتماد و دارای احراز هویت فراهم می‌کند. این صفحه قالب مشترک ارتباط را تعریف
+می‌کند. تنظیمات gateway و مجوزها در [مرجع APIServer](../../02-noderefs/APIServer.mdx)
+هستند؛ نام operationها، بدنهٔ درخواست، پاسخ و تضمین تغییر state در مرجع node هدف
+تعریف می‌شوند.
+
+برای اجرای کلاینت، از [مثال Python](../../03-examples/api/client.mdx) شروع کنید.
+برای پیاده‌سازی node، [پیاده‌سازی operationهای API](./node-operations.mdx) را بخوانید.
+
+## transport و frame
+
+زنجیره‌های پشتیبانی‌شده stream مرتب و قابل اعتماد تحویل می‌دهند:
+
+```text
+TcpListener -> APIServer
+TcpListener -> HttpServer -> APIServer
+UdpListener -> TcpOverUdpServer -> APIServer
+```
+
+APIServer socket باز نمی‌کند و transport را رمزنگاری نمی‌کند. دسترسی راه دور
+به stream حفاظت‌شده نیاز دارد. اتصال مستقیم `UdpListener -> APIServer` پشتیبانی
+نمی‌شود: prefix طول، گم‌شدن یا جابه‌جایی datagram را جبران نمی‌کند.
+TcpOverUdpServer پیش از رسیدن داده به APIServer، stream قابل اعتماد را بازسازی
+می‌کند. ترکیب کامل HTTP و UDP قابل اعتماد در
+[مثال‌های transport](../../03-examples/api/transports.mdx) آمده است.
+
+تمام درخواست‌ها و پاسخ‌ها frame یکسان دارند:
+
+```text
+4-byte unsigned big-endian length | exactly length UTF-8 JSON bytes
+```
+
+طول، prefix را شامل نمی‌شود و باید غیرصفر و در سقف envelope تنظیم‌شده باشد.
+newline یا NUL انتهایی وجود ندارد. read سوکت، callback payload تونل، chunk HTTP
+یا packet UDP مرز frame نیست: prefix یا body می‌تواند میان چند read تقسیم شود
+و یک read می‌تواند چند frame داشته باشد.
+
+در ترکیب HTTP، این بایت‌های frameشده در body حمل می‌شوند. فراخواننده ابتدا پاسخ
+را dechunk می‌کند، سپس prefix API را می‌خواند و با همان طول کامل‌بودن پاسخ را
+تشخیص می‌دهد؛ منتظر EOF یا chunk نهایی HTTP نمی‌ماند. HttpServer method و path
+تنظیم‌شده را بررسی می‌کند. APIServer فقط بایت‌های body را می‌بیند؛ این رابط
+مسیریابی REST، احراز هویت header یا HTTP status جدا برای هر operation ندارد.
+
+## envelope درخواست
+
+```json
+{
+  "id": "request-42",
+  "auth": {"client": "monitor", "token": "<configured token>"},
+  "selector": {"config": "edge-europe", "node": "auth-client"},
+  "operation": "status",
+  "content_type": "application/json",
+  "body_encoding": "utf8",
+  "body": "{\"include_accounting\":true}"
+}
+```
+
+تمام فیلدهای بالا به‌جز `selector.config` اجباری‌اند.
+
+| فیلد | معنا |
+| --- | --- |
+| `id` | رشتهٔ غیرخالی همبستگی، حداکثر ۶۴ بایت UTF-8. در پاسخ تکرار می‌شود و مانع اجرای دوبارهٔ درخواست نیست. |
+| `auth.client` | نام client تنظیم‌شدهٔ API، حداکثر ۲۵۶ بایت UTF-8. |
+| `auth.token` | token ثابت ۳۲ بایتی client، به‌شکل دقیقاً ۶۴ نویسهٔ hexadecimal. |
+| `selector.config` | نام منطقی دقیق و اختیاری config، حداکثر ۲۵۶ بایت UTF-8. |
+| `selector.node` | نام دقیق node عمومی سطح بالا، حداکثر ۲۵۶ بایت UTF-8. |
+| `operation` | نام دقیق operation ثبت‌شده، حداکثر ۶۴ بایت UTF-8. |
+| `content_type` | نوع محتوای body decodeشدهٔ node، حداکثر ۱۲۸ بایت UTF-8؛ باید با نوع درخواست اعلام‌شدهٔ operation یکسان باشد. |
+| `body_encoding` | مقدار `utf8` یا `base64`. |
+| `body` | رشتهٔ JSON حاوی درخواست encodeشدهٔ node، حتی وقتی خود درخواست JSON است. |
+
+نام‌های metadata به بزرگی و کوچکی حروف حساس‌اند. parser بیرونی کلید ناشناخته یا
+تکراری، type نادرست، UTF-8 خراب، دادهٔ غیر whitespace پس از پایان و NUL
+ decodeشده در metadata یا body نوع UTF-8 را رد می‌کند. عمق و شمار مقدارهای
+ envelope پیش از تخصیص درخت JSON محدود می‌شوند. این قواعد، schema بدنهٔ node
+هدف را تعریف نمی‌کنند.
+
+### احراز هویت، انتخاب هدف و مجوز
+
+هر envelope مستقل احراز هویت می‌شود. token API از رمز کاربر ترافیک و
+اعتبارنامهٔ تولیدکنندهٔ upstream در AuthenticationClient جداست. نام client
+ناشناخته و token نادرست هر دو `unauthorized` می‌دهند. احراز هویت پیش از lookup
+هدف انجام می‌شود.
+
+`selector.config` نام منطقی `name` یک config بارشده است؛ نام فایل نیست و config
+تازه‌ای بار نمی‌کند. با پیکربندی APIServer، تمام configهای بارشده باید نام منطقی
+غیرخالی و یکتا داشته باشند. childهای داخلی تولیدشده هدف عمومی API نیستند.
+
+حذف `selector.config` فقط وقتی کار می‌کند که نام دقیق node میان **تمام nodeهای
+اعلام‌شدهٔ سطح بالا در تمام configهای بارشده** یک بار وجود داشته باشد. nodeهایی
+که API ندارند یا برای caller مجاز نیستند نیز شمرده می‌شوند. فیلتر ثبت API یا
+مجوز نمی‌تواند نام مبهم را یکتا کند؛ برای رفع `ambiguous_target` نام config را
+بدهید.
+
+پس از حل هدف، APIServer مجوز دقیق client برای همان config، node و operation را
+بررسی می‌کند. wildcard یا مجوز ضمنی از operation دیگر وجود ندارد. descriptor
+فقط‌خواندنی نیز operation را عمومی نمی‌کند. هنگام startup، هدف‌های allowlist و
+operationهای ثبت‌شده بررسی می‌شوند. وجود نماد قدیمی `TunnelApi` به‌تنهایی چیزی
+را از این gateway در دسترس نمی‌گذارد.
+
+### encoding و نوع محتوای body
+
+با `body_encoding: "utf8"`، بایت‌های UTF-8 decodeشدهٔ `body` بدون تغییر تحویل
+می‌شوند. با `"base64"`، base64 سخت‌گیرانه و canonical بایت دلخواه از جمله NUL را
+حمل می‌کند. base64 encoding است، نه رمزنگاری.
+
+APIServer درخواست node را parse، normalize یا دوباره serialize نمی‌کند. برای
+نمونه، envelope بالا بایت‌های `{"include_accounting":true}` را به handler
+`status` در AuthenticationClient می‌دهد. operation دیگر می‌تواند قالب body و
+نوع محتوای دیگری تعریف کند. schema پذیرفته‌شده را از مرجع node بخوانید؛ envelope
+معتبر همچنان ممکن است درخواست node نامعتبر داشته باشد.
+
+## envelope پاسخ
+
+operation dispatchشده، حتی اگر خطای سطح node برگرداند، از این envelope استفاده
+می‌کند:
+
+```json
+{
+  "id": "request-42",
+  "error": null,
+  "result": {
+    "code": 0,
+    "content_type": "application/json",
+    "body_encoding": "utf8",
+    "body": "{\"can_authenticate\":true}"
+  }
+}
+```
+
+body بالا نمونه است، نه snapshot کامل status. `result.code` نتیجهٔ handler را
+حفظ می‌کند: `0` موفقیت و `1` خطاست. operation ثبت‌شده نوع محتوا و encoding پاسخ
+را اعلام می‌کند و لازم نیست با encoding درخواست برابر باشند. `result.body` را
+با `body_encoding` پاسخ decode کنید و سپس طبق schema node تفسیر کنید. نتیجهٔ
+خالی handler به body خالی با type و encoding اعلام‌شده تبدیل می‌شود.
+
+مرجع operationها همچنان منبع تعریف رفتار است:
+
+- [status در AuthenticationClient](../../02-noderefs/AuthenticationClient.mdx)
+  نمای محلی همگام‌سازی و پذیرش client را توضیح می‌دهد.
+- [API مدیریتی AuthenticationServer](../../02-noderefs/AuthenticationServer.mdx)
+  خواندن حساب، صفحه‌بندی، ساخت، ویرایش مشروط و تغییر رمز را توضیح می‌دهد.
+  مقدارهای unsigned 64-bit آن رشتهٔ ده‌دهی JSON هستند.
+
+### خطاهای gateway
+
+خطای gateway دارای `result: null` است:
+
+```json
+{
+  "id": "request-42",
+  "error": {"code": "ambiguous_target", "message": "Specify the configuration name."},
+  "result": null
+}
+```
+
+اگر ID همبستگی قابل اعتماد و محدود بازیابی نشده باشد، `id` برابر null است.
+پیام‌ها ثابت و محدودند؛ کلاینت باید تصمیم را بر اساس code خطا بگیرد.
+
+| کد | معنا |
+| --- | --- |
+| `invalid_request` | frame یا schema envelope درخواست نامعتبر است. |
+| `invalid_encoding` | encoding body نامعتبر یا پشتیبانی‌نشده است. |
+| `unauthorized` | اعتبارنامهٔ API نامعتبر است. |
+| `forbidden` | operation در allowlist دقیق caller نیست. |
+| `target_not_found` | node عمومی انتخاب‌شده پیدا نشد. |
+| `ambiguous_target` | نام node بدون config با چند node اعلام‌شده مطابقت دارد. |
+| `unsupported_api` | هدف API ثبت‌شده ندارد. |
+| `unsupported_operation` | operation درخواستی ثبت نشده است. |
+| `unsupported_content_type` | نوع محتوای درخواست با operation مطابقت ندارد. |
+| `busy` | ظرفیت gateway یا dispatch اجازهٔ پذیرش کار را نداد. |
+| `timeout` | یکی از deadlineهای API منقضی شد. |
+| `shutting_down` | پذیرش API بسته شده است. |
+| `response_too_large` | نتیجه در سقف پاسخ مربوط جا نمی‌شود. |
+
+خطای gateway و خطای node دو لایهٔ جدا هستند. برای مثال، `conflict` از
+AuthenticationServer داخل `result.body` با `result.code: 1` است؛ timeout gateway
+در `error` قرار می‌گیرد و نتیجهٔ node ندارد. خرابی تحویل پس از dispatch می‌تواند
+تغییری را که قبلاً commit شده پنهان کند؛ آن تغییر را rollback نمی‌کند.
+
+## ترتیب، بستن اتصال و محدودیت‌ها
+
+هر اتصال در هر لحظه یک operation اجرا می‌کند. درخواست‌های کامل pipelineشده در
+صف FIFO منتظر می‌مانند و پاسخ‌ها همان ترتیب را حفظ می‌کنند. اتصال‌های جدا
+می‌توانند هم‌زمان اجرا شوند؛ lockها و پیش‌شرط‌های operation، state مشترک آن‌ها
+را کنترل می‌کنند.
+
+frame/schema خراب و احراز هویت نامعتبر، پس از حداکثر یک خطای محدود، اتصال را
+می‌بندند. خطاهای هدف، operation و body در درخواست معتبر و مجاز می‌توانند به‌ترتیب
+FIFO ادامه یابند. اگر حتی خطا در بودجه جا نشود، امتناع منابع می‌تواند مستقیم
+اتصال را ببندد. پس از شروع پاسخ، خرابی transport یا انقضای خروجی اتصال را می‌بندد
+و frame دومی در پاسخ نیمه‌کاره قرار نمی‌دهد. انقضای درخواست بعدی در صف پشت پاسخ
+قبلی نیز باعث بستن اتصال می‌شود، نه فرستادن خطا خارج از ترتیب.
+
+[جدول محدودیت‌های APIServer](../../02-noderefs/APIServer.mdx) تنظیمات و پیش‌فرض‌ها
+را تعریف می‌کند. سقف envelope شامل prefix چهار بایتی نیست؛ بودجهٔ حافظه تخصیص‌های
+نگه‌داشته‌شده، fragmentها، صف‌ها، jobها و حافظهٔ کاری موقت را هم حساب می‌کند.
+node می‌تواند سقف body یا کار کوچک‌تری داشته باشد. escaping در JSON و base64
+اندازهٔ encodeشده را افزایش می‌دهند؛ طول خام body به‌تنهایی ثابت نمی‌کند envelope
+پاسخ جا می‌شود.
+
+| deadline | بازه |
+| --- | --- |
+| تکمیل frame | از نخستین بایت frame؛ ورودی قطره‌ای آن را reset نمی‌کند. |
+| درخواست | از پذیرش درخواست کامل تا انتشار پاسخ، شامل انتظار FIFO و worker. |
+| خروجی | از انتشار پاسخ تا تحویل به transport، شامل زمان Pause. |
+| بی‌کاری | زمانی که frame، درخواست یا خروجی در جریان نیست. |
+
+تمام محدودیت‌های تنظیم‌شده عدد صحیح مثبت و محدودند؛ صفر حفاظت را غیرفعال
+نمی‌کند. قطع یا timeout تحویل را abandoned می‌کند، اما handler در حال اجرا تا
+پایان reservation خود را نگه می‌دارد. gateway نمی‌تواند کار دلخواهی را که قبلاً
+commit شده قطع و لغو کند.
+
+## نوشتن و پاسخ نامعلوم
+
+`id` درخواست فقط برای همبستگی است. استفادهٔ دوباره از آن تضمین replay، checkpoint
+یا deduplication خودکار ایجاد نمی‌کند. کلاینت عمومی یک بار تلاش می‌کند و نوشتن
+را خودکار تکرار نمی‌کند.
+
+پیش از retry قرارداد operation هدف را بخوانید. APIهای عمومی تغییر در
+AuthenticationServer تضمین می‌کنند **خطای بازگشتی operation در سطح node** یعنی
+همین فراخوانی commit نشده است. پاسخ گم‌شده، خراب یا دیررس، قطع اتصال یا timeout
+ gateway پس از dispatch نتیجه را نامعلوم می‌کند. موفقیت، حافظهٔ سرور را تأیید
+می‌کند؛ persistence معمول و refresh کلاینت جدا هستند.
+
+پس از conflict یا نتیجهٔ نامعلوم، دوباره بخوانید و صریحاً دربارهٔ تغییر درخواستی
+تصمیم بگیرید. token تازه را پنهانی نگیرید و نوشتن را replay نکنید. بازیابی نتیجهٔ
+ساخت حساب، ID اصلی را حفظ می‌کند؛ وجود عمومی حساب مشخص نمی‌کند چه کسی آن را
+ساخته است. خواندن عمومی credential را حذف می‌کند، پس پس از گم‌شدن پاسخ تغییر
+رمز نیز نمی‌تواند رمز ذخیره‌شده را ثابت کند.
+[مثال‌های مدیریت حساب](../../03-examples/api/authentication-users.mdx) و مرجع هر
+operation، مراحل تصمیم‌گیری مربوط را توضیح می‌دهند.

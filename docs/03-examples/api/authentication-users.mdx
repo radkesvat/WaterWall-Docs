@@ -1,0 +1,238 @@
+---
+sidebar_position: 2
+title: "Manage authentication accounts"
+sidebar_label: "Authentication accounts"
+description: "Read, create, edit, disable, and change passwords through explicitly permitted API operations."
+---
+
+# Manage authentication accounts
+
+Start with the [local API client example](client.mdx). These commands use its
+`api-demo` working directory, `central` configuration, `auth-db` node and
+`WATERWALL_REPO` checkout path. The
+[AuthenticationServer management API reference](../../02-noderefs/AuthenticationServer.mdx#management-api)
+is authoritative for request fields, response schemas, limits and error codes.
+The examples below show a workflow rather than a second schema reference.
+
+## Grant each operator its own permissions
+
+The example monitor can read status, users and lists. Creation, configuration
+editing and password changes each require a separate explicit permission.
+Stop the demo WaterWall process cleanly, then add three independent operator
+tokens to its configuration:
+
+```bash
+umask 077
+python3 - <<'PY'
+import json
+from pathlib import Path
+import secrets
+
+path = Path("config.json")
+config = json.loads(path.read_text(encoding="utf-8"))
+api = next(node for node in config["nodes"] if node["name"] == "management-api")
+roles = {
+    "creator": ["get-user", "create-user"],
+    "editor": ["get-user", "update-user"],
+    "password-admin": ["get-user", "change-user-password"],
+}
+existing = {client["name"] for client in api["settings"]["clients"]}
+if existing.intersection(roles):
+    raise SystemExit("These example roles already exist; keep their existing tokens.")
+for name, operations in roles.items():
+    token = secrets.token_hex(32)
+    Path(name + "-token").write_text(token + "\n", encoding="ascii")
+    api["settings"]["clients"].append({"name": name, "token": token, "allow": [{
+        "config": "central", "node": "auth-db", "operations": operations
+    }]})
+path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+PY
+```
+
+Restart WaterWall with the same `core.json`. These static permissions are loaded
+at startup. API tokens are independent of traffic-user passwords and producer
+credentials; producer `allow-user-write` grants no API permission. A server
+restart invalidates old edit tokens and cursors, so take fresh reads afterward.
+
+## Read accounts and pages
+
+For an existing account, write `lookup.json` containing `{"id":"42"}` and run:
+
+```bash
+python3 "$WATERWALL_REPO/tunnels/APIServer/examples/api_client.py" \
+  --client monitor --token-file monitor-token \
+  --config central --node auth-db --operation get-user \
+  --body-file lookup.json > account.json
+```
+
+An empty database returns `not_found`; create the example account below first.
+Account IDs remain strings even when they exceed JavaScript's exact integer
+range. `get-user` returns permitted account details and a current `edit_token`,
+with credentials redacted. Server usage includes accepted reports; an offline
+AuthenticationClient may still have usage to report.
+
+For the first list page, write `list.json` containing `{"limit":50}`:
+
+```bash
+python3 "$WATERWALL_REPO/tunnels/APIServer/examples/api_client.py" \
+  --client monitor --token-file monitor-token \
+  --config central --node auth-db --operation list-users \
+  --body-file list.json > page.json
+```
+
+Inspect `page.json`. If `next_cursor` is not null, prepare the next request using
+that exact opaque value:
+
+```python
+import json
+from pathlib import Path
+
+page = json.loads(Path("page.json").read_text(encoding="utf-8"))
+if page["next_cursor"] is None:
+    raise SystemExit("Traversal complete.")
+Path("list.json").write_text(json.dumps({"limit": 50, "cursor": page["next_cursor"]}), encoding="utf-8")
+```
+
+Repeat the list command for that page. Configuration changes make earlier
+cursors stale: on `stale_cursor`, restart with `{"limit":50}`. Statistics-only
+updates leave the cursor usable, so each page can contain newer usage totals.
+The list is not a frozen usage snapshot. Summaries may abbreviate names; use
+`get-user` for full permitted details. `busy` is a bounded sampling refusal, not
+an empty list. Check the command's exit status before reading its output as a
+successful account or page; the client never retries automatically.
+
+## Create an account
+
+Choose a permanent unique numeric ID and initial password. In a private editor,
+create `create.json` with this example shape, replacing the password in the file:
+
+```json
+{"id":"42","password":"replace-in-this-private-file","config":{"name":"alice","enabled":false}}
+```
+
+Submit once:
+
+```bash
+python3 "$WATERWALL_REPO/tunnels/APIServer/examples/api_client.py" \
+  --client creator --token-file creator-token \
+  --config central --node auth-db --operation create-user \
+  --body-file create.json
+```
+
+Creation needs no edit token. The explicit `enabled:false` stages the account:
+omitted or empty `config` instead creates an enabled account with the default
+unlimited/unset limits and expiry. Consult
+[`create-user`](../../02-noderefs/AuthenticationServer.mdx#create-user) before
+choosing its policy. An existing ID returns `id_exists` and is never replaced.
+
+After a lost reply or post-dispatch timeout, retain the original ID and inputs
+and read that ID. Existence does not prove who created it or that its redacted
+password matches. If absent, explicitly decide whether to retry the same ID and
+inputs while the earlier request may still run. Do not automatically choose a
+new ID, overwrite the account, reset its password or interpret `id_exists` as
+proof of an earlier success.
+
+## Edit limits or disable an account
+
+Read the account with the editor's own token:
+
+```bash
+python3 "$WATERWALL_REPO/tunnels/APIServer/examples/api_client.py" \
+  --client editor --token-file editor-token \
+  --config central --node auth-db --operation get-user \
+  --body-file lookup.json > account.json
+```
+
+Review the result. Build a sparse patch from its sampled token; do not submit the
+complete returned account as a patch:
+
+```python
+import json
+from pathlib import Path
+
+account = json.loads(Path("account.json").read_text(encoding="utf-8"))
+request = {"id": account["user"]["id"], "if_match": account["edit_token"],
+           "patch": {"enabled": True, "limit": {"traffic": {"total": "1000000000"}}}}
+Path("update.json").write_text(json.dumps(request), encoding="utf-8")
+```
+
+```bash
+python3 "$WATERWALL_REPO/tunnels/APIServer/examples/api_client.py" \
+  --client editor --token-file editor-token \
+  --config central --node auth-db --operation update-user \
+  --body-file update.json
+```
+
+To disable the account later, repeat the fresh read and use
+`"patch": {"enabled": false}` instead. Omitted fields remain unchanged. This
+operation preserves usage, first-use history and credentials. The
+[`update-user` reference](../../02-noderefs/AuthenticationServer.mdx#update-user)
+lists editable fields and their units; storing a limit does not make every
+traffic node enforce it.
+
+An edit token covers the server instance and server-wide configuration revision.
+Another account's edit, creation or password change can invalidate it. A node
+`conflict` means this invocation did not commit: reread and reconsider the patch.
+A lost reply, invalid reply or late gateway timeout leaves the outcome unknown.
+Reread and compare intended values, including normalized values where relevant,
+before deciding whether another patch is appropriate. Never automatically fetch
+a new token and replay the old patch.
+
+## Change an account password
+
+The password administrator first obtains a current token with its own permission:
+
+```bash
+python3 "$WATERWALL_REPO/tunnels/APIServer/examples/api_client.py" \
+  --client password-admin --token-file password-admin-token \
+  --config central --node auth-db --operation get-user \
+  --body-file lookup.json > account.json
+```
+
+In a private editor create `password-change.json` with exactly `id`, the returned
+`edit_token` as `if_match`, and the desired `password`. Keep the chosen secret in
+that file rather than command arguments or shell history:
+
+```json
+{"id":"42","if_match":"copy-the-current-edit-token-here","password":"replace-in-this-private-file"}
+```
+
+```bash
+python3 "$WATERWALL_REPO/tunnels/APIServer/examples/api_client.py" \
+  --client password-admin --token-file password-admin-token \
+  --config central --node auth-db --operation change-user-password \
+  --body-file password-change.json
+```
+
+The operation changes credentials together while preserving the account ID,
+configuration, usage, first-use history and runtime reservations. Exact password
+bytes matter. UUID-shaped passwords have additional identity semantics; read
+[`change-user-password`](../../02-noderefs/AuthenticationServer.mdx#change-user-password)
+before changing an account used by UUID-based protocols. Assigning the same
+password still requires a current token and advances the configuration revision.
+
+After an uncertain reply, retain the intended password securely and reread for a
+current token. Public reads cannot prove which password is installed: neither
+account existence nor an advanced revision proves that this request succeeded.
+Explicitly decide whether to resubmit the desired password with the fresh token.
+A successful resubmission establishes that password at its commit point. A
+conflict requires another read and decision. The client does not refresh tokens,
+retry writes or generate a replacement password automatically; the server keeps
+no request retry records.
+
+## What a successful write confirms
+
+The compact acknowledgement contains `id`, the transaction's `config_revision`
+and its `edit_token`. It confirms an in-memory commit, not a disk save or client
+refresh. Periodic/final saving and normal synchronization continue separately;
+crash recovery is outside this API workflow.
+
+Disconnected AuthenticationClients keep cached users, credentials and policy
+until a valid refresh. A password change does not force existing connections to
+disconnect, and changing policy does not guarantee immediate enforcement on an
+offline client. Traffic accounting continues through ordinary synchronization.
+
+A returned node-operation failure means that invocation did not commit. It says
+nothing about an earlier request whose reply was lost. Request IDs only correlate
+responses. See the [protocol's error and delivery rules](../../05-devguides/api/protocol.mdx)
+when integrating these workflows into another administration program.

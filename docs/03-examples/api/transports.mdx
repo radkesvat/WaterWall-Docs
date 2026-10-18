@@ -1,0 +1,176 @@
+---
+sidebar_position: 3
+title: "API transports"
+sidebar_label: "TCP, HTTP, and reliable UDP"
+description: "Carry the same framed API protocol over TCP, HTTP/1.1 bodies, or TcpOverUdp."
+---
+
+# API transports
+
+APIServer consumes an ordered reliable byte stream. Every transport carries the
+same [API frames](../../05-devguides/api/protocol.mdx): a four-byte big-endian
+length followed by that many JSON envelope bytes. The length marks a message;
+the transport supplies delivery and ordering.
+
+The configurations below adapt the complete [local client example](client.mdx).
+Keep its `auth-db`, `management-api`, tokens and `core.json`. Node fragments here
+are additions or replacements inside that example's `nodes` array, not separate
+complete configurations. Stop the demo cleanly before editing and restart after
+each transport change.
+
+## Direct TCP
+
+The initial example already uses:
+
+```text
+Python client -> TcpListener -> APIServer
+```
+
+The listener binds `127.0.0.1:9080` and its `next` is `management-api`. Run the
+unchanged client command from the [first example](client.mdx#read-the-server-status).
+TCP reads may split prefixes and bodies or combine multiple frames; a client
+must assemble the exact prefix and body lengths.
+
+## HTTP/1.1 body tunnel
+
+Change `api-listener.next` to `http-body`, then add this node:
+
+```json
+{
+  "name": "http-body",
+  "type": "HttpServer",
+  "settings": {
+    "http-version": "1.1",
+    "http1-mode": "single",
+    "upgrade": false,
+    "path": "/management",
+    "method": "POST"
+  },
+  "next": "management-api"
+}
+```
+
+The chain becomes:
+
+```text
+HTTP caller -> TcpListener -> HttpServer -> APIServer
+```
+
+Place complete framed API bytes in the HTTP request body, using `Content-Length`
+or valid HTTP chunked encoding. `HttpServer` validates its configured method and
+path, then forwards body bytes. API authentication remains inside each JSON
+envelope; HTTP headers and URLs do not become API selectors or operation bodies.
+This is a body tunnel, not REST routing or per-operation HTTP status codes.
+
+The response body is chunked in this HTTP/1.1 setup. Dechunk it before reading
+the API length. One HTTP chunk is not one API frame. Read the four-byte API
+prefix and exactly its declared body bytes; do not wait for HTTP EOF or a final
+zero-length chunk. Single mode keeps the tunnel alive after the request body
+ends.
+
+The generic `api_client.py` speaks direct TCP only and does not construct HTTP
+requests. For a single status request over this HTTP configuration, the standard
+library's `http.client` handles the HTTP headers and dechunking:
+
+```python
+import http.client
+import json
+from pathlib import Path
+import struct
+
+def exact(body, length):
+    data = bytearray()
+    while len(data) < length:
+        part = body.read(length - len(data))
+        if not part:
+            raise RuntimeError("HTTP body ended before the API frame was complete")
+        data.extend(part)
+    return bytes(data)
+
+request_id = "http-status-1"
+envelope = {
+    "id": request_id,
+    "auth": {"client": "monitor", "token": Path("monitor-token").read_text(encoding="ascii").strip()},
+    "selector": {"config": "central", "node": "auth-db"},
+    "operation": "status", "content_type": "application/json",
+    "body_encoding": "utf8", "body": "{}"
+}
+payload = json.dumps(envelope, separators=(",", ":")).encode("utf-8")
+frame = struct.pack("!I", len(payload)) + payload
+connection = http.client.HTTPConnection("127.0.0.1", 9080, timeout=10)
+try:
+    connection.request("POST", "/management", body=frame,
+                       headers={"Content-Type": "application/octet-stream"})
+    response = connection.getresponse()
+    if response.status != 200:
+        raise RuntimeError("HTTP tunnel request was rejected")
+    length = struct.unpack("!I", exact(response, 4))[0]
+    if not 0 < length <= 1024 * 1024:
+        raise RuntimeError("API response exceeded the client limit")
+    reply = json.loads(exact(response, length).decode("utf-8"))
+    if reply["id"] != request_id or reply["error"] is not None:
+        raise RuntimeError("API correlation or gateway error")
+    result = reply["result"]
+    if result["body_encoding"] != "utf8":
+        raise RuntimeError("Unexpected status response encoding")
+    print(result["body"])
+    if result["code"] != 0:
+        raise SystemExit(1)
+finally:
+    connection.close()
+```
+
+Run the snippet from `api-demo` after switching the configuration. It reads one
+reply and closes its connection without an automatic retry. For HTTP modes and
+their separate settings, consult [HttpServer](../../02-noderefs/HttpServer.mdx).
+
+## Reliable stream over UDP
+
+Direct `UdpListener -> APIServer` is unsupported. A length prefix does not
+recover lost datagrams, reorder them, or reassemble a reliable response larger
+than one datagram. Use the existing paired nodes:
+
+```text
+TCP caller -> TcpListener -> TcpOverUdpClient -> UdpConnector
+                                                |
+                                           UDP transport
+                                                |
+                       APIServer <- TcpOverUdpServer <- UdpListener
+```
+
+Starting again from the direct TCP example, replace `api-listener` with these
+five nodes. Leave `auth-db` and `management-api` in the same `nodes` array:
+
+```json
+[
+  {"name":"api-listener","type":"TcpListener",
+   "settings":{"address":"127.0.0.1","port":9080},"next":"reliable-client"},
+  {"name":"reliable-client","type":"TcpOverUdpClient","next":"udp-out"},
+  {"name":"udp-out","type":"UdpConnector",
+   "settings":{"address":"127.0.0.1","port":9081}},
+  {"name":"udp-in","type":"UdpListener",
+   "settings":{"address":"127.0.0.1","port":9081},"next":"reliable-server"},
+  {"name":"reliable-server","type":"TcpOverUdpServer","next":"management-api"}
+]
+```
+
+Remove the HTTP node if adapting the HTTP variant instead, so it is not left
+unchained.
+
+The Python client still connects to local TCP port 9080 with the same command.
+It does not implement UDP, KCP or FEC. `TcpOverUdpClient` and `TcpOverUdpServer`
+carry and reconstruct the stream; APIServer's four-byte prefix is still needed
+to distinguish complete API messages within it.
+
+Both sides run in one process over loopback here so the example is self-contained.
+For separate machines, put the TCP listener, reliable client and UDP connector
+on the caller side, and the UDP listener, reliable server, APIServer and target
+database on the server side. Change addresses appropriately. Logical API
+selectors refer to configurations loaded on the server. Match FEC settings when
+enabling FEC; see [TcpOverUdpClient](../../02-noderefs/TcpOverUdpClient.mdx) and
+[TcpOverUdpServer](../../02-noderefs/TcpOverUdpServer.mdx) for tuning and MTU rules.
+
+These examples provide no transport encryption. Keep the local examples on
+loopback and use an appropriately protected transport for remote access. The
+same gateway resource limits, deadlines and uncertain-write rules apply to
+every composition.

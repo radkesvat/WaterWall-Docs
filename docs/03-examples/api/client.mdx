@@ -1,0 +1,134 @@
+---
+sidebar_position: 1
+title: "Run the API client"
+sidebar_label: "Run the API client"
+description: "A complete loopback APIServer configuration and the generic Python client."
+---
+
+# Run the API client
+
+This example exposes an empty AuthenticationServer database through a local
+APIServer and reads its status. It uses the standard-library Python client at
+[`tunnels/APIServer/examples/api_client.py`](https://github.com/radkesvat/WaterWall/blob/main/tunnels/APIServer/examples/api_client.py)
+in the WaterWall source checkout.
+
+The chain is `TcpListener -> APIServer`. The gateway invokes the separately
+configured `AuthenticationServer` through its registered API; the database node
+is not the next node in that chain. No AuthenticationClient or producer-protocol
+listener is needed for this example.
+
+## Create a local configuration
+
+Start in the WaterWall repository root. Use a new directory so the example does
+not replace an existing database:
+
+```bash
+export WATERWALL_REPO="$(pwd)"
+umask 077
+mkdir api-demo
+cd api-demo
+```
+
+Generate the configuration and an independent random operator token:
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+import secrets
+
+token = secrets.token_hex(32)
+Path("monitor-token").write_text(token + "\n", encoding="ascii")
+Path("users.json").write_text('{"users":[]}\n', encoding="utf-8")
+core = {"misc": {"workers": 1, "try-enabling-bbr": False}, "configs": ["config.json"]}
+config = {
+    "name": "central",
+    "nodes": [
+        {"name": "auth-db", "type": "AuthenticationServer", "settings": {
+            "db-path": "users.json", "file-save-rate-ms": 60000,
+            "auth-clients": [{"name": "reserved-producer", "secret": secrets.token_hex(32)}]
+        }},
+        {"name": "api-listener", "type": "TcpListener", "settings": {
+            "address": "127.0.0.1", "port": 9080
+        }, "next": "management-api"},
+        {"name": "management-api", "type": "APIServer", "settings": {
+            "clients": [{"name": "monitor", "token": token, "allow": [{
+                "config": "central", "node": "auth-db",
+                "operations": ["status", "get-user", "list-users"]
+            }]}]
+        }}
+    ]
+}
+for filename, value in (("core.json", core), ("config.json", config)):
+    Path(filename).write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+PY
+```
+
+`AuthenticationServer` requires a nonempty `auth-clients` setting. The reserved
+producer above has no permissions and no network listener. Its secret is separate
+from the API operator token and cannot authenticate an API request.
+
+Run WaterWall from this directory, using your installed executable or the existing
+Linux build:
+
+```bash
+"$WATERWALL_REPO/build/linux/Release/Waterwall" --config:core.json
+```
+
+Paths in `core.json` and `db-path` are relative to the process working directory.
+See the [startup configuration guide](../../01-getting-started/tutorial-part1.mdx)
+for other executable and configuration locations. The listener is local only;
+APIServer authenticates requests but does not encrypt the transport.
+
+## Read the server status
+
+In another terminal, enter `api-demo` and set `WATERWALL_REPO` to your checkout's
+absolute path. Run:
+
+```bash
+python3 "$WATERWALL_REPO/tunnels/APIServer/examples/api_client.py" \
+  --host 127.0.0.1 --port 9080 \
+  --client monitor --token-file monitor-token \
+  --config central --node auth-db --operation status
+```
+
+The client sends `{}` as the default node body, reads one complete framed reply,
+and writes the decoded node-result body to stdout. An empty database reports
+`user_count: "0"`. The [AuthenticationServer reference](../../02-noderefs/AuthenticationServer.mdx#status)
+defines the complete result; values such as counts and revisions are decimal
+strings. Credentials are omitted from public results.
+
+The selector uses the configuration's logical name `central`, not the filename
+`config.json`. Omitting `--config` works only when the node name is unique across
+all loaded configurations. Using the qualified selector keeps the target explicit.
+
+## Supply tokens and request bodies
+
+Tokens may come from a file or an environment variable. For the latter:
+
+```bash
+export WATERWALL_API_TOKEN="$(cat monitor-token)"
+python3 "$WATERWALL_REPO/tunnels/APIServer/examples/api_client.py" \
+  --client monitor --token-env WATERWALL_API_TOKEN \
+  --config central --node auth-db --operation status
+```
+
+The default host and port are `127.0.0.1:9080`. Token contents are never supplied
+as a command-line option. `--body-file` supplies the node's request bytes; with the
+default `--body-encoding utf8` they must be UTF-8 without NUL. Use
+`--body-encoding base64` for a registered operation that accepts arbitrary bytes.
+The client reads the file and performs base64 encoding itself. Select the
+operation's registered content type with `--content-type`; its default is
+`application/json`.
+
+The client validates response framing and correlation ID and makes exactly one
+attempt. It does not automatically retry reads or writes. Conditional edits and
+password changes print conflict or uncertain-outcome guidance when applicable.
+The outer request ID correlates replies and does not deduplicate operations.
+
+Continue with [authentication account workflows](authentication-users.mdx) or
+[HTTP and reliable UDP transport](transports.mdx). The
+[API protocol guide](../../05-devguides/api/protocol.mdx) describes framing,
+envelopes and errors for developers writing another client; the
+[APIServer reference](../../02-noderefs/APIServer.mdx) owns gateway settings and
+resource limits.

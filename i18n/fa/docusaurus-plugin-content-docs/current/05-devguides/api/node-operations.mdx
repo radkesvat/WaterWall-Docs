@@ -1,0 +1,208 @@
+---
+sidebar_position: 2
+title: "پیاده‌سازی operationهای API در node"
+sidebar_label: "operationهای node"
+description: "ثبت handlerهای همگام node با قرارداد صریح worker، مالکیت، بودجه و چرخهٔ عمر."
+---
+<!--
+Documentation version: 1
+Sync note: Keep synchronized with the English node API implementation guide.
+-->
+
+# پیاده‌سازی operationهای API در node
+
+node با ثبت operationهای نام‌دار، API خود را ارائه می‌کند. APIServer envelope را
+احراز هویت و مجوزسنجی می‌کند، هدف را پیدا می‌کند و body decodeشده را به handler
+ثبت‌شده می‌دهد. schema بدنه و رفتار آن مسئولیت node هدف است. افزودن operation
+لینک تازه‌ای به زنجیرهٔ تونل اضافه نمی‌کند و به node جدید APIClient نیاز ندارد.
+
+برای مدل runtime و worker، [بخش ۱](../doc1.mdx)، برای قرارداد handlerهای محدود،
+[بخش ۵](../part5-tunnel-anatomy.mdx) و برای چرخهٔ عمر API هنگام shutdown،
+[بخش ۷](../part7-shutdown-and-signals.mdx) را بخوانید. این صفحه قراردادها را به
+نقطه‌های ورود پیاده‌سازی مرتبط می‌کند و جایگزین آن‌ها نیست. بایت‌های رابط بیرونی
+در [پروتکل API](./protocol.mdx) تعریف شده‌اند.
+
+## نقشهٔ سورس
+
+مسیرهای زیر نسبت به ریشهٔ مخزن سورس WaterWall هستند.
+
+| سورس | مسئولیت |
+| --- | --- |
+| `ww/api/node_api.h` و `node_api.c` | descriptor عملیات، context handler، ثبت در startup و پذیرش سراسری. |
+| `ww/api/dispatcher.h` و `dispatcher.c` | jobهای جداشده با reservation، اجرا روی worker انتخاب‌شده و completion روی worker مالک. |
+| `ww/managers/node_manager.c` | حل هدف عمومی، freeze هنگام startup و بستن پذیرش سراسری. |
+| `tunnels/APIServer/` | تجزیهٔ envelope، احراز هویت/مجوز اپراتور، framing، محدودیت و تحویل به session. |
+| `tunnels/AuthenticationClient/instance/api.c` | نمونهٔ موجود status که به worker صفر محدود است. |
+| `tunnels/AuthenticationServer/instance/api.c`، `api/` و `common/` | نمونهٔ عملیات روی worker فراخوان، با parsing، snapshot/transaction و rendering جدا. |
+
+پیاده‌سازی‌های واقعی را به‌عنوان مثال بخوانید و با قرارداد تطبیق دهید. callback
+قدیمی `TunnelApi` خودکار operation عمومی ثبت نمی‌کند.
+
+## ثبت جدول immutable عملیات
+
+descriptor زیر شکل ثبت را نشان می‌دهد؛ `exampleStatus` handler خود node است:
+
+```c
+static const node_api_operation_t operations[] = {
+    {
+        .name = "status",
+        .handler = exampleStatus,
+        .read_only = true,
+        .request_content_type = "application/json",
+        .response_content_type = "application/json",
+        .response_encoding = kNodeApiEncodingUtf8,
+        .execution = kNodeApiCallingWorker,
+    },
+};
+
+bool registered = nodeApiRegister(t, operations, sizeof(operations) / sizeof(operations[0]));
+```
+
+در startup و پس از ساخت state مورد نیاز handler ثبت کنید. شکست ثبت را با مسیر
+cleanup سازندهٔ همان node مدیریت کنید. nodeهای احراز هویت موجود در
+`instance/create.c` ثبت می‌کنند. نام operationها باید در جدول یکتا، غیرخالی و
+حداکثر ۶۴ بایت باشد؛ نوع محتوای درخواست و پاسخ غیرخالی و حداکثر ۱۲۸ بایت است.
+handler، encoding و سیاست اجرا باید معتبر باشند. node نمی‌تواند روی ثبت موجود،
+جدول دومی ثبت کند.
+
+registry، descriptorها و رشته‌هایشان را قرض می‌گیرد. تا `nodeApiUnregister(t)`،
+از جمله هنگام rollback راه‌اندازی، آن‌ها را immutable و زنده نگه دارید. جدول
+static انتخاب ساده‌ای است. NodeManager پیش از شروع کار عادی configها را آماده
+و registry را freeze می‌کند؛ ثبت API سازوکار تغییر حین اجرا نیست. پس از پایان
+callbackها، پیش از آزادکردن هدف unregister کنید.
+
+`read_only` عملیات را توصیف می‌کند و مجوز نمی‌دهد. هر operation عمومی همچنان به
+مجوز دقیق config/node/operation در APIServer نیاز دارد. تغییرها را writable
+اعلام کنید و مجوز مستقل آن‌ها را در صورت نیاز مستند کنید.
+
+## انتخاب event worker
+
+| سیاست اجرا | کاربرد |
+| --- | --- |
+| `kNodeApiCallingWorker` | اجرا روی event worker مالک اتصال؛ state مشترک به synchronization خود نیاز دارد. |
+| `kNodeApiSpecifiedWorker` همراه `wid` | اجرا روی event worker معتبر مشخصی که مالک state عملیات است. |
+
+AuthenticationServer روی worker فراخوان با lockهای صریح اجرا می‌شود.
+AuthenticationClient برای status، worker صفر را انتخاب می‌کند و از مالکیت state
+محلی موجود پیروی می‌کند. handler همیشه روی event worker انتخاب‌شده همگام اجرا
+می‌شود، حتی اگر dispatch و completion با job صف‌شده انجام شوند. باید نتیجهٔ کامل
+را برگرداند؛ امضای handler callback تکمیل asynchronous ندارد.
+
+در این context تثبیت‌شده، از helperهای بررسی‌شدهٔ worker مانند
+`getCurrentEventWorkerBufferPool()` استفاده کنید. با worker ID خام، pool مربوط
+به worker دیگر را قرض نگیرید. راهنمای انتخاب worker context در
+[بخش ۱](../doc1.mdx) آمده است.
+
+## ورودی handler، context و مالکیت نتیجه
+
+```c
+api_result_t exampleStatus(tunnel_t *target, sbuf_t *message,
+                          const node_api_call_context_t *context);
+```
+
+در این امضا line اتصال وجود ندارد. line عادی APIServer همچنان از adapter منبع
+قرض گرفته شده است؛ handler هدف مالک آن نیست، آن را نابود نمی‌کند و برای تحویل
+پاسخ API، callback تونل نمی‌فرستد.
+
+| مقدار | قرارداد |
+| --- | --- |
+| `message` | buffer عادی و owned درخواست از pool همان event worker انتخاب‌شده. در تمام مسیرهای موفقیت و شکست مصرفش کنید. |
+| `context->operation` | نام قرض‌گرفته‌شدهٔ operation ثبت‌شده. |
+| `context->principal` | نام قرض‌گرفته‌شدهٔ client احرازشدهٔ API؛ رمز کاربر ترافیک یا credential تولیدکننده نیست. |
+| `context->deadline_ms` | deadline مطلق monotonic، قابل مقایسه با `nodeApiNowMs()`. |
+| `context->max_response_body_size` | بیشینهٔ بایت خام body نتیجه که dispatcher می‌پذیرد. |
+| `context->working_memory_allowance` | allowance رزروشده برای حافظهٔ محدود موقت و نتیجهٔ handler. |
+| `api_result_t` بازگشتی | `kApiResultOk` یا `kApiResultError`، همراه buffer عادی و owned اختیاری نتیجه از pool همان worker. |
+
+مقدارهای قرضی context پس از return معتبر نیستند. view تجزیه‌شده‌ای که از `message`
+قرض می‌گیرد نباید پس از آزادشدن آن باقی بماند. وقتی ورودی دیگر لازم نیست، آن را
+از طریق pool worker انتخاب‌شده recycle کنید. بازگرداندن buffer مالکیتش را به
+ dispatcher منتقل می‌کند؛ پس از آن نه recycle کنید و نه نگهش دارید. dispatcher
+بایت‌های بازگشتی را برای completion بین workerها کپی می‌کند و نتیجه را با pool
+اصلی‌اش recycle می‌کند. نتیجهٔ null به معنی body خالی است.
+
+descriptor پاسخ، encoding را تعیین می‌کند. نتیجهٔ UTF-8 باید UTF-8 معتبر و بدون
+NUL باشد؛ برای بایت دودویی دلخواه، `kNodeApiEncodingBase64` را انتخاب کنید. در هر
+دو حالت بایت خام body را برگردانید؛ gateway escaping یا base64 envelope را انجام
+می‌دهد. پاسخ gateway از قبل frameشده برنگردانید.
+
+## محدودکردن parsing و کار پیش از دست‌زدن به state مشترک
+
+gateway فقط envelope بیرونی را بررسی می‌کند. فیلدها، typeها، نمایش عددی، اندازهٔ
+body، عمق و تعداد مقدارهای پذیرفته‌شدهٔ node را تعریف و مستند کنید. handlerهای
+JSON موجود از `configLexicalParseBounded()` استفاده می‌کنند تا ورودی خراب را
+پیش از ساخت درخت نامحدود رد کنند. هرجا قرارداد لازم دارد، بایت دقیق ورودی را
+حفظ کنید.
+
+پیش از تخصیص، charge حافظه و هم‌پوشانی طول عمرها را حساب کنید: درخت parseشده،
+آماده‌سازی owned، snapshot، scratch موقت، رشد index در صورت وجود و تخصیص واقعی
+نتیجه در pool. body منطقی کوچک می‌تواند tier بزرگ‌تری از pool را اشغال کند؛
+`bufferpoolQueryBestFit()` charge واقعی را می‌دهد. محاسبهٔ checked و scan محدود
+نمی‌گذارد اندازهٔ بیرونی به overflow یا کار نامحدود تبدیل شود. dispatcher حافظهٔ
+جداشدهٔ درخواست و buffer درخواست را جداگانه حساب می‌کند.
+
+اطراف مرحله‌های محدود و پیش از تغییر برگشت‌ناپذیر deadline را بررسی کنید.
+ dispatcher پیش از فراخوانی handler پذیرش و deadline را بررسی می‌کند و هنگام
+تحویل دوباره deadline را می‌سنجد، اما نمی‌تواند handler همگام را preempt کند.
+پس timeout اعلام‌شده اجازهٔ مسدودکردن نامحدود event worker یا نادیده‌گرفتن
+allowance نیست. امتناع مورد انتظار بودجه، هندسه یا I/O خطای عادی می‌ماند؛ OOM
+heap از سیاست fatal پروژه پیروی می‌کند.
+
+برای خواندن state مشترک، فقط مقدارهای مجاز و owned را زیر ترتیب lock موجود کپی
+کنید و پس از unlock render کنید. APIهای خواندن AuthenticationServer lock را
+nonblocking می‌گیرند و در contention، `busy` می‌دهند. نمای عمومی نباید object
+persistence حاوی credential را serialize کند و بعد سعی کند secretها را حذف کند.
+
+برای نوشتن، مرز precommit محدود تعریف کنید: validate و prepare، گرفتن lockهای
+لازم، بررسی conflict و یکتایی و پذیرش/render پاسخ موفق پیش از انتشار state.
+تغییرهای احراز هویت موجود سپس commit غیرقابل‌شکست انجام می‌دهند و ACK همان
+تراکنش را برمی‌گردانند. snapshot تازه نمی‌گیرند، پس از commit خطای deadline
+برنمی‌گردانند و به‌خاطر قطع client rollback نمی‌کنند. قواعد دقیق حساب، index و
+revision در [بخش ۵](../part5-tunnel-anatomy.mdx) و
+[مرجع AuthenticationServer](../../02-noderefs/AuthenticationServer.mdx) باقی می‌مانند.
+
+## استفاده از مالکیت موجود dispatch و shutdown
+
+پیاده‌سازی عادی operation node به صف job جداگانه نیاز ندارد. APIServer با
+`nodeApiJobCreate()` بایت‌های درخواست/principal را کپی و ظرفیت کار/نتیجه را رزرو
+می‌کند. job به‌جای line یا اشاره‌گر session محلی مالک، tokenهای پایدار session و
+request دارد. `nodeApiJobSubmit()` همیشه صف می‌کند، حتی روی همان worker؛ cleanup
+امتناع submit می‌تواند همان‌جا اجرا شود.
+
+completion روی event worker مالک اتصال اجرا می‌شود. فقط همان worker session
+هنوز زنده را resolve می‌کند و نتیجه را می‌فرستد. session منقضی یا قطع‌شده
+می‌تواند هنگام اجرای handler، job را abandon کند؛ charge job تا پایان اجرا باقی
+می‌ماند. cancellation می‌تواند مالکیت synchronized job را آزاد کند، اما نمی‌تواند
+به state مخصوص مالک session دست بزند یا callback جایگزین بفرستد.
+
+NodeManager پیش از hookهای quiesce هدف‌ها، پذیرش سراسری API را می‌بندد. jobهای
+صف‌شده پیش از اجرا پذیرش را بررسی می‌کنند؛ job ردشده پس از بسته‌شدن نمی‌تواند
+تغییری ایجاد کند. handlerهای محدود که قبلاً پذیرفته شده‌اند، پیش از quiesce
+شدن worker انتخاب‌شده تمام می‌شوند. registry، هدف، pool و domain باید تا پایان
+تمام jobها و completionهای قابل دسترس زنده بمانند. ترتیب کامل
+[shutdown در بخش ۷](../part7-shutdown-and-signals.mdx) را حفظ کنید و برای هر
+operation سازوکار shutdown جدا نسازید.
+
+تحویل از commit جداست. timeout gateway یا completion رهاشده می‌تواند تغییر موفق
+را پنهان کند. روش بازیابی مختص operation را مستند کنید و از نبود تحویل نتیجهٔ
+rollback نگیرید؛ ID بیرونی درخواست برچسب همبستگی است، نه رکورد replay.
+
+## سازمان‌دهی و بررسی operation
+
+ثبت را در `instance/api.c` نگه دارید. وقتی operation بزرگ شد، parsing درخواست،
+تطبیق/render handler و transaction مشترک را مانند فایل‌های `api/` و `common/`
+در AuthenticationServer جدا کنید. به‌جای دسترسی gateway به index خصوصی collection،
+از تغییرهای object layer استفاده کنید. نام function، type و macro خصوصی در
+فایل‌هایی که unity build کنار هم کامپایل می‌کند باید متمایز باشد. callbackهای
+upstream/downstream چیدمان عادی تونل را حفظ می‌کنند.
+
+schema operation را در مرجع node هدف مستند کنید و به‌جای تکرار envelope، به
+پروتکل مشترک لینک بدهید. مثال‌های اجرایی client در مخزن سورس WaterWall می‌مانند؛
+[آموزش کلاینت](../../03-examples/api/client.mdx) به فایل canonical اشاره می‌کند.
+
+از پوشش API ثبت‌شده و laneهای اعتبارسنجی [بخش ۶](../part6-build-test-review.mdx)
+استفاده کنید. ورودی سخت‌گیرانه و سقف‌ها، مجوز دقیق، حفظ state هنگام امتناع، رفتار
+worker انتخاب‌شده، contention و گم‌شدن پاسخ اطراف مرز commit را تست کنید.
+هرجا مجوز و framing مهم‌اند، gateway واقعی را پوشش دهید؛ تست مستقیم handler
+به‌تنهایی این ویژگی‌ها را ثابت نمی‌کند. تغییر state مشترک یا چرخهٔ عمر همچنان
+به اعتبارسنجی گسترده‌تر تعریف‌شده در بخش ۶ نیاز دارد.

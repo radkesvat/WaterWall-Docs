@@ -1,0 +1,219 @@
+---
+sidebar_position: 2
+title: "Implementing node API operations"
+sidebar_label: "Node operations"
+description: "Registering synchronous node handlers with explicit worker, ownership, budget, and lifecycle contracts."
+---
+<!--
+Documentation version: 1
+Sync note: Keep synchronized with the Persian node API implementation guide.
+-->
+
+# Implementing node API operations
+
+A node exposes an API by registering named operations. APIServer authenticates
+and authorizes the envelope, resolves the target, and dispatches the decoded
+body to its registered handler. The target owns its body schema and behavior.
+Adding an operation does not add a tunnel-chain link or require a new APIClient
+node.
+
+Read [Part 1](../doc1.mdx) for the runtime and worker model,
+[Part 5's API boundary contracts](../part5-tunnel-anatomy.mdx#apiserver-and-public-operation-boundaries)
+for bounded handlers, and
+[Part 7's API lifecycle contracts](../part7-shutdown-and-signals.mdx#registered-api-admission-and-detached-jobs)
+for shutdown. This page connects those contracts to the implementation entry
+points; it does not replace them. Client-facing bytes are defined by the
+[API protocol](./protocol.mdx).
+
+## Source map
+
+Paths below are relative to the WaterWall source repository.
+
+| Source | Responsibility |
+| --- | --- |
+| `ww/api/node_api.h` and `node_api.c` | Operation descriptors, handler context, startup registration, and global admission. |
+| `ww/api/dispatcher.h` and `dispatcher.c` | Reserved detached jobs, selected-worker execution, and owner-worker completion. |
+| `ww/managers/node_manager.c` | Public target resolution, startup freeze, and global admission closure. |
+| `tunnels/APIServer/` | Envelope parsing, operator authentication/permissions, framing, limits, and session delivery. |
+| `tunnels/AuthenticationClient/instance/api.c` | Existing status operation confined to worker 0. |
+| `tunnels/AuthenticationServer/instance/api.c`, `api/`, and `common/` | Existing calling-worker operations with separate parsing, snapshots/transactions, and rendering. |
+
+Use the real implementations as examples and check them against the contracts.
+The historical `TunnelApi` callback does not automatically register a public
+operation.
+
+## Register an immutable operation table
+
+The following descriptor shape illustrates registration; `exampleStatus` is the
+node's own handler:
+
+```c
+static const node_api_operation_t operations[] = {
+    {
+        .name = "status",
+        .handler = exampleStatus,
+        .read_only = true,
+        .request_content_type = "application/json",
+        .response_content_type = "application/json",
+        .response_encoding = kNodeApiEncodingUtf8,
+        .execution = kNodeApiCallingWorker,
+    },
+};
+
+bool registered = nodeApiRegister(t, operations, sizeof(operations) / sizeof(operations[0]));
+```
+
+Register during startup after constructing the state the handler needs, and
+handle registration failure through the node's existing construction cleanup.
+Existing authentication nodes register in `instance/create.c`. Operation names
+must be unique within the table, nonempty, and at most 64 bytes; request and
+response content types are nonempty and at most 128 bytes. Handler, encoding,
+and execution policy must be valid. A node cannot register a second table over
+an existing registration.
+
+The registry borrows the descriptors and their strings. Keep them immutable and
+alive until `nodeApiUnregister(t)`, including during startup rollback. Static
+tables are convenient. NodeManager prepares configurations and freezes the
+registry before starting normal operation; registration is not a runtime update
+mechanism. Unregister before freeing the target after its callbacks have settled.
+
+`read_only` describes the operation; it does not grant access. Every public
+operation still needs an exact APIServer configuration/node/operation permission.
+Mark mutations writable and document their permission separately where needed.
+
+## Choose the event worker
+
+| Execution policy | Use |
+| --- | --- |
+| `kNodeApiCallingWorker` | Run on the connection owner's event worker. Shared state must have its own synchronization. |
+| `kNodeApiSpecifiedWorker` with `wid` | Run on a particular valid event worker that owns the operation's state. |
+
+AuthenticationServer uses calling-worker execution and explicit locks.
+AuthenticationClient status selects worker 0 and follows its existing local
+state ownership. A handler always runs synchronously on the chosen event worker,
+even though dispatch and completion use queued jobs. It must return a complete
+result; the handler signature provides no asynchronous completion callback.
+
+Use checked worker helpers, such as `getCurrentEventWorkerBufferPool()`, in that
+established context. Do not use a raw worker ID to borrow another worker's pool.
+See [Choosing a Worker-Context Helper](../doc1.mdx#choosing-a-worker-context-helper).
+
+## Handler inputs, context, and result ownership
+
+```c
+api_result_t exampleStatus(tunnel_t *target, sbuf_t *message,
+                          const node_api_call_context_t *context);
+```
+
+The signature has no connection line. APIServer's normal line remains borrowed
+from its source adapter; a target handler does not own or destroy that line and
+does not send tunnel callbacks to deliver its API response.
+
+| Value | Contract |
+| --- | --- |
+| `message` | Owned ordinary request buffer from the selected event worker's pool. Consume it on every success and failure path. |
+| `context->operation` | Borrowed registered operation name. |
+| `context->principal` | Borrowed authenticated API client name; it is not a traffic-user password or producer credential. |
+| `context->deadline_ms` | Absolute monotonic deadline, comparable with `nodeApiNowMs()`. |
+| `context->max_response_body_size` | Maximum raw result-body bytes accepted by the dispatcher. |
+| `context->working_memory_allowance` | Reserved allowance for the handler's bounded temporary and result storage. |
+| Returned `api_result_t` | `kApiResultOk` or `kApiResultError`, plus an optional owned ordinary result buffer from the same worker's pool. |
+
+Borrowed context values expire on return. Parsed views borrowing `message` must
+not survive its release. Recycle locally owned input through the selected
+worker's pool once it is no longer needed. Returning a buffer transfers its
+ownership to the dispatcher; do not recycle or retain that buffer afterward.
+The dispatcher copies the returned bytes for cross-worker completion and
+recycles the result through its original pool. A null result buffer represents
+an empty body.
+
+The response descriptor determines encoding. A UTF-8 result must contain valid
+UTF-8 with no NUL; choose `kNodeApiEncodingBase64` for arbitrary binary bytes.
+Return raw body bytes in either case: the gateway performs envelope escaping or
+base64 encoding. Do not return an already framed gateway response.
+
+## Bound parsing and work before touching shared state
+
+The gateway validates only its outer envelope. Define and document the node's
+own accepted fields, types, numeric representation, body size, nesting, and
+value-count limits. For JSON operations, existing handlers use
+`configLexicalParseBounded()` to reject malformed input before constructing an
+unbounded tree. Preserve exact input bytes where the operation requires them.
+
+Calculate allocation charges and overlapping lifetimes before allocating:
+parsed trees, owned preparation, snapshots, temporary scratch, index growth
+where applicable, and the actual result-pool allocation. A small logical body
+can occupy a larger pool tier; `bufferpoolQueryBestFit()` supplies its real
+charge. Checked arithmetic and bounded scans keep external sizes from becoming
+overflow or unbounded work. The dispatcher accounts separately for its detached
+request storage and request buffer.
+
+Check deadlines around bounded phases and before an irreversible mutation.
+The dispatcher checks admission and deadline before invoking a handler and
+checks deadline again at delivery, but it cannot preempt a synchronous handler.
+A declared timeout is therefore not permission to block the event worker
+indefinitely or ignore working allowances. Expected budget/geometry/I/O
+refusals remain ordinary errors; heap OOM follows the project's fatal policy.
+
+For shared reads, copy only permitted owned values under the established lock
+order and render after unlocking. The AuthenticationServer read APIs use
+nonblocking acquisition and return `busy` on contention. Public views must not
+serialize credential-bearing persistence objects and then try to redact them.
+
+For writes, define a finite precommit boundary: validate and prepare, acquire
+the required locks, check conflicts and uniqueness, and admit/render the success
+acknowledgement before publishing state. The existing authentication mutations
+then perform a nonfailing commit and return that exact transaction's ACK. They
+do not take a fresh snapshot, return a postcommit deadline failure, or roll back
+because the client disconnected. Their detailed account/index/revision rules
+remain in [Part 5](../part5-tunnel-anatomy.mdx#apiserver-and-public-operation-boundaries)
+and the [AuthenticationServer reference](../../02-noderefs/AuthenticationServer.mdx#management-api).
+
+## Reuse dispatch and shutdown ownership
+
+An ordinary node-operation implementation does not need its own job queue.
+APIServer uses `nodeApiJobCreate()` to copy request/principal bytes and reserve
+working/result capacity. Jobs carry stable session/request tokens instead of a
+line or an owner-local session pointer. `nodeApiJobSubmit()` always queues,
+including same-worker execution; submission refusal can settle cleanup inline.
+
+Completion runs on the connection owner's event worker. Only that worker
+resolves a still-live session and sends its result. A timed-out or disconnected
+session can abandon a job while its handler is running; the job stays charged
+until execution settles. Cancellation can release synchronized job ownership
+but cannot access owner-only session state or send replacement callbacks.
+
+NodeManager closes global API admission before target quiesce hooks. Queued
+jobs check admission before execution; jobs rejected after closure cannot
+mutate. Already-admitted bounded handlers finish before their selected worker
+quiesces. Registry, target, pool, and domain storage must outlive every reachable
+job and completion. Preserve the full
+[Part 7 shutdown sequence](../part7-shutdown-and-signals.mdx#registered-api-admission-and-detached-jobs)
+instead of adding a separate operation-specific shutdown mechanism.
+
+Delivery is separate from commitment. A gateway timeout or abandoned completion
+can conceal a successful mutation. Document operation-specific recovery and
+never infer a rollback from missing delivery; outer request IDs are correlation
+labels, not replay records.
+
+## Organize and verify the operation
+
+Keep registration in `instance/api.c`. When an operation grows, separate request
+parsing, handler adaptation/rendering, and shared-state transactions as the
+AuthenticationServer `api/` and `common/` files do. Reuse object-layer mutations
+rather than accessing private collection indexes from the gateway. Keep private
+function, type, and macro names distinct across files compiled together by unity
+builds. Existing upstream/downstream callbacks retain the normal tunnel layout.
+
+Document the operation schema in the target node reference and link to this
+shared protocol instead of duplicating its envelope. Runnable client examples
+stay in the WaterWall source repository; the
+[client tutorial](../../03-examples/api/client.mdx) points to the canonical file.
+
+Use [Part 6's registered API coverage](../part6-build-test-review.mdx#registered-api-coverage)
+and validation lanes. Exercise strict input and bounds, exact permissions,
+state preservation on refusal, selected-worker behavior, contention, and
+delivery loss around the commit boundary. Include real gateway coverage where
+permissions and framing matter; a direct handler test alone cannot establish
+those properties. Changes to shared state or lifecycle still require the broader
+validation described in Part 6.

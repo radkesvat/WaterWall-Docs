@@ -1,0 +1,235 @@
+---
+sidebar_position: 2
+title: "مدیریت حساب‌های احراز هویت"
+sidebar_label: "حساب‌های احراز هویت"
+description: "خواندن، ساخت، ویرایش، غیرفعال‌کردن و تغییر رمز با operationهای API دارای مجوز صریح."
+---
+
+# مدیریت حساب‌های احراز هویت
+
+از [مثال کلاینت محلی API](client.mdx) شروع کنید. این فرمان‌ها از دایرکتوری کاری
+`api-demo`، config به نام `central`، node به نام `auth-db` و مسیر checkout در
+`WATERWALL_REPO` همان مثال استفاده می‌کنند.
+[مرجع API مدیریتی AuthenticationServer](../../02-noderefs/AuthenticationServer.mdx)
+تعریف اصلی فیلد درخواست، schema پاسخ، سقف‌ها و codeهای خطاست. مثال‌های این صفحه
+روند کار را نشان می‌دهند و مرجع دوم schema نیستند.
+
+## مجوز مستقل برای هر اپراتور
+
+مانیتور مثال می‌تواند status، حساب و فهرست را بخواند. ساخت حساب، ویرایش تنظیمات و
+تغییر رمز هرکدام مجوز صریح جدا می‌خواهند. WaterWall نمونه را به‌صورت عادی متوقف
+کنید، سپس سه token مستقل اپراتور به پیکربندی اضافه کنید:
+
+```bash
+umask 077
+python3 - <<'PY'
+import json
+from pathlib import Path
+import secrets
+
+path = Path("config.json")
+config = json.loads(path.read_text(encoding="utf-8"))
+api = next(node for node in config["nodes"] if node["name"] == "management-api")
+roles = {
+    "creator": ["get-user", "create-user"],
+    "editor": ["get-user", "update-user"],
+    "password-admin": ["get-user", "change-user-password"],
+}
+existing = {client["name"] for client in api["settings"]["clients"]}
+if existing.intersection(roles):
+    raise SystemExit("These example roles already exist; keep their existing tokens.")
+for name, operations in roles.items():
+    token = secrets.token_hex(32)
+    Path(name + "-token").write_text(token + "\n", encoding="ascii")
+    api["settings"]["clients"].append({"name": name, "token": token, "allow": [{
+        "config": "central", "node": "auth-db", "operations": operations
+    }]})
+path.write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
+PY
+```
+
+WaterWall را با همان `core.json` دوباره راه بیندازید. مجوزهای ثابت در startup
+بار می‌شوند. token API از رمز کاربر ترافیک و credential تولیدکننده مستقل است؛
+`allow-user-write` تولیدکننده هیچ مجوز API نمی‌دهد. restart سرور، edit token و
+cursor قبلی را باطل می‌کند؛ پس از آن دوباره بخوانید.
+
+## خواندن حساب‌ها و صفحه‌ها
+
+برای حساب موجود، در `lookup.json` مقدار `{"id":"42"}` را بنویسید و اجرا کنید:
+
+```bash
+python3 "$WATERWALL_REPO/tunnels/APIServer/examples/api_client.py" \
+  --client monitor --token-file monitor-token \
+  --config central --node auth-db --operation get-user \
+  --body-file lookup.json > account.json
+```
+
+دیتابیس خالی `not_found` می‌دهد؛ ابتدا حساب مثال پایین را بسازید. ID حساب حتی
+بالاتر از دامنهٔ عدد صحیح دقیق JavaScript نیز رشته می‌ماند. `get-user` جزئیات
+مجاز حساب و `edit_token` جاری را برمی‌گرداند و credentialها حذف شده‌اند. مصرف
+سرور گزارش‌های پذیرفته‌شده را در بر می‌گیرد؛ AuthenticationClient آفلاین ممکن
+است هنوز مصرف گزارش‌نشده داشته باشد.
+
+برای نخستین صفحهٔ فهرست، در `list.json` مقدار `{"limit":50}` بنویسید:
+
+```bash
+python3 "$WATERWALL_REPO/tunnels/APIServer/examples/api_client.py" \
+  --client monitor --token-file monitor-token \
+  --config central --node auth-db --operation list-users \
+  --body-file list.json > page.json
+```
+
+`page.json` را بررسی کنید. اگر `next_cursor` برابر null نیست، درخواست بعدی را
+با همان مقدار opaque بسازید:
+
+```python
+import json
+from pathlib import Path
+
+page = json.loads(Path("page.json").read_text(encoding="utf-8"))
+if page["next_cursor"] is None:
+    raise SystemExit("Traversal complete.")
+Path("list.json").write_text(json.dumps({"limit": 50, "cursor": page["next_cursor"]}), encoding="utf-8")
+```
+
+فرمان فهرست را برای همان صفحه تکرار کنید. تغییر تنظیمات cursorهای قبلی را stale
+می‌کند: در `stale_cursor` از `{"limit":50}` دوباره شروع کنید. تغییر صرف آمار
+cursor را معتبر نگه می‌دارد، پس هر صفحه می‌تواند مصرف تازه‌تری داشته باشد.
+فهرست snapshot ثابت مصرف نیست. summary ممکن است نام را کوتاه کند؛ برای جزئیات
+مجاز کامل از `get-user` استفاده کنید. `busy` امتناع محدود نمونه‌برداری است، نه
+فهرست خالی. پیش از تفسیر خروجی به‌عنوان حساب یا صفحهٔ موفق، exit status فرمان
+را بررسی کنید؛ کلاینت هرگز خودکار retry نمی‌کند.
+
+## ساخت حساب
+
+ID عددی یکتا و ماندگار و رمز اولیه را انتخاب کنید. در ویرایشگر خصوصی،
+`create.json` را با شکل زیر بسازید و رمز را داخل فایل جایگزین کنید:
+
+```json
+{"id":"42","password":"replace-in-this-private-file","config":{"name":"alice","enabled":false}}
+```
+
+یک بار ارسال کنید:
+
+```bash
+python3 "$WATERWALL_REPO/tunnels/APIServer/examples/api_client.py" \
+  --client creator --token-file creator-token \
+  --config central --node auth-db --operation create-user \
+  --body-file create.json
+```
+
+ساخت حساب edit token نمی‌خواهد. `enabled:false` صریح، حساب را برای آماده‌سازی
+غیرفعال نگه می‌دارد؛ حذف `config` یا `{}` به‌جای آن، حساب فعال با سقف و انقضای
+پیش‌فرض نامحدود/تنظیم‌نشده می‌سازد. پیش از انتخاب policy،
+[`create-user`](../../02-noderefs/AuthenticationServer.mdx#create-user) را بخوانید.
+ID موجود `id_exists` می‌دهد و هرگز جایگزین نمی‌شود.
+
+پس از گم‌شدن پاسخ یا timeout بعد از dispatch، ID و ورودی اصلی را حفظ کنید و
+همان ID را بخوانید. وجود حساب ثابت نمی‌کند چه کسی آن را ساخته یا رمز حذف‌شدهٔ
+آن با رمز شما برابر است. اگر حساب وجود ندارد، صریحاً دربارهٔ تکرار همان ID و
+ورودی تصمیم بگیرید؛ درخواست قبلی ممکن است هنوز در حال اجرا باشد. خودکار ID
+تازه انتخاب نکنید، حساب را overwrite نکنید، رمز آن را reset نکنید و `id_exists`
+را مدرک موفقیت قبلی ندانید.
+
+## ویرایش سقف‌ها یا غیرفعال‌کردن حساب
+
+حساب را با token خود ویرایشگر بخوانید:
+
+```bash
+python3 "$WATERWALL_REPO/tunnels/APIServer/examples/api_client.py" \
+  --client editor --token-file editor-token \
+  --config central --node auth-db --operation get-user \
+  --body-file lookup.json > account.json
+```
+
+نتیجه را بررسی کنید. با token همان snapshot یک patch محدود به فیلدهای لازم
+بسازید؛ کل حساب بازگشتی را به‌عنوان patch نفرستید:
+
+```python
+import json
+from pathlib import Path
+
+account = json.loads(Path("account.json").read_text(encoding="utf-8"))
+request = {"id": account["user"]["id"], "if_match": account["edit_token"],
+           "patch": {"enabled": True, "limit": {"traffic": {"total": "1000000000"}}}}
+Path("update.json").write_text(json.dumps(request), encoding="utf-8")
+```
+
+```bash
+python3 "$WATERWALL_REPO/tunnels/APIServer/examples/api_client.py" \
+  --client editor --token-file editor-token \
+  --config central --node auth-db --operation update-user \
+  --body-file update.json
+```
+
+برای غیرفعال‌کردن بعدی حساب، دوباره بخوانید و به‌جای آن
+`"patch": {"enabled": false}` بفرستید. فیلدهای حذف‌شده تغییر نمی‌کنند. این عملیات
+مصرف، تاریخچهٔ اولین استفاده و credentialها را حفظ می‌کند.
+[مرجع `update-user`](../../02-noderefs/AuthenticationServer.mdx#update-user)
+فیلدهای قابل ویرایش و واحدشان را فهرست می‌کند؛ ذخیره‌کردن یک limit به معنی اعمال
+آن توسط تمام nodeهای ترافیک نیست.
+
+edit token شامل instance سرور و revision سراسری تنظیمات است. ویرایش، ساخت یا
+تغییر رمز حساب دیگر هم می‌تواند آن را باطل کند. `conflict` سطح node یعنی همین
+فراخوانی commit نشده است: دوباره بخوانید و patch را بازبینی کنید. پاسخ گم‌شده،
+نامعتبر یا timeout دیررس gateway نتیجه را نامعلوم می‌کند. پیش از تصمیم دربارهٔ
+patch تازه، دوباره بخوانید و مقدارهای مطلوب، از جمله مقدار normalizeشده در صورت
+لزوم، را مقایسه کنید. token تازه را خودکار نگیرید و patch قدیمی را replay نکنید.
+
+## تغییر رمز حساب
+
+مدیر رمز ابتدا با مجوز خودش token جاری می‌گیرد:
+
+```bash
+python3 "$WATERWALL_REPO/tunnels/APIServer/examples/api_client.py" \
+  --client password-admin --token-file password-admin-token \
+  --config central --node auth-db --operation get-user \
+  --body-file lookup.json > account.json
+```
+
+در ویرایشگر خصوصی، `password-change.json` را با دقیقاً `id`، مقدار بازگشتی
+`edit_token` به نام `if_match` و `password` مطلوب بسازید. secret انتخاب‌شده را
+داخل فایل نگه دارید، نه آرگومان فرمان یا تاریخچهٔ shell:
+
+```json
+{"id":"42","if_match":"copy-the-current-edit-token-here","password":"replace-in-this-private-file"}
+```
+
+```bash
+python3 "$WATERWALL_REPO/tunnels/APIServer/examples/api_client.py" \
+  --client password-admin --token-file password-admin-token \
+  --config central --node auth-db --operation change-user-password \
+  --body-file password-change.json
+```
+
+عملیات credentialها را باهم تغییر می‌دهد و ID حساب، تنظیمات، مصرف، تاریخچهٔ
+اولین استفاده و reservationهای runtime را حفظ می‌کند. بایت دقیق رمز مهم است.
+رمز به‌شکل UUID معنای هویتی دیگری هم دارد؛ پیش از تغییر حساب مورد استفادهٔ
+پروتکل‌های UUID، [`change-user-password`](../../02-noderefs/AuthenticationServer.mdx#change-user-password)
+را بخوانید. تعیین همان رمز نیز token جاری می‌خواهد و revision تنظیمات را افزایش
+می‌دهد.
+
+پس از پاسخ نامعلوم، رمز مطلوب را امن نگه دارید و برای token جاری دوباره بخوانید.
+خواندن عمومی نمی‌تواند رمز نصب‌شده را ثابت کند: نه وجود حساب و نه revision
+بالاتر موفقیت این درخواست را ثابت نمی‌کند. صریحاً تصمیم بگیرید که رمز مطلوب را
+با token تازه دوباره بفرستید یا نه. ارسال مجدد موفق، رمز را در نقطهٔ commit همان
+تراکنش برقرار می‌کند. conflict به خواندن و تصمیم دیگری نیاز دارد. کلاینت token
+را تازه نمی‌کند، نوشتن را retry نمی‌کند و رمز جایگزین خودکار نمی‌سازد؛ سرور نیز
+رکورد retry درخواست نگه نمی‌دارد.
+
+## موفقیت نوشتن چه چیزی را تأیید می‌کند؟
+
+ACK کوچک شامل `id`، مقدار `config_revision` همان تراکنش و `edit_token` آن است.
+این پاسخ commit در حافظه را تأیید می‌کند، نه ذخیره روی دیسک یا refresh کلاینت.
+ذخیرهٔ دوره‌ای/نهایی و همگام‌سازی معمول جدا ادامه دارند؛ crash recovery خارج از
+این روند API است.
+
+AuthenticationClient قطع‌شده، حساب، credential و policy cacheشده را تا refresh
+معتبر حفظ می‌کند. تغییر رمز اتصال‌های موجود را مجبور به قطع نمی‌کند و تغییر
+policy، اعمال فوری روی کلاینت آفلاین را تضمین نمی‌کند. حسابداری ترافیک با
+همگام‌سازی معمول ادامه پیدا می‌کند.
+
+خطای بازگشتی operation در سطح node یعنی همان فراخوانی commit نشده است. دربارهٔ
+درخواست قبلی با پاسخ گم‌شده چیزی نمی‌گوید. ID درخواست فقط پاسخ را مرتبط می‌کند.
+برای استفاده از این روندها در برنامهٔ مدیریتی دیگر،
+[قواعد خطا و تحویل پروتکل](../../05-devguides/api/protocol.mdx) را ببینید.

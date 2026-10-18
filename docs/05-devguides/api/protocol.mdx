@@ -1,0 +1,251 @@
+---
+sidebar_position: 1
+title: "API protocol"
+sidebar_label: "Protocol"
+description: "Framing, authentication, selectors, request and response envelopes, limits, and delivery semantics for APIServer clients."
+---
+<!--
+Documentation version: 1
+Sync note: Keep synchronized with the Persian API protocol guide.
+-->
+
+# API protocol
+
+APIServer carries explicitly registered node operations over an authenticated,
+reliable byte stream. This page defines the shared wire format. The
+[APIServer node reference](../../02-noderefs/APIServer.mdx) owns gateway settings
+and permission configuration; each target node's reference owns its operation
+names, request bodies, responses, and state-change guarantees.
+
+For a runnable client, start with the [Python client example](../../03-examples/api/client.mdx).
+For node implementation, see [Implementing node API operations](./node-operations.mdx).
+
+## Transport and framing
+
+Supported chains deliver an ordered reliable stream:
+
+```text
+TcpListener -> APIServer
+TcpListener -> HttpServer -> APIServer
+UdpListener -> TcpOverUdpServer -> APIServer
+```
+
+APIServer opens no socket and adds no transport encryption. Remote access needs
+an appropriately protected stream. Direct `UdpListener -> APIServer` is
+unsupported: a length prefix does not repair datagram loss or reordering.
+TcpOverUdpServer reconstructs the reliable stream before APIServer reads it.
+See the [transport examples](../../03-examples/api/transports.mdx) for complete
+HTTP and reliable-UDP arrangements.
+
+Every request and response has the same framing:
+
+```text
+4-byte unsigned big-endian length | exactly length UTF-8 JSON bytes
+```
+
+The length excludes the prefix and must be nonzero and within the configured
+envelope limit. There is no newline or terminating NUL. A socket read, tunnel
+payload callback, HTTP chunk, or UDP packet is not a frame boundary: a prefix
+or body can span reads, and one read can contain several frames.
+
+An HTTP composition carries these framed bytes in the HTTP body. The caller
+dechunks the response before reading the API prefix and uses that length to
+recognize a complete reply, without waiting for HTTP EOF or its final chunk.
+HttpServer handles its configured method and path. APIServer receives only body
+bytes; this interface adds no REST routing, header authentication, or
+per-operation HTTP status mapping.
+
+## Request envelope
+
+```json
+{
+  "id": "request-42",
+  "auth": {"client": "monitor", "token": "<configured token>"},
+  "selector": {"config": "edge-europe", "node": "auth-client"},
+  "operation": "status",
+  "content_type": "application/json",
+  "body_encoding": "utf8",
+  "body": "{\"include_accounting\":true}"
+}
+```
+
+All shown fields are required except `selector.config`.
+
+| Field | Meaning |
+| --- | --- |
+| `id` | Nonempty correlation string, at most 64 UTF-8 bytes. It is echoed in the response and does not deduplicate requests. |
+| `auth.client` | Configured API client name, at most 256 UTF-8 bytes. |
+| `auth.token` | The client's 32-byte static token, encoded as exactly 64 hexadecimal characters. |
+| `selector.config` | Optional exact logical configuration name, at most 256 UTF-8 bytes. |
+| `selector.node` | Exact public top-level node name, at most 256 UTF-8 bytes. |
+| `operation` | Exact registered operation name, at most 64 UTF-8 bytes. |
+| `content_type` | Content type of the decoded node body, at most 128 UTF-8 bytes; it must match the operation's declared request type. |
+| `body_encoding` | `utf8` or `base64`. |
+| `body` | A JSON string containing the encoded node request, even when that request is itself JSON. |
+
+Metadata names are case-sensitive. The outer parser rejects unknown or duplicate
+keys, wrong types, malformed UTF-8, trailing non-whitespace input, and decoded
+NUL in metadata or UTF-8 bodies. It bounds the envelope's nesting and values
+before allocating a JSON tree. These outer-envelope rules do not define the
+target node's body schema.
+
+### Authentication, target selection, and permission
+
+Every envelope authenticates independently. An API token is separate from a
+traffic user's password and from AuthenticationClient's upstream producer
+credentials. Unknown client names and incorrect tokens both return
+`unauthorized`. Authentication happens before target lookup.
+
+`selector.config` names a loaded configuration's logical `name`; it is not a
+filename and cannot load a configuration. When an APIServer is configured, all
+loaded configurations must have nonempty unique logical names. Generated
+internal child nodes are not public API targets.
+
+Omitting `selector.config` works only when the exact node name occurs once
+across **all declared top-level nodes in all loaded configurations**. Count
+nodes even if they expose no API or the caller cannot access them. Registration
+and permission filtering cannot make an ambiguous name unique; supply the
+configuration name to resolve `ambiguous_target`.
+
+After resolving the target, APIServer checks the client's exact allowlist entry
+for that configuration, node, and operation. There are no wildcard permissions
+or permissions implied by a different operation. A read-only descriptor does not
+make an operation public. Startup validates allowlist targets and registered
+operations. An old `TunnelApi` symbol alone exposes nothing through this gateway.
+
+### Body encoding and content type
+
+With `body_encoding: "utf8"`, the decoded UTF-8 bytes of `body` are delivered
+unchanged. With `"base64"`, strict canonical base64 carries arbitrary bytes,
+including NUL. Base64 is an encoding, not encryption.
+
+APIServer does not parse, normalize, or reserialize the node request. For example,
+the envelope above delivers the bytes `{"include_accounting":true}` to
+AuthenticationClient's `status` handler. A different registered operation can
+define a different body format and content type. Use that node's reference for
+the accepted schema; a valid envelope can still contain an invalid node request.
+
+## Response envelope
+
+A successfully dispatched operation, including an operation that returns a
+node-level error, uses this envelope:
+
+```json
+{
+  "id": "request-42",
+  "error": null,
+  "result": {
+    "code": 0,
+    "content_type": "application/json",
+    "body_encoding": "utf8",
+    "body": "{\"can_authenticate\":true}"
+  }
+}
+```
+
+The body above is illustrative, not a complete status snapshot.
+`result.code` preserves the handler's result: `0` is success and `1` is an error.
+The registered operation declares the result content type and encoding, which
+need not match the request's encoding. Decode `result.body` using the returned
+`body_encoding`, then interpret it according to the target node's schema. An
+empty handler result becomes an empty body with its declared type and encoding.
+
+Operation references remain authoritative:
+
+- [AuthenticationClient status](../../02-noderefs/AuthenticationClient.mdx)
+  describes the client's local synchronization and admission view.
+- [AuthenticationServer management API](../../02-noderefs/AuthenticationServer.mdx#management-api)
+  describes account reads, pagination, creation, conditional edits, and password
+  changes. Its unsigned 64-bit values use decimal JSON strings.
+
+### Gateway errors
+
+A gateway failure has `result: null`:
+
+```json
+{
+  "id": "request-42",
+  "error": {"code": "ambiguous_target", "message": "Specify the configuration name."},
+  "result": null
+}
+```
+
+`id` is null when no trustworthy bounded correlation ID was recovered.
+Messages are fixed and bounded; clients should branch on the error code.
+
+| Code | Meaning |
+| --- | --- |
+| `invalid_request` | Invalid framing or request-envelope schema. |
+| `invalid_encoding` | Unsupported or invalid body encoding. |
+| `unauthorized` | Invalid API credentials. |
+| `forbidden` | The operation is absent from the caller's exact allowlist. |
+| `target_not_found` | The selected public node could not be resolved. |
+| `ambiguous_target` | The unqualified node name matches multiple declared nodes. |
+| `unsupported_api` | The target has no registered API. |
+| `unsupported_operation` | The requested operation is not registered. |
+| `unsupported_content_type` | The request content type does not match the operation. |
+| `busy` | Gateway or dispatch capacity could not admit the work. |
+| `timeout` | An API deadline expired. |
+| `shutting_down` | API admission has closed. |
+| `response_too_large` | The result cannot fit the applicable response limit. |
+
+A gateway error and a node error are different layers. For example, an
+AuthenticationServer `conflict` is inside `result.body` with `result.code: 1`,
+while a gateway timeout is in `error` and has no node result. Delivery failure
+after dispatch can hide an already committed mutation; it does not turn that
+mutation into a rollback.
+
+## Ordering, connection closure, and limits
+
+Each connection executes one operation at a time. Complete pipelined requests
+wait in FIFO order, and replies retain that order. Separate connections can
+execute concurrently; operation-specific locks and preconditions govern their
+shared state.
+
+Malformed framing/schema and invalid authentication close the connection after
+at most one bounded error. Valid authorized target, operation, and body errors
+may continue in FIFO order. A resource refusal can close directly when even an
+error cannot fit. After a response starts, transport failure or output expiry
+closes the connection without injecting a second frame into a partial response.
+If a later queued request expires behind an earlier pending response, the
+connection closes rather than returning its error out of order.
+
+The [APIServer limits table](../../02-noderefs/APIServer.mdx#optional-limits)
+defines settings and defaults. Envelope caps exclude the four-byte prefix;
+memory limits also account for retained allocations, fragments, queues, jobs,
+and temporary working storage. A node can impose a smaller body or work limit.
+JSON escaping and base64 expand encoded results, so the raw node-body length
+alone does not establish that its response envelope fits.
+
+| Deadline | Interval |
+| --- | --- |
+| Frame assembly | From the frame's first byte; trickle input does not reset it. |
+| Request | From complete-request admission through response publication, including FIFO and worker wait. |
+| Output | From publication through transport handoff, including paused time. |
+| Idle | While no frame, request, or output is in progress. |
+
+All configured limits are positive finite integers; zero does not disable a
+protection. A disconnect or timeout abandons delivery, but a running handler
+retains its reservations until it finishes. The gateway cannot interrupt and
+undo arbitrary work that has already committed.
+
+## Writes and uncertain replies
+
+The request `id` is correlation only. Reusing it creates no replay guarantee,
+checkpoint, or automatic deduplication. The generic client makes one attempt
+and does not retry writes automatically.
+
+Consult the target operation's contract before retrying. AuthenticationServer's
+public mutation APIs guarantee that a returned **node-operation failure** did
+not commit that invocation. A lost, malformed, or late reply, a disconnect, or
+a post-dispatch gateway timeout leaves its outcome unknown. A success
+acknowledges server memory; ordinary persistence and client refresh happen
+separately.
+
+After a conflict or uncertain result, reread and explicitly reconsider the
+requested change. Do not silently fetch a fresh edit token and replay a write.
+Account creation recovery keeps the original ID; public existence alone does
+not prove which caller created it. Public reads omit credentials, so they also
+cannot prove which password is stored after a lost password-change reply.
+See the [account administration examples](../../03-examples/api/authentication-users.mdx)
+and each operation's reference for the appropriate recovery steps.

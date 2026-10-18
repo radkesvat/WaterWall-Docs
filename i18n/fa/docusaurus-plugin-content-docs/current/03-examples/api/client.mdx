@@ -1,0 +1,134 @@
+---
+sidebar_position: 1
+title: "اجرای کلاینت API"
+sidebar_label: "اجرای کلاینت API"
+description: "پیکربندی کامل APIServer روی loopback و استفاده از کلاینت عمومی Python."
+---
+
+# اجرای کلاینت API
+
+این مثال یک دیتابیس خالی AuthenticationServer را از طریق APIServer محلی در دسترس
+می‌گذارد و وضعیت آن را می‌خواند. برنامهٔ نمونه فقط از کتابخانهٔ استاندارد Python
+استفاده می‌کند و در مسیر
+[`tunnels/APIServer/examples/api_client.py`](https://github.com/radkesvat/WaterWall/blob/main/tunnels/APIServer/examples/api_client.py)
+در checkout سورس WaterWall قرار دارد.
+
+زنجیره `TcpListener -> APIServer` است. gateway از API ثبت‌شدهٔ
+`AuthenticationServer` که جداگانه پیکربندی شده استفاده می‌کند؛ node دیتابیس، node
+بعدی این زنجیره نیست. این مثال به AuthenticationClient یا listener پروتکل
+تولیدکننده نیاز ندارد.
+
+## ساخت پیکربندی محلی
+
+از ریشهٔ مخزن WaterWall شروع کنید. دایرکتوری تازه‌ای بسازید تا دیتابیس موجودی
+جایگزین نشود:
+
+```bash
+export WATERWALL_REPO="$(pwd)"
+umask 077
+mkdir api-demo
+cd api-demo
+```
+
+پیکربندی و یک token تصادفی مستقل برای اپراتور بسازید:
+
+```bash
+python3 - <<'PY'
+import json
+from pathlib import Path
+import secrets
+
+token = secrets.token_hex(32)
+Path("monitor-token").write_text(token + "\n", encoding="ascii")
+Path("users.json").write_text('{"users":[]}\n', encoding="utf-8")
+core = {"misc": {"workers": 1, "try-enabling-bbr": False}, "configs": ["config.json"]}
+config = {
+    "name": "central",
+    "nodes": [
+        {"name": "auth-db", "type": "AuthenticationServer", "settings": {
+            "db-path": "users.json", "file-save-rate-ms": 60000,
+            "auth-clients": [{"name": "reserved-producer", "secret": secrets.token_hex(32)}]
+        }},
+        {"name": "api-listener", "type": "TcpListener", "settings": {
+            "address": "127.0.0.1", "port": 9080
+        }, "next": "management-api"},
+        {"name": "management-api", "type": "APIServer", "settings": {
+            "clients": [{"name": "monitor", "token": token, "allow": [{
+                "config": "central", "node": "auth-db",
+                "operations": ["status", "get-user", "list-users"]
+            }]}]
+        }}
+    ]
+}
+for filename, value in (("core.json", core), ("config.json", config)):
+    Path(filename).write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
+PY
+```
+
+تنظیم `auth-clients` در `AuthenticationServer` باید غیرخالی باشد. تولیدکنندهٔ
+رزروشدهٔ بالا هیچ مجوز و listener شبکه‌ای ندارد. secret آن از token اپراتور API
+جداست و نمی‌تواند درخواست API را احراز هویت کند.
+
+WaterWall را از همین دایرکتوری، با فایل اجرایی نصب‌شده یا build موجود Linux،
+اجرا کنید:
+
+```bash
+"$WATERWALL_REPO/build/linux/Release/Waterwall" --config:core.json
+```
+
+مسیرهای `core.json` و `db-path` نسبت به دایرکتوری کاری فرایند هستند. برای محل‌های
+دیگر فایل اجرایی و پیکربندی، [راهنمای راه‌اندازی](../../01-getting-started/tutorial-part1.mdx)
+را ببینید. listener فقط محلی است؛ APIServer درخواست را احراز هویت می‌کند اما
+transport را رمزنگاری نمی‌کند.
+
+## خواندن وضعیت سرور
+
+در ترمینال دیگری وارد `api-demo` شوید و `WATERWALL_REPO` را روی مسیر مطلق checkout
+خود تنظیم کنید. سپس اجرا کنید:
+
+```bash
+python3 "$WATERWALL_REPO/tunnels/APIServer/examples/api_client.py" \
+  --host 127.0.0.1 --port 9080 \
+  --client monitor --token-file monitor-token \
+  --config central --node auth-db --operation status
+```
+
+کلاینت به‌صورت پیش‌فرض `{}` را به‌عنوان بدنهٔ node می‌فرستد، یک پاسخ frameشدهٔ کامل
+می‌خواند و بدنهٔ decodeشدهٔ نتیجهٔ node را روی stdout می‌نویسد. دیتابیس خالی مقدار
+`user_count: "0"` می‌دهد. نتیجهٔ کامل در
+[مرجع AuthenticationServer](../../02-noderefs/AuthenticationServer.mdx#status)
+تعریف شده است؛ مقدارهایی مانند شمارنده‌ها و revisionها رشتهٔ ده‌دهی هستند.
+اعتبارنامه‌ها از نتیجه‌های عمومی حذف شده‌اند.
+
+selector از نام منطقی پیکربندی یعنی `central` استفاده می‌کند، نه نام فایل
+`config.json`. حذف `--config` فقط وقتی مجاز است که نام node میان تمام configهای
+بارشده یکتا باشد. selector کامل، هدف را صریح نگه می‌دارد.
+
+## تأمین token و بدنهٔ درخواست
+
+token از فایل یا متغیر محیطی خوانده می‌شود. برای حالت محیطی:
+
+```bash
+export WATERWALL_API_TOKEN="$(cat monitor-token)"
+python3 "$WATERWALL_REPO/tunnels/APIServer/examples/api_client.py" \
+  --client monitor --token-env WATERWALL_API_TOKEN \
+  --config central --node auth-db --operation status
+```
+
+host و port پیش‌فرض `127.0.0.1:9080` هستند. محتوای token هرگز آرگومان خط فرمان
+نیست. `--body-file` بایت‌های درخواست node را تأمین می‌کند؛ با
+`--body-encoding utf8` پیش‌فرض، این بایت‌ها باید UTF-8 بدون NUL باشند. برای
+operation ثبت‌شده‌ای که بایت دلخواه می‌پذیرد، از `--body-encoding base64` استفاده
+کنید؛ خود کلاینت فایل را می‌خواند و base64 می‌کند. با `--content-type` نوع محتوای
+ثبت‌شدهٔ operation را مشخص کنید؛ پیش‌فرض `application/json` است.
+
+کلاینت frame پاسخ و ID همبستگی را بررسی می‌کند و دقیقاً یک بار تلاش می‌کند.
+خواندن یا نوشتن را خودکار تکرار نمی‌کند. برای ویرایش مشروط و تغییر رمز، در صورت
+نیاز راهنمای conflict یا نتیجهٔ نامعلوم را چاپ می‌کند. ID بیرونی درخواست فقط
+پاسخ را به درخواست مرتبط می‌کند و مانع اجرای دوبارهٔ operation نمی‌شود.
+
+ادامه را در [مدیریت حساب‌های احراز هویت](authentication-users.mdx) یا
+[transportهای HTTP و UDP قابل اعتماد](transports.mdx) بخوانید.
+[راهنمای پروتکل API](../../05-devguides/api/protocol.mdx) قالب frame، envelope و
+خطاها را برای نوشتن کلاینت دیگر توضیح می‌دهد؛ تنظیمات gateway و سقف منابع در
+[مرجع APIServer](../../02-noderefs/APIServer.mdx) قرار دارند.
