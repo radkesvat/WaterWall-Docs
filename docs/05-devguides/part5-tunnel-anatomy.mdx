@@ -816,9 +816,9 @@ Preserve `control_mutex -> users_lock -> collection/user -> stats` lock order;
 aggregate sampling describes an interval while traffic continues. Diagnostics
 never change admission, observations, baselines, batches or scheduling state.
 
-AuthenticationServer explicitly registers only the read-only `status`, `get-user`
-and `list-users` operations, each on the calling event worker. Their strict
-operation-body parser must apply the 4096-byte, depth-two and 16-value bounds
+AuthenticationServer explicitly registers the read-only `status`, `get-user`
+and `list-users` operations plus writable `update-user`, each on the calling event
+worker. The strict read-operation parser must apply the 4096-byte, depth-two and 16-value bounds
 before building a JSON tree. IDs are canonical nonzero unsigned decimal strings;
 all numeric result leaves use decimal strings without floating-point conversion.
 Public projections copy only their explicit permitted fields and never use the
@@ -851,6 +851,73 @@ revision under the same state write lock. Statistics-only changes do not invalid
 reports its current statistics revision and accounting-clock reference. Advance
 only past emitted records, return a smaller nonempty prefix when budgets require
 it, and never issue a partial-success cursor after timeout or contention.
+
+Every successful server read publishes an owned `edit_token` sampled with its
+configuration revision: the existing 32 lowercase hexadecimal instance characters
+followed by 16 revision characters. The 48-character token is a server-wide
+optimistic edit precondition, not an authorization credential; pagination cursors
+keep their separate 64-character representation. Statistics-only mutations do
+not change the token, while any accepted configuration edit does, including
+unrelated-account and same-value edits. Recreating the server changes its identity.
+
+`update-user` requires its own exact operation permission. Keep monitors read-only;
+producer credentials and protocol `allow-user-write` grant no gateway permission.
+Use public snake_case and `u`/`d` leaves, with canonical unsigned decimal strings,
+in this operation only. Require exactly nonzero `id`, canonical `if_match`, and a
+nonempty sparse `patch`. Reject protected fields, empty supplied containers,
+unknown/duplicate keys, wrong types and invalid encoding before any mutation.
+Bound the body to 32 KiB, lexical depth to four object levels and values to 64
+before constructing its JSON tree. Preserve read-parser bounds unchanged.
+
+Share the owned configuration-only preparation, semantic validation, preflight
+and nonfailing commit primitives with the existing blocking protocol/object
+callers. The API tries locks in `server state write -> collection write -> target
+user configuration write` order. Configuration patches must not acquire or write
+the statistics lock or replace whole user/time/statistics snapshots. Under state,
+compare instance and revision before resolving the account; mismatch is
+`conflict` without a fresh token. Ordinary contention returns `busy` without
+waiting. Acquire every required lock before erasing an index entry or changing a
+field. Complete uniqueness, overlap, capacity, memory and deadline checks before
+the first logical mutation; no refusal may leave half-applied state.
+
+The API name-index path must use reserved/no-grow insertion and non-advancing
+erase; it must not reserve `count + 1` and rehash the table for one edit. Bound
+inspection of the selected account's old name to 32 KiB plus terminator detection
+only when renaming, and refuse oversized names without changing them. Other
+selected fields must not hash/inspect that name for diagnostics. Preserve existing
+average-case hash semantics; cluster probing/shifting is not a count-independent
+worst-case latency guarantee. Reuse existing Allowed-IP tree nodes when possible;
+preflight exact checked new-growth geometry against 1 MiB and the remaining
+working allowance before allocation/copy. No second index or full-user scan is
+introduced. Fixed API diagnostics must not scan or log arbitrary stored names,
+notes, request bodies or credentials.
+
+Charge parser storage, prepared values, scratch, index growth and the actual
+result-pool allocation including overlaps. Preflight the fixed 256-byte success
+body and reserve its buffer before mutation. Render the anticipated ID, next
+revision and token before the final precommit deadline check. Then commit the
+selected fields/index membership and increment configuration revision exactly
+once within the state-write transaction. After commit, do no fallible allocation,
+deadline-aware rendering, fresh snapshot or rollback: return that transaction's
+prepared acknowledgement. Private capacity reservation may survive a precommit
+refusal; logical account/index/revision/accounting state must not change.
+
+Guard configuration-revision exhaustion before mutation in both API and producer
+AddNewUser/UpdateUser paths, and keep an invariant guard in the increment helper.
+UINT64_MAX-1 to UINT64_MAX remains valid; further mutations refuse rather than
+wrap. Preserve statistics, usage, first-use/creation observations, credentials,
+runtime reservations and producer checkpoints. Disabled/expired accounts remain
+editable by durable ID. API success acknowledges memory only, with no save or
+client-refresh guarantee. Existing save frequency and producer ordering remain.
+
+A returned operation-level failure guarantees this edit did not commit. A lost
+reply, abandoned connection or late gateway timeout may follow a committed edit
+and therefore leaves its outcome unknown. Preserve generic dispatcher completion
+behavior; never infer rollback or add cancellation rollback. Callers reread and
+reconsider after conflict or unknown outcome; never automatically obtain a fresh
+token and replay the old patch. Request IDs are correlation labels rather than
+idempotency records. The compact acknowledgement, including maximum request-ID
+escaping, must fit the gateway's minimum 1024-byte encoded envelope.
 
 Primary-save telemetry is fixed-size process-local state under the server lock.
 Record an existing locked save once, at its primary failure/commit decision;

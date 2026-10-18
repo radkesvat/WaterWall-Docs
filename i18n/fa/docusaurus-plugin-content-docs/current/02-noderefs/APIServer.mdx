@@ -6,13 +6,13 @@ description: "اجرای operationهای ثبت‌شده روی stream قابل 
 ---
 
 <!--
-Documentation version: 2
+Documentation version: 3
 Sync note: Keep synchronized with tunnels/APIServer/description.md and the English node reference.
 -->
 
 # APIServer
 
-`APIServer` یک node انتهایی برای دسترسی بیرونی به operationهایی است که صریحاً ثبت شده‌اند. خودش socket باز نمی‌کند. operationهای فقط‌خواندنی ثبت‌شده شامل `AuthenticationClient.status` و `AuthenticationServer.status`، `get-user` و `list-users` هستند. اعتبارنامه‌های ثابت مدیر و مجوزهای دقیق آن از رمز کاربران ترافیک و secret سرور احراز هویت مستقل‌اند؛ قطع یا رد AuthenticationClient دسترسی تشخیصی را وابسته به آن نمی‌کند.
+`APIServer` یک node انتهایی برای دسترسی بیرونی به operationهایی است که صریحاً ثبت شده‌اند. خودش socket باز نمی‌کند. operationهای فقط‌خواندنی ثبت‌شده شامل `AuthenticationClient.status` و `AuthenticationServer.status`، `get-user` و `list-users` هستند؛ `AuthenticationServer.update-user` نوشتن مشروط با مجوز صریح است. اعتبارنامه‌های ثابت مدیر و مجوزهای دقیق آن از رمز کاربران ترافیک و secret سرور احراز هویت مستقل‌اند؛ قطع یا رد AuthenticationClient دسترسی تشخیصی را وابسته به آن نمی‌کند.
 
 ## جایگاه
 
@@ -48,6 +48,13 @@ TCP caller -> TcpListener -> TcpOverUdpClient -> UdpConnector
         "allow": [
           {"config": "edge-europe", "node": "auth-client", "operations": ["status"]},
           {"config": "central", "node": "auth-db", "operations": ["status", "get-user", "list-users"]}
+        ]
+      },
+      {
+        "name": "editor",
+        "token": "<different 64 hexadecimal characters representing 32 random bytes>",
+        "allow": [
+          {"config": "central", "node": "auth-db", "operations": ["get-user", "update-user"]}
         ]
       }
     ]
@@ -187,6 +194,50 @@ python3 examples/api_client.py --host 127.0.0.1 --port 9080 \
 دریافتی را به همان بدنه اضافه کنید. `stale_cursor` نیاز به پیمایش تازه بدون
 cursor دارد و `busy` به معنی امتناع محدود نمونه‌برداری است. retryها به تصمیم
 فراخواننده‌اند و کلاینت نمونه به‌صورت خودکار تکرار نمی‌کند.
+
+برای ویرایش مشروط، token جداگانهٔ editor با مجوز دقیق `get-user` و
+`update-user` تنظیم کنید؛ token مانیتور فقط‌خواندنی می‌ماند. در فایل
+`lookup.json` بدنهٔ `{"id":"42"}` قرار دهید و ابتدا حساب را بخوانید:
+
+```bash
+python3 examples/api_client.py --host 127.0.0.1 --port 9080 \
+  --client editor --token-file /private/path/editor-token \
+  --config central --node auth-db --operation get-user \
+  --body-file lookup.json > account.json
+```
+
+پس از بازبینی حساب، فقط برگ‌های مورد نظر را همراه token همان snapshot در
+فایل ویرایش قرار دهید؛ کل user را به patch تبدیل نکنید:
+
+```python
+import json
+from pathlib import Path
+
+account = json.loads(Path("account.json").read_text(encoding="utf-8"))
+request = {"id": account["user"]["id"], "if_match": account["edit_token"],
+           "patch": {"enabled": False}}
+Path("update.json").write_text(json.dumps(request), encoding="utf-8")
+```
+
+یک بار ارسال کنید:
+
+```bash
+python3 examples/api_client.py --host 127.0.0.1 --port 9080 \
+  --client editor --token-file /private/path/editor-token \
+  --config central --node auth-db --operation update-user \
+  --body-file update.json
+```
+
+تمام خواندن‌های سرور `edit_token` دارند؛ `update-user` آن را به‌عنوان
+`if_match` می‌خواهد. تغییر تنظیمات، حتی حساب دیگر، هم token ویرایش قبلی و هم
+cursor قبلی را باطل می‌کند؛ تغییر صرف آمار آن‌ها را باطل نمی‌کند. پاسخ موفق
+فقط `id`، `config_revision` و `edit_token` همان commit در حافظه را دارد؛ ذخیره
+و refresh کلاینت جدا هستند. `conflict` سطح node یعنی commit نشده: دوباره
+بخوانید و قصد تغییر را بازبینی کنید. گم‌شدن پاسخ، قطع یا timeout gateway
+می‌تواند پس از commit رخ دهد؛ نتیجه نامعلوم است و پیش از تصمیم تازه باید
+حساب دوباره خوانده شود. token تازه را خودکار نگیرید و patch قدیمی را replay
+نکنید. کلاینت نمونه راهنمای conflict/نتیجهٔ نامعلوم را چاپ می‌کند و retry
+خودکار نوشتن ندارد؛ ID درخواست باعث deduplication نمی‌شود.
 
 ## lifecycle و metadata
 
