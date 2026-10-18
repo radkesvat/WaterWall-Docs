@@ -5,7 +5,7 @@ sidebar_label: "Part 5: Anatomy & Workflow"
 description: "The on-disk layout of a WaterWall tunnel, what each file owns, node.c metadata, the create/line-state patterns, HTTP constraints, and the implementation workflow."
 ---
 <!--
-Documentation version: 176
+Documentation version: 177
 -->
 
 # Part 5: Anatomy of a Tunnel & Workflow
@@ -759,6 +759,65 @@ code):
 - Never read a field after destroying the state.
 - Do not add an `initialized` boolean unless an explicitly documented
   line-role/callback contract requires state before ordinary `Init`.
+
+## APIServer and public operation boundaries
+
+APIServer is a Layer-4 terminal node carrying four-byte unsigned big-endian
+lengths followed by UTF-8 JSON envelopes. It borrows normal lines, blocks splice,
+and creates no listener. Direct TCP, ordinary HttpServer body tunneling and
+TcpOverUdpServer's reconstructed stream provide its reliable input. Raw UDP is
+not an API transport. HTTP headers, method/path routing and per-operation HTTP
+status mapping do not belong to the API envelope layer.
+
+Authenticate each envelope using APIServer's independent static operator token
+before target lookup. Resolve exact logical configuration/node names globally,
+then apply the exact operation allowlist. Node-only selection counts every
+declared top-level node with that name, including nodes without a registered API
+or permission. Never let permission filtering remove ambiguity, expose generated
+children or load a filename from a selector. All loaded configuration names must
+be nonempty and unique when an APIServer is present; configurations without an
+APIServer retain their existing rules.
+
+Keep lexical depth/value limits local to the small outer envelope. Reject
+unknown/duplicate keys, malformed UTF-8, trailing input and decoded NUL in keys,
+metadata and UTF-8 body strings. Strict canonical base64 carries arbitrary body
+bytes. Preserve decoded opaque bytes without parsing or reserializing the node's
+schema. Do not log credentials, envelopes, bodies or returned user data.
+
+Reserve memory before parsing, copying, encoding and handler dispatch, including
+temporary overlaps. Bound input bytes, retained allocation charge, fragment and
+request entries, sessions, unfinished jobs and output. Measure the complete
+encoded response before emitting its prefix. Node-level failures remain dispatched
+results; an encoded result over the limit becomes a bounded gateway error.
+
+One operation executes at a time per connection; queued requests and responses
+remain FIFO. As an exact-line tail, APIServer gates its reply producer on consumer
+Pause/Resume, while finite deadlines and hard limits remain active. Schedule
+bounded parsing/output continuations so buffered work does not require new input.
+After a turn reaches its work limit, a complete queued request with no active job
+or response is also runnable work and requires a continuation. Waiting for a job
+or paused output alone must not cause repeated immediate wakeups; their deadlines
+remain armed.
+Publishing a complete response ends that request's deadline and begins its
+independent output deadline. Once a prefix/body starts, expiry closes the line
+instead of injecting a second frame. A queued request expiring behind an earlier
+pending response closes without emitting an out-of-order error.
+
+The handler's reserved body allowance is separate from the encoded envelope cap.
+Reserve at least 4096 body bytes even for a smaller envelope cap, so a bounded
+valid diagnostic result can become `response_too_large` at serialization. During
+preparation, working memory must fit that result's actual worker-pool allocation
+plus 8192 bytes of bounded parsing metadata after final padding is known.
+
+AuthenticationClient's registered status handler runs on worker 0 and copies
+owned scalar values before serialization. Pin active/baseline tables and
+preflight their immutable collection counts before allocating a detailed scan.
+Preserve `control_mutex -> users_lock -> collection/user -> stats` lock order;
+aggregate sampling describes an interval while traffic continues. Diagnostics
+never change admission, observations, baselines, batches or scheduling state.
+
+See [APIServer](../02-noderefs/APIServer.mdx) for complete settings, wire examples
+and supported HTTP/1.1 composition.
 
 ## HTTP-Specific Rules
 

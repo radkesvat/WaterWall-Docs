@@ -1,0 +1,185 @@
+---
+sidebar_position: 9
+title: "APIServer"
+sidebar_label: "APIServer"
+description: "اجرای operationهای ثبت‌شده روی stream قابل اعتماد با احراز هویت مستقل."
+---
+
+<!--
+Documentation version: 1
+Sync note: Keep synchronized with tunnels/APIServer/description.md and the English node reference.
+-->
+
+# APIServer
+
+`APIServer` یک node انتهایی برای دسترسی بیرونی به operationهایی است که صریحاً ثبت شده‌اند. خودش socket باز نمی‌کند. نخستین operation تولیدی، `AuthenticationClient.status` و فقط خواندنی است. اعتبارنامه‌های ثابت مدیر و مجوزهای دقیق آن از رمز کاربران ترافیک و secret سرور احراز هویت مستقل‌اند؛ قطع یا رد AuthenticationClient دسترسی تشخیصی را وابسته به آن نمی‌کند.
+
+## جایگاه
+
+```text
+TcpListener -> APIServer
+TcpListener -> HttpServer -> APIServer
+UdpListener -> TcpOverUdpServer -> APIServer
+```
+
+اتصال مستقیم `UdpListener -> APIServer` پشتیبانی نمی‌شود؛ frameهای API به stream مرتب و قابل اعتماد نیاز دارند. برای برنامهٔ TCP در مسیر UDP قابل اعتماد، از nodeهای موجود استفاده کنید:
+
+```text
+TCP caller -> TcpListener -> TcpOverUdpClient -> UdpConnector
+                                      loopback/protected UDP
+                            UdpListener -> TcpOverUdpServer -> APIServer
+```
+
+احراز هویت API رمزنگاری transport نیست. مثال‌ها را روی loopback قرار دهید و برای دسترسی راه دور از stream حفاظت‌شده استفاده کنید.
+
+## تنظیمات
+
+این node به config با `name` منطقی `edge-europe` تعلق دارد؛ همان config باید AuthenticationClient عمومی با نام `auth-client` داشته باشد:
+
+```json
+{
+  "name": "management-api",
+  "type": "APIServer",
+  "settings": {
+    "clients": [
+      {
+        "name": "monitor",
+        "token": "<64 hexadecimal characters representing 32 random bytes>",
+        "allow": [
+          {"config": "edge-europe", "node": "auth-client", "operations": ["status"]}
+        ]
+      }
+    ]
+  }
+}
+```
+
+placeholder را با token تصادفی تازه جایگزین کنید؛ برای نمونه `python3 -c 'import secrets; print(secrets.token_hex(32))'`. `clients` و فهرست مجوزها نباید خالی باشند. نام clientها و tokenهای decodeشدهٔ ۳۲ بایتی باید یکتا باشند. هر مجوز یک config منطقی، node عمومی و فهرست غیرخالی operationهای دقیق را مشخص می‌کند؛ wildcard و مجوز ضمنی مدیر وجود ندارد. reference نامعتبر یا operation ثبت‌نشده، آماده‌سازی را متوقف می‌کند. وجود `TunnelApi` به‌تنهایی آن را بیرونی نمی‌کند.
+
+با حضور هر APIServer، تمام configهای بارشده باید نام منطقی غیرخالی و یکتا داشته باشند. selector مسیر فایل نیست و فایل تازه‌ای بار نمی‌کند. نام config/node به حروف حساس و حداکثر ۲۵۶ بایت UTF-8 است. childهای داخلی و تولیدشده هدف عمومی نیستند.
+
+## محدودیت‌های اختیاری
+
+همهٔ مقدارها عدد صحیح مثبت و محدودند؛ صفر حفاظت را غیرفعال نمی‌کند. هندسهٔ ناسازگار که یک request/response محدود را جا ندهد در startup رد می‌شود. envelope بدون prefix حساب می‌شود؛ بودجهٔ حافظه، charge تخصیص و copyهای موقت مربوط را نیز در بر می‌گیرد.
+
+| تنظیم | پیش‌فرض | کاربرد |
+| --- | --- | --- |
+| `max_request_envelope` | 1048576 | بایت envelope درخواست. |
+| `max_response_envelope` | 1048576 | بایت envelope پاسخ encodeشده. |
+| `max_input_bytes` | 2097152 | payload ورودی نگه‌داشته‌شده در هر line. |
+| `max_line_memory` | 8388608 | charge حافظهٔ نگه‌داشته‌شده در هر line. |
+| `max_input_fragments` | 256 | سقف fragment/ورودی FIFO هر line. |
+| `max_queued_requests` | 8 | درخواست منتظر، علاوه بر یک درخواست فعال. |
+| `max_sessions` | 256 | session زندهٔ هر instance. |
+| `max_jobs` | 64 | job پذیرفته‌شده و تمام‌نشدهٔ هر instance. |
+| `handler_working_memory` | 8388608 | allowance موقت رزروشدهٔ هر handler. |
+| `max_memory` | 67108864 | مجموع حافظهٔ نگه‌داشته‌شده و reservationها. |
+| `frame_timeout_ms` | 15000 | مهلت مطلق تکمیل frame از نخستین بایت. |
+| `request_timeout_ms` | 10000 | پذیرش request کامل تا انتشار پاسخ، شامل انتظار FIFO/worker. |
+| `output_timeout_ms` | 15000 | انتشار پاسخ تا تحویل به transport، شامل Pause. |
+| `idle_timeout_ms` | 60000 | زمان بی‌کاری بدون frame/request/output جاری. |
+
+ورودی قطره‌ای مهلت frame را reset نمی‌کند. پس از انتشار پاسخ کامل، deadline درخواست پایان می‌یابد و deadline مستقل خروجی آغاز می‌شود. timeout یا قطع، job را abandoned می‌کند؛ reservation آن تا لغو واقعی یا پایان handler محدودِ در حال اجرا آزاد نمی‌شود.
+
+حافظهٔ کاری باید تخصیص واقعی استخر worker برای نتیجهٔ ۴۰۹۶ بایتی و ۸۱۹۲ بایت فرادادهٔ تجزیه را پوشش دهد. محدودیت کوچک‌تر پاکت پاسخ، برای نتیجهٔ معتبرِ بزرگ یک خطای محدود `response_too_large` برمی‌گرداند.
+
+## پروتکل
+
+هر request و response با طول unsigned چهار بایتی big-endian شروع می‌شود و سپس دقیقاً همان تعداد بایت JSON با UTF-8 دارد. طول شامل prefix نیست. newline یا NUL انتهایی وجود ندارد. مرز callback، chunk HTTP یا packet UDP مرز پیام API نیست؛ prefix/body می‌توانند تکه‌تکه یا چند frame در یک read باشند.
+
+```json
+{
+  "id": "request-42",
+  "auth": {"client": "monitor", "token": "<configured token>"},
+  "selector": {"config": "edge-europe", "node": "auth-client"},
+  "operation": "status",
+  "content_type": "application/json",
+  "body_encoding": "utf8",
+  "body": "{\"include_accounting\":true}"
+}
+```
+
+همهٔ فیلدهای نمایش‌داده‌شده به‌جز `selector.config` اجباری‌اند. حذف config فقط وقتی مجاز است که نام دقیق node میان **تمام nodeهای top-level تمام configهای بارشده** یکتا باشد. ابهام پیش از بررسی ثبت API یا مجوز محاسبه می‌شود؛ allowlist آن را یکتا نمی‌کند. احراز هویت پیش از lookup هدف انجام می‌شود و مجوز به هدف و operation حل‌شده اعمال می‌شود.
+
+`id` رشتهٔ غیرخالی UTF-8 با حداکثر ۶۴ بایت برای correlation است؛ deduplication یا checkpoint اجرا نیست. نام operation حداکثر ۶۴ و content type حداکثر ۱۲۸ بایت دارد. content type باید با descriptor operation برابر باشد. کلید ناشناخته/تکراری، type نادرست، دادهٔ اضافه، UTF-8 خراب و NUL decodeشده در metadata یا body نوع UTF-8 رد می‌شوند.
+
+`body` همیشه رشتهٔ JSON است. نوع `utf8` بایت‌های decodeشده را بدون تغییر تحویل می‌دهد؛ نوع `base64` باید strict و canonical باشد و بایت دلخواه از جمله NUL را حمل می‌کند. gateway محتوای node را parse یا normalize نمی‌کند. schema آن با handler است؛ `status` بدنهٔ `{}` یا `{"include_accounting":true}` را می‌پذیرد.
+
+پاسخ dispatchشده، حتی خطای سطح node، شکل زیر را دارد:
+
+```json
+{
+  "id": "request-42",
+  "error": null,
+  "result": {
+    "code": 0,
+    "content_type": "application/json",
+    "body_encoding": "utf8",
+    "body": "{\"can_authenticate\":true}"
+  }
+}
+```
+
+body بالا نمونهٔ خلاصه است؛ snapshot کامل در [AuthenticationClient](AuthenticationClient.mdx) آمده است. مقدارهای unsigned 64-bit در status رشتهٔ ده‌دهی‌اند. `result.code` معنای موفقیت/خطای handler را حفظ می‌کند. نتیجهٔ null handler به body خالی با type/encoding اعلام‌شده تبدیل می‌شود.
+
+خطای gateway، `result: null` دارد:
+
+```json
+{
+  "id": "request-42",
+  "error": {"code": "ambiguous_target", "message": "Specify the configuration name."},
+  "result": null
+}
+```
+
+اگر ID محدود و قابل اعتماد قابل بازیابی نباشد، null است. codeها عبارت‌اند از `invalid_request`، `invalid_encoding`، `unauthorized`، `forbidden`، `target_not_found`، `ambiguous_target`، `unsupported_api`، `unsupported_operation`، `unsupported_content_type`، `busy`، `timeout`، `shutting_down` و `response_too_large`. پیام‌ها ثابت و محدودند. client ناشناس و token نادرست هر دو `unauthorized` می‌دهند.
+
+frame/schema خراب و احراز هویت نامعتبر پس از حداکثر یک پاسخ خطای محدود، اتصال را می‌بندند. خطاهای هدف/operation/body در request معتبر و مجاز می‌توانند به ترتیب FIFO ادامه یابند. اگر خطا هم در بودجه جا نشود، بستن مستقیم مجاز است. پس از شروع پاسخ، خرابی transport یا timeout اتصال را می‌بندد و frame تازه در میانهٔ پاسخ درج نمی‌کند. انقضای request صف‌شده پشت پاسخ قبلی نیز بدون خطای خارج از ترتیب اتصال را می‌بندد.
+
+## تونل body در HTTP
+
+برای ترکیب مستندشده از HTTP/1.1 معمولی در حالت single استفاده کنید:
+
+```json
+{
+  "name": "http-body",
+  "type": "HttpServer",
+  "settings": {
+    "http-version": "1.1",
+    "http1-mode": "single",
+    "upgrade": false,
+    "path": "/management",
+    "method": "POST"
+  },
+  "next": "management-api"
+}
+```
+
+بایت‌های frame API را در body با Content-Length یا chunked معتبر بفرستید. پاسخ HTTP را ابتدا dechunk کنید و سپس طول API را بخوانید. برای شناخت پاسخ کامل منتظر EOF یا chunk پایانی نمانید. method/path تنظیم‌شده فقط تونل body را انتخاب می‌کند؛ APIServer تنها بایت body را می‌بیند. اعتبارنامه در envelope هر request است. این رابط request object از نوع REST، احراز هویت header یا HTTP status جدا برای هر operation ندارد.
+
+## برنامهٔ نمونه
+
+`examples/api_client.py` فقط از کتابخانهٔ استاندارد Python استفاده می‌کند. token از محیط یا فایل خوانده می‌شود و آرگومان خط فرمان نیست:
+
+```bash
+export WATERWALL_API_TOKEN="$(cat /private/path/operator-token)"
+python3 examples/api_client.py --host 127.0.0.1 --port 9080 \
+  --client monitor --token-env WATERWALL_API_TOKEN \
+  --config edge-europe --node auth-client
+```
+
+به‌جای محیط می‌توانید `--token-file /private/path/operator-token` بدهید. body پیش‌فرض status برابر `{}` است؛ `--body-file` بایت فایل را حفظ می‌کند و `--body-encoding base64` برای operation دودویی است. client طول و ID پاسخ را کنترل می‌کند، frame را کامل می‌خواند و body decodeشده را به stdout می‌نویسد. retry خودکار ندارد. برای TcpOverUdp به TcpListener محلی نمودار وصل شوید؛ پیاده‌سازی KCP در Python لازم نیست.
+
+## lifecycle و metadata
+
+تمام lineهای پذیرفته‌شده برای APIServer از نوع borrowed normal هستند و هرگز `lineDestroy()` نمی‌شوند. state پیش از Est سمت قبلی آماده و پاسخ‌ها downstream ارسال می‌شوند. در هر اتصال فقط یک operation dispatch می‌شود و بقیه FIFO هستند. Pause/Resume تولیدکنندهٔ پاسخ را کنترل می‌کند؛ deadline و سقف‌ها فعال می‌مانند. job جداشده فقط token session/request دارد؛ تنها worker اتصال می‌تواند session زنده را resolve کند و line را لمس کند. shutdown پیش از quiescence هدف‌ها admission عمومی API را می‌بندد؛ مالک واقعی lineها پیش از نابودی registry آن‌ها را drain می‌کند.
+
+| ویژگی | مقدار |
+| --- | --- |
+| node flags | `kNodeFlagChainEnd`, `kNodeFlagBlocksSplice` |
+| `can_have_prev` | `true` |
+| `can_have_next` | `false` |
+| `layer_group` | `kNodeLayer4` |
+| `layer_group_prev_node` | `kNodeLayer4` |
+| `layer_group_next_node` | `kNodeLayerNone` |
+| `required_padding_left` | `0` bytes |

@@ -5,7 +5,7 @@ sidebar_label: "Part 1: Overview & Mental Model"
 description: "The runtime model, core objects, callback directions, and tunnel lifecycle you must understand before changing any WaterWall tunnel."
 ---
 <!--
-Documentation version: 162
+Documentation version: 163
 -->
 
 # WaterWall Developer Guide
@@ -291,6 +291,14 @@ internal process containment and lifecycle deadlines (see Part 7). In particular
 Windows driver extraction or DNS/route cleanup. Keep stdin finite and close its writers: the read is synchronous. The Windows
 launcher observer independently bounds stalled configuration transfer; the runtime
 shutdown coordinator itself cannot interrupt a pre-controller read.
+
+API-facing configuration strings retain lexical evidence before the ordinary
+configuration parser discards source bytes or serializes variable substitutions.
+An embedded-NUL suffix must never turn into a valid C-string token or selector.
+These checks cover operator settings and public selector names; unrelated node
+settings retain their existing parsing rules. Runtime JSON error state is local
+to each parsing thread, since envelopes and operation bodies can be parsed on
+different event workers. Global JSON allocator hooks remain startup-only.
 
 ## The Four Core Objects
 
@@ -721,6 +729,42 @@ borrowing worker 0's pool.
 `tests/worker_identity_source_policy_test.py` enforces these rules: it rejects
 new `getWorkerXxx(getWID())` nesting, raw `getWID() == 0` ownership decisions,
 raw current-WID affinity comparisons, and tunnel-API recycle boilerplate.
+
+### Registered external node operations
+
+`ww/api/node_api.h` defines opt-in operation descriptors alongside node instances;
+existing `TunnelApi` entrypoints are not automatically public. A descriptor fixes
+the operation name, capability, request content type, response content type and
+encoding, and event-worker execution policy. Register only after successful
+constructor setup and freeze descriptors before runtime dispatch. Remove them on
+normal destruction, startup rollback and callback-table rejection before the
+instance or its dynamic library is reclaimed. Public node/tunnel layouts and the
+external-node ABI do not carry this registry.
+
+The common dispatcher receives already decoded, authenticated and authorized
+opaque bytes. The handler consumes an ordinary request buffer from its execution
+worker's pool and returns an ordinary result buffer from that same worker, or
+null for an empty body. It must respect its response and temporary-work allowance,
+perform finite synchronous work, and never retain borrowed call-context pointers,
+block on network I/O or wait for another worker. It must not infer permissions
+from command text. Response type/encoding come from the immutable descriptor.
+
+Dispatch and reply delivery are force-queued, including same-worker calls. A
+detached job owns heap bytes, cancellation state, synchronized reservations,
+owner WID and non-reused session/request tokens. Its foreign execution and
+cancellation paths must never dereference a raw connection line or owner-worker
+state. The target worker copies a bounded result into detached storage and
+recycles its result locally; only the connection owner resolves the live token
+and materializes output from its own pool. A line reference alone does not make
+foreign scheduling safe against logical destruction.
+
+Publish pending ownership before checked submission because refusal cleanup can
+run synchronously. Cancellation is notification/freeing only: it must not post
+new work, restart timers or call tunnel callbacks. Disconnect or timeout abandons
+a request but cannot interrupt a running handler or release its job/storage
+reservation early. Keep the reservation until execution/cancellation settles.
+Client request IDs correlate replies; they are neither lifetime tokens nor
+exactly-once execution or retry guarantees.
 
 ### Choosing an Idle Table
 
