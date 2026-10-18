@@ -6,7 +6,7 @@ description: "راهنمای node AuthenticationServer در WaterWall."
 ---
 
 <!--
-Documentation version: 159
+Documentation version: 160
 -->
 
 # AuthenticationServer
@@ -148,6 +148,99 @@ AuthenticationClient -> AuthenticationServer
 | `allow-user-write` | `AddNewUser` و `UpdateUser`. |
 
 `Authenticate` برای همه قابل استفاده است. تمام ماژول‌های دیگر به یک session token معتبر نیاز دارند.
+
+## لاگ ممیزی مدیریت
+
+نبودن `audit-log` این قابلیت را غیرفعال می‌کند. برای فعال‌کردن، این object را در
+`settings` قرار دهید:
+
+```json
+"audit-log": {
+  "path": "logs/auth-admin.jsonl",
+  "max-file-size": 16777216,
+  "max-files": 7
+}
+```
+
+`path` اجباری و نام دقیق فایل فعال است؛ مسیر نسبی از working directory فرایند
+محاسبه می‌شود. دایرکتوری والد باید پیش از startup موجود باشد. `max-file-size`
+حد صحیح بایت، با پیش‌فرض 16777216 (16 MiB) و بازهٔ 16384 تا 1073741824 است.
+`max-files` از ۲ تا ۳۲ و پیش‌فرض ۷ است و فایل فعال را نیز حساب می‌کند. کلید
+ناشناخته، تکراری و type نامعتبر رد می‌شوند. log level وجود ندارد و فیلتر سطح
+لاگر معمولی، رویدادهای ممیزی را حذف نمی‌کند.
+
+پیش از نوشتن رکوردی که فایل را از سقف عبور دهد، rotation انجام می‌شود. آرشیوها
+از `path.1` (جدیدترین) تا `path.N-1` هستند؛ قدیمی‌ترین هنگام نیاز حذف می‌شود.
+فایل کامل موجود در startup ادامه پیدا می‌کند و truncate نمی‌شود. فایل فعال
+غیرخالی که با newline تمام نشده باشد رد می‌شود؛ پیش از restart آن را بررسی و
+ترمیم کنید. فایل فعال، آرشیوها و sidecar پایدار `path.lock` متعلق به همین writer
+هستند. مسیر اختصاصی و جدا از دیتابیس، backup و لاگ معمولی، داخل دایرکتوری تحت
+کنترل اپراتور انتخاب کنید. هنگام فعال‌بودن backup معمولی، نام فعال مطابق
+`authenticationserver-*.json` در `normal-backups-path` رزرو است؛ aliasهای همان
+دایرکتوری نیز رد می‌شوند. نام متمایزی مانند `auth-admin.jsonl` می‌تواند در همان
+دایرکتوری قرار گیرد. هنگام اجرا lock را حذف و فایل‌ها را با ابزار بیرونی
+rename یا rotate نکنید. writer فایل عادی بدون link alias می‌خواهد، permission
+خصوصی اعمال می‌کند و writer دوم را نمی‌پذیرد. در Unix مجوز `0600` و در Windows
+یک ACL حفاظت‌شده برای کاربر فرایند و SYSTEM اعمال می‌شود. اگر لاگ فعال نتواند
+فایل‌ها را باز یا اعتبارسنجی کند، startup شکست می‌خورد.
+
+تلاش‌های موفق و ردشدهٔ `create-user`، `update-user` و `change-user-password`
+که به handler ثبت‌شده برسند، ثبت می‌شوند. نتیجهٔ `AddNewUser` و `UpdateUser`
+پروتکل تولیدکننده، از جمله رد مجوز تولیدکنندهٔ احرازشده نیز ثبت می‌شود.
+خواندن‌ها، احراز هویت، batch ترافیک و رد درخواست در gateway پیش از dispatch
+رکورد مدیریتی ایجاد نمی‌کنند. این قابلیت تاریخچهٔ مدیریت حساب است، نه لاگ
+کامل دسترسی و امنیت.
+
+هر خط JSON با UTF-8 فقط این metadata محدود را دارد:
+
+| فیلد | معنا |
+| --- | --- |
+| `timestamp_ms` | میلی‌ثانیهٔ Unix با ساعت دیواری UTC، به‌شکل رشتهٔ ده‌دهی؛ اصلاح ساعت می‌تواند آن را عقب ببرد. |
+| `server_instance`, `sequence` | هویت همین نمونهٔ سرور و ترتیب پذیرش رکورد؛ sequence رشتهٔ ده‌دهی است. برای تشخیص restart و ترتیب استفاده شوند. |
+| `config`, `node` | نام منطقی config و node مقصد. |
+| `source`, `actor` | `api` و نام client احرازشدهٔ API، یا `producer` و نام تولیدکننده؛ هویت نامعلوم `null` است. |
+| `gateway_config`, `gateway_node` | هویت APIServer برای API؛ در درخواست تولیدکننده `null`. نام client به‌تنهایی لزوماً یکتای سراسری نیست. |
+| `operation`, `user_id` | نام ثابت operation و ID canonical ده‌دهی؛ اگر parsing ID را مشخص نکرده باشد `null`. |
+| `outcome`, `error` | `committed` با خطای `null`، یا `rejected` با کد خطای ثابت. |
+| `config_revision` | revision دقیق commit به‌شکل رشتهٔ ده‌دهی؛ برای رد درخواست `null`. |
+| `fields` | نام leafهای تنظیمات انتخاب‌شده، بدون مقدار؛ ساخت/تغییر رمز از markerهای `account` و/یا `credentials` استفاده می‌کند. ویرایش با مقدار قبلی نیز می‌تواند نام فیلد داشته باشد. |
+| `identity_truncated` | آیا label هویت actor/gateway از سقف کپی محدود بیشتر بوده است. نام‌های پیکربندی‌شدهٔ مقصد/تولیدکننده هنگام فعال‌بودن ممیزی اعتبارسنجی می‌شوند. |
+
+هر دو منبع spelling عمومی API مانند `enabled`، `notes`، `limit.traffic.u`،
+`wireguard_allowed_ips` و `time.expire_at_ms` را به‌کار می‌برند. رمز، credential
+مشتق‌شده، secret تولیدکننده، token، بدنهٔ درخواست و مقدار فیلد ویرایش‌شده هیچ‌گاه
+وارد رکورد نمی‌شوند. رویداد موفق همان لحظهٔ commit revision و پیش از ارسال
+پاسخ صف می‌شود؛ گم‌شدن پاسخ آن را به rejection تبدیل نمی‌کند. `AddNewUser`
+تولیدکننده رفتار موجود ذخیره و rollback را حفظ می‌کند؛ شکست ذخیره همراه rollback
+موفق، نتیجهٔ ردشده است.
+
+صف ثابت ۲۵۶ رکورد، عملیات حساب را از نوشتن فایل جدا می‌کند. mutex کوتاه فقط
+کپی metadata محدود را حفاظت می‌کند؛ ساخت JSON، I/O، rotation و diagnostic در
+یک thread مستقل انجام می‌شوند. پرشدن صف یا خطای فایل حساب را rollback نمی‌کند
+و ACK موفق را به شکست تبدیل نمی‌کند. صف پر، رویداد جدید را حذف و سلامت را
+نامناسب می‌کند. خطای I/O writer همین نمونه را fault می‌کند تا بعد از بایت‌های
+نامطمئن/ناقص رکورد دیگری نوشته نشود؛ رکوردهای صف‌شده و بعدی dropped حساب
+می‌شوند. پس از اصلاح علت، restart لازم است. shutdown عادی رکوردهای پذیرفته‌شده
+را پیش از آزادکردن writer تخلیه می‌کند؛ writer faultشده رکوردهای ازدست‌رفته را
+بازیابی نمی‌کند.
+
+`status.audit` همیشه وجود دارد و شامل `enabled`، `healthy`، `queued_records`،
+`written_records`، `dropped_records`، `write_failures` و `last_error` است.
+شمارنده‌ها رشته‌های unsigned ده‌دهی و متعلق به عمر همین node هستند.
+`queued_records` رکورد در حال نوشتن را حساب نمی‌کند؛ `written_records` تعداد
+append و flush موفق است. شمارنده‌ها مستقل نمونه‌برداری می‌شوند و معادلهٔ
+حسابداری snapshot‌شده نیستند. پس از حذف رکورد یا خطای I/O، `healthy` false
+می‌ماند. `last_error` برابر `null` یا یکی از `queue_full`، `sequence_exhausted`،
+`open`، `write`، `flush`، `rotate`، `close`، `invalid-file` است. status مسیر فایل،
+متن خطای سیستم یا محتوای رکورد را افشا نمی‌کند. حالت غیرفعال healthy، شمارندهٔ
+صفر و خطای null دارد. لاگر diagnostic معمولی نیز خطای startup/runtime را
+گزارش می‌کند.
+
+صف‌شدن به معنی نوشته‌شدن نیست و flush تضمین دوام پس از crash نیست. لاگ با
+دیتابیس کاربران transaction اتمیک مشترک ندارد، برای هر رکورد disk-sync تضمین
+نمی‌کند، replay/recovery یا تشخیص دستکاری ارائه نمی‌دهد. موفقیت API همچنان
+تعهد حافظه‌ای موجود است؛ رکورد ممیزی ثابت نمی‌کند ذخیرهٔ دیتابیس یا refresh
+کلاینت کامل شده است.
 
 ## فرمت دیتابیس
 
@@ -601,6 +694,15 @@ revision را به هم پیوند می‌دهد و شرط خوش‌بینانه
     "last_result": "success",
     "last_attempt_age_ms": "3200",
     "last_success_age_ms": "3200"
+  },
+  "audit": {
+    "enabled": false,
+    "healthy": true,
+    "queued_records": "0",
+    "written_records": "0",
+    "dropped_records": "0",
+    "write_failures": "0",
+    "last_error": null
   }
 }
 ```
