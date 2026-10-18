@@ -5,7 +5,7 @@ sidebar_label: "Part 5: Anatomy & Workflow"
 description: "The on-disk layout of a WaterWall tunnel, what each file owns, node.c metadata, the create/line-state patterns, HTTP constraints, and the implementation workflow."
 ---
 <!--
-Documentation version: 177
+Documentation version: 178
 -->
 
 # Part 5: Anatomy of a Tunnel & Workflow
@@ -817,7 +817,7 @@ aggregate sampling describes an interval while traffic continues. Diagnostics
 never change admission, observations, baselines, batches or scheduling state.
 
 AuthenticationServer explicitly registers the read-only `status`, `get-user`
-and `list-users` operations plus writable `update-user`, each on the calling event
+and `list-users` operations plus writable `update-user` and `create-user`, each on the calling event
 worker. The strict read-operation parser must apply the 4096-byte, depth-two and 16-value bounds
 before building a JSON tree. IDs are canonical nonzero unsigned decimal strings;
 all numeric result leaves use decimal strings without floating-point conversion.
@@ -918,6 +918,85 @@ reconsider after conflict or unknown outcome; never automatically obtain a fresh
 token and replay the old patch. Request IDs are correlation labels rather than
 idempotency records. The compact acknowledgement, including maximum request-ID
 escaping, must fit the gateway's minimum 1024-byte encoded envelope.
+
+`create-user` has an independent exact operation permission; update permission
+and producer credentials do not grant creation. Require a caller-supplied
+canonical nonzero decimal-string ID and nonempty exact UTF-8 password, with only
+an optional public `config`. Reuse the 18 strict configuration leaves and numeric
+rules without relaxing update-user's nonempty-patch requirement. Omitted or empty
+creation config preserves `userCreate()` defaults: enabled, 120000 ms statistics
+interval, empty strings and zero unlimited/unset limits/expiry. Supplied nested
+objects must remain nonempty. Bound creation bodies to 32 KiB, depth four and 64
+lexical values including keys before JSON-tree allocation. Reject token fields,
+protected import fields, aliases, NUL and malformed UTF-8.
+
+Prepare a fresh private owned user outside shared locks; credential derivation
+must not run under the API state/collection locks. Preserve 32-byte `user_t`
+alignment with matched aligned allocation/release, and never copy initialized
+native locks with struct assignment or memcpy. Derive ordinary credentials from
+the exact supplied password and use constructor-generated wall-clock creation
+time. Keep statistics, first use, runtime and client-local observations empty.
+Destroy/wipe owned password staging and unpublished users on every refusal and
+release preparation ownership after transfer. Public creation/read responses
+remain projections with no credentials.
+
+The creation transaction tries `server state write -> collection write`, without
+acquiring any existing user's config/statistics lock. Reject exhausted revision
+under state; under collection prioritize existing ID over other duplicate
+classes. Share existing indexed integrity/preflight/reserved insertion with
+blocking add/load callers while preserving their duplicate precedence. Creation
+never upserts or treats an identical account as a successful replay. Fixed
+`credentials_exist` groups hash/UUID/WireGuard conflicts without revealing keys
+or the conflicting account; crypto/backend or native-init refusal is typed
+`creation_failed`, separate from malformed input.
+
+Before any reserve, admit complete checked new extents for active pointers,
+monotonic stable slots, block pointers/new 64-user blocks, all seven hash maps'
+value/metadata arrays and optional Allowed-IP growth. Use real STC rounding and
+load-factor geometry. Charge private preparation, aligned allocation overhead,
+scratch, unpublished-slot/string copies and actual result-pool storage, including
+peak overlaps, against the supplied aggregate working allowance. Creation has
+no fixed 1 MiB total-growth cap. Keep name-map capacity sufficient for all active
+users, including unnamed accounts, so later bounded renames can insert without
+growth. Removed stable slots remain unavailable until collection clear.
+
+When name-map growth is required, inspect admitted buckets and stored names with
+a cumulative byte-work budget equal to the supplied working allowance, including
+terminator detection and bounded deadline checks. Refuse before rehash if the
+scan cannot fit. Skip this full scan when name capacity is sufficient. Preserve
+average-case collision semantics and finite synchronous native rehash/crypto;
+check deadlines between reserves without promising interruptible operations or
+a strict response-time bound. Fixed diagnostics never scan/log stored names or
+credentials.
+
+Reserve/prebuild the same 256-byte transaction ACK and actual pool charge before
+publication. Prepare an unpublished stable slot, including all native lock/string
+failure paths, and check deadlines immediately before publication. Reserved
+insertion must not allocate/rehash: publish all indexes, active pointer, active
+count and monotonic slot count once, then increment configuration revision once
+under state ownership. Impossible commit-stage inconsistencies are fatal
+invariants, not ordinary partial-success errors. Private reserved capacity may
+survive precommit refusal; membership/counts/revisions and published pointers
+must remain stable. After commit return the existing ACK without allocation,
+rendering, deadline refusal or rollback. Existing accounts, statistics revision
+and producer checkpoints remain unchanged.
+
+Creation has no edit-token precondition: unrelated valid creations/edits do not
+invalidate the input. Success returns the exact committed revision/token and
+invalidates older tokens/cursors. No immediate save or telemetry update occurs;
+ordinary periodic/final persistence and client refresh remain separate. Keep
+producer `AddNewUser` synchronous save/rollback unchanged. An offline client
+cannot admit a previously unknown account until normal refresh, and existing
+pending accounting must survive that refresh.
+
+A returned creation node failure publishes no account. Post-dispatch delivery
+failure is outcome unknown even if shutdown/disconnect abandons the reply. The
+caller retains the original ID/inputs and rereads that ID. Presence establishes
+existence, not creator or password ownership; absence permits an explicit same-ID
+retry decision while the first request may still run. Never automatically choose
+another ID, replace a user, reset credentials or treat `id_exists` as replay
+proof. IDs are caller-managed permanent identities unique in the current
+collection, without an all-time ledger or cross-crash exactly-once guarantee.
 
 Primary-save telemetry is fixed-size process-local state under the server lock.
 Record an existing locked save once, at its primary failure/commit decision;
