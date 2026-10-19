@@ -5,7 +5,7 @@ sidebar_label: "Part 2: Lines & Lifetime"
 description: "The connection lifecycle, re-entrancy hazards, line references, and the clean-finish patterns that keep WaterWall tunnels free of use-after-free bugs."
 ---
 <!--
-Documentation version: 189
+Documentation version: 191
 -->
 
 # Part 2: Lines, Callbacks & Lifetime Safety
@@ -27,7 +27,7 @@ Every connection is driven by six events, each in two directions (upstream towar
 | `Init` | A line is starting; initialize this tunnel's per-line state. | Flows upstream from the creating adapter. |
 | `Est` | Repeatable notification that an adapter's transport is established (e.g. the remote socket connected); protocol negotiation is separate. | Normally relayed downstream, back toward the originating adapter. |
 | `Payload` | A chunk of data (`sbuf_t`) to transform and forward. | Either direction. |
-| `Pause` | Repeatable advisory request to stop production; ordinary middle nodes relay it transparently. | Either direction; adapters, exact-line endpoints and SpeedLimit handle producer control. |
+| `Pause` | Repeatable advisory request to stop production; ordinary middle nodes relay it transparently. | Either direction; adapters, exact-line endpoints, SpeedLimit and bandwidth-enabled UserController handle producer control. |
 | `Resume` | Repeatable advisory request to resume production; it does not prove all pressure has cleared. | Either direction; ordinary middle nodes relay it transparently. |
 | `Finish` | This direction is closing. | Directional and destructive. See below. |
 
@@ -56,7 +56,7 @@ helpers can remain inline. Struct visibility does not authorize direct dispatch.
 Pause/Resume defaults forward every notification, including duplicates. Dispatch
 does not store a paused bit, count holds, gate Payload, or infer a node's role from
 its chain position. Registered handlers still run, including handlers that map
-different lines or implement the SpeedLimit exception. Ordinary middle nodes use
+different lines or implement the explicit limiter exception. Ordinary middle nodes use
 the forwarding defaults. This transparency is separate from permanent per-line
 bypass: a node that still transforms payload or owns state must remain active.
 
@@ -1445,7 +1445,7 @@ node can synchronously submit Payload, Est, Pause, Resume or Finish. Keep accept
 payloads ordered and bounded until their protocol can carry them. Preserve the
 required wire order, including control messages before application bodies, even
 when application data arrives from the Est callback. Pause is independent of the
-establishment signal. Adapters, exact-line endpoints and SpeedLimit retain
+establishment signal. Adapters, exact-line endpoints, SpeedLimit and bandwidth-enabled UserController retain
 producer control; ordinary middle-node scheduled output need not wait for Resume.
 Continuing after any callback still requires the exact line references and
 logical-life checks described above. Never forward into a finished direction or
@@ -1503,7 +1503,7 @@ is never transparent forwarding.
 | Ordinary middle transform or parser | Relay every Pause/Resume. Transform admitted input and retain only necessary framing/protocol/ordering state under explicit bounds. |
 | Ordinary middle node with scheduled output | Relay every Pause/Resume. Due timers and ready backlogs may send without Resume, in FIFO and protocol order. |
 | Association or multiplexing boundary | Map exact lines and combine pressure reasons for the producers it controls. Being in the middle of a configured chain does not remove its endpoint responsibilities. |
-| SpeedLimit | Explicit middle-node exception: combine local throttling with external pressure; handle or absorb notifications so neither reason is released by the other. |
+| SpeedLimit and bandwidth-enabled UserController | Explicit middle-node exception: combine local throttling with external pressure; handle or absorb notifications so neither reason is released by the other. UserController datagram backlog alone does not hold its producer. |
 
 An ordinary middle node may originate advisory Pause/Resume toward either live,
 initialized side. After originating Pause, it must arrange its own eventual
@@ -1513,7 +1513,7 @@ hold requiring an equal number of Resume calls.
 
 These advisory requests do not carry the identity of every outstanding issuer.
 An advisory Resume may override another node's Pause; it does not promise that
-all receivers are writable or all queues empty. Endpoints and SpeedLimit retain
+all receivers are writable or all queues empty. Endpoints and the explicit limiters retain
 the combination of pressure reasons that they explicitly own. Ordinary middle
 nodes do not recreate that machinery merely to relay notifications.
 
@@ -1532,7 +1532,7 @@ of transmission. No generic timer or payload gate belongs in `ww` dispatch.
 
 Node-specific descriptions below also document scheduling gates implemented by
 individual nodes. Those gates do not establish a general requirement that an
-ordinary middle node wait for Resume. Endpoint and SpeedLimit flow control remains
+ordinary middle node wait for Resume. Endpoint and explicit-limiter flow control remains
 required independently of those local scheduling choices.
 
 The [reverse activation prefix](./part3-buffers-and-padding.mdx#reverse-activation-prefix)
@@ -1556,7 +1556,7 @@ reentrancy barrier. Reentrant input has its own FIFO position and bound; seriali
 nested batches after older input within the outer synchronous dispatch. They must
 not be relabeled as one ever-growing batch. Work deferred beyond that dispatch
 remains a bounded, ordered backlog. An ordinary middle node may release ready
-work without Resume; endpoint and SpeedLimit drains retain their flow control.
+work without Resume; endpoint and explicit-limiter drains retain their flow control.
 
 Finish, logical death, protocol rejection and hard-limit refusal are terminal:
 stop immediately and release the untransferred remainder. Batch completion never
@@ -1590,7 +1590,7 @@ publish consumption before callbacks and release when that responsibility ends. 
 ordering obligation; a guarded admission/drain can serialize reentry without
 adding permanent queues to every middle node.
 
-At an endpoint or SpeedLimit, Resume releases a producer according to the reasons
+At an endpoint or an explicit limiter, Resume releases a producer according to the reasons
 that endpoint or limiter owns; it does not prove that every queue in the chain is
 empty. Ordinary middle nodes relay notifications without consumer-permission
 queues or a Resume prerequisite for due output. Locally originated advisory
@@ -1764,6 +1764,48 @@ pointer does not guarantee rearm admission.
 Each notification path returns without touching line state after the callback,
 which may synchronously close or reenter the connection. Token availability never
 overrides consumer pressure, and empty queued input cannot stall a drain.
+
+### UserController shared user shaping
+
+Bandwidth-enabled UserController is an explicit producer-control limiter on its borrowed normal lines. For streams,
+its local queue hold and external consumer Pause are independent reasons: neither releases the other. Datagram backlog
+does not create a producer hold or send Pause/Resume solely for local shaping: UDP producers may otherwise discard
+arrivals before the controller's bounded queue fills. Datagram queue overflow drops the newly refused input; explicit
+external consumer Pause/Resume still applies and is propagated. The direction carrying queued
+upstream bytes controls the producer toward prev; downstream bytes control the producer toward next. Mapping those
+bytes to upload/download depends separately on the saved Init origin. A consumer Pause suspends that direction's drain
+and removes its eligible fair turn. Resume establishes progress before notifying the producer, because notification may
+reenter Payload or Finish. Anonymous and unlimited immediate forwarding remain transparent; a retained FIFO still has
+priority after a finite-to-unlimited transition. UserController still borrows the line. For an internal close, save the
+Init origin before clearing local state, finish the noncreator side first, then the creator side; reverse-origin lines
+therefore finish prev before next. Receiving Finish still propagates only away from its sender.
+
+A user's independent directional bucket and fair-turn queue belong to one AuthenticationClient runtime and are shared
+across controllers and workers. Waiter identity is a non-reused runtime ticket, not a raw user pointer or numeric ID alone.
+No user, collection or budget lock covers a neighboring callback. Ready queues receive bounded FIFO turns; paused,
+canceled, empty or removed tickets do not block eligible work. Refill uses fresh monotonic samples across workers; burst
+capacity is `max(1, ceil(R / 10))` bytes at actual logical rate `R` bytes/s, with zero unlimited and no unsigned-64 rate
+clamp. The one-byte minimum permits integer-byte progress at very low rates. Whole datagrams can hold a turn while earning
+credit, so FIFO fairness does not promise equal latency.
+An oversized head datagram must earn complete credit before release. Credit earned before its activation is limited to
+ordinary capacity; abandoning its turn cannot donate an oversized burst to another ticket.
+
+Managed positive arrival observes first use before retention, independently of charged traffic. Delivery first previews
+eligibility without consuming credit, prepares exact output and reserves all retained costs, then revalidates and commits
+bandwidth plus multiplied quota under shared locks. Successful commit is immediately followed by ownership handoff,
+without intervening fallible preparation or scheduling. Streams may split; datagrams stay whole. A quota-exhausting final
+chunk is handed off once before closure. Queued, canceled or discarded data consumes no quota or multiplier remainder.
+An already exhausted user cannot commit more. Public traffic-accounting APIs retain their ordinary accounting behavior.
+
+The creator binds a pure owner-worker payload-mode resolver before preparation, or a manual instance configures
+`payload-mode` as `stream`, `datagram` or `dest_context->protocol`; conflicting or missing sources reject startup.
+The destination option reads protocol metadata once during Init: exactly TCP selects stream and exactly UDP selects
+datagram; missing, ambiguous or unsupported protocol rejects the line, even when unmanaged. It is opt-in, not an implicit
+fallback. Use it only when destination metadata is ready before Init and describes payload framing at this point in the
+chain; transport conversion may leave routing metadata that no longer describes local payloads.
+Either Init direction evaluates and saves the mode before admission or forwarding. Late promotion uses that saved mode,
+independently of later routing metadata changes. SOCKS/Trojan/VLESS classify their initialized exact-line role, HTTP uses stream, and WireGuard's normal
+transport uses datagram in either orientation. This metadata API adds no WireGuard authentication integration.
 
 ### StreamFragmenter upstream scheduling
 
@@ -2293,12 +2335,12 @@ Before you call a flow change done:
 - On a `false` from `lineCallWithRef()`, do you avoid touching `line`, `ls`, and
   `LinestateDestroy()`?
 - Does `Finish` destroy local state **before** propagating the real close?
-- When closing from the middle, do you finish upstream first, then downstream,
+- When closing from the middle, do you finish the noncreator side before the creator side,
   then return?
 - If you send final protocol bytes during `Finish`, do you mark the sender side
   finished before the send and block reflected `Pause`/`Resume`?
 - Are Pause/Resume repeatable and transparent in ordinary middle nodes, with due
-  output independent of Resume? Do adapters, exact-line endpoints and SpeedLimit
+  output independent of Resume? Do adapters, exact-line endpoints, SpeedLimit and bandwidth-enabled UserController
   retain producer control? Are local advisory holds released without relying on
   more input, and are FIFO, receiver limits and overflow/close behavior explicit?
 - Does retained data have a parser, protocol, ordering or producer obligation,

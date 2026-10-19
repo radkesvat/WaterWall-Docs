@@ -6,7 +6,7 @@ description: "راهنمای node UserController در WaterWall."
 ---
 
 <!--
-Documentation version: 155
+Documentation version: 157
 -->
 
 # UserController
@@ -70,8 +70,8 @@ TunDevice -> WireGuardDevice -> UserController -> UdpStatelessSocket   (line sta
 ```
 
 در هر دو چیدمان، per-peer line ابتدا بدون مدیریت از `UserController` عبور می‌کند، چون هنوز user روی آن ثبت نشده است.
-پس از احراز هویت peer در `WireGuardDevice`، user با `lineAddUser()` به line اضافه می‌شود و سپس
-[Programmatic Promotion API](#programmatic-promotion-api) همان line را در همان لحظه زیر پوشش محدودیت‌های user می‌برد.
+WireGuardDevice اکنون از peerهای تنظیم‌شده استفاده می‌کند و user پایگاه داده را روی line نمی‌گذارد. integration
+سفارشی می‌تواند با `lineAddUser()` و [Programmatic Promotion API](#programmatic-promotion-api) line را مدیریت کند.
 
 `UserController` در هر دو جهت کار می‌کند: چه line از `prev` با upstream `Init` آغاز شود و چه از `next` با downstream
 `Init`. مبدأ هر line ذخیره می‌شود تا upload و download در جهت درست محاسبه شوند؛ بخش
@@ -85,6 +85,7 @@ TunDevice -> WireGuardDevice -> UserController -> UdpStatelessSocket   (line sta
   "type": "UserController",
   "settings": {
     "auth-client-node-name": "auth-client",
+    "payload-mode": "stream",
     "sweep-interval-ms": 1000,
     "verbose": false
   },
@@ -101,6 +102,7 @@ TunDevice -> WireGuardDevice -> UserController -> UdpStatelessSocket   (line sta
 | `type` | string | باید `UserController` باشد. |
 | `settings` | object | باید object غیرخالی باشد. |
 | `settings.auth-client-node-name` | string | نام یک `AuthenticationClient` موجود. نباید به خود `UserController` اشاره کند. |
+| `settings.payload-mode` | string | برای instance دستی اجباری است: `stream`، `datagram` یا `dest_context->protocol`. سازندهٔ داخلی resolver تغییرناپذیر می‌دهد. |
 
 ## تنظیمات اختیاری
 
@@ -121,9 +123,70 @@ TunDevice -> WireGuardDevice -> UserController -> UdpStatelessSocket   (line sta
 | `connections-out` | حداکثر تعداد line‌های outbound هم‌زمان برای user. |
 | `ips` | حداکثر تعداد source IP‌های هم‌زمان برای user. استفاده دوباره از IP قبلاً شمرده‌شده مجاز است. |
 
-این node `connections-in` را اعمال نمی‌کند. محدودیت سرعت `bandwidth` نیز وظیفه آن نیست؛ برای محدود کردن نرخ ارسال بر حسب بایت بر ثانیه از `SpeedLimit` استفاده کنید.
+این node `connections-in` را اعمال نمی‌کند. پهنای باند محلی را طبق قرارداد بخش بعد اعمال می‌کند.
 
 نبودن یک limit یا مقدار صفر آن یعنی فیلد مربوطه نامحدود است.
+
+## پهنای باند و مرزبندی payload {#bandwidth-and-payload-framing}
+
+`limit.bandwidth.u` یا `up` و `.d` یا `down` تعداد بایت منطقی واقعی در ثانیه هستند؛ صفر یعنی نامحدود و کل بازهٔ
+unsigned 64-bit معتبر است. همهٔ اتصال‌ها، controllerها و workerهای یک user در همان AuthenticationClient سهم مشترک
+دارند؛ userها، جهت‌ها و instanceهای دیگر مستقل‌اند. هماهنگی بین ماشین‌ها وجود ندارد. `traffic-multiplier` فقط
+مصرف سهمیه را تغییر می‌دهد؛ نرخ، burst، اندازهٔ صف و ساعت را تغییر نمی‌دهد.
+
+ظرفیت burst عادی برای نرخ `R` برابر `max(1, ceil(R / 10))` بایت است؛ تقریباً ۱۰۰ میلی‌ثانیه با حداقل یک بایت در نرخ
+خیلی کم. صف‌های واجد شرایط به نوبت‌های محدود FIFO سرویس می‌گیرند؛ datagram کامل هنگام جمع کردن اعتبار نوبت خود را
+نگه می‌دارد، بنابراین fairness تضمین تأخیر برابر نیست. stream
+می‌تواند به قطعه‌های دقیق تقسیم شود؛ datagram کامل و به ترتیب ارسال می‌شود. datagram خالی جای خود را در FIFO حفظ
+می‌کند و نرخ یا سهمیه مصرف نمی‌کند. بستهٔ بزرگ‌تر از burst ابتدا کل اعتبار خود را جمع می‌کند و سپس یک‌جا می‌رود؛
+بنابراین burst لحظه‌ای استثنای یک datagram دارد، حتی با نرخ ۱ بایت در ثانیه. idle پیش از فعال شدن head فقط اعتبار
+عادی می‌دهد. لغو یا Pause نوبت head را آزاد و اعتبار قابل انتقال را به ظرفیت عادی محدود می‌کند. سقف datagram برابر
+۶۵٬۵۳۵ بایت است؛ سقف کوچک‌تر خود پروتکل همچنان برقرار است.
+
+| محدوده، مجموع دو جهت | بایت منطقی | هزینهٔ تخصیص | buffer | ticket صف جهت |
+| --- | ---: | ---: | ---: | ---: |
+| هر line مدیریت‌شده | 1 MiB | 2 MiB | 256 | 2 |
+| هر user در AuthenticationClient | 4 MiB | 8 MiB | 1024 | 1024 |
+| هر AuthenticationClient | 64 MiB | 128 MiB | 16384 | 16384 |
+
+این‌ها سقف منابع‌اند، نه تنظیم نرخ. رد پذیرش stream، line را می‌بندد و صف را بدون هزینه دور می‌ریزد. overflow
+در datagram فقط بستهٔ تازهٔ ردشده را حذف می‌کند و FIFO پذیرفته‌شده سالم می‌ماند. رد timer یا continuation لازم،
+line را در هر دو حالت می‌بندد. Pause مصرف‌کننده drain و نوبت آن جهت را متوقف می‌کند؛ Resume پیش از اعلان بیرونی
+پیشرفت را برقرار می‌کند. برای stream، فشار محلی و فشار مصرف‌کننده مستقل‌اند. backlog محلی datagram به‌تنهایی
+Pause/Resume به تولیدکننده نمی‌فرستد، زیرا تولیدکنندهٔ UDP ممکن است هنگام Pause بسته‌ها را پیش از پر شدن صف این node
+حذف کند. datagram هنگام انتظار برای اعتبار نرخ همچنان وارد صف محدود می‌شود؛ Pause/Resume صریح مصرف‌کننده همچنان
+اعمال و به تولیدکننده منتقل می‌شود.
+
+نخستین ورود با طول مثبت، پیش از queue شدن، مشاهدهٔ first-use، گزارش و انقضا را حتی offline و با ضریب تخفیف آغاز
+می‌کند. صفر بایت آغاز استفاده نیست. هزینه فقط یک بار، با ضریب، درست پیش از واگذاری مالکیت Payload اعمال می‌شود.
+آخرین قطعهٔ مجاز که سهمیه را تمام یا رد می‌کند یک بار تحویل و سپس line زنده بسته می‌شود؛ user از قبل over-quota
+grant جدید نمی‌گیرد. دادهٔ صف‌شده یا دورریخته‌شده هزینه ندارد. handoff تأیید تحویل socket نیست.
+
+refresh با ID یکسان، حتی تعویض رمز، اعتبار bucket، کسر refill، timestamp و هویت ticket را حفظ می‌کند. تغییر نرخ
+ابتدا اعتبار نرخ قدیم را محاسبه و به ظرفیت تازه محدود می‌کند؛ refresh بدون تغییر burst تازه نمی‌دهد. گذار به نامحدود
+FIFO را حفظ و گذار از نامحدود به محدود فقط یک burst عادی ایجاد می‌کند. اتصال مدیریت‌شده در outage عادی یا رد
+credential کلاینت اجرای cache را ادامه می‌دهد.
+
+instance دستی همیشه به `payload-mode` صریح نیاز دارد، حتی وقتی userهای فعلی نامحدودند:
+
+| مقدار | رفتار payload |
+| --- | --- |
+| `stream` | بایت‌ها می‌توانند بین چند تحویل تقسیم شوند. |
+| `datagram` | هر payload یک datagram کامل باقی می‌ماند. |
+| `dest_context->protocol` | پروتکل مقصد یک بار در Init خوانده می‌شود: فقط TCP یعنی stream و فقط UDP یعنی datagram. |
+
+در حالت destination context، پروتکل غایب، مبهم یا پشتیبانی‌نشده باعث رد line می‌شود. این گزینه تنها وقتی مناسب است
+که پروتکل مقصد پیش از Init مشخص باشد و نوع payload در همین محل chain را توصیف کند. تبدیل transport می‌تواند
+metadata مسیریابی UDP را روی line دارای بایت‌های stream رمزگشایی‌شده باقی بگذارد؛ بنابراین حذف setting هرگز
+به‌صورت خودکار این تشخیص را فعال نمی‌کند.
+
+سازندهٔ داخلی بلافاصله پس از ساخت و پیش از prepare،
+`usercontrollerSetPayloadModeResolver(controller, owner, resolver)` را bind می‌کند؛ setting و resolver هم‌زمان
+پذیرفته نیستند. resolver پرس‌وجوی خالص metadata روی worker مالک است؛ هر منبع mode در Init هر جهت، پیش از
+admission یا forwarding، یک بار تعیین و ذخیره می‌شود. promotion دیرهنگام هم از همان mode استفاده می‌کند و تغییر
+destination آن را عوض نمی‌کند. SOCKS/Trojan/VLESS نقش TCP و UDP
+remote را از state آماده می‌خوانند؛ HTTP همواره stream و transport معمولی WireGuard در هر دو جهت datagram است.
+packet line وارد این node نمی‌شود. این قابلیت احراز هویت database برای WireGuard اضافه نمی‌کند؛ رفتار unmanaged آن حفظ می‌شود.
 
 ## direction Awareness {#direction-awareness}
 
@@ -145,15 +208,15 @@ user از `next` وارد می‌شوند، بنابراین downstream payload 
 در `Init` از هر سمت (upstream `Init` برای line‌ای که از `prev` شروع شده، downstream `Init` برای line‌ای که از `next`
 شروع شده):
 
-1. line state آماده و جهت شروع line، از `prev` یا `next`، ذخیره می‌شود
+1. line state آماده و جهت شروع line ذخیره می‌شود؛ payload mode تعیین و ذخیره می‌شود و اگر تعیین نشود حتی line ناشناس رد می‌شود
 2. user handle فعلی line خوانده می‌شود
 3. line‌های anonymous یا دارای handle نامعتبر بدون اعمال محدودیت عبور می‌کنند و می‌توان بعداً آن‌ها را promote کرد
 4. line‌های authenticated از طریق `AuthenticationClient` بررسی می‌شوند
 5. برای line‌های پذیرفته‌شده connection/IP slot رزرو می‌شود و line در sweep ثبت خواهد شد
 6. line ردشده در همان سمتی که آن را شروع کرده finish می‌شود و سمت مقابل راه نمی‌افتد
 
-برای هر payload، upload یا download با توجه به مبدأ line محاسبه می‌شود (بخش [direction Awareness](#direction-awareness) را ببینید). اگر نتیجه accounting بستن user باشد، buffer
-بازیافت و هر دو جهت finish می‌شوند.
+ورود مثبت first-use را ثبت می‌کند. برای تحویل، mode ذخیره‌شده و جهت مبدأ تعیین‌کننده‌اند؛ bandwidth و quota پس از
+آماده‌سازی و درست پیش از handoff ثبت می‌شوند. قطعهٔ نهایی مجاز یک بار ارسال و سپس line بسته می‌شود؛ صف و حذف هزینه ندارند.
 
 در `Finish`، node accounting state را آزاد و state خودش را پاک می‌کند؛ سپس طبق قواعد directional finish، `Finish` را فقط به جهت مقابل می‌فرستد.
 
@@ -221,7 +284,7 @@ sweep registry تا زمان مدیریت شدن line‌ها reference آن‌ه
 - live connection/IP counters state محلی پردازش هستند و از طریق helper‌های `AuthenticationClient` نگه‌داری می‌شوند.
 - مصرف قابل‌کسر به stats عادی user اضافه می‌شود. ضریب `traffic-multiplier` روی AuthenticationClient تنظیم می‌شود؛ اندازهٔ واقعی payload، bandwidth و سرعت تغییر نمی‌کنند.
 - نخستین ترافیک واقعی حتی با هزینهٔ گرد‌شدهٔ صفر، زمان انقضا را شروع می‌کند. باقی‌ماندهٔ کسری هر جهت با ID پایدار در refresh منتقل و در reconnect حفظ می‌شود؛ این state فقط در حافظه است.
-- این node stream-style support node است، نه packet tunnel.
+- این node روی normal line با payload از نوع stream یا datagram کار می‌کند و packet tunnel نیست.
 
 ## متادیتای node {#متادیتای-نود}
 

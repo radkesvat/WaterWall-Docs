@@ -6,7 +6,7 @@ description: "چرخه‌ی عمر اتصال، خطرهای re-entrancy، نگ�
 ---
 
 <!--
-Documentation version: 165
+Documentation version: 167
 -->
 
 # بخش ۲: line‌ها، callback‌ها و ایمنی طول عمر
@@ -575,11 +575,12 @@ void encryptionclientTunnelUpStreamFinish(tunnel_t *t, line_t *l)
 ### بستن هر دو جهت از میانه‌ی chain {#بستن-هر-دو-جهت-از-میانهی-زنجیره}
 
 وقتی خود یک تونل میانی تصمیم می‌گیرد اتصال را به‌علت خطای پروتکل یا رسیدن به یک
-محدودیت tear down کند، مسئول بستن **هر دو** سمت است. ترتیب امن:
+محدودیت tear down کند، مسئول بستن **هر دو** سمت است. برای normal line قرضی با مالک در سمت prev، ترتیب امن زیر است؛
+اگر مالک سمت next باشد جهت‌ها برعکس می‌شوند تا همیشه سمت غیرسازنده پیش از سازنده Finish شود:
 
 1. line state خود تونل را نابود کنید.
-2. ابتدا `Finish` را در **upstream** بفرستید. چون `Finish` ‏re-entrant نیست، line
-   پس از آن هنوز زنده است.
+2. ابتدا `Finish` را در **upstream** بفرستید. سمت next این line را قرض گرفته و نباید آن را نابود کند یا
+   callback به سمت فرستنده بازتاب دهد؛ در این چیدمان line پس از آن زنده می‌ماند.
 3. سپس `Finish` را در **downstream** بفرستید. این فراخوانی ممکن است line را از بین
    ببرد.
 4. بلافاصله `return` کنید.
@@ -936,7 +937,7 @@ Byteهای راه دور به Socket مربوط به TcpConnector می‌رسن�
 - اگر `lineCallWithRef()` مقدار `false` برگرداند، آیا از دست‌زدن به `line`، ‏`ls` و
   `LinestateDestroy()` خودداری می‌کنید؟
 - آیا `Finish`، ‏state محلی را **پیش از** propagateکردن close واقعی نابود می‌کند؟
-- هنگام close از میانه، آیا ابتدا upstream، سپس downstream را Finish می‌کنید و
+- هنگام close از میانه، آیا ابتدا سمت غیرسازنده و سپس سمت سازنده را Finish می‌کنید و
   بعد بلافاصله برمی‌گردید؟
 - اگر هنگام `Finish` ‏byte‌های پایانی پروتکل را می‌فرستید، آیا پیش از ارسال سمت
   فرستنده را Finish‌شده علامت می‌زنید و reflection مربوط به `Pause`/`Resume` را
@@ -960,3 +961,40 @@ Byteهای راه دور به Socket مربوط به TcpConnector می‌رسن�
 ---
 
 ادامه: **[بخش ۳: buffer‌ها، padding و shift buffer‌ها](./part3-buffers-and-padding.mdx)**.
+
+## کنترل جریان UserController {#usercontroller-shared-user-shaping}
+
+UserController دارای bandwidth محدود، مانند SpeedLimit استثنای صریح producer-control روی normal line قرضی است.
+برای stream، Pause مصرف‌کننده و hold صف محلی مستقل‌اند؛ Resume هیچ‌کدام را به‌اشتباه آزاد نمی‌کند. backlog محلی
+datagram نه hold تولیدکننده ایجاد می‌کند و نه به‌تنهایی Pause/Resume می‌فرستد، زیرا تولیدکنندهٔ UDP ممکن است پیش از
+پر شدن صف محدود controller ورودی‌ها را حذف کند. overflow صف datagram فقط ورودی تازهٔ ردشده را حذف می‌کند؛
+Pause/Resume صریح مصرف‌کننده همچنان اعمال و منتقل می‌شود. صف upstream تولیدکنندهٔ
+سمت prev و صف downstream تولیدکنندهٔ سمت next را کنترل می‌کند؛ upload/download جداگانه از مبدأ Init ذخیره‌شده
+تعیین می‌شوند. Pause آن جهت را از drain و نوبت عادلانه خارج می‌کند. Resume پیش از callback بیرونی پیشرفت را
+برقرار می‌کند، چون callback می‌تواند Payload یا Finish را بازورود کند. middle node عادی همچنان همهٔ اعلان‌ها را
+شفاف عبور می‌دهد و output آماده را منتظر Resume نمی‌گذارد.
+
+bucket و FIFO نوبت‌های هر user و جهت بین همهٔ controllerها و workerهای همان AuthenticationClient مشترک‌اند.
+ticket به runtime یکتا تعلق دارد و دوباره استفاده نمی‌شود؛ هیچ قفل user، collection یا budget هنگام callback همسایه
+نگه داشته نمی‌شود. نوبت محدود موفق به انتها می‌رود و ticket خالی، Pause، لغوشده یا حذف‌شده مانع دیگران نیست.
+نرخ بر حسب بایت منطقی واقعی در ثانیه است، صفر نامحدود و کل unsigned 64-bit معتبر است. burst عادی تقریباً ۱۰۰ ms
+است؛ datagram بزرگ اعتبار کامل را پیش از ارسال جمع می‌کند و آزاد کردن نوبت اعتبار بزرگ را منتقل نمی‌کند.
+
+ورود مثبت ابتدا first-use را حتی offline ثبت می‌کند. delivery ابتدا preview بدون مصرف، سپس آماده‌سازی دقیق و
+reservation منابع و در پایان commit اتمی bandwidth و quota ضرب‌شده است. پس از commit هیچ کار fallible تا handoff
+نیست. stream می‌تواند split شود؛ datagram کامل می‌رود. قطعهٔ نهایی تمام‌کنندهٔ سهمیه یک بار تحویل و سپس line
+بسته می‌شود. صف و حذف هزینه و باقی‌ماندهٔ multiplier ندارند؛ API عمومی accounting قرارداد خود را حفظ می‌کند.
+
+سازنده پیش از prepare یک resolver خالص metadata روی worker مالک bind می‌کند؛ instance دستی `payload-mode` برابر
+`stream`، `datagram` یا `dest_context->protocol` می‌دهد. منبع متعارض یا غایب در startup رد می‌شود. گزینهٔ destination
+پروتکل را یک بار در Init می‌خواند: فقط TCP یعنی stream و فقط UDP یعنی datagram؛ پروتکل غایب، مبهم یا
+پشتیبانی‌نشده line را حتی در حالت unmanaged رد می‌کند. این گزینه صریح است و fallback خودکار نیست. تنها وقتی از
+آن استفاده کنید که metadata مقصد پیش از Init آماده باشد و framing در همین محل chain را توصیف کند؛ تبدیل transport
+می‌تواند metadata مسیریابی نامتناسب با payload فعلی باقی بگذارد. Init هر جهت mode را پیش از admission/forward
+ذخیره می‌کند؛ promotion دیرهنگام از همان مقدار استفاده می‌کند، مستقل از تغییر destination. SOCKS/Trojan/VLESS نقش آمادهٔ
+TCP/UDP remote، HTTP مقدار stream و transport عادی WireGuard در هر دو جهت datagram می‌دهند. این binding احراز
+هویت database برای WireGuard اضافه نمی‌کند.
+
+در close داخلی UserController، مبدأ Init پیش از پاک‌کردن state ذخیره می‌شود و سمت غیرسازنده پیش از سازنده Finish
+می‌شود؛ برای line آغازشده از next، ابتدا prev و سپس next بسته می‌شوند. controller همچنان line را قرض گرفته و
+مالک آن نیست. Finish دریافتی فقط دور از فرستنده انتشار می‌یابد.
