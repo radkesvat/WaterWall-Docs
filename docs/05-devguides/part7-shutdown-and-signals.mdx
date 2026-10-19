@@ -945,29 +945,36 @@ Per-interface configuration must be serialized with other network managers:
 D-Bus read/compare/write does not provide a cross-process atomic transaction.
 
 Every TUN backend calls `deviceReaderSessionEndRequest()` in the request phase
-and defers `deviceReaderSessionEndWait()` to BringDown. Linux and Darwin stop
-pipes are nonblocking and close-on-exec; `EINTR` is retried, a full pipe means a
-wake is already armed, and bounded reader polling prevents a hard wake failure
-from turning join into an unbounded wait. Every opened reader generation follows
-the same close, signal, `EndWait`, join, pool-owner reset, generation-retire
-order during rollback, restart, and shutdown. TUN output admission closes in the
-same request phase. BringDown waits for admitted worker writes and discards queued
-output before native device/session resources can close; no writer thread is
-joined. `Down` is published only after required ownership is gone.
-`UdpStatelessSocket` has no external producer session: its worker messages and async DNS requests settle before the owning workers acknowledge
-`Quiesced`, and it closes its WIO only from `onWorkerQuiesce` on the recorded
-`io_wid`.
+and defers `deviceReaderSessionEndWait()` to BringDown. Linux closes its reader
+generation and capacity-notification admission, and each owner detaches its WIO
+in `onWorkerQuiesce`. BringDown waits for admitted reads and detached watchers
+before retiring pending records. Refcounted queued tokens can outlive the device;
+a closed generation permits only token settlement, never device access. Required
+runtime resume/stop notification failure must not silently strand a disabled
+reader or an attached watcher.
 
-Both Linux TUN offload modes allocate direct receive scratch before device
-publication. Heap exhaustion is fatal; unsupported geometry or OS offload setup
-refusal can still select raw-IP framing. The running reader alone accesses current
-scratch. For GSO or assured ordinary input,
-it validates the record and reserves its storage and work context, plus an output
-allowance only in GSO mode, before transferring scratch ownership to the selected
-worker FIFO and acquiring replacement scratch. If capacity is unavailable, it keeps that one unadmitted record in scratch and
-waits on the session capacity event before reading again. Stop wakes that wait;
-the unadmitted record is discarded on reader exit. The device retains current
-scratch across restarts and releases it only after reader join.
+Windows closes receive/rearm admission, disables its one-shot thread-pool wait,
+waits for admitted worker receives, disables the wait again to settle a concurrent
+rearm, and quiesces native callbacks before ending Wintun. Queued notifications
+retain only the closed reader generation. The session owns its read event; the
+backend must not close that event separately. Its separate stop event also serves
+DNS command cancellation and remains alive through those operations.
+
+Darwin/BSD stop pipes remain nonblocking and close-on-exec. Their reader must
+join before pool ownership reset and fragment retirement. Every backend closes
+worker-output admission in the same request phase and settles admitted writes
+before native resources close. `Down` is published only after required ownership
+is gone. `UdpStatelessSocket` has no external producer session; its worker
+messages and async DNS requests settle before worker quiescence, and it closes
+its WIO on the recorded owner.
+
+Linux receive scratch belongs exclusively to each queue's worker. GSO/assured
+records reserve input storage, work context and any output allowance before
+transferring scratch to the destination FIFO. Ordinary checksum work copies only
+the compact packet. Capacity refusal retains the current record and returns to
+the event loop; workers never wait for their own queued deliveries. Stop discards
+unadmitted records after receive roots quiesce. Shared fragment storage uses
+detached allocations under its mutex and retains one device-wide set of limits.
 
 Ordinary batches, checksum work and GSO work share each worker's session FIFO
 in both offload modes. A GSO step allocates, segments, completes checksums, and
@@ -1003,7 +1010,8 @@ access; it never forces cleanup of storage reachable by a live reader.
 
 Device delivery uses local generation/session gates. A producer entering before
 gate closure may finish; a later entrant is refused and releases its retained
-ownership. An old reader generation is joined before restart opens a new one.
+ownership. An old reader generation is quiesced (and external reader threads joined) before
+restart opens a new one.
 TUN and raw devices own bounded per-worker output FIFOs. Their published
 writer generation is detached before admission closes. Native writes hold that
 generation's operation gate; close waits for them without serializing writes
@@ -1032,8 +1040,8 @@ WinDivert handle. Cancellation is not evidence that the kernel has released its
 buffer. These native roots require no dedicated application writer thread.
 
 Device fragment storage is session-local. Close admission, wait for admitted
-delivery, join the producer, reset exclusive pool ownership, and retire assembly
-or staged buffers before reopening. No incomplete assembly crosses generations.
+delivery, quiesce worker producers or join external readers, reset exclusive pool
+ownership where applicable, and retire assembly or staged buffers before reopening. No incomplete assembly crosses generations.
 Pool retirement detaches its pointer before delayed queue cleanup can release the
 last session reference. EndWait waits for admitted delivery roots only; packets
 already handed downstream carry no device receipt and follow ordinary packet
@@ -1210,7 +1218,7 @@ execution of the console lifetime and IOCP admission tests. Local completion
 should still use the smallest focused set that covers the changed ownership
 boundary. The full production and unit lanes remain a release checkpoint.
 
-The trusted TUN/PTC checksum mode is selected before device thread creation and
+The trusted TUN/PTC checksum mode is selected before receive activation and
 normal worker dispatch. Keep it immutable through shutdown and local device
 restart: queued partial packets and PCBs retain that contract until settlement.
 Existing session generations, delivery gates, detached-output cleanup and owner

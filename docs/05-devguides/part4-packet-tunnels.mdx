@@ -280,9 +280,10 @@ Receive callbacks consume buffers on the selected event worker. A successful raw
 write transfers buffer ownership to the queue; refusal leaves it with the caller.
 Stop requests do not join threads or authorize destruction.
 
-Linux TUN keeps lifecycle/open/rollback coordination in `tun_linux.c`, packet
-loops and worker GSO adaptation in `tun_linux_io.c`, and interface/route/DNS
-configuration in `tun_linux_config.c`. Capture keeps lifecycle coordination in
+Linux TUN keeps lifecycle/open/rollback coordination in `tun_linux.c`, worker
+receive and GSO adaptation in `tun_linux_reader.c`, native writes in
+`tun_linux_io.c`, fixed multiqueue setup in `tun_linux_queues.c`, and
+interface/route/DNS configuration in `tun_linux_config.c`. Capture keeps lifecycle coordination in
 `capture_linux.c`, reader and residual drain work in `capture_linux_io.c`,
 Netlink parsing/transactions/verdicts in `capture_linux_nfqueue.c`, and firewall
 identities, command supervision and reconciliation in `capture_linux_rules.c`.
@@ -310,6 +311,61 @@ provided by `device_flow_hash.h`; worker reduction and posting remain in
 policies. Hash values, fragment keys and packet-admission rules do not depend on
 this source organization.
 
+## Worker-owned TUN receive
+
+Linux and Windows TUN receive runs on ordinary event workers, without a dedicated
+application reader thread. Each native receive source has exactly one owner.
+Linux installs a nonblocking readiness watcher through a worker message queued
+behind packet Init; poller creation/registration refusal propagates through
+`wioAdd()` without publishing an active watcher. Windows uses a one-shot Wintun read-event wait whose foreign
+callback only posts a coalesced notification to worker 0. Windows workers copy
+and release ring packets before forwarding ordinary buffers. An empty ring
+rearms the native wait; a budget-limited drain queues a continuation. Windows
+callbacks admit at most 128 received records or 256 KiB, counting discarded
+records too. Linux callbacks attempt at most 64 reads and stop after 64 KiB;
+a single native record can exceed the remaining byte quantum.
+
+TunDevice's boolean `multi-queue` setting defaults to `true`. In that mode a
+newly created Linux device attempts one queue per event worker. All queues and
+fixed eBPF steering must be established before interface activation. Unsupported
+multiqueue/steering or refused extra-queue setup leaves one queue owned by worker
+0; extra descriptors are closed before publication. Existing legacy interfaces
+keep the single-queue attachment path. Queue count and steering stay fixed through
+a run; there is no automatic live queue migration. Queue mode is independent of
+checksum/GSO framing, and startup logs both choices. With `multi-queue: false`,
+Linux skips `IFF_MULTI_QUEUE`, eBPF steering and extra queue attachment, and uses
+one queue owned by worker 0. The configured processing worker count and full
+flow-worker selection remain unchanged; native writes use the same resulting
+queue set. Invalid types, including `null`, are rejected at node construction.
+Other platforms accept the boolean and retain their existing receive arrangement.
+
+Ingress steering uses the symmetric IPv4 address pair and protocol, excluding
+ports and fragment IDs. Thus ordinary packets and fragments of any transport
+flow have one receive producer, regardless of kernel write-learned affinity.
+Flows with the same address pair/protocol share a receive queue. WaterWall's
+existing full flow hash still chooses the processing worker after reassembly;
+queue owner and processing owner need not coincide. Other IP versions steer to
+queue zero and keep the existing downstream validation policy.
+
+All Linux readers share one session budget and destination FIFO set. Nonblocking
+`deviceReaderSessionTryPost()` retains the whole input batch only on capacity
+refusal; all other results transfer ownership. A reader publishes its waiting
+flag before attempting admission, retains its pending input, disables read
+interest, and resumes from a coalesced capacity notification. It must never call
+the legacy blocking admission path. Notification admission is independently
+closed and quiesced before its device context is reclaimed. An idle destination
+FIFO may drain inline only on its own worker inside an admitted normal callback;
+new work never overtakes a scheduled FIFO head or unfinished GSO work.
+
+The shared Linux fragment table uses its existing mutex and device-wide entry,
+range and storage limits. Its assembly and discard paths use detached allocations
+with finalized padding, never another worker's pool. Released fragment pointers
+belong to the caller's result array and survive subsequent offers. Other devices
+retain their exclusively owned reader-pool mode. Each Linux queue additionally
+retains at most one current receive allocation and one pending fragment-release
+batch (at most 17 packets); these bounded reader allocations are separate from
+the shared queued-work and fragment-storage budgets.
+
 ## Device ingress fragment policy
 
 Every fresh Linux TunDevice attempts checksum offload independently of `gso`.
@@ -326,7 +382,9 @@ upgrade keeps checksum-only mode on that descriptor.
 | Checksum and TCPv4 GSO | Same virtio framing | `TUN_F_CSUM \| TUN_F_TSO4` |
 
 Unavailable checksum/virtio setup or common scratch, capacity-notifier or FIFO
-resources cause a close/reopen into raw mode before publication. Open, MTU,
+resources can cause a close/reopen into raw mode before publication. Worker
+FIFO and budget resources remain required for raw worker reads; failure to
+establish them also in raw mode fails startup. Open, MTU,
 nonblocking and other genuine construction failures still fail construction.
 A GSO output-allowance failure disables TSO4 with a successful `TUN_F_CSUM`
 downgrade before publishing checksum-only state; if that ioctl fails, the
@@ -378,7 +436,7 @@ for any accepted protocol. The rule applies on both the worker and reader
 completion paths. TCP GSO segment completion instead preserves a computed TCP
 zero. Keep this offload encoding outside the generic checksum backend.
 
-Either Linux offload mode has one FIFO per event worker. Ordinary batches,
+Every Linux receive mode has one FIFO per event worker. Ordinary batches,
 checksum work and GSO work share that FIFO, so a later ordinary packet cannot
 overtake unfinished GSO work on the same worker. Each callback shares a budget of 64 packets and
 64 KiB across ordinary packets, GSO segments, and intact aggregates. An intact
@@ -403,8 +461,9 @@ ordinary packets and GSO work. Each GSO item reserves its actual aggregate
 allocation, work context, and one maximum output allocation allowance, with two
 packet slots. It retains that allowance through segmented or intact delivery and
 releases the reservation after finishing or being discarded. Workers do not
-wait for capacity. When admission is full, the reader keeps the unadmitted
-aggregate in scratch and waits for a session capacity notification. Reader
+wait for capacity. When admission is full, the owning worker keeps the unadmitted
+record, suspends native read interest, and returns to its event loop until a
+session capacity notification schedules a retry. Reader
 drain staging and fragment storage have separate existing bounds; session and
 FIFO-message metadata are bounded separately by packet count. The 8 MiB limit
 is an admission charge, not a total process-memory bound. There is no
@@ -478,7 +537,8 @@ range arrays bound metadata separately. These limits exclude pool caches and RSS
 Entries expire after 15 seconds without deadline refresh. Refusal/expiry keeps
 one fixed 15-second local poison interval; retries do not extend it. Opportunistic
 sweeping can retain bounded expired storage while idle. Retirement releases all
-storage after reader join and pool-owner reset; poison survives restart until its
+storage after reader quiescence (or external-thread join) and any required
+pool-owner reset; poison survives restart until its
 local deadline. No downstream timer epoch or residue receipt controls this owner.
 IPv4 identification reuse still has the protocol's inherent delayed-fragment
 ambiguity.
@@ -1028,7 +1088,8 @@ immediately enqueue packet delivery.** Creating an inactive device handle is
 different from bringing it up and launching its reader. If a creation/open API
 also starts reading, call that API from the later startup callback instead of
 `createHandle`. TunDevice keeps device creation and `tundeviceBringUp()` in
-`onStart`; the latter starts its reader thread and opens worker-output admission.
+`onStart`; the latter queues receive activation behind packet Init and opens worker-output
+admission on Linux and Windows. Darwin/BSD retain their external reader.
 Native output remains deferred onto event workers.
 
 The risk is initialization order, even when workers have not started dispatching.
