@@ -5,7 +5,7 @@ sidebar_label: "Part 4: Packet Tunnels"
 description: "Packet-line semantics, pure packet tunnels, packet/stream bridges, packet-line initialization, and paired-tunnel direction rules for layer-3 work."
 ---
 <!--
-Documentation version: 163
+Documentation version: 165
 -->
 
 # Part 4: Packet Lines & Packet Tunnels
@@ -457,9 +457,9 @@ One session owns all incomplete bytes; no incomplete datagram is published.
 Completion requires fragment zero, consistent final end and gap-free coverage.
 Fragment zero supplies the header including TOS, TTL, reserved and DF bits; MF
 and offset are cleared, total length and IPv4 checksum are rebuilt. Transport
-bytes and checksums are unchanged. Whole-datagram transport validation remains
-active: in a trusted direct pair TunDevice performs it after reassembly;
-otherwise it belongs to the downstream consumer.
+bytes and checksums are unchanged. The direct trusted Linux TUN/PTC pair skips
+whole-datagram transport checksum verification after reassembly. Other routes
+retain their downstream consumer's validation policy.
 Overlaps are dropped without overwriting accepted bytes; conflicting ends and
 range exhaustion poison the identity. Raw overlapping zero with staged tails
 also poisons, preserving the former local rejection rule.
@@ -652,75 +652,94 @@ header generation remains enabled on every route.
 
 ### Direct TunDevice / PacketsToConnection checksums
 
-Only a reciprocal immediate `TunDevice -> PacketsToConnection` pair may select
-trusted IPv4 header and TCP/UDP transport checksums. Both nodes advertise the
-static `kNodeFlagSupportsTrustedPacketChecksums` capability. TunDevice configures its
-private device after successful Linux virtio/checksum setup, scratch allocation,
-and worker FIFO setup, then publishes `kNodeFlagTrustedPacketChecksumsActive` on
-both instances before starting device threads. Checksum-only mode, including
-`gso:false` and a rejected GSO upgrade, is eligible. Raw fallback, non-Linux
-devices, or an intervening node retain ordinary behavior. A pair of
-TUN devices cannot negotiate the bridge contract. PTC reads the published mode
-when each owner-worker route is created lazily, regardless of node start order.
+Only a reciprocal immediate Linux `TunDevice -> PacketsToConnection` pair may
+select trusted IPv4 header and TCP/UDP transport checksums. Both nodes advertise
+`kNodeFlagSupportsTrustedPacketChecksums`. TunDevice selects its private receive
+policy and publishes `kNodeFlagTrustedPacketReceiveChecksumsActive` on both
+instances before starting device threads. This happens automatically in raw,
+checksum-only and GSO modes, independently of `gso`; no extra setting is needed.
+Non-Linux devices, interposed nodes and a pair of TUN devices retain ordinary
+verification. PTC reads the published receive mode when each owner-worker route
+is created lazily, regardless of node start order. The mode remains immutable
+through quiescence, pending work settlement and teardown.
 
-The active TUN verifies IPv4 structure without verifying its header checksum,
-including fragment admission and trusted ordinary/GSO writes. The active PTC
-netif and fake DNS also skip IPv4 header checksum verification. Header generation
-remains enabled: lwIP output, reassembly, segmentation and GSO aggregation still
-produce valid IPv4 header checksums. Complete TCP/UDP records with matching
-`NEEDS_CSUM` coordinates, or applicable `DATA_VALID`, carry
-assurance only in TUN-private queued work. Simultaneous flags are rejected.
-Ordinary records, generated GSO segments, and intact aggregates share the existing
-bounded worker FIFO; no checksum marker is added to an sbuf or line.
+This pair assumes all IPv4 input supplied by the kernel TUN interface has valid
+IPv4 header and TCP/UDP checksums, including forwarded input that the kernel may
+not have transport-verified. Corrupted payload can therefore be accepted,
+acknowledged and forwarded through a new connection with a fresh valid checksum.
+This is the kernel-boundary contract, independent of checksum metadata assurance.
+Other packet consumers and devices do not inherit it.
+
+The active TUN validates IPv4 structure without verifying its header checksum,
+including fragment admission and trusted ordinary/GSO writes. It skips TCP/UDP
+receive verification for unmarked ordinary records, after reassembly, and before
+GSO segmentation. The active PTC netif and fake DNS omit incoming IPv4 header and
+TCP/UDP checksum verification. Structure, exact lengths, metadata consistency,
+partial-fragment rejection, reassembly limits, repair requests, alignment copies,
+flow lookup, receive credit and output admission remain enforced. IPv6 and
+UDP-Lite verification remain enabled. Header generation remains enabled: lwIP
+output, reassembly, segmentation and GSO aggregation still produce valid IPv4
+header checksums.
+
+Complete TCP/UDP records with matching `NEEDS_CSUM` coordinates, or applicable
+`DATA_VALID`, carry positive assurance only in TUN-private queued work.
+Simultaneous flags are rejected. Receive trust does not manufacture positive
+metadata assurance for unmarked records. Ordinary records, generated GSO
+segments and intact aggregates share the existing bounded worker FIFO; no
+checksum marker is added to an sbuf or line.
 
 With active GSO on this pair, preflighted, assured TCPv4 GSO is delivered intact
 as one complete, unfragmented IPv4 packet of at most 65,535 bytes. PTC's custom pbuf
 wraps the aggregate for lwIP input without userspace segmentation or transport
 checksum completion. The aggregate retains the worker selected by the ordinary
 flow hash and its position in the worker FIFO. lwIP sees one larger TCP segment;
-no GSO metadata or original segment count is passed into the stack.
-
-Unmarked GSO transport checksums are verified before segmentation, then segments
-receive ordinary completion. Supported partial GSO seeds retain the kernel pseudoheader
+no GSO metadata or original segment count is passed into the stack. Unmarked GSO
+uses the existing segmentation path without pre-segmentation transport checksum
+verification. Supported partial GSO seeds retain the kernel pseudoheader
 destination; segmentation adjusts the transport length and completes IPv4
-headers. Unmarked ordinary transport checksums are verified after reassembly;
-corrupt transport bytes are never repaired into apparent validity. Generic
-offload coordinates retain materialization followed by transport validation. Partial IP fragments
-are rejected; preserved ordinary fragments still reach PTC's fatal input guard.
-IPv4 UDP checksum zero remains disabled and TCP zero remains a valid checksum.
-UDP lengths must be bounded by the IP payload. Ordinary verification covers
-the full IP payload, including any suffix beyond a shorter UDP declared length,
-matching the pinned lwIP receive checksum span. Positive offload assurance and
-partial writes require an exact UDP span; a shorter declaration takes ordinary
-verification instead of certifying its unchecked suffix.
+headers. Generic offload coordinates retain materialization; partial IP
+fragments are rejected. Preserved ordinary fragments still reach PTC's fatal
+input guard. IPv4 UDP checksum zero remains disabled and TCP zero remains a valid
+checksum. UDP lengths must be bounded by the IP payload. Positive offload
+assurance and partial writes require an exact UDP span; a shorter declaration
+retains ordinary conversion instead of certifying its unchecked suffix.
 
-Only active PTC netifs omit IPv4 header and TCP/UDP receive sums. IPv6, UDP-Lite,
-parsing, flow lookup, fragment guards, repair requests, alignment copies, receive credit,
-and output admission retain their contracts. Active, exactly bound IPv4 PCBs copy
-TCP payload without checksum-on-copy work. These copy-only writes keep ordinary
-copying below 64 bytes and call WaterWall's `wwMemoryCopyLarge()` entry point for
-larger spans, without requiring aligned payload addresses. Uncomputed segment
-caches remain invalid through append and split operations. When a full output sum
-is needed, an invalid cache selects a checksum over the actual pbuf chain.
+Receive trust and transmit capability are independent. After successful Linux
+virtio/checksum setup, scratch allocation and worker FIFO setup, TunDevice also
+publishes `kNodeFlagTrustedPacketChecksumsActive` on both instances. This transmit
+mode requires actual negotiated checksum support and ready resources, including
+checksum-only mode with `gso:false` or a rejected GSO upgrade; raw fallback does
+not qualify. PTC's `ww_trusted_receive_checksums` controls the receive exemption;
+`ww_partial_transport_checksum` controls only the negotiated transmit policy.
+Never enable partial transmit checksums solely because receive trust is active.
 
-Complete IPv4 TCP/UDP output fitting the actual netif MTU may omit its transport
-sum. The transport paths call `ip_output_if` with no IP options and account for
-its generated `IP_HLEN` header; other callers must supply their actual header
-length. Output needing fragmentation receives a full transport checksum first,
-including oversized UDP and exceptional TCP retransmissions. Fake DNS uses the
-same immutable route MTU and header geometry. Its input uses TUN assurance only
-on an active instance; other instances still validate UDP before cache mutation.
+Only transmit-enabled, exactly bound IPv4 PCBs copy TCP payload without
+checksum-on-copy work. These copy-only writes keep ordinary copying below 64
+bytes and call WaterWall's `wwMemoryCopyLarge()` entry point for larger spans,
+without requiring aligned payload addresses. Uncomputed segment caches remain
+invalid through append and split operations. When a full output sum is needed,
+an invalid cache selects a checksum over the actual pbuf chain. Raw TUN retains
+complete software-generated output checksums and checksum-on-copy.
 
-The ordinary active TUN writer replaces each complete supported packet's checksum field
-with the folded, non-complemented pseudoheader seed and emits ten-byte
-little-endian virtio metadata: `NEEDS_CSUM`, `GSO_NONE`, exact checksum start and
-offset, and zero GSO fields. A zero partial UDP seed is valid. Fragments and other
-protocols retain zero metadata; no fragment requests whole-datagram completion.
-The kernel can deliver partial packets locally or complete/offload them when
-forwarding. `DATA_VALID` is never used to ask a TUN writer to repair bytes.
-The mode is immutable through quiescence, pending work settlement, and teardown.
-ConnectionToPackets, raw/capture devices, and ordinary PTC netifs retain their
-full checksum behavior, including when sharing an engine with an active route.
+In negotiated transmit mode, complete IPv4 TCP/UDP output fitting the actual
+netif MTU may omit its transport sum. The transport paths call `ip_output_if` with
+no IP options and account for its generated `IP_HLEN` header; other callers must
+supply their actual header length. Output needing fragmentation receives a full
+transport checksum first, including oversized UDP and exceptional TCP
+retransmissions. Fake DNS uses the same immutable route MTU and header geometry.
+Its receive exemption applies only on the receive-trusted instance; other
+instances still validate UDP before cache mutation.
+
+The transmit-enabled ordinary TUN writer replaces each complete supported
+packet's checksum field with the folded, non-complemented pseudoheader seed and
+emits ten-byte little-endian virtio metadata: `NEEDS_CSUM`, `GSO_NONE`, exact
+checksum start and offset, and zero GSO fields. A zero partial UDP seed is valid.
+Fragments and other protocols retain zero metadata; no fragment requests
+whole-datagram completion. The kernel can deliver partial packets locally or
+complete/offload them when forwarding. `DATA_VALID` is never used to ask a TUN
+writer to repair bytes. ConnectionToPackets, raw/capture devices and ordinary
+PTC netifs retain full checksum behavior, including when sharing an engine with
+an active route.
 
 ### PTC output dispatch and TUN TCP aggregation
 
