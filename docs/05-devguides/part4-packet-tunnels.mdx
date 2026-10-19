@@ -353,9 +353,22 @@ refusal; all other results transfer ownership. A reader publishes its waiting
 flag before attempting admission, retains its pending input, disables read
 interest, and resumes from a coalesced capacity notification. It must never call
 the legacy blocking admission path. Notification admission is independently
-closed and quiesced before its device context is reclaimed. Destination FIFOs
-always drain through a deferred worker callback, including same-worker posts;
-new work never overtakes a scheduled FIFO head or unfinished GSO work.
+closed and quiesced before its device context is reclaimed. A Linux reader may
+open a synchronous receive-burst scope on its admitted current worker. A newly
+claimed same-worker FIFO accumulates input without posting a wake, then drains
+one bounded quantum when the scope ends, before the read callback returns.
+An existing scheduled token retains its ownership. Tokens claimed by foreign
+producers or outside a successful scope use the ordinary queued path; foreign
+appends can join an already locally claimed token. New work never
+overtakes a scheduled FIFO head or unfinished GSO work.
+
+`deviceReaderSessionTryBeginBurst()` requires an enabled worker FIFO and returns
+false outside the supplied worker's admitted normal callback. The caller keeps
+a live session reference, never nests scopes for the same queue, and calls
+`deviceReaderSessionEndBurst()` on every successful scope before yielding,
+including capacity refusal, read failure and closure. End clears the scope before
+delivery callbacks; unfinished work keeps its queued continuation and token
+reference. The native reader's generation gate remains held through End.
 
 The shared Linux fragment table uses its existing mutex and device-wide entry,
 range and storage limits. Its assembly and discard paths use detached allocations
@@ -1302,13 +1315,27 @@ MTU behavior remain supported; generated IPv4 IDs and IPv6 fragment IDs use
 separate shared sequences. Finite-width wrap is unchanged. Direct bridge pairs
 still require reassembly when exchanging fragments.
 
-Device receive dispatch coalesces ordinary established, in-order TCP ACK intent
-before packet construction. Each batch is bounded by the existing 64-packet and
-64-KiB worker quantum; an oversized ordinary packet travels alone. An absent
-worker engine skips batching without creating a stack for device-only traffic.
+Device receive dispatch opens a generic `packet_batch_t` scope around its existing
+64-packet and 64-KiB worker quantum; an oversized ordinary packet travels alone.
+The dispatcher has no lwIP dependency. Consumers join through persistent,
+owner-local participants that supply synchronous begin/end callbacks. Repeated
+joins of one participant share one begin/end pair. Empty scopes invoke no hooks;
+participants and their callback contexts must remain alive until scope end returns.
+Scopes cannot nest or span an event-loop yield. End clears the active scope and
+all participant memberships before flushing callbacks, which cannot open another
+scope; joins during a flush have no active scope.
+
+PTC joins its engine before stack entry, coalescing ordinary established, in-order
+TCP ACK intent before packet construction. Multiple PTC instances on one worker
+share the engine's one participant. A newly created engine can join immediately.
+Device-only traffic does no lwIP batch work, even when another configuration uses
+lwIP on the same worker. Output retains each connection's own interface and chain.
 Worker-owned readers enqueue even when the destination is their current worker.
-Same-worker delivery starts in a deferred FIFO drain after the bounded producer
-callback returns, so packets from one read burst can share the ACK quantum.
+Linux readers collect a bounded burst before ending their receive-burst scope.
+An eligible same-worker FIFO then drains inline through the existing ACK quantum,
+so its packets share ACK state without a receive-dispatch self-wake. Other FIFO
+tokens and unfinished quanta remain queued; same-worker input is not delivered
+during native read collection. Other workers may drain their queues concurrently.
 `wwLwipEngineBeginAckBatch()` and `wwLwipEngineEndAckBatch()` require the owner
 outside stack entry or dispatch. They must pair synchronously, without nesting
 or an event-loop yield. End flushes current cumulative ACK/window state before
