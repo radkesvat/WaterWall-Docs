@@ -35,7 +35,10 @@ UdpListener -> TcpOverUdpServer -> APIServer
 ```
 
 APIServer opens no socket and adds no transport encryption. Remote access needs
-an appropriately protected stream. Direct `UdpListener -> APIServer` is
+an authenticated encrypted transport with peer identity verification. API tokens
+do not prevent unauthenticated resource consumption; restrict reachability or
+authenticate peers in the transport. Input bounds do not eliminate connection
+floods. Direct `UdpListener -> APIServer` is
 unsupported: a length prefix does not repair datagram loss or reordering.
 TcpOverUdpServer reconstructs the reliable stream before APIServer reads it.
 See the [transport examples](../../03-examples/api/transports.mdx) for complete
@@ -91,7 +94,9 @@ Metadata names are case-sensitive. The outer parser rejects unknown or duplicate
 keys, wrong types, malformed UTF-8, trailing non-whitespace input, and decoded
 NUL in metadata or UTF-8 bodies. It bounds the envelope's nesting and values
 before allocating a JSON tree. These outer-envelope rules do not define the
-target node's body schema.
+target node's body schema. Runtime lexical rejections return fixed protocol
+errors without configuration-parser stderr diagnostics; startup/configuration
+parsing retains its diagnostics.
 
 ### Authentication, target selection, and permission
 
@@ -191,13 +196,16 @@ Messages are fixed and bounded; clients should branch on the error code.
 | `busy` | Gateway or dispatch capacity could not admit the work. |
 | `timeout` | An API deadline expired. |
 | `shutting_down` | API admission has closed. |
-| `response_too_large` | The result cannot fit the applicable response limit. |
+| `response_too_large` | A valid result cannot fit the encoded response limit or representable size. |
+| `invalid_response` | The handler returned invalid UTF-8 or NUL for a declared UTF-8 result. |
 
 A gateway error and a node error are different layers. For example, an
 AuthenticationServer `conflict` is inside `result.body` with `result.code: 1`,
 while a gateway timeout is in `error` and has no node result. Delivery failure
 after dispatch can hide an already committed mutation; it does not turn that
-mutation into a rollback.
+mutation into a rollback. `invalid_response` is a post-dispatch failure, so a
+mutation may already have committed. Invalid handler bytes are neither echoed
+nor logged. Base64 operations may return arbitrary bytes.
 
 ## Ordering, connection closure, and limits
 
@@ -219,7 +227,11 @@ defines settings and defaults. Envelope caps exclude the four-byte prefix;
 memory limits also account for retained allocations, fragments, queues, jobs,
 and temporary working storage. A node can impose a smaller body or work limit.
 JSON escaping and base64 expand encoded results, so the raw node-body length
-alone does not establish that its response envelope fits.
+alone does not establish that its response envelope fits. Declared request lengths
+do not allocate unread bodies: frame capacity grows for received bytes, charging
+old/new capacity overlap. The hard input-byte limit includes copied incomplete
+input; pressure watermarks subtract those copied bytes so receiving can continue
+after raw backlog or older queued requests drain.
 
 | Deadline | Interval |
 | --- | --- |
@@ -242,7 +254,8 @@ and does not retry writes automatically.
 Consult the target operation's contract before retrying. AuthenticationServer's
 public mutation APIs guarantee that a returned **node-operation failure** did
 not commit that invocation. A lost, malformed, or late reply, a disconnect, or
-a post-dispatch gateway timeout leaves its outcome unknown. A success
+a post-dispatch gateway error, including `timeout` or `invalid_response`, leaves
+its outcome unknown. A success
 acknowledges server memory; ordinary persistence and client refresh happen
 separately.
 

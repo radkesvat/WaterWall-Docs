@@ -6,7 +6,7 @@ description: "راهنمای node AuthenticationClient در WaterWall."
 ---
 
 <!--
-Documentation version: 159
+Documentation version: 160
 -->
 
 # AuthenticationClient
@@ -93,7 +93,7 @@ AuthenticationClient -> TcpConnector
 }
 ```
 
-chain اتصال به سرور احراز هویت راه دور:
+نمونه transport محلی loopback:
 
 ```json
 {
@@ -411,6 +411,36 @@ u8[response_data_len] response_data
 
 revision‌های پاسخ به‌عنوان آخرین revision‌های سرور ذخیره می‌شوند و پیش از دریافت‌های زمان‌بندی‌شده، با revision جدول کاربران محلی مقایسه می‌شوند.
 
+## محدودیت‌ها و transport محافظت‌شده
+
+پروتکل credential کلاینت و جدول کامل شامل رمز کاربران را حمل می‌کند. اتصال راه دور غیرقابل‌اعتماد باید transport
+رمزشده با احراز هویت سرور و بررسی هویت داشته باشد. مثال `127.0.0.1` فقط محلی است. chain محافظت‌شده:
+`AuthenticationClient -> TlsClient -> TcpConnector` در برابر `TcpListener -> TlsServer -> AuthenticationServer`.
+برای `TlsClient` از `settings: {"sni":"auth.example.com","verify":true,"alpns":[]}` استفاده کنید؛ `verify:true`
+زنجیره گواهی و hostname را بررسی می‌کند. سمت سرور `cert-file` و `key-file` نود `TlsServer` باید گواهی معتبر همان
+نام را تعیین کنند. credential تنظیم‌شده پس از JSON escaping و با epoch رزومه ۶۴ بایتی باید در payload داده
+Authenticate به اندازه ۱۶۳۷۵ بایت جا شود؛ مقدار بزرگ‌تر هنگام startup رد می‌شود و truncate نمی‌شود.
+
+پاسخ serialized جدول کامل، شامل metadata پاسخ، سقف framing تقریباً ۱۶ MiB دارد. جدول بزرگ‌تر sync نمی‌شود؛
+شکست pull الزامی می‌تواند push مصرف تازه را نیز عقب بیندازد. pagination در این پیاده‌سازی وجود ندارد.
+
+رد `stats-push-not-allowed` پذیرش از cache را با همان enabled/expiry/quota و ظرفیت محلی حفظ می‌کند. batch دقیق،
+بدهی و شواهد اولین استفاده باقی می‌مانند. خطاهای push غیرنهایی مانند `invalid-usage-batch`، `usage-digest-failed`
+یا خطای ناشناخته نیز بدون فرض درباره commit، همان batch را حفظ می‌کنند. reconnect و reauthenticate پس از cooldown
+monotonic حداقل ۳۰ ثانیه یا interval اتصال مجدد در صورت بزرگ‌تر بودن انجام می‌شود؛ حتی با همه intervalهای صفر،
+retry سر موعد مستقل زمان‌بندی می‌شود. ترافیک، درخواست صریح یا Resume آن را دور نمی‌زنند. Session موفق این وضعیت
+را پاک نمی‌کند؛ فقط ACK مطابق batch حفظ‌شده آن را پاک می‌کند. status دلیل محدود `stats_push_denied` یا
+`stats_push_rejected` و deadline/debt واقعی را نشان می‌دهد. diagnostic خطای سرور حداکثر ۱۲۸ بایت ورودی را escape
+می‌کند و truncation را مشخص می‌کند.
+
+تا حل batch هیچ pull از آن جلو نمی‌زند؛ cache مانند outage قدیمی می‌ماند و ترافیک بعدی جدا جمع می‌شود. بازیابی به
+همان epoch زنده سرور وابسته است؛ permission تنظیم startup است و تغییر آن همراه restart تضمین بازیابی checkpoint
+حافظه را ندارد. `usage-replay-conflict` و `usage-sequence-invalid` خطای نهایی‌اند و پذیرش تازه را می‌بندند.
+`authentication-required` همان مسیر عادی reauthentication را با حفظ batch طی می‌کند.
+
+هنگام pull الزامی یا in-flight، first-use push با latch کلی و flag هر user معلق می‌ماند. اتمام pull بدون packet
+دیگر push را ادامه می‌دهد. Pause نوشتن timer پیشرفت تکراری ایجاد نمی‌کند؛ Resume کار ثبت‌شده را ادامه می‌دهد.
+
 ## Stats Push
 
 دلتاهای بایت و مشاهده اولین مصرف محلی با ID پایدار همگام می‌شوند:
@@ -450,7 +480,7 @@ capture تازه این بدهی را با deltaهای مرئیِ تأییدنش
 checkpoint سرور با هویت احراز‌شده مرتبط است و expiry یا جایگزینی session آن را پاک نمی‌کند. processهای مستقل
 نام تنظیم‌شده مستقل لازم دارند. از دست رفتن epoch با batch نامطمئن، وضعیت
 `kAuthenticationClientStateContinuityError` ایجاد می‌کند: batch حفظ می‌شود، transport بسته می‌شود و تلاش خودکار
-برای رسیدگی اپراتور متوقف می‌شود. بدون batch نامطمئن، ثبت تازه و pull مجاز است. این تضمین برای قطع اتصال در زمان
+تا رفع وضعیت حسابداری توسط اپراتور متوقف می‌شود؛ API برای reset یا reconciliation وجود ندارد. بدون batch نامطمئن، ثبت تازه و pull مجاز است. این تضمین برای قطع اتصال در زمان
 اجرای دو process است و بازیابی مصرف پس از crash/restart ارائه نمی‌دهد.
 ACK پذیرش در حافظه سرور است، نه ذخیره دیسک. ذخیره دوره‌ای/نهایی دیتابیس checkpoint را ذخیره نمی‌کند. restart
 کلاینت ممکن است مصرف گزارش‌نشده را از بین ببرد؛ restart سرور ممکن است مصرف ACKشده پس از آخرین ذخیره موفق و
