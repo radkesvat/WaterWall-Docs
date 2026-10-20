@@ -316,6 +316,31 @@ Recoverable shared-copy results, transactional staging and caller rollback are
 an explicit policy redesign requiring a maintainer request. Do not introduce
 them as incidental hardening of these shared APIs.
 
+### Paged client table publication
+
+Producer synchronization uses shared request 9 (`GetUsersPage`) and `Users` response 3. A traversal owns a private
+incremental table and page clock ranges. It replays an unresolved usage batch before starting and keeps `pull_required`
+through every page, inter-page gap and terminal validation. A pending correlation represents one request; removing it
+must not release the traversal barrier. First-use/push work remains latched and local traffic continues accumulating.
+
+Every request binds the current epoch and last acknowledged sequence/digest. Only matching ACK/enrollment updates
+those local facts. Check exact decimal-string metadata, instance/config revision, total, contiguous positions, bounded
+count, canonical advancing cursor, completion flags and checkpoint before admitting rows. Count exact received user
+object spans before construction. Positive host-representable `sync-max-users`/`sync-max-bytes` default to 100000 and
+268435456. They bound one traversal, including an early declared-total refusal, without whole-total reservation.
+Resource or protocol failure releases staging only and preserves active cache, debt, clocks and generation.
+
+Configuration edits invalidate a cursor; traffic-only changes do not. Server state remains locked for each bounded
+page and is released before transport callbacks; no full frozen server snapshot persists. The client requires a separate
+terminal cursor validation before publishing. The installed statistics revision is the first page's conservative sample,
+with latest observed remote revision stored separately; statistics differences alone retain ordinary refresh cadence.
+
+Before runtime movement, finish structural/ID/index validation, baseline copying, page-clock coverage and current debt
+completeness. Under the table lock, merge current local deltas/observations, then migrate reservations, shaping and carry.
+Migration/publication is a nonfailing commit. Reapply each user's OWN page wall/accounting/receipt samples after migration,
+because runtime migration replaces clock state. Publish active and baseline together and increment generation once.
+Keep relative catch-up debt even if saturation hides it or an account is absent; never prune debt to finish a traversal.
+
 ### Account configuration and accounting ownership
 
 `usersPatchConfigByIdentifier()` pins an existing user with the collection write
@@ -330,12 +355,42 @@ Collection-to-user lock order remains unchanged; first-use updates share that
 user lock. Configuration edits preserve live reservations and client refreshes
 migrate them by durable ID while rebuilding the expiry projection.
 
+Collection lookups return borrowed user/string pointers whose lifetime needs external collection ownership when removal
+or replacement can run concurrently. Successful non-self `usersCopy(dest, src)` replaces the destination and invalidates
+all of its old user/string pointers; failed copy preserves them, and self-copy is a no-op. Standalone indexed-field
+setters such as `userSetId` and `userSetWireGuardAllowedIps` must not mutate accounts already owned by a collection;
+use collection transactions so every lookup index changes together. Runtime self-move is also a no-op.
+
+A successful prepared configuration patch transfers its owned values, clears its aliases/presence masks and consumes
+the preparation; only destruction is valid afterward. Busy, timeout and other precommit refusals leave it reusable.
+Prepared account creation remains reusable, including a later duplicate-ID attempt after successful creation.
+
+Fresh JSON imports derive each credential once and use structural/index validation. Trusted baseline copies preserve
+those derived values without recomputation. Public `usersValidate` and `userPasswordDataValid` still perform the full
+credential consistency diagnostic in every build, and arbitrary caller-supplied checked-add objects retain that check.
+An incremental required-ID import rolls back only its own appended rows on failure; successful pages never copy or
+rederive the accumulated table. The collection keeps full diagnostic, standalone and legacy update APIs available.
+
 AuthenticationServer validates at most 64 request frames before executing an envelope. The session at entry governs
 all siblings, and successful Authenticate does not authorize adjacent requests. Without a valid token, frame payload
 is at most 16 KiB. Authenticate data is at most 16,375 bytes and uses strict quiet JSON parsing with depth two and eight
 lexical values; configured credentials must fit the exact escaped handshake including a resume epoch. Failed
 Authenticate closes further input admission before response handoff while preserving bounded paused response delivery.
 Only authenticated administrative refusals and commits enter the audit queue; anonymous refusals consume no slots.
+
+Producer module descriptors are the single source for operation names, permissions, store mutation, state-lock class
+and handlers. Parse each envelope once into at most 64 borrowed frame views before any operation; run mutation-first
+and read-second over those views under one state lock. Authenticate mutates session state without becoming a store
+mutation. Page and point reads share the lock; unknown wire operations remain ordinary bounded refusals. Digest lookup
+uses canonical base64 with exact decoded lengths; password payloads stay length-bounded and are copied before C-string use.
+
+Request 9 is paged synchronization (`GetUsersPage`, with the retained `GetAllUsers` C alias). Each request independently
+checks token, pull permission and the producer's epoch/acknowledged sequence/digest. Stateless instance/config/position
+cursors bind configuration, not authority. At most 128 users and a 256 KiB response target form ordinary pages; one
+exceptional first row may use the hard response cap after exact metadata overhead. Admit encoded row size before
+copying its strings. A terminal cursor requires one final validation under the same state lock before client publication.
+Configuration changes invalidate traversal; foreign traffic/first-use updates do not. No server full-table snapshot or
+usage acknowledgement is created by paging. See the [producer page schema](../02-noderefs/AuthenticationServer.mdx#getuserspage-module).
 
 AuthenticationServer `UpdateUser` selects a nonzero exact durable ID and accepts
 only explicit configuration leaves. It rejects protected/unknown/duplicate keys,
@@ -1806,6 +1861,14 @@ canceled, empty or removed tickets do not block eligible work. Refill uses fresh
 capacity is `max(1, ceil(R / 10))` bytes at actual logical rate `R` bytes/s, with zero unlimited and no unsigned-64 rate
 clamp. The one-byte minimum permits integer-byte progress at very low rates. Whole datagrams can hold a turn while earning
 credit, so FIFO fairness does not promise equal latency.
+Bandwidth preview and delivery commit use separate samples for pacing and expiry. Buckets, grants and retries use
+fresh monotonic milliseconds. Installed client expiry projections retain their local monotonic interpretation,
+including an explicit projection without a client clock. A standalone user without that projection compares absolute
+and first-use-duration expiry against fresh wall time under the same locks; wall-clock corrections never refill buckets.
+Preview does not charge. Commit rechecks shared enabled/expiry/traffic eligibility and charges only delivered bytes
+through the same directional fractional-remainder primitive as ordinary scaled traffic accounting. Live reservation
+gauges remain separate from stored gauge predicates.
+
 An oversized head datagram must earn complete credit before release. Credit earned before its activation is limited to
 ordinary capacity; abandoning its turn cannot donate an oversized burst to another ticket.
 

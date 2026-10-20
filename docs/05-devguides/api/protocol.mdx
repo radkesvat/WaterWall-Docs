@@ -21,7 +21,10 @@ For a runnable client, start with the [Python client example](../../03-examples/
 For account commands, use the [administration CLI](../../03-examples/api/administration-cli.mdx).
 They share the standard-library transport module
 [`ww_api.py`](https://github.com/radkesvat/WaterWall/blob/main/tunnels/APIServer/client/ww_api.py);
-copying the generic example requires its sibling `client/` directory too.
+`ww_api_cli.py` shares connection options, bounded token loading and uncertain-write
+advice. The transport module remains independent of argparse; AuthenticationServer
+body/schema validation stays in `ww_admin.py`. Copying the generic example requires
+its sibling `client/` directory too. It writes decoded result bytes directly to stdout.
 For node implementation, see [Implementing node API operations](./node-operations.mdx).
 
 ## Transport and framing
@@ -120,7 +123,10 @@ After resolving the target, APIServer checks the client's exact allowlist entry
 for that configuration, node, and operation. There are no wildcard permissions
 or permissions implied by a different operation. A read-only descriptor does not
 make an operation public. Startup validates allowlist targets and registered
-operations. An old `TunnelApi` symbol alone exposes nothing through this gateway.
+operations and prepares immutable descriptors reused after registry freeze. A
+missing exact permission returns `forbidden`. An old `TunnelApi` symbol alone
+exposes nothing through this gateway. `read_only` is descriptive metadata; it
+enforces neither permission, rollback nor retry safety.
 
 ### Body encoding and content type
 
@@ -190,14 +196,16 @@ Messages are fixed and bounded; clients should branch on the error code.
 | `forbidden` | The operation is absent from the caller's exact allowlist. |
 | `target_not_found` | The selected public node could not be resolved. |
 | `ambiguous_target` | The unqualified node name matches multiple declared nodes. |
-| `unsupported_api` | The target has no registered API. |
-| `unsupported_operation` | The requested operation is not registered. |
 | `unsupported_content_type` | The request content type does not match the operation. |
 | `busy` | Gateway or dispatch capacity could not admit the work. |
 | `timeout` | An API deadline expired. |
 | `shutting_down` | API admission has closed. |
 | `response_too_large` | A valid result cannot fit the encoded response limit or representable size. |
 | `invalid_response` | The handler returned invalid UTF-8 or NUL for a declared UTF-8 result. |
+
+Shared clients also recognize generic `unsupported_api` and `unsupported_operation`
+codes. Current APIServer does not emit them: startup resolves each permitted
+descriptor, and requests absent from the allowlist receive `forbidden`.
 
 A gateway error and a node error are different layers. For example, an
 AuthenticationServer `conflict` is inside `result.body` with `result.code: 1`,
@@ -215,7 +223,8 @@ execute concurrently; operation-specific locks and preconditions govern their
 shared state.
 
 Malformed framing/schema and invalid authentication close the connection after
-at most one bounded error. Valid authorized target, operation, and body errors
+at most one bounded error. Gateway `timeout` and `invalid_encoding` also close
+the connection. Valid authorized target, operation, and body errors
 may continue in FIFO order. A resource refusal can close directly when even an
 error cannot fit. After a response starts, transport failure or output expiry
 closes the connection without injecting a second frame into a partial response.
@@ -235,7 +244,7 @@ after raw backlog or older queued requests drain.
 
 | Deadline | Interval |
 | --- | --- |
-| Frame assembly | From the frame's first byte; trickle input does not reset it. |
+| Frame assembly | From first-fragment arrival, including queue residence; trickle input does not reset it. |
 | Request | From complete-request admission through response publication, including FIFO and worker wait. |
 | Output | From publication through transport handoff, including paused time. |
 | Idle | While no frame, request, or output is in progress. |
