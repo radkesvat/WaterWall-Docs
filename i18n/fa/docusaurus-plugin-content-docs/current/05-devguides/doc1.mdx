@@ -372,20 +372,28 @@ tunnel_t *templateTunnelCreate(node_t *node)
 
 - **WID یعنی index یک slot ثبت‌شده‌ی worker**، نه شناسه‌ی thread در سیستم‌عامل یا
   برنامه مانند `getTID()`.
-- thread‌های ثبت‌نشده، از جمله thread‌های reader/writer مربوط به TUN، ‏thread‌های
-  raw device و capture، ‏thread‌های کمکی و تست، مقدار
+- همه‌ی worker‌های ثبت‌شده هنگام اجرای عادی event loop دارند و نقش ثبت‌شده‌ی
+  جداگانه‌ای بدون event loop وجود ندارد. `getWorkersCount()` تعداد همه‌ی slot‌های
+  ثبت‌شده را برمی‌گرداند.
+- thread‌های ثبت‌نشده، از جمله reader‌های TUN در Darwin/BSD، ‏reader‌های capture،
+  callback‌های completion بومی و thread‌های کمکی و تست، مقدار
   `getWID() == kInvalidWID` یعنی `UINT8_MAX` را می‌بینند.
-- `getWID()` می‌تواند `kInvalidWID` برگرداند. هر call site که به state متعلق به
-  worker دسترسی دارد باید هویت thread را با predicate‌هایی مانند
-  `currentThreadIsEventWorker()` یا `workerWIDIsRegistered(wid)` بررسی کند.
+- `workerWIDIsRegistered(wid)` معتبر بودن slot را بررسی می‌کند و
+  `currentThreadIsWorker()` هویت ثبت‌شده‌ی thread فراخواننده را. هیچ‌کدام مالکیت
+  state یک worker دیگر را ثابت نمی‌کند؛ برای بررسی مالک دقیق از
+  `currentThreadOwnsWorker(wid)` استفاده کنید.
 - **thread‌های کمکی** باید کارِ دارای مالکیت را از طریق صف پیام worker ارسال کنند و
   هرگز نباید مستقیماً یک pool محلی worker را قرض بگیرند. custom event خام loop فقط
   برای عملیات بدون مالکیت و متعلق به خود loop رزرو شده است.
-- **pseudo-worker مربوط به lwIP** ثبت‌شده است؛ یعنی `workerWIDIsRegistered()` برای
-  آن `true` است، اما event worker نیست و `workerWIDIsEventWorker()` برایش `false`
-  است، زیرا event loop متعلق به WaterWall ندارد.
+- ‏lwIP روی worker‌های عادی اجرا می‌شود و thread یا slot جداگانه‌ای ندارد؛ سقف
+  تعداد worker‌ها همچنان ۲۵۴ است.
 - thread‌های native/library برای log و تشخیص خطا از `getTID()` استفاده می‌کنند و تا
   زمانی که صریحاً با `workerBindCurrentThread()` متصل نشوند WID نامعتبر دارند.
+
+هویت worker پس از detachشدن loop و صف پیام هنگام teardown تا زمان unbindشدن thread
+معتبر می‌ماند. این هویت وجود loop یا pool، بازبودن admission یا فعال‌بودن callback
+عادی را تضمین نمی‌کند؛ مرز resource و lifecycle لازم را جداگانه بررسی کنید.
+nullبودن `loop` هرگز نشان‌دهنده‌ی نقش دیگری برای worker نیست.
 
 snapshot‌های منابع پردازه نیز از همین قاعده‌ی مالکیت پیروی می‌کنند. provider‌های
 host و cgroup فقط هنگام مقداردهی همگام global state و در sampler پس‌زمینه‌ی worker
@@ -400,24 +408,24 @@ host و cgroup فقط هنگام مقداردهی همگام global state و د�
 
 هرگز `getWID()` را مستقیماً در بررسی affinity، ‏index یک array یا lookup منبع
 به‌کار نبرید. محدودترین helper سازگار با context موجود را انتخاب کنید. helper
-دامنه‌ی معتبر را در قرارداد خود کد می‌کند و اجازه نمی‌دهد یک thread ثبت‌نشده یا
-pseudo-worker مربوط به lwIP صرفاً به‌دلیل برابری اتفاقی از بررسی عبور کند.
+دامنه‌ی معتبر را در قرارداد خود کد می‌کند و اجازه نمی‌دهد یک thread ثبت‌نشده
+صرفاً به‌دلیل برابری اتفاقی از بررسی عبور کند.
 
 | context | استفاده |
 | --- | --- |
-| callback یک `line_t *` دارد | `lineIsOnCurrentEventWorker(line)`، ‏`lineGetWID(line)`، ‏`lineGetBufferPool(line)`، ‏`lineReuseBuffer(line, buf)` |
+| callback یک `line_t *` دارد | `lineIsOnCurrentWorker(line)`، ‏`lineGetWID(line)`، ‏`lineGetBufferPool(line)`، ‏`lineReuseBuffer(line, buf)` |
 | callback پیام worker یک `worker_t *worker` دارد | `worker->wid`، ‏`worker->buffer_pool`، ‏`worker->loop`؛ TLS را دوباره نخوانید. |
-| callback مربوط به event/timer/I/O یک loop یا event دارد | یک بار `getLoopEventWorkerWID(weventGetLoop(ev))` را بگیرید و مقدار محلی را دوباره استفاده کنید. |
-| callback واقعی event loop بدون line یا worker | `getCurrentEventWorker()`، ‏`getCurrentEventWorkerWID()`، ‏`getCurrentEventWorkerBufferPool()`، ‏`getCurrentEventWorkerLoop()` |
-| callback چرخه‌ی عمر که `wid` صریح دریافت کرده است | `currentThreadIsEventWorkerWID(wid)` |
-| کدی که بنا بر طراحی به worker 0 نیاز دارد | WID صریح `0` همراه `currentThreadIsEventWorkerWID(0)`؛ هرگز آن را از TLS پیش‌فرض استنباط نکنید. |
-| API قابل‌دسترسی از بیرون یا در غیر این صورت fallible | `tryGetCurrentEventWorker()` یا `currentThreadIsEventWorker()`؛ سپس error یا `NULL` برگردانید یا کار را queue کنید. |
-| کدی که ممکن است روی lwIP اجرا شود | `workerWIDIsRegistered()` یا WID مقصد صریح؛ هرگز array مربوط به event worker. |
+| callback مربوط به event/timer/I/O یک loop یا event دارد | یک بار `getLoopWorkerWID(weventGetLoop(ev))` را بگیرید و مقدار محلی را دوباره استفاده کنید. |
+| callback واقعی event loop بدون line یا worker | `getCurrentWorker()`، ‏`getCurrentWorkerWID()`، ‏`getCurrentWorkerBufferPool()`، ‏`getCurrentWorkerLoop()` |
+| callback چرخه‌ی عمر که `wid` صریح دریافت کرده است | `currentThreadOwnsWorker(wid)` |
+| کدی که بنا بر طراحی به worker 0 نیاز دارد | WID صریح `0` همراه `currentThreadOwnsWorker(0)`؛ هرگز آن را از TLS پیش‌فرض استنباط نکنید. |
+| API قابل‌دسترسی از بیرون یا در غیر این صورت fallible | `tryGetCurrentWorker()` یا `currentThreadIsWorker()`؛ سپس error یا `NULL` برگردانید یا کار را queue کنید. |
+| callback خام lwIP | مالک engine انتخاب‌شده؛ پیش از ورود به stack، مالکیت engine و WID صریح را بررسی کنید. |
 | thread کمکی device | فقط pool/channel متعلق به device؛ تحویل به یک event worker صریح. |
 | فقط logging | استفاده‌ی خام از `getWID()` مجاز است، به شرط عبور از `workerWIDForLog()` و چاپ با `%d` در کنار `getTID()`؛ مقدار `-1` یعنی ثبت‌نشده. |
 
-accessor‌های `getCurrentEventWorker*()` که pointer برمی‌گردانند فقط برای callback‌های
-داخلی‌اند که قراردادشان از قبل حضور روی event worker را تضمین می‌کند. این توابع
+accessor‌های بررسی‌شده‌ی `getCurrentWorker*()` فقط برای callback‌های
+داخلی‌اند که قراردادشان از قبل حضور روی worker ثبت‌شده را تضمین می‌کند. این توابع
 به‌جای fallback به worker 0، ‏abort می‌کنند. بنابراین هر چیزی که از thread دستگاه،
 callback یک library یا API عمومی قابل‌دسترسی است باید از شکل predicate استفاده کند
 و در صورت نبود context معتبر به‌طور تمیز fail شود.
@@ -436,7 +444,7 @@ callback همیشه روی event worker مالک line اجرا می‌شود. ک
 
 ```c
 // Callback مربوط به Line: هم Affinity و هم مالکیت Pool از خود Line می‌آیند.
-if (! lineIsOnCurrentEventWorker(l))
+if (! lineIsOnCurrentWorker(l))
 {
     sendWorkerMessageForceQueueWithCleanup(lineGetWID(l), doWork, cleanup, t, l, buf);
     return;
@@ -451,12 +459,12 @@ static void onWorkerMessage(worker_t *worker, void *arg1, void *arg2, void *arg3
 }
 
 // Callback مربوط به Timer: مالک را از Loop بگیرید، یک بار بررسی و دوباره استفاده کنید.
-const wid_t wid = getLoopEventWorkerWID(weventGetLoop(timer));
+const wid_t wid = getLoopWorkerWID(weventGetLoop(timer));
 ts->worker_timers[wid] = NULL;
 
-// Callback مربوط به lwIP: فقط Worker مقصد Packet می‌تواند Inline عمل کند.
-if (currentThreadIsEventWorkerWID(route_ctx->packet_wid)) { emitInline(); }
-else                                                     { queueToPacketWorker(); }
+// خروجی lwIP: همسایه‌های دلخواه را حتی روی همان worker در صف بگذارید.
+// PTC فقط می‌تواند sink مستقیم و تأییدشده‌ای را فراخوانی کند که صرفاً enqueue می‌کند.
+queueToPacketWorker();
 
 // Thread دستگاه: فقط منابع متعلق به دستگاه؛ تحویل با WID صریح.
 sbuf_t *buf = bufferpoolGetLargeBuffer(dev->reader_buffer_pool);

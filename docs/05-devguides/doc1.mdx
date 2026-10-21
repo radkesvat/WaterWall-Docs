@@ -590,11 +590,22 @@ ready. The rest of this guide is, in effect, a detailed expansion of that list.
 Worker thread identity in WaterWall is explicit and invalid by default:
 
 - **WID means a registered worker slot index**, not an OS/application thread identifier (`getTID()`).
+- Every registered worker owns an event loop during normal operation; there is
+  no separate registered non-event role. `getWorkersCount()` counts all registered
+  worker slots.
 - Unregistered threads (Darwin/BSD TUN readers, capture threads, native completion callbacks, helper threads, or test threads) observe `getWID() == kInvalidWID` (`UINT8_MAX`).
-- `getWID()` can return `kInvalidWID`. Callers accessing worker-owned state must verify thread identity with predicates like `currentThreadIsEventWorker()` or `workerWIDIsRegistered(wid)`.
+- `workerWIDIsRegistered(wid)` validates a slot; `currentThreadIsWorker()` checks
+  the calling thread's registered identity. Neither proves ownership of another
+  worker's state: use `currentThreadOwnsWorker(wid)` for that exact-owner check.
 - **Auxiliary threads** must post ownership-bearing work through the worker message queue and must **never borrow a worker-local pool** directly. Raw loop custom events are reserved for loop-owned, non-owning operations.
 - lwIP runs on ordinary event workers. There is no stack thread or extra worker slot; the configured maximum remains 254 event workers.
 - Native/library threads use `getTID()` for logging/diagnostics and remain WID-invalid unless explicitly bound via `workerBindCurrentThread()`.
+
+Worker identity survives loop/message-queue detachment during teardown until the
+thread unbinds. A registered identity does not prove that a loop or pool is still
+available, that message admission is open, or that a normal callback is active;
+check the required resource and lifecycle boundary separately. A null `loop`
+never identifies a different worker role.
 
 During normal operation, a `wio_t` belongs exclusively to its event worker:
 only that worker accesses it, writes through it, closes it, and runs its associated
@@ -657,19 +668,19 @@ cannot slip through an equality comparison that happens to match.
 
 | Context | Use |
 | --- | --- |
-| Callback has a `line_t *` | `lineIsOnCurrentEventWorker(line)`, `lineGetWID(line)`, `lineGetBufferPool(line)`, `lineReuseBuffer(line, buf)` |
+| Callback has a `line_t *` | `lineIsOnCurrentWorker(line)`, `lineGetWID(line)`, `lineGetBufferPool(line)`, `lineReuseBuffer(line, buf)` |
 | Worker-message callback has `worker_t *worker` | `worker->wid`, `worker->buffer_pool`, `worker->loop` — do not re-read TLS |
-| Event/timer/io callback has a loop or event | `getLoopEventWorkerWID(weventGetLoop(ev))` once, then reuse the local |
-| Genuine event-loop callback with no line or worker | `getCurrentEventWorker()`, `getCurrentEventWorkerWID()`, `getCurrentEventWorkerBufferPool()`, `getCurrentEventWorkerLoop()` |
-| Lifecycle callback given an explicit `wid` | `currentThreadIsEventWorkerWID(wid)` |
-| Code that needs worker 0 by design | explicit WID `0` plus `currentThreadIsEventWorkerWID(0)`; never infer it from default TLS |
-| Externally reachable or otherwise fallible API | `tryGetCurrentEventWorker()` / `currentThreadIsEventWorker()`, then return an error, `NULL`, or queue |
+| Event/timer/io callback has a loop or event | `getLoopWorkerWID(weventGetLoop(ev))` once, then reuse the local |
+| Genuine event-loop callback with no line or worker | `getCurrentWorker()`, `getCurrentWorkerWID()`, `getCurrentWorkerBufferPool()`, `getCurrentWorkerLoop()` |
+| Lifecycle callback given an explicit `wid` | `currentThreadOwnsWorker(wid)` |
+| Code that needs worker 0 by design | explicit WID `0` plus `currentThreadOwnsWorker(0)`; never infer it from default TLS |
+| Externally reachable or otherwise fallible API | `tryGetCurrentWorker()` / `currentThreadIsWorker()`, then return an error, `NULL`, or queue |
 | lwIP raw callback | The selected engine owner; validate explicit engine/WID ownership before stack entry |
 | Auxiliary device thread | device-owned pools/channels only; post to an explicit event worker |
 | Logging only | raw `getWID()` is fine, passed through `workerWIDForLog()` printed with `%d` (`-1` means unregistered) alongside `getTID()` |
 
-The pointer-returning `getCurrentEventWorker*()` accessors are for internal
-callbacks whose contract already guarantees an event worker. They abort rather
+The checked `getCurrentWorker*()` accessors are for internal
+callbacks whose contract already guarantees a registered worker. They abort rather
 than fall back to worker 0, so anything reachable from a device thread, a
 library callback, or a public API must use the predicate form and fail cleanly.
 
@@ -690,7 +701,7 @@ result, cancellation, and lifetime contract.
 
 ```c
 // Line callback: affinity and pool ownership both come from the line.
-if (! lineIsOnCurrentEventWorker(l))
+if (! lineIsOnCurrentWorker(l))
 {
     sendWorkerMessageForceQueueWithCleanup(lineGetWID(l), doWork, cleanup, t, l, buf);
     return;
@@ -705,7 +716,7 @@ static void onWorkerMessage(worker_t *worker, void *arg1, void *arg2, void *arg3
 }
 
 // Timer callback: derive the owner from the loop, validate once, reuse it.
-const wid_t wid = getLoopEventWorkerWID(weventGetLoop(timer));
+const wid_t wid = getLoopWorkerWID(weventGetLoop(timer));
 ts->worker_timers[wid] = NULL;
 
 // lwIP output: queue arbitrary neighbours, including on the same worker.
@@ -793,7 +804,7 @@ message-owned until safe settlement.
 
 Idle ages measure elapsed time in cached monotonic milliseconds. The local table
 uses its owner's `wloopNowMonotonicMS(loop)`. The shared table uses
-`wloopNowMonotonicMS(getCurrentEventWorkerLoop())` for creation, refresh, timer
+`wloopNowMonotonicMS(getCurrentWorkerLoop())` for creation, refresh, timer
 scans and posted-expiration rechecks. Each operation reads only its executing
 worker's own cache; the table's timer loop does not supply time for other workers.
 All worker caches share the underlying monotonic clock domain, so their deadlines
