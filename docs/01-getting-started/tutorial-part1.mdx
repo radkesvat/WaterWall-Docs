@@ -355,34 +355,56 @@ applied when chains are finalized at startup, after internally inserted nodes ar
 known. Enabling it permits splice only where the platform and every node support
 it. Values other than JSON `true` or `false` stop startup with a configuration error.
 
-On supported Linux builds, enabled splice also makes a best-effort startup
-request to raise `fs.pipe-user-pages-soft` to the 512 MiB splice budget converted
-to system pages, capped by `fs.pipe-user-pages-hard` when that limit is nonzero.
-These settings apply system-wide to each user's pipe usage. WaterWall preserves
+Splice has a process-wide pipe-capacity ceiling selected by `ram-profile`:
+
+| Profile | Pipe-capacity ceiling |
+| --- | --- |
+| S1 (`minimal`, `ultralow`, numeric `0` or `1`) | 32 MiB |
+| S2 (numeric `2`) | 64 MiB |
+| M1 (`client`, numeric `3`) | 128 MiB |
+| M2 (`client-larger`, numeric `4`) | 256 MiB |
+| L1 (numeric `5`) | 384 MiB |
+| L2 (`server`, numeric `6`) | 512 MiB |
+
+When RAM detection is available at startup, the budget is capped further at 20%
+of effective maximum RAM: host physical RAM bounded by applicable finite
+container/cgroup limits. It uses total capacity rather than currently free RAM,
+and rounds down to whole 1 MiB pipes. The RAM cap may reduce the budget below
+32 MiB, including to zero. If detection is unavailable, WaterWall warns and uses
+the profile ceiling. For example, `server` with 640 MiB effective RAM gets a
+128 MiB budget.
+
+On supported Linux builds, enabled splice with a nonzero budget also makes a
+best-effort startup request to raise `fs.pipe-user-pages-soft` to that budget
+converted to system pages, capped by `fs.pipe-user-pages-hard` when that limit is
+nonzero. These settings apply system-wide to each user's pipe usage. WaterWall preserves
 an unlimited soft limit (`0`) and any soft limit already at or above the target;
 lack of permission or another failure does not stop startup. It never changes
 the hard limit or `fs.pipe-max-size`, or writes persistent sysctl configuration.
 A successful increase remains in effect after exit.
 
 After every startup configuration's chains are finalized, and before prepare/start
-hooks or producers run, WaterWall allocates complete splice buffers with their
-fixed maximum required padding and full-sized 1 MiB pipes, up to a process-wide
-512 MiB capacity budget. The number of pipes is also capped
+hooks or producers run, WaterWall records the fixed maximum required padding and
+initializes an empty shared splice inventory. Startup creates no splice buffers
+or pipes. The number of pipes that can be created is also capped
 at `floor((RLIMIT_NOFILE.soft - open_descriptors) / 8)`: each pipe has two
 descriptors, so inventory uses at most one quarter of the remaining descriptor
 allowance, leaving the rest for configuration and runtime resources. The
 `/proc/self/fd` count includes its temporary scan descriptor
-conservatively; an unavailable limit or scan leaves the inventory empty. Kernel
-limits and allocation failures can reduce the acquired inventory further.
-Startup logs the actual pipe count and capacity. This is a pipe-capacity budget,
-not a reservation of 512 MiB of physical payload memory.
+conservatively; an unavailable limit or scan prevents pipe creation. Startup logs
+the configured capacity ceiling and zero allocated capacity. The budget bounds
+kernel pipe capacity; it does not reserve that much physical payload memory.
 
 Each worker caches up to eight unused splice buffers. An empty local cache draws
-from the shared master. If both are empty, checkout returns NULL and callers
-normally fall back to ordinary buffers, even if other worker caches retain pipes. Healthy pipes are retained until shutdown; traffic
-never creates replacement pipes, grows them, or accepts smaller pipes. An
-unusable pipe is retired without replacement. Setting `splice` to `false` skips
-both pipe-limit tuning and inventory allocation.
+from the shared master, then creates a small refill on demand within the byte
+and descriptor ceilings. Each new buffer gets a full-sized 1 MiB private pipe;
+smaller pipes are refused. Concurrent workers share the same growth budget.
+If no entry can be obtained, callers normally fall back to ordinary buffers,
+even if other worker caches retain pipes. Kernel refusals stop growth briefly
+without disabling reuse of existing pipes. Healthy pipes are retained until
+shutdown. An unusable pipe is retired without restoring its creation allowance.
+Chains that never request splice buffers create no pipes. Setting `splice` to
+`false` skips both pipe-limit tuning and inventory setup.
 
 ### `tcp-tune`
 
