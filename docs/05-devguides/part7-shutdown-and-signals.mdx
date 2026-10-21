@@ -675,10 +675,12 @@ deadline. Cleanup never substitutes for the worker-affine expiration callback.
 Explicit removal, worker detachment, or table destruction leaves the item
 message-owned so cancellation frees it once instead of restoring it. Capacity
 reserved for attached items permits restoration without allocating in cancellation
-cleanup. Staging and index growth follow the fatal heap-allocation policy; they
-have no OOM retry or rollback path. Item creation rejects duplicate keys or
-unrepresentable index geometry before publication and exposes a handle only
-after both the map and expiration heap own it.
+cleanup. Draining one worker's inventory must preserve those heap reservations
+for attached items whose expiration messages belong to other workers, even when
+those items are temporarily absent from the heap. Staging and index growth follow
+the fatal heap-allocation policy; they have no OOM retry or rollback path. Item
+creation rejects duplicate keys or unrepresentable index geometry before
+publication and exposes a handle only after both the map and expiration heap own it.
 
 Worker-local and shared idle tables have different shutdown boundaries. Quiesce
 each `local_idle_table_t` timer on its exact owner worker before line drain. An
@@ -687,9 +689,15 @@ worker's loop, callbacks, lines, and pools remain alive. A registry of borrowed
 lines instead remains available until the line owners remove its entries, then
 the empty table is destroyed on that same worker. Tunnel storage order cannot
 prove that a neighboring owner has already drained. Never transfer a local table
-or item handle to another worker. For `idle_table_t`, drain each owner WID's active
-inventory on that WID before final shared-table destruction. An item already
-owned by a posted expiration message is detached by owner drain rather than
+or item handle to another worker. A local natural-expiration callback may extend
+or remove its own active item, and callbacks may manipulate other active items
+under their usual lifetime rules. A local drain callback is terminal for its
+already-detached item and must not refresh or remove it. Never synchronously
+drain, quiesce, or destroy the same local table from either callback; defer those
+lifecycle operations until the outer expiration or drain dispatch returns.
+For `idle_table_t`, drain each owner WID's active inventory on that WID before
+final shared-table destruction. An item already owned by a posted expiration
+message is detached by owner drain rather than
 called back or freed there; the message callback or cleanup retains delivery and
 table ownership until it settles exactly once.
 
