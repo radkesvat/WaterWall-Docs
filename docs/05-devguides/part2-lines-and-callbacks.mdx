@@ -289,8 +289,10 @@ replace the baseline while that batch is unresolved, so cached policy may remain
 sequence and replay inconsistency still block new admission. This recovery needs the same live server checkpoint;
 startup permission changes or process restart do not provide checkpoint recovery.
 
-A required/in-flight pull defers first-use reporting while preserving its request latch and per-user flags. Pull/ACK
-completion continues remembered reporting. Paused control writes do not rearm the short progress timer; Resume restarts
+A required/in-flight pull defers first-use reporting while preserving its request latch and per-user flags. After a
+non-accounting refresh failure, an installed usable cache may report against its unchanged baseline between traversal
+attempts. Pull and reporting retries retain separate deadlines; never send a new batch during an active traversal.
+Pull/ACK completion continues remembered reporting. Paused control writes do not rearm the short progress timer; Resume restarts
 eligible work explicitly. Worker quiescence cancels both progress and reconnect timer roots.
 
 Credential eligibility and handle liveness check cached enabled state, expiry and cumulative traffic quota. Persisted
@@ -332,10 +334,10 @@ Optional jobs and request timeout may all be zero: waiting indefinitely for an u
 Multiple Pings retain their own absolute deadlines and the timer tracks the earliest one.
 
 Periodic ticks join an active traversal. An explicit `authenticationclientRequestPull()` during traversal coalesces
-into one later traversal, and installation preserves that latch. New configuration edits still invalidate final
-cursor validation. Failed mandatory refreshes defer new reports; frequent edits may restart traversal repeatedly,
-and retained missing-account debt may prevent installation. Keep these limitations without deleting debt or
-publishing partial tables.
+into one later traversal, and installation preserves that latch. Producer pages retain an immutable server snapshot,
+so configuration edits do not invalidate its continuation or final validation. A failed refresh releases staging and
+backs off that pull without preventing new reports from an already installed baseline. Due pull retries still get a
+turn under continuing traffic. Initial synchronization and unresolved-batch replay remain barriers.
 
 Every request binds the current epoch and last acknowledged sequence/digest. Only matching ACK/enrollment updates
 those local facts. Check exact decimal-string metadata, instance/config revision, total, contiguous positions, bounded
@@ -344,16 +346,39 @@ object spans before construction. Positive host-representable `sync-max-users`/`
 268435456. They bound one traversal, including an early declared-total refusal, without whole-total reservation.
 Resource or protocol failure releases staging only and preserves active cache, debt, clocks and generation.
 
-Configuration edits invalidate a cursor; traffic-only changes do not. Server state remains locked for each bounded
-page and is released before transport callbacks; no full frozen server snapshot persists. The client requires a separate
-terminal cursor validation before publishing. The installed statistics revision is the first page's conservative sample,
-with latest observed remote revision stored separately; statistics differences alone retain ordinary refresh cadence.
+Each producer session retains a reference to an immutable encoded snapshot. Sessions may share a snapshot acquired
+at the same configuration and statistics revision; a new acquisition cannot reuse pre-ACK counters. Snapshot offsets,
+rows and construction scratch share the server's finite `snapshot-max-bytes` allowance (256 MiB by default).
+Capture and page reads hold server state ownership and release it before transport callbacks. Terminal validation,
+replacement, session expiry/destruction and a renewable idle lease release references; the default lease is 60 seconds.
+Resource refusal never publishes a partial snapshot. Administrative `list-users` retains its separate live revision
+cursor contract. Each page carries current wall/accounting timestamps, while snapshot revisions and records remain
+fixed. Envelope revisions may be newer; installed revisions come from the validated snapshot, with latest observed
+remote revisions stored separately. The client requires terminal validation before publishing.
 
 Before runtime movement, finish structural/ID/index validation, baseline copying, page-clock coverage and current debt
 completeness. Under the table lock, merge current local deltas/observations, then migrate reservations, shaping and carry.
 Migration/publication is a nonfailing commit. Reapply each user's OWN page wall/accounting/receipt samples after migration,
 because runtime migration replaces clock state. Publish active and baseline together and increment generation once.
 Keep relative catch-up debt even if saturation hides it or an account is absent; never prune debt to finish a traversal.
+An absent account's owed traffic and first-use evidence move into retained orphan obligations before publication.
+They do not block installing other accounts and are not sent while the ID is absent. The same durable ID's later
+return reattaches its obligation exactly once. The retained ledger and replacement overlaps have a finite allowance
+derived from `sync-max-bytes`; capacity refusal preserves the old table and every obligation. Status includes
+`orphan_debt_count`, and detailed accounting includes these obligations. Authoritatively absent IDs cannot admit new
+connections; live-handle accounting/close and shaping-ticket settlement retain their existing ownership rules.
+Retain the original local first-use origin, report timestamp and strongest elapsed-age sample alongside orphan debt,
+including observations already acknowledged before later bytes became owed. Restore that evidence after runtime
+migration and before installing the new clock projection; absence must never restart duration expiry. Each newly
+appearing account receives a handle-generation floor. Continuous membership migrates that floor, while removal and
+reappearance establish a new one: an older handle must neither become active again nor release a new connection's
+reservation. Independently owned shaping tickets still settle by their own tokens.
+
+Only an explicit `usage-accounts-missing` response may resolve a rejected batch without an ACK. Validate its current
+epoch, exact attempted sequence and payload digest, unchanged prior checkpoint sequence/digest, and unique missing
+IDs belonging to that batch before releasing immutable attempt storage. Preserve debt, baseline and checkpoint;
+the uncommitted sequence remains reusable for the surviving accounts. A lost reply or unproved/malformed refusal
+never permits rewriting an uncertain batch. Exact accepted-batch replay remains acknowledgeable after account removal.
 
 ### Account configuration and accounting ownership
 
@@ -403,22 +428,24 @@ Only authenticated administrative refusals and commits enter the audit queue; an
 Producer module descriptors are the single source for operation names, permissions, store mutation, state-lock class
 and handlers. Parse each envelope once into at most 64 borrowed frame views before any operation; run mutation-first
 and read-second over those views under one state lock. Authenticate mutates session state without becoming a store
-mutation. Page and point reads share the lock; unknown wire operations remain ordinary bounded refusals. Digest lookup
+mutation. Page requests take exclusive ownership for snapshot bookkeeping; point reads take shared ownership.
+An unauthenticated envelope without Authenticate returns bounded refusals under shared ownership. Session resolution
+must be repeated after reacquiring exclusive ownership. Unknown wire operations remain ordinary bounded refusals. Digest lookup
 uses canonical base64 with exact decoded lengths; password payloads stay length-bounded and are copied before C-string use.
 
 Request 9 is paged synchronization (`GetUsersPage`, with the retained `GetAllUsers` C alias). Each request independently
-checks token, pull permission and the producer's epoch/acknowledged sequence/digest. Stateless instance/config/position
-cursors bind configuration, not authority. At most 128 users and a 256 KiB response target form ordinary pages; one
+checks token, pull permission and the producer's epoch/acknowledged sequence/digest. Instance/config/position
+cursors bind the session's retained snapshot, not authority. At most 128 users and a 256 KiB response target form ordinary pages; one
 exceptional first row may use the hard response cap after exact metadata overhead. Admit encoded row size before
 copying its strings. A terminal cursor requires one final validation under the same state lock before client publication.
-Configuration changes invalidate traversal; foreign traffic/first-use updates do not. No server full-table snapshot or
-usage acknowledgement is created by paging. See the [producer page schema](../02-noderefs/AuthenticationServer.mdx#getuserspage-module).
+Configuration and traffic edits leave an acquired snapshot unchanged. Paging never acknowledges usage.
+See the [producer page schema](../02-noderefs/AuthenticationServer.mdx#getuserspage-module).
 
 AuthenticationServer `UpdateUser` selects a nonzero exact durable ID and accepts
 only explicit configuration leaves. It rejects protected/unknown/duplicate keys,
 empty containers, null, invalid UTF-8/NUL, excessive nesting and trailing input.
 The checked lexical parser consumes the full authentication payload with depth
-limit eight, without applying host-config file-size limits. Successful nonempty
+limit four and at most 64 lexical values before JSON-tree allocation, without applying host-config file-size limits. Successful nonempty
 patches bump config_revision once, even for a same-value assignment, inside the
 server state write lock; stats_revision and producer checkpoint are unchanged.
 Competing patches serialize: omitted fields survive and the latest accepted edit
@@ -473,6 +500,13 @@ imported IP/device/connection/speed gauges are not live global occupancy or an
 admission source. See the [statistics ownership table](../02-noderefs/AuthenticationServer.mdx#statistics-ownership)
 for the current boundaries and requirements for future telemetry. No live gauge
 reporting, reset, or crash-recovery behavior is implied.
+Producer write JSON is bounded before tree allocation: `PushUserStats` allows
+depth three and at most `7 + 9 * 4096` lexical values (including keys),
+`UpdateUser` allows depth four and 64 values, and full `AddNewUser` allows depth
+four and 256 values. Keep these independent of the 16 MiB wire cap and preserve
+credential-string cleanup on post-parse refusal. Envelope response assembly
+reserves space for a correlated error for every remaining frame, so an oversized
+read response cannot discard the acknowledgement of an earlier committed write.
 
 First nonzero measured client traffic, including a discounted increment below one charged byte, captures a valid local monotonic origin (zero is allowed) and immutable positive
 accounting-clock estimate inside the user write lock, then updates counters/expiry under stats write lock. Generic
