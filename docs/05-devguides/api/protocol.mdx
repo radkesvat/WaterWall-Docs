@@ -207,6 +207,10 @@ Shared clients also recognize generic `unsupported_api` and `unsupported_operati
 codes. Current APIServer does not emit them: startup resolves each permitted
 descriptor, and requests absent from the allowlist receive `forbidden`.
 
+Gateway `busy` and `shutting_down` are definite pre-dispatch refusals: the handler was not invoked.
+Python create/update/password clients report these refusals without automatic retry. A node result containing
+the same code is a separate operation outcome; apply that operation's commit contract.
+
 A gateway error and a node error are different layers. For example, an
 AuthenticationServer `conflict` is inside `result.body` with `result.code: 1`,
 while a gateway timeout is in `error` and has no node result. Delivery failure
@@ -242,6 +246,16 @@ old/new capacity overlap. The hard input-byte limit includes copied incomplete
 input; pressure watermarks subtract those copied bytes so receiving can continue
 after raw backlog or older queued requests drain.
 
+Predictive Pause also holds input while older complete/active requests leave insufficient budget for the next
+frame. Before its header is known, the check uses `max_request_envelope + 4`; afterward it uses the declared
+complete size, counting already buffered bytes once. Completion/output drain autonomously releases the hold.
+An incomplete frame alone can keep receiving. Pause is advisory; late or coalesced input can still exceed a
+hard cap and close, and the original frame deadline remains absolute.
+
+The limits apply together: `max_jobs=64` does not guarantee 64 concurrent jobs. With current defaults roughly
+seven small jobs fit the shared 64 MiB domain before substantial session storage because each reserves an
+8 MiB handler allowance plus other storage. Actual retained input/output can reduce that capacity.
+
 | Deadline | Interval |
 | --- | --- |
 | Frame assembly | From first-fragment arrival, including queue residence; trickle input does not reset it. |
@@ -259,6 +273,10 @@ undo arbitrary work that has already committed.
 The request `id` is correlation only. Reusing it creates no replay guarantee,
 checkpoint, or automatic deduplication. The generic client makes one attempt
 and does not retry writes automatically.
+The Python transport bounds each socket `recv` request to 64 KiB while preserving the accepted frame limit
+and one original monotonic deadline across resolution, connection, send and all response chunks. Short reads
+do not renew the deadline. Early EOF, oversized prefixes, malformed replies, timeout or transport loss after
+sending leave mutation delivery uncertain; pre-dispatch refusals remain definite.
 
 Consult the target operation's contract before retrying. AuthenticationServer's
 public mutation APIs guarantee that a returned **node-operation failure** did
