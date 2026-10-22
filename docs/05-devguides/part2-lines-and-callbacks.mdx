@@ -5,7 +5,7 @@ sidebar_label: "Part 2: Lines & Lifetime"
 description: "The connection lifecycle, re-entrancy hazards, line references, and the clean-finish patterns that keep WaterWall tunnels free of use-after-free bugs."
 ---
 <!--
-Documentation version: 191
+Documentation version: 192
 -->
 
 # Part 2: Lines, Callbacks & Lifetime Safety
@@ -1869,6 +1869,48 @@ may have destroyed this borrowed node's state without destroying the line.
 The automatically derived threshold saturates at `INT_MAX`, matching KCP's signed
 queue-count interface. The send-buffer setting remains an advisory threshold,
 not a hard admission cap.
+
+### Raw QUIC transforms
+
+`QuicClient` and `QuicServer` borrow the existing normal line and create neither
+sockets nor companion/application lines. Client upstream plaintext becomes
+next-side carrier data; server upstream carrier data becomes next-side
+plaintext. Their outputs preserve these directions even though the transforms
+have opposite roles. One QUIC v1 connection carries one client-initiated
+bidirectional application stream per line. The client sends encrypted opening
+byte `0x00`; the server validates and consumes it before releasing application
+data, including queued server-first output. It is never application data.
+
+Both nodes initialize and publish local state before forwarding next Init once.
+Client handshake startup is independent of Est. Every supported downstream Est
+is relayed, including repeats; authenticated protocol readiness produces no
+extra Est. Application bytes wait under hard budgets until handshake/stream
+readiness, while input and library output are serialized against reentry.
+Neighbor callbacks run after the QUICHE driver call returns. After each callback,
+check both line life and local attachment: Finish may retire this transform on
+a still-live borrowed line.
+
+Incoming Pause/Resume relay, including duplicates. Due loss/ACK alarms and ready
+FIFO output continue through advisory Pause. A separate local send-pressure
+latch asks only the application source to pause when any retained byte count,
+entry count or allocation charge exceeds three quarters of its hard limit.
+Resume requires all three below one half; equality preserves its state. The
+allocation limit is twice the configured byte budget. Accepted unacknowledged
+chunks remain charged, so ACK-only input must be able to release pressure. An external Pause reaching a UDP adapter can stop ACK ingress;
+finite pauses recover when deadlines permit, while prolonged pauses can close
+the association.
+
+A received Finish closes its sender's direction before cleanup and never emits
+back toward that side. Cancel alarms and detach protocol state before forwarding
+away. A local failure settles local state and finishes next before prev under
+the ordinary borrowed-line topology. Neither QUIC node calls `lineDestroy()`.
+Application-side Finish may make a bounded synchronous ready-wire drain only
+toward the still-open carrier, honoring congestion/pacing and guarding every
+reentrant signal against the finished side. No asynchronous reliable-drain
+promise survives received Finish: the line owner
+may destroy it immediately after the handler returns. Final unacknowledged data
+may be lost; the peer has finite deadlines. Application stream FIN/reset closes
+the association after preceding decoded bytes, without application half-close.
 
 ### SpeedLimit independent drains
 

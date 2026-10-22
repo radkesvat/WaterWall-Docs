@@ -6,7 +6,7 @@ description: "مدل buffer sbuf_t، ‏buffer pool‌های هر worker، بو�
 ---
 
 <!--
-Documentation version: 155
+Documentation version: 156
 -->
 
 # بخش ۳: buffer‌ها، padding و shift buffer‌ها {#بخش-۳-بافرها-padding-و-shift-bufferها}
@@ -272,3 +272,47 @@ void myTunnelUpStreamPayload(tunnel_t *t, line_t *l, sbuf_t *buf)
 سالم می‌ماند. رد timer/continuation لازم هر دو mode را می‌بندد. buffer تحت مالکیت با pool همان line بازیافت می‌شود
 و buffer واگذارشده هرگز محلی بازیافت نمی‌شود. هویت reservation شامل runtime/ticket یکتا است تا release دیرهنگام
 به user حذف‌شده و دوباره‌ساخته‌شده با همان ID هزینه کم نکند. هزینهٔ کل client تا آزاد شدن buffer قدیمی باقی می‌ماند.
+
+## حامل و نگهداری خام QUIC
+
+`carrier-mode` در QuicClient/QuicServer صریح است. `datagram` هر Payload حامل را به
+یک دیتاگرام کامل QUIC بدون پوشش اضافی نگاشت می‌کند. `stream` طول چهار‌بایتی unsigned
+با ترتیب big-endian و سپس بدنه دارد. parser مشترک، header ثابت چهار‌بایتی و بدنهٔ
+ناقص محدود دارد؛ طول صفر یا بالاتر از ۱٬۴۷۲ را پیش از allocation بدنه رد می‌کند.
+fragmentation، coalescing و reentry سری‌شده پشتیبانی می‌شوند. نوع adapter برای
+تشخیص خودکار حامل بررسی نمی‌شود. سمت برنامه بایت‌ها را حفظ می‌کند، نه تعداد Payload.
+
+ورودی QUICHE فقط در مدت فراخوانی قرضی است. packet خروجی و plaintext decodeشده در
+eventهای owned مستقل با سقف بایت و entry stage و پس از driver تحویل می‌شوند.
+بافرها از pool دقیق line با padding کامل chain هستند. frame خروجی prefix خودش را
+می‌سازد؛ هر دو نود padding اضافی صفر و `kNodeFlagBlocksSplice` دارند.
+
+پیش‌فرض هر backlog برابر ۲ MiB و ۱۰۲۴ entry است. retention برنامهٔ queued و فعال
+را با send پذیرفته‌شده ولی تأییدنشدهٔ engine، شامل بایت opening، با هم حساب کنید.
+chunk ارسال حداکثر ۱۶ KiB است و ledger به‌ترتیب FIFO offset، طول و charge allocation
+را نگه می‌دارد؛ فقط entry کاملاً تأییدشدهٔ جلوی صف credit را آزاد می‌کند. ACK جزئی
+یا خارج از ترتیب از gap قبلی عبور نمی‌کند. charge allocation متعلق به WaterWall
+برای هر backlog حداکثر دو برابر بودجهٔ بایت است. overflow ارتباط را می‌بندد و
+بایت قابل‌اعتماد را بی‌صدا حذف نمی‌کند؛ این سقف، محدودیت کل heap/RSS در QUICHE نیست.
+
+پنجرهٔ ثابت stream و connection از ۱۶ KiB تا ۱۶ MiB و حداکثر بودجهٔ دریافت است؛
+autotuning خاموش است. فقط stream برنامهٔ صفر وجود دارد: سرور یک bidirectional
+ورودی، کلاینت صفر و هر دو صفر unidirectional برنامه اعلام می‌کنند. سقف packet
+غیرقابل‌رمزگشایی ۸ است. QUICHE پس از پردازش هر frame، بیش از ۱۶ KiB دادهٔ دریافت‌شدهٔ
+CRYPTO را که در بافر هر encryption level مانده باشد رد می‌کند. بررسی فعالِ
+crypto-send رشد بیش از ۱۶ KiB را فقط وقتی رد می‌کند که همان level از قبل دادهٔ
+ارسال‌نشده داشته باشد؛ وقتی بافر ارسال‌نشده خالی است این بررسی انجام نمی‌شود و
+دادهٔ ارسال‌شده ولی تأییدنشده هم در آن حساب نمی‌شود. این مقدار سقف کل retention
+مربوط به TLS/CRYPTO نیست.
+سقف CID فعالِ اعلام‌شده ۲ و ضریب سخت anti-amplification پیش از اعتبارسنجی ۳ است؛
+migration خاموش است. کتابخانهٔ pin‌شده، CIDهای صادرشدهٔ فعال و درحال بازنشستگی را
+جداگانه تا ۱۰ نگه می‌دارد و ممکن است original destination connection ID نیز بماند؛
+سقف اعلام‌شده، کل حافظهٔ CIDها را توصیف نمی‌کند.
+حداکثر اندازهٔ datagram خروجی قابل‌تنظیم بین ۱۲۰۰ تا ۱۴۵۲ بایت است؛ packetهای معمول
+QUIC می‌توانند کوچک‌تر باشند. datagram ورودی در حالت framed به‌طور مستقل حداکثر
+۱٬۴۷۲ بایت است. با تغییر pin library یا admission، این محدودیت‌ها را با engine
+تولید هماهنگ نگه دارید.
+
+ring ثابت descriptor شرط `(max-buffered-buffers + 1) * 24 <= max-buffered-bytes` دارد.
+backing ledger ارسال برای هر entry تنظیم‌شده ۱۶ بایت و هر backlog از نوع wire/plaintext
+برای هر entry تعداد ۲۴ بایت، حتی در ring خالی، charge می‌شود.

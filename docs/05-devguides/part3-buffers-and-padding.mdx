@@ -5,7 +5,7 @@ sidebar_label: "Part 3: Buffers & Padding"
 description: "The sbuf_t buffer model, worker buffer pools, left-padding budgets, and how to prepend protocol headers without breaking chain composition."
 ---
 <!--
-Documentation version: 184
+Documentation version: 185
 -->
 
 # Part 3: Buffers, Padding & Shift Buffers
@@ -1489,6 +1489,55 @@ malformed input or receiver closure; never exceed a receiver's hard limit just t
 finish the batch. Separately scheduled or deferred work follows the exact node's
 role in [Part 2](./part2-lines-and-callbacks.mdx#flow-control-roles-and-admission);
 ordinary middle-node output needs no consumer-pause gate.
+
+### Raw QUIC carrier and retention
+
+`QuicClient`/`QuicServer` have an explicit `carrier-mode`. `datagram` maps exactly
+one carrier Payload to one complete QUIC datagram without an outer envelope.
+`stream` uses a four-byte unsigned big-endian datagram length followed by its
+body. Its shared incremental parser has a fixed four-byte header cache and
+bounded partial body; zero or greater-than-1,472 lengths fail before body
+allocation. It handles arbitrary fragmentation/coalescing and serialized
+reentry. No adapter-type inspection or automatic carrier detection is permitted.
+The application side is a byte stream and preserves bytes, not Payload counts.
+
+QUICHE receives borrowed input only during its call. Complete wire packets and
+decoded plaintext are staged in independently bounded owned events and delivered
+after the driver returns. WaterWall buffers use the exact line's pool and full
+chain padding. Framed output is constructed with its own four-byte prefix; both
+nodes advertise zero additional left padding and `kNodeFlagBlocksSplice`.
+
+The default per-backlog limits are 2 MiB and 1,024 entries. Count queued and
+active application retention together with accepted but unacknowledged engine
+send data, including the opening byte. The engine uses at most 16 KiB per send
+chunk and a FIFO ledger of offsets, lengths and allocation charges; only fully
+acknowledged entries at the front release credit. Partial or out-of-order ACKs
+cannot free later entries across a gap. Each documented backlog also caps
+retained WaterWall allocation charge at twice its byte budget. Overflow closes
+the association rather than discarding arbitrary reliable bytes. These are
+storage-accounting limits, not a total QUICHE heap/RSS cap.
+
+The fixed stream and connection receive windows are 16 KiB–16 MiB, no greater
+than the configured receive/storage budget, with receive autotuning disabled.
+The engine permits only application stream 0: the server advertises one incoming
+bidirectional stream, the client zero, and both zero application unidirectional
+streams. It bounds undecryptable packets at eight. QUICHE rejects more than
+16 KiB of buffered CRYPTO receive data per encryption level after processing a
+frame. The enabled crypto-send check rejects growth past 16 KiB only when that
+level already has unsent data; it skips an empty unsent buffer and excludes sent
+but unacknowledged data. This is not a 16 KiB cap on total TLS/CRYPTO retention.
+The engine advertises active connection-ID limit two, disables migration, and
+retains strict pre-validation amplification factor three. The pinned library
+separately caps self-issued active plus retiring IDs at ten and may also retain
+the original destination connection ID; the advertised limit does not describe
+total CID storage.
+Fixed descriptor rings require `(max-buffered-buffers + 1) * 24 <= max-buffered-bytes`.
+Send-ledger backing charges 16 bytes per configured entry; each wire/plaintext
+backlog charges 24 bytes per entry, including empty-ring reservations.
+The configured maximum emitted datagram size is 1,200–1,452 bytes; ordinary QUIC
+packets may be smaller. Accepted framed input is independently bounded at 1,472
+bytes. Keep these internal bounds aligned with the production engine when
+changing its pinned library or admission mapping.
 
 ### HalfDuplex setup and direct forwarding
 
