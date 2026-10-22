@@ -6,7 +6,7 @@ description: "راهنمای node HeaderServer در WaterWall."
 ---
 
 <!--
-Documentation version: 152
+Documentation version: 153
 -->
 
 # HeaderServer
@@ -19,9 +19,10 @@ state مسیر ادامه پیش از فراخوانی Init node بعدی ثبت
 پس از بازگشت Init بعدی و پایان replay صف اولیه، node همهٔ state محلی را آزاد و صفر می‌کند و برای همیشه روی آن line از مسیر callbackها کنار می‌رود. در حالت port ثابت، این bypass بلافاصله پس از تنظیم port و پیش از ارسال Init انجام می‌شود. پس از مقداردهی اولیهٔ سمت بعدی، Pause/Resume شفاف و تکرارپذیر هستند و replay اولیه را متوقف نمی‌کنند.
 
 `HeaderServer` در سمت سرور، header‌های کوچکِ metadata اتصال را می‌خواند. این
-node سه کار مختلف انجام می‌دهد:
+node چهار کار مختلف انجام می‌دهد:
 
 - header دوبایتی port مخصوص WaterWall را از `HeaderClient` می‌خواند و در `dest_context->port` می‌نویسد.
+- header تک‌بایتی TCP/UDP مخصوص WaterWall را می‌خواند و فقط `dest_context->protocol` را جایگزین می‌کند.
 - HAProxy PROXY protocol v1 یا v2 را می‌خواند و IPv4 و port واقعی کلاینت را در `src_context` می‌نویسد.
 - هنگام `Init` در upstream یک destination port ثابت تنظیم می‌کند.
 
@@ -82,6 +83,25 @@ TcpListener -> HeaderServer -> TcpConnector
   "next": "relay-connector"
 }
 ```
+
+### بازیابی تنها هویت TCP/UDP
+
+اگر فرستنده فقط پروتکل را می‌فرستد و آدرس و port مقصد از قبل مشخص هستند، از این حالت استفاده کنید:
+
+```json
+{
+  "name": "protocol-reader",
+  "type": "HeaderServer",
+  "settings": {
+    "override": "dest_context->protocol"
+  },
+  "next": "router-or-connector"
+}
+```
+
+برای transport مقصد مورد نظر فرستنده، آن را با `HeaderClient.data = "dest_context->protocol"` جفت کنید؛ برای transport مبدأ پذیرفته‌شده، از `"src_context->protocol"` استفاده کنید. سرور پیش از مقداردهی اولیهٔ `next` نشانگر را اعمال می‌کند، بدون اینکه آدرس، port یا metadata مبدأ را تغییر دهد.
+
+برای حمل UDP روی TCP همچنان به framing جداگانهٔ datagram، مانند جفت `UdpOverTcp`، نیاز دارید.
 
 ### خواندن source IP و port از PROXY protocol
 
@@ -168,6 +188,8 @@ header را می‌خواند، source IP و source port را در `src_ctx` م�
 | --- | --- |
 | `"dest_context->port"` | header دو بایتی upstream مخصوص WaterWall خوانده می‌شود و `dest_ctx.port` تنظیم می‌شود. |
 | `"line->dest_ctx->port"` | نام مستعار سازگار با `"dest_context->port"`. |
+| `"dest_context->protocol"` | header تک‌بایتی TCP/UDP مخصوص WaterWall خوانده می‌شود و فقط `dest_ctx.protocol` جایگزین می‌شود. |
+| `"line->dest_ctx->protocol"` | نام مستعار `"dest_context->protocol"`. |
 | `"proxy-protocol->source-fields"` | PROXY protocol v1 یا v2 خوانده می‌شود و `src_ctx.ip` و `src_ctx.port` تنظیم می‌شوند. |
 | `1` تا `65535` | این destination port ثابت در upstream `Init` تنظیم می‌شود. |
 
@@ -190,6 +212,18 @@ payload در `buffer_stream_t` نگه داشته می‌شوند، بنابرا�
 
 port‌های decodeشده کمتر از `10` رد می‌شوند تا رفتار محافظه‌کارانه قدیمی این تونل
 حفظ شود.
+
+## حالت WaterWall Protocol Header
+
+وقتی `override` برابر `"dest_context->protocol"` یا `"line->dest_ctx->protocol"` باشد، `HeaderServer` منتظر یک بایت upstream می‌ماند. مقدار `6` را به‌عنوان TCP و `17` را به‌عنوان UDP می‌خواند و فقط فیلد زیر را جایگزین می‌کند:
+
+```text
+line->routing_context.dest_ctx.protocol
+```
+
+این نشانگر فقط یک بار برای هر line عادی لایه ۴ خوانده می‌شود. همهٔ metadata مبدأ و آدرس و port مقصد حفظ می‌شوند. سرور پیش از فراخوانی Init بعدی پروتکل را اعمال می‌کند و سپس payload باقی‌مانده را به‌ترتیب عبور می‌دهد. callbackهای payload خالی header را کامل نمی‌کنند. هر مقدار بایت دیگری، line را بدون مقداردهی اولیهٔ `next` می‌بندد.
+
+این header فقط metadata داخلی مسیریابی است و آدرس IP، port یا فیلدهای PROXY protocol ندارد. مرز datagramهای UDP را نیز encode نمی‌کند.
 
 ## حالت PROXY Protocol Source-Fields
 
@@ -279,6 +313,7 @@ callback‌های `UpStreamEst` و `DownStreamInit` برای این node غیر�
 | مقدار | اندازه |
 | --- | --- |
 | WaterWall port header | `2 bytes` |
+| WaterWall protocol header | `1 byte` |
 | حداقل port قابل قبول از WaterWall header | `10` |
 | PROXY protocol v1 header | حداکثر `108 bytes` |
 | PROXY protocol v2 base header | `16 bytes` |
@@ -291,6 +326,7 @@ callback‌های `UpStreamEst` و `DownStreamInit` برای این node غیر�
 ## نکته‌ها
 
 - حالت port-header در WaterWall را همراه با `HeaderClient.data = "src_context->port"` استفاده کنید.
+- حالت protocol-header را با `HeaderClient.data = "src_context->protocol"` یا `"dest_context->protocol"` جفت کنید؛ حمل UDP روی TCP به framing جداگانه نیاز دارد.
 - حالت PROXY source-fields را تنها با یک فرستنده قابل اعتماد PROXY به کار ببرید.
 - حالت PROXY source-fields فعلاً فقط IPv4 را پشتیبانی می‌کند.
 - حالت PROXY source-fields فقط `src_ctx` را به‌روز می‌کند و `dest_ctx` را تغییر نمی‌دهد.
@@ -314,7 +350,7 @@ metadata برگرفته از کد منبع:
 ## پشتیبانی از splice
 
 `HeaderServer` پرچم `kNodeFlagSupportsSplice` را دارد. هنگام انتظار برای header
-پورت یا PROXY protocol، کل payload دریافتی را با `sbufEnsureOrdinary()` به حافظهٔ
+پورت، پروتکل TCP/UDP یا PROXY protocol، کل payload دریافتی را با `sbufEnsureOrdinary()` به حافظهٔ
 عادی تبدیل می‌کند و سپس به BufferStream می‌دهد. بایت‌های application همراه header
 حفظ می‌شوند. پس از تکمیل header، هر دو جهت و صف محدود reentry، buffer‌های splice
 را بدون تبدیل عبور می‌دهند. حالت پورت ثابت به خواندن payload نیاز ندارد.

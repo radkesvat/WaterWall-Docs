@@ -6,7 +6,7 @@ description: "راهنمای node HeaderClient در WaterWall."
 ---
 
 <!--
-Documentation version: 153
+Documentation version: 154
 -->
 
 # HeaderClient
@@ -19,18 +19,18 @@ header یک‌باره قرار می‌دهد.
 - فرستادن metadata مسیریابی WaterWall به یک `HeaderServer` جفت‌شده
 - افزودن header پروتکل HAProxy PROXY پیش از رسیدن ترافیک به گیرنده‌ای که PROXY protocol را می‌شناسد
 
-`HeaderClient` socket باز نمی‌کند و line نمی‌سازد. تنها نخستین payloadِ upstream را تغییر می‌دهد. state اختصاصی برای هر line نگه نمی‌دارد و پیش از تحویل payload، برای همیشه روی آن line از مسیر callbackها کنار می‌رود. ماسک nodeهای فعال line، رفتار یک‌باره را تضمین می‌کند. callbackهای بعدی مستقیماً به node فعال مجاور می‌رسند. Pause/Resume در تمام مراحل راه‌اندازی شفاف و تکرارپذیر هستند.
+`HeaderClient` socket باز نمی‌کند و line نمی‌سازد. تنها نخستین payloadِ upstream را تغییر می‌دهد و پیش از تحویل آن، برای همیشه روی آن line از مسیر callbackها کنار می‌رود. حالت‌های protocol از `Init` تا تحویل نخستین payload یا `Finish`، یک snapshot کوچک برای هر line نگه می‌دارند؛ حالت‌های port و PROXY state اختصاصی line ندارند. ماسک nodeهای فعال line، رفتار یک‌باره را تضمین می‌کند. callbackهای بعدی مستقیماً به node فعال مجاور می‌رسند. Pause/Resume در تمام مراحل راه‌اندازی شفاف و تکرارپذیر هستند.
 
 ## عملکرد
 
 - برای انتخاب فرمت header یک‌باره به `settings.data` نیاز دارد.
-- `Init` را بی‌درنگ در جهت upstream به `next` می‌فرستد.
+- در حالت‌های protocol، پیش از فرستادن `Init` در upstream به `next`، پروتکل انتخاب‌شده را بررسی و ذخیره می‌کند. حالت‌های دیگر `Init` را بی‌درنگ عبور می‌دهند.
 - فقط روی اولین upstream payload، header تنظیم‌شده را prepend می‌کند.
-- از header قدیمی دوبایتی port در WaterWall پشتیبانی می‌کند.
+- از header دوبایتی port و header تک‌بایتی پروتکل TCP/UDP در WaterWall پشتیبانی می‌کند.
 - از header‌های IPv4-only مربوط به HAProxy PROXY protocol v1 و v2 با یک frontend IPv4 تنظیم‌شده پشتیبانی می‌کند.
 - همه payload‌های بعدی upstream را بدون تغییر عبور می‌دهد.
 - payload و callback‌های `Est`، `Pause` و `Resume` را در downstream بدون تغییر عبور می‌دهد.
-- برای عبور جهت‌دار `Init` و `Finish` از callbackهای پیش‌فرض استفاده می‌کند.
+- snapshot پروتکل را پیش از bypass یا عبور جهت‌دار `Finish` صفر می‌کند؛ حالت‌های دیگر از callbackهای پیش‌فرض `Init` و `Finish` استفاده می‌کنند.
 
 ## جایگاه رایج
 
@@ -124,6 +124,27 @@ frontend‌ای باشد که کلاینت‌ها به آن وصل می‌شون
 ```
 
 با این چیدمان، اگر سمت کلاینت اتصال را روی port عمومی `443` بپذیرد، اتصال از طریق `198.51.100.20:9000` عبور می‌کند و سپس سمت relay به `127.0.0.1:443` وصل می‌شود.
+
+### فرستادن تنها هویت TCP/UDP
+
+اگر گیرنده از قبل آدرس و port مقصد را می‌داند، می‌توانید تنها پروتکل مقصد مورد نظر را بفرستید:
+
+```json
+{
+  "name": "protocol-header",
+  "type": "HeaderClient",
+  "settings": {
+    "data": "dest_context->protocol"
+  },
+  "next": "relay-connector"
+}
+```
+
+در سمت مقابل از `HeaderServer.settings.override = "dest_context->protocol"` استفاده کنید.
+اگر هدف تشخیص transport مبدأ پذیرفته‌شده است، مقدار `"src_context->protocol"` را انتخاب کنید.
+context انتخاب‌شده باید هنگام upstream `Init` در `HeaderClient` دقیقاً TCP یا UDP را مشخص کرده باشد؛ از context دیگر به‌عنوان fallback استفاده نمی‌شود.
+
+این header آدرس یا port ندارد. برای حمل UDP روی TCP همچنان به framing جداگانهٔ datagram، مانند جفت `UdpOverTcp`، نیاز دارید.
 
 ### اجبار همه ترافیک relay شده به یک backend port
 
@@ -233,6 +254,10 @@ WaterWall از `HeaderServer` با `settings.override =
 | `1` تا `65535` | همین port ثابت را در header دوبایتی WaterWall encode می‌کند. |
 | `"src_context->port"` | مقدار `line->routing_context.src_ctx.port` را به‌عنوان header دو بایتی WaterWall encode می‌کند. |
 | `"line->src_ctx->port"` | نام مستعار سازگار با `"src_context->port"`. |
+| `"src_context->protocol"` | مقدار `src_ctx.protocol` را هنگام `Init` ذخیره و TCP یا UDP را در یک header تک‌بایتی encode می‌کند. |
+| `"line->src_ctx->protocol"` | نام مستعار `"src_context->protocol"`. |
+| `"dest_context->protocol"` | مقدار `dest_ctx.protocol` را هنگام `Init` ذخیره و TCP یا UDP را در یک header تک‌بایتی encode می‌کند. |
+| `"line->dest_ctx->protocol"` | نام مستعار `"dest_context->protocol"`. |
 | `"proxy-protocol"` | یک header از نوع PROXY protocol v2 تولید می‌کند. |
 | `"proxy-protocol-v1"` | یک header از نوع PROXY protocol v1 تولید می‌کند. |
 | `"proxy-protocol-v2"` | یک header از نوع PROXY protocol v2 تولید می‌کند. |
@@ -254,6 +279,14 @@ payload
 ```
 
 header مربوط به port یک مقدار شانزده‌بیتی big-endian است که فقط یک بار برای هر line فرستاده می‌شود. payload‌های بعدی upstream دقیقاً بدون تغییر عبور می‌کنند.
+
+در حالت‌های protocol، نخستین payloadِ upstream به این شکل تبدیل می‌شود:
+
+```text
+1-byte protocol header | payload
+```
+
+مقدار بایت برای TCP برابر `6` و برای UDP برابر `17` است و فقط یک بار برای هر line عادی لایه ۴ فرستاده می‌شود. این header آدرس IP، port یا فیلدهای PROXY protocol ندارد. کلاینت تنها context انتخاب‌شده را هنگام upstream `Init` و پیش از فراخوانی Init بعدی ذخیره می‌کند؛ بنابراین تغییر بعدی routing context توسط connector روی header اثری ندارد. اگر پروتکل انتخاب‌شده تنظیم نشده، مبهم یا پشتیبانی‌نشده باشد، line بدون مقداردهی اولیهٔ `next` بسته می‌شود.
 
 در حالت‌های PROXY protocol، `HeaderClient` یک header از نوع IPv4 TCP PROXY می‌سازد. Source IP از `line->routing_context.src_ctx` و destination IP از `settings.frontend-ipv4` گرفته می‌شود. برای مقصد در headerِ PROXY از `dest_ctx` استفاده نمی‌شود، زیرا ممکن است `TcpConnector` پیش از ارسال نخستین payload، `dest_ctx` را به backend مقصد اتصال تغییر داده باشد.
 
@@ -295,6 +328,21 @@ port‌های انتخاب‌شده:
 }
 ```
 
+برای header تک‌بایتی پروتکل، یکی از contextهای پروتکل کلاینت را با این تنظیم سرور جفت کنید:
+
+```json
+{
+  "name": "header-server",
+  "type": "HeaderServer",
+  "settings": {
+    "override": "dest_context->protocol"
+  },
+  "next": "router-or-connector"
+}
+```
+
+سرور پیش از مقداردهی اولیهٔ node بعدی فقط `dest_ctx.protocol` را تغییر می‌دهد؛ metadata مبدأ، آدرس مقصد و port مقصد حفظ می‌شوند.
+
 برای برگرداندن source fields از PROXY protocol:
 
 ```json
@@ -318,7 +366,7 @@ PROXY فعلاً فقط IPv4 را پشتیبانی می‌کند و تنها `sr
 
 | جهت | رفتار |
 | --- | --- |
-| upstream `Init` | callback را به `next` می‌فرستد. |
+| upstream `Init` | در حالت protocol، پروتکل انتخاب‌شده را بررسی و ذخیره می‌کند و سپس به `next` می‌فرستد؛ در حالت‌های دیگر بی‌درنگ عبور می‌دهد. |
 | اولین upstream payload | header تنظیم‌شده را prepend می‌کند و به `next` می‌فرستد. |
 | payload‌های upstream بعدی | بدون تغییر به `next` می‌روند. |
 | upstream pause/resume | به `next` فرستاده می‌شود. |
@@ -329,7 +377,7 @@ callback‌های `UpStreamEst` و `DownStreamInit` برای این node غیر�
 
 ## Finish
 
-پیش از نخستین payload، callbackهای پیش‌فرض Finish را در جهت دریافت‌شده عبور می‌دهند. پس از bypass، Finish مستقیماً به node فعال بعدی در همان جهت می‌رسد. این node منبع اختصاصی برای هر line ندارد که نیاز به پاک‌سازی داشته باشد.
+پیش از نخستین payload، حالت‌های protocol ابتدا snapshot هر line را صفر می‌کنند و سپس Finish را در جهت دریافت‌شده عبور می‌دهند. حالت‌های دیگر از callbackهای پیش‌فرض Finish استفاده می‌کنند. پس از bypass، Finish مستقیماً به node فعال بعدی در همان جهت می‌رسد و snapshot پروتکل از قبل صفر شده است.
 
 با دریافت `Finish` در upstream، `HeaderClient` آن را به `next` می‌فرستد.
 
@@ -342,6 +390,7 @@ callback‌های `UpStreamEst` و `DownStreamInit` برای این node غیر�
 | مقدار | اندازه |
 | --- | --- |
 | header دو بایتی WaterWall برای port | `2 bytes` |
+| header پروتکل WaterWall | `1 byte` |
 | header پروتکل PROXY v1 | حداکثر `108 bytes` |
 | header پروتکل PROXY v2 | `16` یا `28 bytes` |
 | `required_padding_left` | `108 bytes` |
@@ -356,7 +405,8 @@ callback‌های `UpStreamEst` و `DownStreamInit` برای این node غیر�
 - حالت‌های PROXY protocol فعلاً فقط IPv4 را پشتیبانی می‌کنند.
 - destination IP در PROXY protocol از `settings.frontend-ipv4` می‌آید، نه `dest_ctx`.
 - اگر یک listener روی چند frontend IPv4 ترافیک قبول کند، یک مقدار ثابت `frontend-ipv4` ممکن است همه اتصال‌های پذیرفته‌شده را درست توصیف نکند.
-- مقدار encode‌شده هنگام رسیدن نخستین payloadِ upstream خوانده می‌شود.
+- مقدار پروتکل هنگام upstream `Init` ذخیره می‌شود؛ فیلدهای port و PROXY هنگام رسیدن نخستین payloadِ upstream خوانده می‌شوند.
+- نشانگر پروتکل مرز datagramهای UDP را حفظ نمی‌کند؛ برای حمل UDP روی TCP از framing جداگانه استفاده کنید.
 - تنها نخستین payloadِ upstream تغییر می‌کند و مسیر پاسخ بدون تغییر است.
 
 ## متادیتای نود
