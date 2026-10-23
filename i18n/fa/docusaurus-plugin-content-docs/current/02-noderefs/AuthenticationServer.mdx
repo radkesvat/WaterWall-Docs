@@ -6,7 +6,7 @@ description: "راهنمای node AuthenticationServer در WaterWall."
 ---
 
 <!--
-Documentation version: 165
+Documentation version: 166
 -->
 
 # AuthenticationServer
@@ -123,6 +123,10 @@ AuthenticationClient -> AuthenticationServer
 `normal-backups-count-limit` فقط عدد صحیح JSON از `1` تا `2147483647` (`INT_MAX`) می‌پذیرند.
 `file-save-rate-ms` اجباری است. پیش‌فرض یا timeout ارث‌رسیدهٔ هر کلاینت فقط وقتی اعمال می‌شود که گزینه وجود نداشته باشد.
 صفر، مقدار منفی یا اعشاری، نگارش دارای ممیز یا توان، رشته، `null` و مقدار خارج از بازه پیش از استفاده در timer یا نگهداری backup، راه‌اندازی را متوقف می‌کنند.
+
+`verbose` و مجوزهای `allow-stats-push`، `allow-user-pull` و `allow-user-write` در هر producer
+فقط Boolean واقعی JSON می‌پذیرند و در نبود فیلد `false` هستند. رشته، عدد، `null` و سایر نوع‌ها یا تکرار این
+فیلدها در همان object راه‌اندازی را رد می‌کند. پیام خطا نام فیلد و برای مجوز producer، index آرایه را مشخص می‌کند.
 
 ## Auth Clients
 
@@ -506,6 +510,17 @@ ACK فقط پذیرش در حافظه سرور است، نه تأیید ذخیر
 
 پیامی که session token معتبر دارد نباید شامل `Authenticate` باشد. envelope خراب، فریم ناقص، payload بزرگ‌تر از حد مجاز یا بایت‌های اضافه‌ای که حتی یک header کامل درخواست را تشکیل نمی‌دهند، باعث بسته شدن امن اتصال منطقی می‌شوند.
 
+در rollback ذخیرهٔ ناموفق `AddNewUser`، فقط slot آخرین افزودن منتشرنشده زیر مالکیت انحصاری پیوستهٔ
+تراکنش پس گرفته می‌شود؛ تلاش مجدد از ظرفیت نگه‌داشته‌شده استفاده می‌کند. حذف عادی همچنان slot پایدار را نگه
+می‌دارد و اشاره‌گر حذف‌شده را نامعتبر می‌کند.
+
+Allowed-IP از نوع IPv4-mapped IPv6 خانوادهٔ IPv6 را حفظ می‌کند: `::ffff:10.0.0.1/128` برای lookup و
+تشخیص overlap با IPv4 `10.0.0.1/32` متفاوت است و به آن تبدیل نمی‌شود.
+
+خروجی کامل JSON در APIهای native مانند `userToJson()`، `usersToJson()` و `usersUserToJson*()` دارای
+credential و مخصوص caller مورداعتماد است. caller مالک درخت برگشتی و مسئول حذف آن است. خروجی کل جدول،
+زیر قفل read برای همهٔ حساب‌ها تخصیص و کپی انجام می‌دهد؛ وضعیت عمومی باید از projectionهای redacted موجود استفاده کند.
+
 ## انواع درخواست
 
 | نوع | ماژول | Permission | داده request | response موفق |
@@ -552,7 +567,10 @@ JSON باید در سقف payload پاسخ، یعنی ۱۶ MiB منهای header
 داده درخواست `{"name":"edge-1","secret":"long-random-secret"}` است؛ برای resume فیلد `epoch` نیز ارسال
 می‌شود. envelope باید token صفر داشته باشد. پاسخ موفق نوع `4` و شامل token و epoch با طول مجموع ۱۲۸ بایت است.
 احراز هویت در envelope دارای token معتبر با `already-authenticated` رد می‌شود. شکست resume خطای
-`accounting-continuity-lost` می‌دهد.
+`accounting-continuity-lost` می‌دهد. فقط عدم تطبیق name/secret خطای `authentication-failed` دارد.
+پس از تطبیق معتبر، کمبود ظرفیت یا شکست تولید token/epoch خطای موقت `session-unavailable` می‌دهد؛ session،
+epoch و checkpoint قبلی حفظ می‌شوند و کلاینت با backoff محدود دوباره متصل می‌شود، بدون از دست دادن cache
+قابل‌استفاده یا حسابداری معلق.
 
 ### GetUsersPage
 
@@ -1179,9 +1197,10 @@ plain به UUID، هویت UUID را اضافه می‌کند؛ UUID به plain 
 آماده‌سازی و مشتق‌سازی یک بار پیش از قفل‌های مشترک انجام می‌شود. ترتیب try-lock
 برابر state، collection و configuration کاربر است؛ انتظار و stats lock ندارد.
 از ظرفیت رزروشدهٔ index استفاده می‌شود و رشد/rehash یا اسکن کل کاربران رخ
-نمی‌دهد. رمز قبلی باید در ۳۲ KiB به‌علاوهٔ یک بایت terminator پایان یابد؛
+نمی‌دهد. طول ذخیره‌شدهٔ معتبر رمز قبلی زیر همین قفل‌ها باید حداکثر ۳۲ KiB باشد؛ plaintext قبلی دوباره اسکن نمی‌شود؛
 رکورد importشدهٔ بزرگ‌تر بدون تغییر `resource_limit` می‌دهد. این سقف operation
-است. بدنه، رشتهٔ decodeشده، staging آماده و plaintext جایگزین‌شده طبق مالکیت
+است. رمز جدید ورودی همچنان اعتبارسنجی محدود دارد؛ deadline پیش و پس از precommit بررسی می‌شود و cleanup
+جایگزینی همچنان متناسب با تخصیص قبلی کار دارد. بدنه، رشتهٔ decodeشده، staging آماده و plaintext جایگزین‌شده طبق مالکیت
 objectها در مسیر cleanup مالک پاک می‌شوند؛ این تضمین شامل همهٔ بافرهای خام transport و configuration نیست.
 
 کدهای node عبارت‌اند از `invalid_request`، `conflict`، `not_found`،

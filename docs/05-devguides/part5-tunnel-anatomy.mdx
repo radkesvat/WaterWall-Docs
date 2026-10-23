@@ -5,7 +5,7 @@ sidebar_label: "Part 5: Anatomy & Workflow"
 description: "The on-disk layout of a WaterWall tunnel, what each file owns, node.c metadata, the create/line-state patterns, HTTP constraints, and the implementation workflow."
 ---
 <!--
-Documentation version: 181
+Documentation version: 182
 -->
 
 # Part 5: Anatomy of a Tunnel & Workflow
@@ -1113,8 +1113,10 @@ write` order, with no statistics lock, I/O or worker wait. Check the four creden
 indexes for another account's keys, allowing the target's own identities. Plain to
 UUID, UUID to plain, UUID replacement and case-equivalent UUID assignments must
 update validity/membership correctly. A textual change need not revoke an unchanged
-protocol identity. Inspect the selected old password for at most 32 KiB plus one
-terminator byte; an oversized imported password yields `resource_limit` unchanged.
+protocol identity. Admit the selected old password using its authoritative cached owned length under the existing
+locks, with a 32 KiB maximum; an oversized imported password yields `resource_limit` unchanged. Keep bounded scanning
+of external new passwords, deadline checks before/after precommit, and secure cleanup proportional to the replaced
+allocation.
 Inspect no unrelated strings or full table. Preserve average-case hash semantics,
 without promising interruptible crypto or worst-case constant-time collision work.
 
@@ -1187,6 +1189,9 @@ validity bits so zero is valid, preserve the previous success after a failure,
 and do not downgrade primary success for optional postcommit backup/sync warnings.
 This view changes neither persistence frequency nor its commit guarantee.
 
+AuthenticationServer `verbose` and producer `allow-stats-push`, `allow-user-pull` and `allow-user-write` must be
+unique JSON Booleans in their own objects; absence defaults to false. Reject invalid types before runtime timers.
+
 AuthenticationServer database loading and producer `AddNewUser` must validate the
 complete byte span before importing users: reject trailing non-whitespace, invalid
 UTF-8, raw/decoded NUL and duplicate decoded keys. Database reads retain their
@@ -1202,6 +1207,12 @@ AuthenticationServer saving distinguishes a primary absent at open from other
 read failures. Confirmed absence publishes the valid in-memory table without
 rotating or requiring the existing recovery backup; subsequent saves resume
 ordinary rotation. Empty/read/close failures retain the ordinary save refusal.
+A failed producer addition may reclaim only its unpublished last storage slot through
+`usersRollbackUnpublishedLastUserByIdentifier()`. The caller must continuously hold external exclusive transaction
+ownership from insertion to rollback, expose no candidate pointer and roll back the most recent addition. The helper
+locks the collection, validates both last-active and last-allocated identity, removes all indexes and destroys the
+candidate before decrementing the slot count. Identity/storage mismatches are fatal invariants. Retain allocated
+capacity for retries; ordinary removal still invalidates pointers and never reuses their slots.
 Startup rollback must skip final database saving while releasing all created
 resources; normal process shutdown saves a loaded database. Weekly history slots
 subtract calendar days from `tm_mday` before local `mktime`, with `tm_isdst=-1`.
@@ -1212,7 +1223,8 @@ creation.
 
 Shared user Allowed-IP parsing requires complete `inet_pton` IPv4/IPv6 syntax;
 trim only surrounding whitespace, then preserve existing prefix checks, host-bit
-masking and overlap rules. Imports reserve no more than 64 speculative records
+masking and overlap rules. IPv4-mapped IPv6 remains IPv6: `::ffff:10.0.0.1/128` is distinct from
+`10.0.0.1/32` for lookup and overlap; never silently convert it to IPv4. Imports reserve no more than 64 speculative records
 above the existing count before validating entries. A string-valued `password`
 or `pass` identifies a standalone record; object-valued entries with those names
 remain name-map users. The selected `password` still takes precedence over `pass`,
