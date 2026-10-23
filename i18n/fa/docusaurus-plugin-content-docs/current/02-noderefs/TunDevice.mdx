@@ -6,7 +6,7 @@ description: "راهنمای node TunDevice در WaterWall."
 ---
 
 <!--
-Documentation version: 160
+Documentation version: 162
 -->
 
 # TunDevice
@@ -50,13 +50,32 @@ worker و مسیریابی ثابت کرنل را امتحان می‌کند. ا
 نمی‌کند و هر worker همچنان جریان‌های خودش را پردازش می‌کند. خواندن و نوشتن
 هر دو از مجموعهٔ صف‌های انتخاب‌شده استفاده می‌کنند.
 
-انتخاب صف بر اساس جفت آدرس IPv4 و پروتکل است تا fragmentها و packetهای معمولی
-یک جریان reader یکسان داشته باشند. اتصال‌های دارای همان جفت آدرس و پروتکل
-یک صف دریافت مشترک دارند؛ hash کامل جریان همچنان worker پردازش را تعیین می‌کند.
+برای TCP/UDP بدون fragmentation، انتخاب صف از hash متقارن آدرس‌ها، portها و
+پروتکل استفاده می‌کند و با affinity مربوط به worker پردازش هماهنگ است. اتصال‌های
+بین همان دو host می‌توانند صف‌های متفاوت داشته باشند. fragmentها و پروتکل‌های
+دیگر از جفت آدرس و پروتکل استفاده می‌کنند؛ packetهای عادی و fragmentشدهٔ یک flow
+ممکن است reader متفاوت داشته باشند و جابه‌جا شوند. جدول مشترک fragment،
+reassembly و worker مقصد را حفظ می‌کند. ورودی malformed یا نسخهٔ IP پشتیبانی‌نشده
+برای اعتبارسنجی بعدی به صف صفر می‌رود.
 در Windows نیز worker صفر با اعلان رویداد Wintun بسته‌ها را در batchهای محدود
 می‌خواند. Linux و Windows دیگر thread اختصاصی برای خواندن TUN ندارند؛ سایر
 workerها همچنان جریان‌های خود را پردازش می‌کنند. backend مربوط به Darwin/BSD
-همچنان از reader قبلی استفاده می‌کند.
+از thread خارجی با pool مستقل استفاده می‌کند. در Windows، macOS و BSD، صف دریافت
+هر device به ۸ MiB هزینهٔ واقعی تخصیص buffer و ۱۰۲۴ packet محدود است. پذیرش
+منتظر worker نمی‌ماند؛ ادامهٔ batch که جا نمی‌شود فوراً دور ریخته می‌شود و پس
+از آزادشدن ظرفیت، readهای بعدی دوباره پذیرفته می‌شوند. اندازهٔ batch جاری در
+Windows و macOS حداکثر ۱۲۸ packet است. در BSD این اندازه به پروفایل RAM بستگی
+دارد و در پروفایل `server` به ۲۵۶ packet می‌رسد. حافظهٔ batch جاری، metadata صف
+و ذخیرهٔ محدود fragment جدا از این بودجه حساب می‌شوند؛ ترتیب پذیرفته‌شدهٔ هر
+worker حفظ می‌شود.
+
+رکورد معمولی offload در Linux، شامل `DATA_VALID` و `NEEDS_CSUM` مطابق با تضمین
+ورودی، فقط بایت‌های IP را در تخصیص best-fit کپی می‌کند. هزینهٔ همان تخصیص و metadata
+کار، یک slot و بدون سهم خروجی segmentation رزرو می‌شود؛ scratch نزد reader برای
+استفادهٔ دوباره می‌ماند. GSO سهم aggregate و خروجی و دو slot را حفظ می‌کند. جفت
+مستقیم trusted از TUN/PTC می‌تواند aggregate تضمین‌شدهٔ TCPv4 GSO را بدون segmentation
+تحویل دهد؛ سایر مسیرها segmentهای اندازهٔ MTU می‌گیرند. startup فقط هندسه و هزینهٔ
+scratch را نگه می‌دارد، نه یک buffer بلااستفاده.
 
 ## جایگاه رایج
 
@@ -119,7 +138,7 @@ TcpListener -> StreamToPackets -> TunDevice
 | فیلد | نوع | توضیح |
 |---|---|---|
 | `device-name` | string | نام TUN interface. این نام باید با interface‌های دیگر سیستم‌عامل یا node‌های دیگر WaterWall تداخل نداشته باشد. |
-| `device-ip` | string | آدرس device به شکل CIDR، مثل `10.10.0.1/24`. WaterWall آن را به IP و subnet mask جدا می‌کند. |
+| `device-ip` | string | آدرس IPv4 دستگاه به شکل CIDR، مثل `10.10.0.1/24`. IPv6 رد می‌شود، زیرا مسیر packet فقط IPv4 را پردازش می‌کند. |
 
 object مربوط به `settings` الزامی است و نباید خالی باشد.
 
@@ -132,7 +151,7 @@ object مربوط به `settings` الزامی است و نباید خالی ب�
 | `gso` | `true` | درخواست TCPv4 GSO در Linux. مقدار `false` segmentation را غیرفعال می‌کند، ولی هر device تازه همچنان checksum offload را خودکار امتحان می‌کند. نوع‌های نامعتبر از جمله `null` رد می‌شوند. رد شدن GSO حالت checksum-only را حفظ می‌کند؛ نبود پشتیبانی checksum/framing یا منابع لازم باعث raw fallback می‌شود. حالت نهایی در startup log ثبت می‌شود. MTU همچنان اندازهٔ هر packet خروجی segmentation را محدود می‌کند. |
 | `route-table` | `off` | نصب route‌های native سیستم‌عامل را کنترل می‌کند. مقدارهای `off`، `main`، `auto` یا table name/number لینوکس. |
 | `system-route` | `false` | میان‌بری برای full-device routing. اگر `true` باشد و `route-table` را ننویسید، مانند `route-table: "main"` عمل می‌کند. |
-| `route-cidrs` | full route بر اساس family آدرس device | CIDR‌هایی که وقتی routing فعال است باید از TUN عبور کنند. |
+| `route-cidrs` | `0.0.0.0/0` | CIDRهای IPv4 که هنگام فعال بودن routing از TUN عبور می‌کنند. وجود هر IPv6، حتی در فهرست مختلط یا پس از exclusion، ساخت node را پیش از نصب route رد می‌کند. |
 | `route-exclude-cidrs` | ندارد | CIDR‌هایی که از `route-cidrs` کم می‌شوند؛ مناسب LAN، شبکه مدیریت و endpoint‌های upstream. |
 | `dns` | تنظیم نشده | یک یا دو DNS server از نوع IPv4 برای TUN interface. |
 | `loop-protection` | وقتی system routing فعال است، فعال می‌شود | نمی‌گذارد socket‌های outbound خود WaterWall دوباره از TUN عبور کنند. |
@@ -190,7 +209,10 @@ modifier مربوط به ECN در رکورد TCPv4 GSO لینوکس نیز پش�
 
 در Windows و macOS، مقدارهای غیر از `main` یا `auto` رد می‌شوند.
 
-اگر routing فعال باشد و `route-cidrs` را ننویسید، WaterWall بر اساس family مربوط به `device-ip` یک full route می‌سازد. default route مانند `0.0.0.0/0` به دو route از نوع `/1` تقسیم می‌شود تا default route فعلی سیستم مستقیماً جایگزین نشود.
+اگر routing فعال باشد و `route-cidrs` را ننویسید، WaterWall مسیر کامل IPv4 می‌سازد.
+با `route-table: off` فهرست capture نصب نمی‌شود. exclusion از خانوادهٔ دیگر
+مسیر IPv4 را تغییر نمی‌دهد؛ وجود IPv6 در فهرست capture فعال همیشه رد می‌شود،
+حتی اگر exclusion آن را حذف می‌کرد. default route مانند `0.0.0.0/0` به دو route از نوع `/1` تقسیم می‌شود تا default route فعلی سیستم مستقیماً جایگزین نشود.
 
 با `route-exclude-cidrs` می‌توانید شبکه‌هایی را از route‌ها کم کنید:
 
@@ -423,8 +445,11 @@ fragment‌ها metadata عادی دارند. حالت‌های انتخاب‌�
 
 در جفت مستقیم trusted روی Linux با framing فعال، writer تنها TCP data‌های مجاور
 و سازگار را به یک GSO record با header خصوصی و payload iovec‌های buffer‌های اصلی
-تبدیل می‌کند. جمع‌آوری منتظر پرشدن batch نمی‌ماند: سقف ۶۴ packet و ۲۵۶ KiB
-allocation charge با یک lookahead است و طول IPv4 هر record حداکثر ۶۵۵۳۵ بایت.
-هر packet اولیه همچنان باید در MTU جا شود. UDP، fragment، control، packet ناسازگار،
-node میانی و `gso:false` مسیر عادی را دارند. هیچ کپی تجمیعی از payload ساخته
-نمی‌شود؛ writer هنگام stop همهٔ buffer‌های محلی را قبل از join تسویه می‌کند.
+تبدیل می‌کند. هر worker FIFO خروجی و flush deferred خودش را دارد؛ thread یا pool
+اختصاصی writer وجود ندارد. workerها می‌توانند هم‌زمان بنویسند؛ ترتیب در FIFO همان
+worker حفظ می‌شود. هر flush حداکثر ۶۴ packet و ۲۵۶ KiB هزینهٔ تخصیص را پردازش
+می‌کند؛ یک تخصیص بزرگ‌تر به‌تنهایی پیش می‌رود و باقیمانده دوباره زمان‌بندی می‌شود.
+طول IPv4 هر record حداکثر ۶۵۵۳۵ بایت است. هر packet اولیه همچنان باید در MTU جا شود.
+UDP، fragment، control، packet ناسازگار، node میانی و `gso:false` مسیر عادی را دارند.
+کپی تجمیعی payload ساخته نمی‌شود. stop ابتدا پذیرش را می‌بندد و منتظر callbackهای
+پذیرفته‌شده می‌ماند، سپس bufferهای باقی‌مانده را آزاد می‌کند.
