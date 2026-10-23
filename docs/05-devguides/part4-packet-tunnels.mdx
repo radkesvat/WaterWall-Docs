@@ -408,7 +408,7 @@ upgrade keeps checksum-only mode on that descriptor.
 | Checksum only | 10-byte little-endian virtio header + IP | `TUN_F_CSUM` |
 | Checksum and TCPv4 GSO | Same virtio framing | `TUN_F_CSUM \| TUN_F_TSO4` |
 
-Unavailable checksum/virtio setup or common scratch, capacity-notifier or FIFO
+Unavailable checksum/virtio setup, scratch geometry, capacity-notifier or FIFO
 resources can cause a close/reopen into raw mode before publication. Worker
 FIFO and budget resources remain required for raw worker reads; failure to
 establish them also in raw mode fails startup. Open, MTU,
@@ -477,11 +477,15 @@ covers work/batch admission and FIFO maintenance, not each generated segment.
 The kernel's requested `gso_max_segs` value of 2,048 is best effort: failure
 is logged and GSO continues. It limits some producers, but is not an ingress
 validity bound: forwarded/injected GSO can exceed it. Before publication, the
-reader's initial scratch buffer uses checked best-fit pool geometry and direct
-allocation under the fatal heap-allocation policy. Unsupported geometry or OS
-offload setup refusal can fall back to raw-IP framing. Admission transfers scratch
-itself to worker work and obtains a replacement; the reader does not copy aggregate
-payloads.
+device validates and stores scratch capacity, final padding and allocation charge
+from checked best-fit pool geometry without retaining a dummy packet allocation.
+Each reader allocates its own scratch under the fatal heap-allocation policy.
+Unsupported geometry or OS offload setup refusal can fall back to raw-IP framing.
+Segment admission transfers scratch itself to worker work and obtains a
+replacement; the reader does not copy aggregate payloads. Every non-segment
+record, including assured ordinary input, copies only its IP bytes into the
+queried best-fit allocation and retains scratch. Its reservation covers that
+actual allocation and work metadata, one packet slot and no output allowance.
 
 The session's 512 packet-slot and 8 MiB allocation-charge budget covers queued
 ordinary packets and GSO work. Each GSO item reserves its actual aggregate
@@ -519,8 +523,8 @@ each component remains responsible for its input and output contracts.
 
 At either packet-to-stack input, MF or a nonzero fragment offset causes a bounded
 input drop; DF alone is allowed. Reject after structural normalization and before
-stack delivery. CTP also filters destination/protocol before fragment handling and
-never reads transport ports from a non-first fragment. Rejection must recycle the
+stack delivery. CTP also filters destination/protocol before rejecting fragments and
+never reads transport ports from rejected fragments. Rejection must recycle the
 input, settle any copied message and ingress gate exactly once, preserve the
 chain-owned packet line, and leave unrelated connections running. The first drop
 logs a warning; subsequent drops increment the instance counter, with its total
@@ -811,7 +815,7 @@ assurance and partial writes require an exact UDP span; a shorter declaration
 retains ordinary conversion instead of certifying its unchecked suffix.
 
 Receive trust and transmit capability are independent. After successful Linux
-virtio/checksum setup, scratch allocation and worker FIFO setup, TunDevice also
+virtio/checksum setup, validated scratch geometry and worker FIFO setup, TunDevice also
 publishes `kNodeFlagTrustedPacketChecksumsActive` on both instances. This transmit
 mode requires actual negotiated checksum support and ready resources, including
 checksum-only mode with `gso:false` or a rejected GSO upgrade; raw fallback does
@@ -1385,7 +1389,15 @@ returning; batching introduces no cross-burst timer or delay policy.
 Eligible receive-credit updates share the queue. Accepted payload that advances
 the receive sequence into an existing out-of-order gap requests an immediate ACK,
 including partial gap progress and a trimmed duplicate prefix, with or without
-a device batch. Zero-window reopening and existing connection-control,
+a device batch. A receive-window update reaching the existing threshold bypasses
+batching when the last successfully output wire advertisement is unknown or its right
+edge no longer exceeds `rcv_nxt`, using TCP sequence comparisons. The record
+uses the transmitted 16-bit window and negotiated scaling (SYN is unscaled);
+1–127 internal bytes at scale 7 still advertise zero. Capture occurs before
+output consumes the packet, and publication requires actual `ERR_OK` output,
+which records local acceptance without claiming peer receipt. Failed or skipped
+output and RST do not publish an advertisement. Split credit
+returns therefore cannot conceal a closed wire window. Existing connection-control,
 duplicate, out-of-order and SACK paths retain their existing behavior. Eligibility
 and gap state are captured before duplicate trimming or out-of-order queue changes
 can make recovery input appear ordinary.
