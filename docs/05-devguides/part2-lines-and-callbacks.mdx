@@ -303,6 +303,17 @@ IP/connection/device/speed gauges must not reject credentials. Live capacity is 
 operation. Local allowances can overshoot global quotas across disconnected clients; administrative changes arrive
 with a valid refresh, and already-produced usage remains acceptable after policy changes.
 
+Consumers that must try several UUID-derived credentials use AuthenticationClient's typed UUID source metadata and
+generation-checked copy pages. A page visits at most 256 source rows, including rows without UUID credentials, and
+returns only owned UUID/durable-ID values. Callers must bound their retained copies and crypto work, wipe copied
+credentials on release, and never retain private user pointers or perform crypto under database locks. Every page in
+one candidate snapshot uses the same installed `users_generation`; a changed generation invalidates unfinished
+construction. Include currently ineligible UUID accounts in the snapshot and recheck eligibility after protocol proof.
+`authenticationclientResolveUUIDCandidateWithProfile()` checks the current UUID owner, durable ID and continuous
+membership generation floor with availability, eligibility and profile copying under the normal lock order. Ordinary
+refresh preserves continuous identities; removal/recreation or UUID reassignment invalidates older candidates. The
+returned handle uses the current generation. Snapshot limits report configured sync bounds, not a process-wide RAM cap.
+
 Shared credential copying in `lineAddUser()`,
 `lineAddAuthenticatedCredentials()` (including `lineSetAuthenticatedCredentials()`),
 `lineCopyUsers()` and AuthenticationClient profile lookups intentionally fails
@@ -2462,6 +2473,36 @@ start a reply drain or require a later permission-reconciliation step.
 Credentials already published on the line remain available to later nodes. UDP
 and fallback remain active for framing, owned-backend cleanup, branch selection
 and delayed replay.
+
+### VmessServer authentication and association ownership
+
+VmessServer borrows its carrier and owns only its dependent fixed-destination UDP backend.
+Publish verified destination and identity before protected Init; managed mode inserts
+UserController on decoded traffic, while fallback bypasses that helper. TLS and WebSocket remain
+separate preceding nodes and require no VMess chain-introspection setting.
+
+A node shares one immutable, reference-counted vector of copied UUID identities and derived
+keys across workers. Build it from generation-checked AuthenticationClient pages outside broad
+credential locks. Pending searches pin the vector, use one worker-owned trial cipher context,
+and yield through a coalesced worker pump after 256 trials or one millisecond. Ordinary ready
+continuations have no deliberate timer delay or throughput rate limit. A stale-vector miss
+must reconsider an installed replacement before selecting fallback; successful header verification
+must revalidate UUID ownership, durable ID, identity incarnation and current eligibility before
+publishing the handle. Account refresh must not reset replay protection.
+
+AuthID and session replay tables are shared by all workers of one VmessServer instance, with
+full-key equality and atomic admission. Keep AuthID marks through the entire inclusive 120-second
+past/future window, including the future edge. A nondecreasing wall-clock cutoff prevents a
+backward correction from reviving purged timestamps. Session marks retain UUID/key/IV identity
+for three monotonic minutes. Capacity refusal must never evict live protection. Separate node
+instances have independent replay domains.
+
+Authentication admission counts pending carriers, retained input and all live credential-vector
+allocations, including construction and pinned old generations. The absolute handshake deadline
+starts at Init and input never extends it. Quiescence closes admission and detaches worker timers;
+queued work settles under normal worker-message ownership. Worker stop closes pending carriers
+through their owners and releases construction state. Ordinary source-owner drain settles established
+carriers and dependent UDP lines before pools, helpers or shared state are reclaimed.
 
 ### HttpProxyServer fallback association
 
