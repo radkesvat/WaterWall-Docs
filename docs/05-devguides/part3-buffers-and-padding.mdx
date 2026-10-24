@@ -5,7 +5,7 @@ sidebar_label: "Part 3: Buffers & Padding"
 description: "The sbuf_t buffer model, worker buffer pools, left-padding budgets, and how to prepend protocol headers without breaking chain composition."
 ---
 <!--
-Documentation version: 186
+Documentation version: 187
 -->
 
 # Part 3: Buffers, Padding & Shift Buffers
@@ -1832,6 +1832,48 @@ materializing any private-pipe body. For UDP the combined buffer also contains t
 normal representation. Est, Resume and empty TCP input must not generate a standalone response header; no timeout or Finish
 flush emits one. Publish the response-sent latch before the combined handoff to preserve FIFO under reentry.
 Est remains prompt and independent of reply availability and output Pause.
+
+### VmessCommon and VmessClient ordinary records
+
+`tunnels/Internals/VmessCommon` owns the shared VMess KDF, prepared UUID keys,
+AuthID/header operations, mode validation, response derivation and persistent body
+codec. Server credential vectors, candidate searches, authentication pumps and replay
+tables stay in VmessServer. Explicit timestamp/entropy inputs make client seals
+deterministic in independent vectors; production draws fresh request material at its
+first transmission commit. Mutable cipher/SHAKE contexts stay on the line's worker;
+temporary, session and node-owned key material is wiped at its lifetime boundary.
+
+Request plaintext is at most 316 bytes and its full envelope at most 374 bytes.
+The client authenticates the fixed 18-byte response length before retaining a response
+plaintext of 4..259 bytes, at most 293 wire bytes including both tags. Validate the
+expected marker and exact outer command length, consume bounded options/commands
+without applying remote account changes, and preserve coalesced body bytes. The server
+continues to emit its ordinary 38-byte response. Response authenticated-length keys
+and nonces use request key/IV; response body encryption and SHAKE use derived response
+key/IV, matching the pinned peer's independent directional material.
+
+VmessClient blocks splice for the expanded chain and advertises zero required left
+padding. Allocate ordinary output with full onward padding, combining the request with
+the first encoded body record. TCP records use at most 16 KiB plaintext; UDP uses one
+record per nonempty datagram. Reuse the codec's maximum-frame arithmetic: tags,
+authenticated-length offsets and worst-case padding all count. Drop empty/oversized
+local UDP without splitting or request emission. An empty framed record is termination;
+verify its encrypted tag before accepting EOF.
+
+Each client direction has inclusive 2 MiB logical, 1,024-entry and 8 MiB allocation
+charge limits. Active popped buffers and incomplete fragments retain reservations;
+compact fragments when that reduces retained storage. Release reservations and owned
+buffers exactly once on handoff, refusal or close. Separate TX/RX guards retain input
+only for incomplete parsing or FIFO ordering; complete decoded records are delivered
+incrementally without a pressure-only output queue. Server unauthenticated input stays
+limited to 64 KiB: a large early plaintext burst can exceed that wire allowance after
+framing during identification. No response acknowledgement barrier, implicit pacing
+or enlarged server limit hides that admission refusal.
+
+Encrypted output data uses ordinals 0..65,534 with 65,535 reserved for termination.
+Deliver valid incoming data at 65,535, then close before another record can reuse its
+nonce. Authenticated lengths obey the same boundary; no wrap, rekey, reconnect or
+automatic replay is introduced.
 
 ### VmessServer ordinary records and bounded retention
 
