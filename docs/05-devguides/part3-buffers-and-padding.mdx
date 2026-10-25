@@ -5,7 +5,7 @@ sidebar_label: "Part 3: Buffers & Padding"
 description: "The sbuf_t buffer model, worker buffer pools, left-padding budgets, and how to prepend protocol headers without breaking chain composition."
 ---
 <!--
-Documentation version: 187
+Documentation version: 188
 -->
 
 # Part 3: Buffers, Padding & Shift Buffers
@@ -1855,9 +1855,10 @@ key/IV, matching the pinned peer's independent directional material.
 VmessClient blocks splice for the expanded chain and advertises zero required left
 padding. Allocate ordinary output with full onward padding, combining the request with
 the first encoded body record. TCP records use at most 16 KiB plaintext; UDP uses one
-record per nonempty datagram. Reuse the codec's maximum-frame arithmetic: tags,
-authenticated-length offsets and worst-case padding all count. Drop empty/oversized
-local UDP without splitting or request emission. An empty framed record is termination;
+record per datagram, with empty local datagrams retained only in packetaddr mode.
+Reuse the codec's maximum-frame arithmetic: tags, authenticated-length offsets and
+worst-case padding all count. Drop native empty/oversized local UDP without splitting
+or request emission. An empty framed record is termination;
 verify its encrypted tag before accepting EOF.
 
 Each client direction has inclusive 2 MiB logical, 1,024-entry and 8 MiB allocation
@@ -1870,15 +1871,43 @@ limited to 64 KiB: a large early plaintext burst can exceed that wire allowance 
 framing during identification. No response acknowledgement barrier, implicit pacing
 or enlarged server limit hides that admission refusal.
 
-Encrypted output data uses ordinals 0..65,534 with 65,535 reserved for termination.
-Deliver valid incoming data at 65,535, then close before another record can reuse its
-nonce. Authenticated lengths obey the same boundary; no wrap, rekey, reconnect or
-automatic replay is introduced.
+Both endpoints explicitly pass their immutable `encrypted-counter-policy` to each
+body context. Default `wrap` permits data at all ordinals 0..65,535 and continues
+65,535 to 0 under the same session key. This deliberately repeats the 16-bit AEAD
+nonce sequence for interoperability: it is not rekeying and does not preserve nonce
+uniqueness. `strict` reserves output ordinal 65,535 for EOF, delivers valid incoming
+data at that ordinal and then closes before another nonce use. NONE/zero are unaffected.
+The policy is local with no negotiation; a strict peer can close a wrap peer at its limit.
+
+Advance once only after a successful record, keeping body and authenticated-length
+nonces on the same ordinal. Preserve pending length/padding state across partial input.
+SHAKE masking/padding continues across rollover without resetting session material or
+response parsing. Authentication failure and EOF remain terminal; never retry using
+another ordinal or policy. In wrap mode the counter is bounded modulo 65,536; strict
+retains the 65,536 exhaustion sentinel. No reconnect or automatic replay is introduced.
+
+Packetaddr uses ordinary UDP command 2 with the exact outer domain
+`sp.packet-addr.v2fly.arpa` and port 0. This is the only zero-port request exception;
+never route that marker to DNS or an outbound connector. Every authenticated body
+record contains envelope family 0x01/IPv4 or 0x02/IPv6, its network-order address,
+a big-endian nonzero port, then exactly one datagram. The envelope occupies 7 or
+19 bytes, which must be subtracted from the body-mode maximum application payload.
+It carries no domain encoding. Validate the complete envelope before routing and
+never split a datagram. A header-only envelope is an empty application datagram;
+an empty outer framed record is still EOF. Native UDP keeps its empty-drop/EOF rules.
+
+Client packetaddr retains one immutable final IP/port and one owned carrier. Explicit
+local DNS may supply that IP; an unresolved domain is refused before transport Init.
+Unexpected reply sources are dropped/counted rather than delivered to another
+association. Server packetaddr owns one bounded destination backend per IP/family/port,
+and encodes replies from that immutable backend target. Queued encoded replies own
+all envelope/payload bytes independently of backend lifetime. Existing per-direction
+byte, entry and allocation budgets remain unchanged by the destination-count limit.
 
 ### VmessServer ordinary records and bounded retention
 
 VmessServer blocks splice for the complete expanded chain. Its borrowed normal carrier owns
-incremental authenticated-header and record parsing; each fixed-destination UDP backend is a
+incremental authenticated-header and record parsing; each native or packetaddr UDP backend is a
 separately owned normal line. Never copy VLESS's initial-callback UUID requirement or successful
 TCP bypass into VMess: its AuthID/header may be split at any byte, and encrypted records remain
 active for the connection lifetime.
@@ -1889,7 +1918,8 @@ record lengths in wide arithmetic: authenticated-length framing can represent 65
 16-byte offset. Keep parser length/padding state until exactly that body is consumed. Empty
 framed records terminate the protocol and must not become empty UDP datagrams; authenticate an
 encrypted terminal record before accepting it. Raw `none` (`zero` client configuration) is TCP
-only. A UDP reply must fit one record; empty or oversized replies are dropped without splitting.
+only. A UDP reply must fit one record; oversized replies are dropped without splitting.
+Native UDP drops empty replies; packetaddr encodes their nonempty address envelope.
 
 Each unauthenticated carrier retains at most 65,536 logical input bytes and 256 buffers under
 the node-wide `auth-pending-max-bytes` allowance. Consumed AuthID/header bytes remain charged to
@@ -1899,12 +1929,12 @@ Popped active buffers retain their reservations across callbacks. Incomplete bod
 bounded ordinary allocation; completed bodies are handed onward before parsing later records.
 No queue is maintained solely because an ordinary TCP consumer sent advisory Pause.
 
-The first response includes exactly one encrypted response header before its body. Output nonce
-ordinals 0 through 65,534 carry data, with 65,535 reserved for termination. Input may authenticate
-data at ordinal 65,535, but must close before another encrypted record can reuse the nonce.
-Authenticated-length counters follow the same boundary. Unencrypted bodies have no AEAD counter
-limit. Terminal closure follows WaterWall's full-close model and does not promise delivery of
-application replies still pending at nonce exhaustion.
+The first response includes exactly one encrypted response header before its body.
+Both directions follow the configured wrap/strict policy above; unencrypted bodies
+have no AEAD counter limit. Terminal closure follows WaterWall's full-close model and
+does not promise delivery of unsubmitted application replies at strict exhaustion.
+`send-termination=false` suppresses only optional outgoing empty framed EOF; valid
+incoming EOF remains authenticated and accepted, and raw zero has no framed EOF.
 
 Fallback restores every inspected byte before untouched carrier input and secures replay ownership
 before branch Init. Only unknown credentials or unavailable authentication before recognition can

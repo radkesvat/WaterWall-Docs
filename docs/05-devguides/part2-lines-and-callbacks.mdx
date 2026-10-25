@@ -5,7 +5,7 @@ sidebar_label: "Part 2: Lines & Lifetime"
 description: "The connection lifecycle, re-entrancy hazards, line references, and the clean-finish patterns that keep WaterWall tunnels free of use-after-free bugs."
 ---
 <!--
-Documentation version: 194
+Documentation version: 195
 -->
 
 # Part 2: Lines, Callbacks & Lifetime Safety
@@ -2492,7 +2492,8 @@ the first outward Payload. Direct TCP forwards every Est promptly, including rep
 UDP maps the carrier's first Est once. The first Est sets one idle deadline. Repeated
 Est never resets it. Direct TCP due output proceeds through advisory Pause; an owned
 UDP carrier defers only its idle header while that exact carrier is paused. Empty TCP
-and empty/oversized local UDP do not trigger a request. There is no separate response
+and empty native/oversized local UDP do not trigger a request. Packetaddr preserves empty
+application datagrams through a nonempty address envelope. There is no separate response
 deadline because a backend can legitimately remain silent.
 
 Independent TX/RX guards preserve each admitted FIFO across nested payloads and
@@ -2503,8 +2504,10 @@ boundaries, and authenticated empty records terminate only after tag verificatio
 
 Finish publishes the sender's closed side before any outward callback, detaches
 associations, cancels timers, settles buffers and wipes session material. Protocol
-termination may go only toward an open wire side after request submission; Finish
-never starts a request. Never reflect Finish or pressure toward its closed sender.
+termination may go only toward an open wire side after request submission when
+`send-termination` is true (the default). False omits that record and uses the same
+full-close path, including strict counter exhaustion. Incoming valid EOF remains
+accepted independently. Finish never starts a request. Never reflect Finish or pressure toward its closed sender.
 An owned carrier receiving Finish must be logically dead before returning, including
 when Finish reenters final-record handoff. Temporary references preserve allocation;
 recheck logical life and association membership after callbacks. Borrowed application
@@ -2512,10 +2515,35 @@ lines remain their source owner's responsibility during normal close and shutdow
 
 ### VmessServer authentication and association ownership
 
-VmessServer borrows its carrier and owns only its dependent fixed-destination UDP backend.
+VmessServer borrows its carrier and owns its dependent UDP backend normal lines.
 Publish verified destination and identity before protected Init; managed mode inserts
 UserController on decoded traffic, while fallback bypasses that helper. TLS and WebSocket remain
 separate preceding nodes and require no VMess chain-introspection setting.
+
+Native UDP keeps one fixed-destination backend. Authenticated packetaddr UDP uses a
+bounded per-carrier associative table of immutable IP/family/port destinations:
+`packetaddr-max-destinations` defaults to 64 and accepts 1..1024. Each live entry owns
+one same-worker normal backend, with copied source/listener context and authenticated
+identity published before protected Init. Managed UserController sees each decoded
+application datagram once; envelope/carrier bytes are not separate application traffic.
+At capacity, drop only a datagram requiring a new destination. An exact backend Finish
+removes its entry, permitting later recreation while admission remains open. Replies
+carry that backend's immutable target and queued reply bytes remain independently owned.
+
+Publish table removal, inventory removal and association detachment before callbacks.
+Recheck logical life and exact membership after reentry; references preserve allocation
+only. Carrier closure closes backend admission and drains every owned entry; worker
+stop also drains the separate owner inventory before pools and chains are reclaimed.
+Pressure relays retain the existing exact-line head/tail roles and finite response
+FIFO; packetaddr does not grant ordinary transforms a new producer gate. All these
+lines are normal lines, and only their creators destroy them.
+
+The server authenticates/parses the request before applying `allowed-security`, UDP
+and packetaddr permissions, and must enforce them before protected Init or backend
+creation. Denied authenticated requests close without fallback. The body allow-list
+classifies chunked NONE as `none` and unframed NONE as `zero`; it introduces no new
+wire mode or header-authentication mechanism. Mux.Cool/XUDP remain unsupported;
+WaterWall's custom Mux is not an interoperable substitute.
 
 A node shares one immutable, reference-counted vector of copied UUID identities and derived
 keys across workers. Build it from generation-checked AuthenticationClient pages outside broad
