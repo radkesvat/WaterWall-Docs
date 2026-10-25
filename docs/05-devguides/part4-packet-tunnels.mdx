@@ -287,6 +287,7 @@ interface/route/DNS configuration in `tun_linux_config.c`. Capture keeps lifecyc
 `capture_linux.c`, reader and residual drain work in `capture_linux_io.c`,
 Netlink parsing/transactions/verdicts in `capture_linux_nfqueue.c`, and firewall
 identities, command supervision and reconciliation in `capture_linux_rules.c`.
+Port-aware Linux capture predicates live in `capture_linux_steering.c`.
 These are private implementation boundaries, not interchangeable device backends.
 
 TunDevice makes a best-effort attempt to place the first byte of each received IP
@@ -392,6 +393,72 @@ retain their exclusively owned reader-pool mode. Each Linux queue additionally
 retains at most one current receive allocation and one pending fragment-release
 batch (at most 17 packets); these bounded reader allocations are separate from
 the shared queued-work and fragment-storage budgets.
+
+## Worker-owned Linux capture receive
+
+RawSocket's Linux input uses NFQUEUE, with no dedicated application reader
+thread. `multi-queue` defaults to `true`: capture prepares one independently
+bound Netlink socket/queue per event worker and installs fixed classic BPF
+predicates through iptables. A refused extra queue or steering installation
+falls back to a single queue owned by worker 0 only after partial owned rules
+have been removed and residual packets settled. Incomplete cleanup fails startup.
+`multi-queue: false` skips extra queues and steering. The configured processing
+worker count remains unchanged in either mode. Windows accepts the setting and
+retains its existing capture reader.
+
+Unfragmented IPv4 TCP/UDP records with four transport bytes use a symmetric
+address/port/protocol receive hash. Distinct port pairs between the same two IPs
+can therefore select different readers. All fragments, including fragment zero,
+and short TCP/UDP records retain the address/protocol fallback. Structurally valid
+unfragmented packets of every other protocol use round-robin NFQUEUE selection:
+disjoint classic BPF predicates feed cascading iptables `statistic --mode nth`
+rules. This is the default and needs no protocol mapping or chain inspection.
+IPv4 length and IHL bounds are checked before ports are read. Steering does not
+validate opaque TCP/UDP contents or checksums. Invalid IPv4 shapes select queue
+zero for ordinary capture validation.
+
+The capture hash is a compact 32-bit classic BPF predicate, distinct from TUN's
+64-bit eBPF and WaterWall's processing affinity. TCP/UDP retains software flow
+selection after receipt; its reader is not necessarily its processing worker.
+Opaque complete packets continue on their reader worker. A single receive queue
+instead round-robins opaque processing across configured workers. Preserved
+fragments retain the existing shared fragment association; reassembled opaque
+packets use the ordinary opaque dispatch policy. A later decoder owns any new
+TCP/UDP affinity exposed by its transformation.
+
+Each multiqueue source range has one flow rule and one opaque rule per receive
+queue. Opaque rules use independent owned identities and rollback records; only
+one NOTRACK rule is installed per range. Protocol exclusions apply equally to
+both receive families and NOTRACK. Queue identities stay fixed through a run.
+Never round-robin native TCP/UDP flows or replace their fixed steering with CPU
+fanout. Opaque round robin permits reordering between worker readers.
+
+Each worker performs a bounded native drain (256 receive/verdict steps or
+256 KiB) and yields. Receive, verdict sends, dispatch admission and retry paths
+never block the loop. A packet stays private until its NF_DROP verdict succeeds;
+verdict backpressure retains the exact packet/id, enables writable readiness and
+has an absolute 250 ms deadline. Interrupted primitives yield through a queued
+continuation. Shutdown can change an unsent DROP to ACCEPT; an accepted packet
+must never also be published through RawSocket.
+
+Worker queues share one 512-packet / 8 MiB allocation-charge dispatch budget and
+one synchronized fragment table with detached storage. Capacity refusal retains
+at most one current record and the bounded fragment-release batch per reader,
+disables native read interest and resumes from coalesced credit notifications.
+The kernel's 65,536-packet queue allowance and requested 64 MiB receive buffering
+are divided over the active queue set, rather than multiplied per worker.
+Kernel socket limits can reduce the actual buffer allowance.
+
+Before capture activation, and after owner watchers have detached, the lifecycle
+coordinator alone services inactive queues with NF_ACCEPT. Supervised firewall
+commands invoke bounded nonblocking progress callbacks during normal waits and
+failure cleanup. Every Capture generation is registered, so waiting for one
+device or another component also services other eligible Capture queues.
+After capture activates, service while workers remain behind their startup gate
+uses NF_DROP and queues detached packets through the bounded session FIFO.
+Normal worker activation is queued behind packet Init; the kernel queues and
+session FIFO buffer traffic during that ownership handoff. See
+[Part 7](./part7-shutdown-and-signals.mdx#10-external-devices-and-lwip).
 
 ## Device ingress fragment policy
 
@@ -639,16 +706,17 @@ same literal exclusions in its WinDivert filter using `ip.Protocol` comparisons.
 The constructor consumes the borrowed exclusion set synchronously; neither
 backend retains a pointer into the node's settings.
 
-The reader must be ready before rule installation. Install all INPUT rules
-before any enabled NOTRACK rules and activate capture only after all selected
-rules succeed.
+Prepare the inactive queue readers before rule installation and service them
+with NF_ACCEPT from the lifecycle coordinator during commands. Install all INPUT
+rules before any enabled NOTRACK rules and activate worker capture only after
+all selected rules succeed.
 The lifecycle owner removes NOTRACK before NFQUEUE, including startup rollback,
 normal stop, and cleanup following reader failure. Attempt queue cleanup even if
 NOTRACK cleanup fails. Account for each rule kind independently, including
 commands that may have committed before a timeout; reconcile those outcomes
 against the corresponding table and chain. Retain failed cleanup ownership for
-retry and report residual rules. Do not mutate the rule ledger from the reader
-thread or run blocking firewall commands in the nonblocking stop-request phase.
+retry and report residual rules. Do not mutate the rule ledger from a normal worker receive callback or run
+blocking firewall commands in the nonblocking stop-request phase.
 
 Rule removal affects future packets. Already-marked or queued packets remain
 untracked. `--queue-bypass` cannot undo NOTRACK; abrupt process death or final
@@ -888,6 +956,30 @@ while untrusted ordinary writes use zero metadata and complete IP bytes.
 Invalid generated metadata remains a defect. Other I/O errors
 retain the device's existing transient, packet-local and fatal handling.
 
+## Decoded packet worker affinity
+
+`packet_affinity.h` provides a decoder-owned continuation and bounded shared
+fragment table. IpManipulator's normal protoswap receive paths and PingClient /
+PingServer use it after restoring the native TCP/UDP tuple. Each node handles
+only the bytes it has decoded; capture does not inspect its neighbours or learn
+protocol mappings. Complete TCP/UDP packets use the existing shared flow hash.
+Same-worker and one-worker delivery are inline; foreign delivery is force-queued
+onto the target worker's own packet line. Other decoded protocols stay local.
+
+A decoder context has a fixed continuation which must not repeat decoding.
+Queued records retain the target line and carry the packet's checksum request;
+cancellation destroys the owned buffer without touching worker pools or decoder
+state. Normal runtime quiescence settles worker callbacks/messages before node
+destruction. Context destruction releases staged fragments after that settlement.
+
+Preserved TCP/UDP fragments use the leading fragment's ports to select the same
+worker as complete packets in that flow. Later fragments arriving first are held
+within the existing shared fragment limits, not hashed independently by IP ID.
+The helper preserves fragment bytes and boundaries; pending fragment checksum
+requests are completed before storage. It never moves normal lines or rebalances
+outbound protocol encoding. A worker handoff preserves flow ownership, but does
+not reconstruct a global packet order across independently running readers.
+
 ## ProtoSwap checksum representation
 
 ProtoSwap normalizes the TCP/UDP checksum's source and destination address
@@ -906,7 +998,8 @@ UDP checksum zero stays zero; enabled UDP arithmetic zero is transmitted as
 Every fragment receives the protocol mapping. Only the fragment containing both
 transport checksum bytes receives the address adjustment, including a later TCP
 fragment after an 8- or 16-byte first fragment. Fragmentation may occur before
-encoding or between endpoints; no reassembly or ordering state is needed.
+encoding or between endpoints; checksum conversion itself needs no reassembly
+or ordering state. Decoded worker selection uses the fragment association above.
 Fragments of one datagram must receive consistent final addresses. Malformed
 IPv4/transport lengths, partial checksum fields and invalid local fragment
 geometry pass through unchanged, with their pending request preserved. Trailing
@@ -1214,14 +1307,16 @@ server data: PingClient <-- Echo Request -- PingServer
   delivering its payload regardless of its own `send-replies` setting. Data
   delivery does not wait for a reply.
 - Correlation and replay suppression belong to one bounded synchronized tracker
-  per Ping node. Device flow affinity chooses the packet line that runs a
-  callback; its WID is not request/reply correlation identity. Both remain
+  per Ping node. The arrival worker runs correlation and reply generation;
+  its WID is not request/reply correlation identity. Both remain
   active when reply generation is disabled. Duplicate requests deliver inner
   data once and receive another reply only when local reply generation is enabled.
 - With reply generation enabled, a request receiver publishes two distinct
   buffers. The generated reply clone travels back toward the request sender,
   while the decoded original continues in the received direction. With it
-  disabled, only the decoded original is published.
+  disabled, only the decoded original is published. Decoded TCP/UDP originals
+  resume on their inner flow worker through `packetAffinityForward()`; replies
+  remain on the arrival worker. Other decoded protocols remain local.
 - The shared codec keeps its checked input APIs. At the nodes' reply and strip
   call sites, the validated envelope, exact independent clone and locally retained
   original already establish success. Assert those caller guarantees rather than

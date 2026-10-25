@@ -6,7 +6,7 @@ description: "راهنمای node RawSocket در WaterWall."
 ---
 
 <!--
-Documentation version: 156
+Documentation version: 157
 -->
 
 # RawSocket
@@ -132,6 +132,7 @@ raw output برمی‌گرداند. پیش‌فرض ارسال Reply در هر �
 | گزینه | نوع | پیش‌فرض | توضیح |
 | --- | --- | --- | --- |
 | `dont-capture-protocols` | array of integers | `[]` | شناسه‌های protocol در IPv4 که capture نمی‌شوند؛ فقط اعداد صحیح ۰ تا ۲۵۵ پذیرفته می‌شوند و تکراری‌ها نادیده گرفته می‌شوند. مقدار صفر همان protocol صفر است، نه همهٔ protocol‌ها. |
+| `multi-queue` | boolean | `true` | در Linux، برای هر event worker یک receive queue درخواست می‌کند؛ اگر queue اضافی یا steering در دسترس نباشد، یک queue روی worker صفر استفاده می‌شود. مقدار `false` مستقیماً همین حالت تک‌صف را انتخاب می‌کند. پردازش packet همچنان از همهٔ workerها استفاده می‌کند. در Windows پذیرفته می‌شود ولی آرایش دریافت را تغییر نمی‌دهد. حالت write-only صف دریافت ندارد. |
 | `capture-device-name` | string | `unnamed-capture-device` | نامی که به capture-device backend داده می‌شود. |
 | `raw-device-name` | string | `unnamed-raw-device` | نامی که به raw-output backend داده می‌شود. |
 | `bypass-conntrack` | boolean | `true` | در Linux، NOTRACK را برای هر دو مسیر capture و raw output کنترل می‌کند: rule‌های source-range در `raw PREROUTING` و rule دقیق با mark خودکار در `raw OUTPUT`. مقدار `false` نصب هر دو را غیرفعال می‌کند؛ NFQUEUE و رفتار drop-and-dispatch همچنان فعال می‌مانند. در حالت write-only فقط rule خروجی لازم است. روی WinDivert ویندوز اثری ندارد. |
@@ -167,6 +168,19 @@ Alias‌های سازگاری:
 - NFQUEUE socket، capture reader و rule‌های capture موردنیاز
 
 اگر capture range وجود نداشته باشد، هیچ capture device یا کد setup مرتبط با capture اجرا نمی‌شود و node فقط در مسیر write کار می‌کند.
+
+در Linux هر receive queue یک worker مشخص دارد و خواندن آن غیرمسدودکننده است.
+TCP/UDP همچنان با hash متقارن آدرس‌ها، protocol و portها توزیع می‌شود. بسته‌های
+کاملِ پروتکل‌های دیگر به‌طور پیش‌فرض با ruleهای `statistic --mode nth` به‌صورت
+round-robin میان صف‌ها پخش می‌شوند و روی worker خواننده ادامه پیدا می‌کنند؛
+تنظیم جدید یا شناخت nodeهای بعدی لازم نیست. در حالت تک‌صف، پردازش این بسته‌ها
+بین workerها به‌صورت round-robin تقسیم می‌شود. fragmentها سیاست وابستگی قبلی
+را حفظ می‌کنند؛ پس از reassembly، بستهٔ غیر TCP/UDP مانند بستهٔ کامل توزیع می‌شود.
+هر node که بعداً TCP/UDP را decode کند، خودش مسئول انتخاب worker جریان داخلی است.
+در حالت چندصفی، برای هر capture range و receive queue یک rule جریان و یک rule
+بستهٔ غیر TCP/UDP وجود دارد؛ در حالت تک‌صف فقط یک rule برای هر capture range
+نصب می‌شود. هزینهٔ بررسی ruleها با تعداد queueها رشد می‌کند. round-robin می‌تواند
+ترتیب رسیدن بسته‌ها از workerهای مختلف را تغییر دهد.
 
 وقتی backend مربوط به capture یک packet دریافت می‌کند:
 
@@ -287,9 +301,12 @@ NFQUEUE capture و رفتار drop-and-dispatch آن همچنان فعال می�
 PMTU discovery نیستند؛ پیام‌های ICMP لازم باید همچنان به stack مسئول برسند.
 گزینهٔ `skip-sysctl` نصب NOTRACK را غیرفعال نمی‌کند.
 
-ابتدا reader آماده و همهٔ rule‌های INPUT نصب می‌شوند، سپس در صورت فعال بودن
-این گزینه rule‌های NOTRACK اضافه می‌شوند. capture پس از نصب همهٔ rule‌های
-انتخاب‌شده فعال می‌شود. شکست نصب باعث شکست startup و rollback rule‌های نصب‌شده می‌شود.
+ابتدا همهٔ rule‌های INPUT نصب می‌شوند، سپس در صورت فعال بودن این گزینه rule‌های
+NOTRACK اضافه می‌شوند. coordinator هنگام اجرای این فرمان‌های تحت نظارت، queueهای
+غیرفعال را با `NF_ACCEPT` سرویس می‌کند. capture پس از نصب همهٔ rule‌های
+انتخاب‌شده فعال می‌شود. اگر نصب rule‌های چندصفی شکست بخورد، rule‌های جزئی حذف
+می‌شوند و نصب با یک queue تکرار می‌شود. شکست نصب تک‌صفی، نصب NOTRACK یا
+rollback ناقص باعث شکست startup می‌شود.
 cleanup ابتدا حذف NOTRACK و سپس حذف NFQUEUE را امتحان می‌کند؛ شکست در حذف
 NOTRACK مانع تلاش برای حذف NFQUEUE نمی‌شود. وضعیت هر rule، از جمله نتیجهٔ
 نامعلوم پس از timeout، جداگانه در جدول مربوط به خودش پیگیری می‌شود. شکست reader
@@ -305,19 +322,24 @@ firewall میزبان عبور می‌کنند. این یک سیاست availabil
 تا وقتی listener وجود ندارد، packet‌ها capture یا transform نمی‌شوند. این گزینه
 در زمانی که WaterWall هنوز به queue متصل است، overflow شدن queue را fail-open
 نمی‌کند. WaterWall از شماره queue‌هایی که از قبل در rule‌های INPUT استفاده
-شده‌اند دوری می‌کند. شکست نهایی در startup مربوط به capture یا cleanup کردن
-rule، ‏queue را سریع می‌بندد و آن capture-device object را غیرقابل restart
-می‌کند؛ در نتیجه `--queue-bypass` برای هر rule مربوط به NFQUEUE که حذف نشده باشد فعال می‌شود.
-queue reader باید پیش از نصب اولین rule آماده بودن خود را گزارش کند و در تمام
-مدت نصب rule‌ها، rollback و cleanup هنگام bring-down در حال اجرا بماند. تا زمانی
-که همه rule‌ها نصب نشده‌اند و raw output device آماده نیست، packet‌ها
-`NF_ACCEPT` می‌گیرند و وارد chain نمی‌شوند. سپس capture به حالت
-drop-and-dispatch تغییر می‌کند. هنگام shutdown، پیش از حذف rule‌ها capture
-غیرفعال می‌شود. خروج غیرمنتظره reader نیز capture را غیرفعال و queue را فوراً
-می‌بندد تا rule‌های باقی‌مانده fail-open شوند. تا زمانی که thread مربوط به
-reader قابل join است، مالک queue descriptor محسوب می‌شود؛ cleanup نهایی درخواست
-بسته شدن می‌دهد و wrapper مربوط به reader فقط پس از پایان استفاده routine از
-descriptor، ‏queue را می‌بندد.
+شده‌اند دوری می‌کند. شکست startup، queueها را می‌بندد؛ rollback کامل اجازهٔ
+restart بعدی را می‌دهد. cleanup ناموفق ruleها یا خطای I/O در queue غیرفعال،
+capture-device object را غیرقابل restart می‌کند. بسته‌شدن queueها باعث فعال‌شدن
+`--queue-bypass` برای ruleهای NFQUEUE باقی‌مانده می‌شود.
+پیش از فعال‌شدن capture و پس از جداشدن watcherهای workerها، coordinator در زمان
+نصب rule، rollback و cleanup هنگام bring-down، خواندن‌های محدود و nonblocking
+با verdict برابر `NF_ACCEPT` انجام می‌دهد. raw output device پیش از فعال‌شدن
+capture آماده است. فعال‌سازی دریافت پس از packet Init در صف هر worker قرار
+می‌گیرد. هنگام فرمان‌های بعدی startup، capture از `NF_DROP` استفاده می‌کند و
+packetها را با همان بودجهٔ مشترک برای تحویل روی worker در صف می‌گذارد؛ پرشدن FIFO
+نشست، خواندن native را متوقف می‌کند. تا زمان اجرای event loop ممکن است packetها
+در queueهای محدود kernel و FIFO نشست باقی بمانند. worker فعال از drop-and-dispatch
+استفاده می‌کند. هنگام shutdown،
+capture غیرفعال و پذیرش دریافت بسته می‌شود؛ هر watcher روی worker مالک جدا
+می‌شود و سپس ruleها پاک و descriptorها آزاد می‌شوند. خطای نهایی دریافت، پذیرش
+را می‌بندد و cleanup منظم را درخواست می‌کند؛ بسته‌شدن socket صف باعث می‌شود
+ruleهای باقی‌مانده fail-open شوند. در Linux هیچ thread اختصاصی برای capture
+reader یا cleanup ساخته نمی‌شود.
 
 به‌صورت پیش‌فرض backend لینوکس پیش از ساخت resource‌های NFQUEUE یک batch از
 تنظیمات best-effort مربوط به backlog و سایر پارامترهای TCP را با `sysctl` اعمال می‌کند.

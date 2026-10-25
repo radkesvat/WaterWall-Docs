@@ -1020,10 +1020,50 @@ without joining. The wait phase joins or quiesces external callback roots while
 device and tunnel state remain valid. Final stop releases remaining interface,
 writer, route, DNS, and platform resources after worker line drain.
 
-Linux Capture's reader-state condition wait pairs `wcondvar_t` with
-`wcond_mutex_t` and the `condmutex*` helpers. A native condition variable requires
-that compatible mutex; the project's ordinary `wmutex_t` is a hybrid mutex and
-cannot be substituted into a condition wait.
+Linux Capture prepares inactive NFQUEUE readers before installing rules. While
+its rules are installed, the coordinator services bounded receive/verdict batches
+with NF_ACCEPT. After every rule succeeds, capture activates and queues reader
+activation behind worker packet Init. During later startup commands, while
+workers remain gated, coordinator service uses NF_DROP and posts detached
+packets through the bounded session FIFO without invoking tunnel callbacks.
+During normal operation, each Netlink descriptor has one worker
+owner. Stop closes reader/session admission; owner quiescence detaches WIOs and
+verdict timers. BringDown waits for admitted callbacks and detached watchers
+before reclaiming native ownership on the coordinator. Unsent verdicts remain
+available for NF_ACCEPT; already-dispatched packets follow ordinary ownership.
+
+Only after this handoff may supervised rule cleanup pump the queues. Remove
+NOTRACK before NFQUEUE, settle residual packets within the device packet/time
+bounds, then close descriptors. Pending rules retain their ownership ledger for
+retry; closed queues make remaining queue-bypass rules fail open, but cannot
+undo NOTRACK. A failed verdict or drain is reported and closes the queue rather
+than leaving a bound queue without a reader. Session/generation references make
+late worker notifications inert after stop, restart or device destruction.
+
+`procRunArgvWithDeadline()` supports an optional bounded nonblocking parent-thread
+progress callback. With it, quiet-output poll waits are sliced at 5 ms and child
+reaping/termination grace also service progress. The original absolute command
+deadline remains authoritative. Each Linux Capture reader generation also
+registers a caller-owned progress record on its lifecycle coordinator thread.
+Every supervised command services
+these records, including another device's cleanup and commands without an
+explicit progress callback. POSIX `execCmd()` also services registered progress
+while waiting for user scripts, retaining their existing unlimited duration.
+Capture residual drains service the registry between their own bounded passes. After all owner watchers detach, a device can reclaim
+coordinator ownership for acceptance before its own sequential QuiesceWait hook
+runs. This keeps all still-bound queues serviced during intervening cleanup.
+The generation unregisters before its device is freed; late worker tokens retain
+no command registration. Registration, BringUp, BringDown and destruction share
+the same coordinator thread.
+
+Registered Capture progress skips active worker-owned queues. During startup,
+`workers_run_flag == false` provides the separate exclusive-context proof that
+queued worker activation has not begun. Coordinator service follows capture
+admission: inactive devices accept, while activated devices drop and queue
+packets for later worker delivery. A full session FIFO stops native reads until
+capacity returns. Otherwise closed/quiesced reader
+admission and zero attached watchers prove the handoff. Progress must never race
+worker reads, borrow their pools, or invoke callbacks through the tunnel chain.
 
 On Linux and BSD, built-in TUN configuration commands use the deadline-aware
 process supervisor (7-second command deadline, 250-ms termination grace, 64-KiB
