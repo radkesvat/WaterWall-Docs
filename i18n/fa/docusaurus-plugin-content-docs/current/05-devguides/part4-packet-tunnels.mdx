@@ -246,8 +246,6 @@ if (tunnelchainIsWorkerPacketLine(tunnelGetChain(t), l))
 به‌ویژه مراقب این موارد باشید:
 
 - `routing_context.src_ctx` و `routing_context.dest_ctx`
-- `recalculate_checksum` که scratch flag مختص packet است؛
-  `lineSetRecalculateChecksum` را ببینید
 - هر line state مربوط به تونل که روی packet line ذخیره شده است
 
 این فیلدها با هر packet بازنویسی می‌شوند. آن‌ها را peer، ‏flow یا session پایدار
@@ -261,6 +259,42 @@ if (tunnelchainIsWorkerPacketLine(tunnelGetChain(t), l))
 اگر پشت ترافیک packet واقعاً به چرخه‌ی عمر مختص flow یا اتصال نیاز دارید، **در
 پشت سمت packet، ‏line‌های عادی بسازید**؛ packet line را وادار نکنید مانند اتصال
 رفتار کند.
+
+### درخواست checksum متعلق به buffer است
+
+درخواست ترمیم checksum روی `sbuf_t` همان packet قرار دارد، نه روی packet line
+مشترک worker. از `sbufSetRecalculateChecksum()` و `sbufGetRecalculateChecksum()`
+استفاده کنید؛ نگه‌داشتن packet علامت‌خورده یا ارسال آن به worker دیگر نباید درخواست
+packet نامرتبطی را تغییر دهد. کپی کامل و رشد buffer درخواست را حفظ می‌کنند؛ کپی
+صرف بایت‌ها به تخصیص دیگر به انتقال صریح درخواست یا ترمیم پیش از copy نیاز دارد.
+قواعد دقیق نمایش معمولی، reset، کپی و بازه‌ها در بخش ۳ آمده‌اند.
+
+`packettunnelTakeChecksumRequest(buf)` درخواست همان buffer را می‌گیرد و پاک
+می‌کند. `packettunnelConsumeChecksumRequest(buf)` آن را در مرز نهایی مصرف و در
+صورت نیاز checksum را اصلاح می‌کند. مرز نهایی می‌تواند پیش از ترمیم flag را پاک
+کند، چون packet ناموفق حذف می‌شود. helperهای مشترک حتی بدون درخواست، ساختار دقیق
+یک packet IPv4 را بررسی می‌کنند؛ IPv6، دادهٔ ناقص و بایت‌های اضافه پذیرفته نمی‌شوند.
+`false` فقط نبود درخواست است و اعتبار checksum را تضمین نمی‌کند.
+
+`TunDevice` و `RawSocket` درخواست buffer واقعی را مصرف می‌کنند. پل‌های packet به
+stream پیش از تبدیل به بایت‌های stream ترمیم را کامل می‌کنند؛ این flag روی wire
+ارسال نمی‌شود. PTC درخواست را با کپی aligned مرتبط نگه می‌دارد؛ CTP ترمیم را روی
+کپی بایت‌ها پیش از صف‌گذاری کامل می‌کند. Ping پیش از encapsulation درخواست packet
+داخلی و پیش از validation/decapsulation درخواست packet بیرونی را مصرف می‌کند؛
+درخواست بیرونی به packet داخلی انتقال نمی‌یابد.
+
+decoded affinity خود buffer را همراه درخواست آن جابه‌جا می‌کند و snapshot جداگانه
+روی line بازنمی‌گرداند. fragment دارای درخواست پیش از staging ترمیم می‌شود؛ این
+ترمیم checksum header IPv4 را پوشش می‌دهد و transport checksum کل datagram را
+از یک fragment نمی‌سازد. مالکیت، ترتیب، worker affinity و cancellation ثابت‌اند.
+
+ترمیم incremental فقط تغییر همان transform را پوشش می‌دهد و درخواست قدیمی را
+حفظ می‌کند. ProtoSwap پیش از encoding، ترمیم در پروتکل بومی را کامل و درخواست را
+پاک می‌کند؛ refusal یا no-match بایت‌ها و درخواست را دست‌نخورده می‌گذارند. درخواست
+قدیمی را پس از encoding دوباره تنظیم نکنید. packetهای دارای checksum عمداً خراب
+می‌توانند بدون درخواست باقی بمانند. این flag از تضمین checksum در metadata خصوصی
+TUN، حالت trusted و offload/GSO مستقل است؛ trusted بودن درخواست صریح را حذف
+نمی‌کند و درخواست نیز اعتبارسنجی ساختار یا شروط offload را دور نمی‌زند.
 
 ## دو نوع تونل packet
 
@@ -507,8 +541,9 @@ TesterClient(packet-mode=true)
 - منطق عادی `Finish` مختص اتصال را روی packet line اجرا نکنید، مگر آنکه قرارداد
   نقش دقیق handler صریحاً آن را الزام کند.
 - state مربوط به packet line را state محلی و مشترک worker در نظر بگیرید.
-- routing context و `recalculate_checksum` را metadata تغییرپذیر مختص packet
-  بدانید، نه هویت پایدار session.
+- routing context را scratch state تغییرپذیر worker بدانید، نه هویت پایدار session.
+- درخواست checksum را فقط روی buffer همان packet نگه دارید؛ نگه‌داری یا تحویل
+  packet نباید درخواست buffer دیگری را تغییر دهد.
 - برای چرخه‌ی عمر مختص flow، پشت سمت packet یک line عادی بسازید.
 - تونل ساخته‌شده با `packettunnelCreate()` هیچ state مختص line ندارد و
   `lstate_size == 0` است.

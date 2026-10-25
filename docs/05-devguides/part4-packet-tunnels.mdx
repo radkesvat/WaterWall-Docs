@@ -248,7 +248,6 @@ on it is **worker-local scratch state**, not per-connection identity. Be
 especially careful with:
 
 - `routing_context.src_ctx` and `routing_context.dest_ctx`
-- `recalculate_checksum` (a per-packet scratch flag, see `lineSetRecalculateChecksum`)
 - any tunnel line state stored on the packet line
 
 These fields are overwritten packet-to-packet. Do **not** treat them as a stable
@@ -259,16 +258,43 @@ sense as one of:
 - packet-pipeline scratch state,
 - bridge state anchored to the worker packet side.
 
-A final checksum boundary must take and clear the current packet's request with
-`packettunnelTakeChecksumRequest()` before any drop or inter-tunnel callback.
-Keep the returned value with that locally owned packet until repair; never
-restore it to the shared line after a callback. Stream creation can reenter
-packet delivery, so deferring consumption until after `Init` can apply one
-packet's request to another.
+Checksum repair intent belongs to each ordinary packet's `sbuf_t`, not the
+shared line. Queued, duplicated and retained packets carry independent requests,
+including during reentrant callbacks on the same worker.
 
 If you need real per-flow or per-connection lifecycle behind packet traffic,
 **create normal lines behind the packet side** — do not try to make the packet
 line behave like a connection.
+
+## Packet checksum repair boundaries
+
+Use `sbufSetRecalculateChecksum()` / `sbufGetRecalculateChecksum()` for an
+outstanding repair request on an ordinary resident packet. False does not prove
+validity and must preserve intentional checksum corruption. Complete copies,
+growth and reset follow [Part 3](./part3-buffers-and-padding.mdx#packet-checksum-repair-requests).
+
+`packettunnelTakeChecksumRequest(buf)` clears and returns that buffer's request.
+`packettunnelConsumeChecksumRequest(buf)` takes it and validates exact IPv4
+structure before performing requested repair. Validation is unconditional:
+malformed input, IPv6 and trailing bytes are refused even when unrequested.
+These are terminal boundaries; refusal discards the packet. A transform that can
+refuse and pass unchanged must preflight and preserve bytes and intent on refusal.
+
+TunDevice, RawSocket and packet/connection bridges consume the actual packet's
+request. Aligned copies retain intent locally until finalization; raw-byte
+ConnectionToPackets messages complete repair before queueing. Packet/stream
+bridges finish repair before serialization; no local flag is serialized. Ping
+repairs inner packets before encapsulation and requested outer packets before
+validation, then clears outer intent when stripping to the inner packet.
+Generated replies, originals and duplicates own independent requests.
+
+Mark the surviving allocation after replacement and each generated packet
+according to existing repair behavior. Incremental IpOverrider/ProtoSwap address
+corrections preserve earlier requests unless a complete repair satisfies them.
+Buffer-owning queues and affinity messages need no parallel request boolean.
+Raw-byte SmuggleFin handoffs retain one explicitly and restore it onto the newly
+constructed packet. No request grants checksum assurance or enables offload;
+trusted TUN/PTC input still honors explicit repair requests.
 
 ## Device implementation boundaries
 
@@ -540,8 +566,8 @@ IPv4 and TCP option bytes retain the negotiated contract's copying semantics
 when segmenting. A partial TCP seed must retain the kernel's pseudoheader
 contribution while changing its length; the IPv4 header's current destination
 can be a source-route hop rather than TCP's final destination. Valid negotiated
-TCPv4 GSO traffic is not filtered by a TCP-option allowlist. No virtio metadata,
-checksum request flag, or new line state reaches the chain.
+TCPv4 GSO traffic is not filtered by a TCP-option allowlist. No virtio metadata or checksum-assurance flag reaches the chain; ordinary
+packet repair requests remain separate from private TUN work.
 
 Ordinary `NEEDS_CSUM` completion uses `tunLinuxOffloadCompleteChecksum()` to
 sum the metadata-selected span, including its existing checksum-field seed.
@@ -885,7 +911,8 @@ Complete TCP/UDP records with matching `NEEDS_CSUM` coordinates, or applicable
 Simultaneous flags are rejected. Receive trust does not manufacture positive
 metadata assurance for unmarked records. Ordinary records, generated GSO
 segments and intact aggregates share the existing bounded worker FIFO; no
-checksum marker is added to an sbuf or line.
+checksum-assurance marker is added to an sbuf or line. The sbuf repair request
+is separate and never certifies received bytes.
 
 With active GSO on this pair, preflighted, assured TCPv4 GSO is delivered intact
 as one complete, unfragmented IPv4 packet of at most 65,535 bytes. PTC's custom pbuf
@@ -988,7 +1015,7 @@ Same-worker and one-worker delivery are inline; foreign delivery is force-queued
 onto the target worker's own packet line. Other decoded protocols stay local.
 
 A decoder context has a fixed continuation which must not repeat decoding.
-Queued records retain the target line and carry the packet's checksum request;
+Queued records retain the target line and owned sbuf, whose request travels with it;
 cancellation destroys the owned buffer without touching worker pools or decoder
 state. Normal runtime quiescence settles worker callbacks/messages before node
 destruction. Context destruction releases staged fragments after that settlement.
@@ -1039,8 +1066,8 @@ that understands this checksum convention.
 
 The shared `updateIpv4TransportChecksumAddresses()` helper takes an effective
 TCP/UDP protocol separately from the visible IP protocol and explicit old/new
-address contributions in network byte order. It must never manage a line's
-checksum request. It applies RFC 1624 equation 3 with 16-bit complements and
+address contributions in network byte order. This byte-oriented helper must
+never manage an sbuf's checksum request. It applies RFC 1624 equation 3 with 16-bit complements and
 end-around carry, and changes at most the two transport checksum bytes.
 For whole packets, validate TCP minimum header/data offset or UDP declared length
 against IPv4 total length using the effective protocol. For fragments, compute
@@ -1419,7 +1446,7 @@ handler belongs in it:
 - Do not run normal per-connection `Finish` logic on packet lines unless the exact
   handler-role contract explicitly requires it.
 - Treat packet-line state as worker-local shared state.
-- Treat routing context and `recalculate_checksum` as mutable per-packet metadata,
+- Treat routing context as mutable packet-line scratch metadata,
   never as durable session identity.
 - For per-flow lifecycle, create normal lines behind the packet side.
 - A `packettunnelCreate()` tunnel has no per-line state (`lstate_size == 0`).

@@ -94,6 +94,43 @@ sbufShiftRight(b, n);              // advance cursor: consume n bytes from the f
 buffer with the source's full original aligned left padding. The caller owns
 both the result and the remaining source, including when the source becomes empty.
 
+### Packet checksum repair requests
+
+`kSbufFlagRecalculateChecksum` uses the existing `sbuf_t.flags` storage without
+changing the 32-byte header. `sbufSetRecalculateChecksum(buf, requested)` changes
+only this bit; `sbufGetRecalculateChecksum(buf)` reads it. Requesting repair
+requires an ordinary resident buffer and asserts against a splice wrapper.
+
+True means this packet has an outstanding request for the existing checksum
+repair operation. False means no repair requested; it does not certify checksum
+validity. Deliberately invalid checksums remain possible. The bit is independent
+of TUN-private checksum assurance, hardware offload and GSO metadata.
+
+Fresh allocations, reset and ordinary pool reuse clear the request. Whole-payload
+`sbufDuplicateTo()`, `sbufDuplicate()` and `sbufDuplicateByPool()` copy it exactly,
+including clearing a previously marked destination when the source is unmarked.
+A failed duplicate leaves destination bytes, geometry and flags unchanged.
+Each clone owns its own request; consuming one does not change another.
+`sbufReserveSpace()` preserves the request across replacement or no growth; use
+only its returned pointer after it may replace the allocation.
+
+Byte-copy helpers, including `sbufWriteBuf()`, do not transfer intent. New partial
+moves, slices and range extractions start unmarked and do not consume the source's
+request. Concatenation preserves the destination bit through growth without ORing
+source bits. Cursor/length changes preserve the bit mechanically; mutable access
+and byte writers do not infer checksum consequences. Packet-aware callers must
+complete repair before losing a packet boundary, or explicitly assign intent to
+complete constructed packets. Segmentation, fragmentation and synthetic output
+choose intent for each result according to their checksum generation semantics.
+Splice wrappers stay unmarked; materialization never creates packet intent.
+
+Forwarding transfers bytes and intent together. After forwarding or recycling,
+the sender must not inspect or change either. A successful complete repair clears
+the bit; an incremental correction covering only a transform's own edit preserves
+an earlier request. A terminal consumer may take it before repair because refusal
+discards the packet. A transform that declines and forwards unchanged preserves
+both bytes and request. See [packet boundaries in Part 4](./part4-packet-tunnels.mdx#packet-checksum-repair-boundaries).
+
 ### Splice payloads: `kSbufFlagSplice`
 
 A splice allocation keeps the common 32-byte `sbuf_t` header and exactly
