@@ -347,14 +347,19 @@ worker, and connections between the same hosts can use different queues.
 IPv4 header and declared-length bounds
 are checked before reading ports, including when IP options are present.
 
-Complete, structurally valid IPv4 packets other than TCP/UDP use round-robin
-receive queues. One shared per-interface eBPF map counter advances atomically
-across all kernel CPUs.
+Complete, structurally valid IPv4 packets other than TCP/UDP use approximate
+round-robin receive queues. Each interface owns a `BPF_MAP_TYPE_PERCPU_ARRAY` with
+one bounded 32-bit cursor per kernel CPU. Ordinary loads, increments and stores
+advance that CPU's cursor modulo the queue count; no `BPF_ATOMIC` instruction is
+needed. Selection adds the CPU ID before reducing modulo the queue count, so CPUs
+need not all begin at queue zero. Overlapping updates can lose a cursor step:
+there is no exact global round-robin sequence or equal-count guarantee.
 These packets continue processing on the receiving worker. With one receive
-queue, a device-local sequence distributes opaque processing across the configured
-workers. This is the Linux default without another setting or chain inspection.
-Unsupported map, atomic-operation or steering setup uses the existing one-reader
-fallback. Other platforms retain their existing receive and processing policies.
+queue, the existing device-local sequence distributes opaque processing across
+the configured workers. This is the Linux default without another setting or
+chain inspection. Unsupported per-CPU map or steering setup uses the existing
+one-reader fallback. Other platforms retain their existing receive and processing
+policies.
 Decoders that restore inner TCP/UDP select the restored flow's worker.
 
 All IPv4 fragments, including fragment zero, use the symmetric address-pair and
@@ -422,9 +427,13 @@ Unfragmented IPv4 TCP/UDP records with four transport bytes use a symmetric
 address/port/protocol receive hash. Distinct port pairs between the same two IPs
 can therefore select different readers. All fragments, including fragment zero,
 and short TCP/UDP records retain the address/protocol fallback. Structurally valid
-unfragmented packets of every other protocol use round-robin NFQUEUE selection:
-disjoint classic BPF predicates feed cascading iptables `statistic --mode nth`
-rules. This is the default and needs no protocol mapping or chain inspection.
+unfragmented packets of every other protocol use random NFQUEUE selection:
+disjoint classic BPF predicates feed cascading iptables `statistic --mode random`
+rules. For N queues, conditional probabilities are `1/N`, `1/(N-1)` and so on,
+with an unconditional final queue. Each queue has approximately the same share,
+without exact global counts or round-robin order. There is no shared nth-selection
+counter; kernel RNG implementations may still use local locking. This is the
+default and needs no protocol mapping or chain inspection.
 IPv4 length and IHL bounds are checked before ports are read. Steering does not
 validate opaque TCP/UDP contents or checksums. Invalid IPv4 shapes select queue
 zero for ordinary capture validation.
@@ -443,7 +452,7 @@ queue. Opaque rules use independent owned identities and rollback records; only
 one NOTRACK rule is installed per range. Protocol exclusions apply equally to
 both receive families and NOTRACK. Queue identities stay fixed through a run.
 Never round-robin native TCP/UDP flows or replace their fixed steering with CPU
-fanout. Opaque round robin permits reordering between worker readers.
+fanout. Random opaque selection permits reordering between worker readers.
 
 Each worker performs a bounded native drain (256 receive/verdict steps or
 256 KiB) and yields. Receive, verdict sends, dispatch admission and retry paths
