@@ -5,7 +5,7 @@ sidebar_label: "Part 4: Packet Tunnels"
 description: "Packet-line semantics, pure packet tunnels, packet/stream bridges, packet-line initialization, and paired-tunnel direction rules for layer-3 work."
 ---
 <!--
-Documentation version: 166
+Documentation version: 167
 -->
 
 # Part 4: Packet Lines & Packet Tunnels
@@ -361,15 +361,18 @@ keep the single-queue attachment path. Queue count and steering stay fixed throu
 a run; there is no automatic live queue migration. Queue mode is independent of
 checksum/GSO framing, and startup logs both choices. With `multi-queue: false`,
 Linux skips `IFF_MULTI_QUEUE`, eBPF steering and extra queue attachment, and uses
-one queue owned by worker 0. The configured processing worker count and TCP/UDP
-flow-worker selection remain unchanged; native writes use the same resulting
+one queue owned by worker 0. The configured processing worker count remains
+unchanged; complete native TCP/UDP flows retain per-flow receive locality across
+those workers, while opaque records rotate. Consumers still establish any
+required ownership at their own processing boundary. Native writes use the same resulting
 queue set. Invalid types, including `null`, are rejected at node construction.
 Other platforms accept the boolean and retain their existing receive arrangement.
 
-Ingress steering uses the same symmetric address/port/protocol hash as processing
+Ingress steering uses the same symmetric address/port/protocol hash as consumer
 affinity for unfragmented IPv4 TCP/UDP packets with both ports present. With all
-worker queues active, these packets select the queue owned by their processing
-worker, and connections between the same hosts can use different queues.
+worker queues active, these packets begin processing on their receiving worker,
+and connections between the same hosts can use different queues. This steering
+preserves locality; it is not a consumer's proof of ownership after tuple changes.
 IPv4 header and declared-length bounds
 are checked before reading ports, including when IP options are present.
 
@@ -380,13 +383,18 @@ advance that CPU's cursor modulo the queue count; no `BPF_ATOMIC` instruction is
 needed. Selection adds the CPU ID before reducing modulo the queue count, so CPUs
 need not all begin at queue zero. Overlapping updates can lose a cursor step:
 there is no exact global round-robin sequence or equal-count guarantee.
-These packets continue processing on the receiving worker. With one receive
-queue, the existing device-local sequence distributes opaque processing across
-the configured workers. This is the Linux default without another setting or
-chain inspection. Unsupported per-CPU map or steering setup uses the existing
-one-reader fallback. Other platforms retain their existing receive and processing
-policies.
-Decoders that restore inner TCP/UDP select the restored flow's worker.
+All complete packets continue processing on their receiving worker when multiple
+receive queues are active. With one receive queue, complete native TCP/UDP
+records with visible ports use the symmetric flow hash before entering a worker
+FIFO. The same flow stays in one FIFO even when other workers are delayed.
+Opaque or unclassifiable records rotate across workers using the session-local
+cursor. External-reader backends use the same policy. Single-reader classification
+recognizes unfragmented IPv4 and plain IPv6 TCP/UDP with both ports inside the
+declared packet length; it does not walk IPv6 extension headers or guess opaque
+transport fields. Unsupported per-CPU map or steering setup uses the existing
+one-reader fallback. Device readers do not inspect their chain or assign
+transport-state ownership. Consumers that need it select a worker from the tuple
+visible at their processing boundary, including after an earlier decoder.
 
 All IPv4 fragments, including fragment zero, use the symmetric address-pair and
 protocol fallback, excluding ports and fragment IDs. TCP/UDP packets too short
@@ -394,8 +402,8 @@ to contain both ports use that fallback too. Every fragment of
 one datagram therefore has one receive producer. Ordinary packets and fragmented
 datagrams of the same transport flow can have different readers and can reorder
 across those readers. The shared fragment table preserves assembly and processing
-affinity for preserved fragments; completed packets follow their ordinary protocol
-policy after reassembly, including opaque processing. Opaque round robin also
+affinity for preserved fragments; completed packets follow the ordinary reader
+placement policy after reassembly. Opaque round robin also
 permits reordering across readers. Kernel write-learned
 queue migration remains bypassed. Malformed headers and unsupported IP versions
 select queue zero and retain the existing downstream validation policy.
@@ -465,20 +473,27 @@ validate opaque TCP/UDP contents or checksums. Invalid IPv4 shapes select queue
 zero for ordinary capture validation.
 
 The capture hash is a compact 32-bit classic BPF predicate, distinct from TUN's
-64-bit eBPF and WaterWall's processing affinity. TCP/UDP retains software flow
-selection after receipt; its reader is not necessarily its processing worker.
-Opaque complete packets continue on their reader worker. A single receive queue
-instead round-robins opaque processing across configured workers. Preserved
-fragments retain the existing shared fragment association; reassembled opaque
-packets use the ordinary opaque dispatch policy. A later decoder owns any new
-TCP/UDP affinity exposed by its transformation.
+64-bit eBPF and WaterWall's consumer affinity. With multiple receive queues,
+complete packets of every protocol begin processing on their reader worker.
+A single receive queue assigns complete visible TCP/UDP flows to their symmetric
+hash worker before dispatch. Opaque or unclassifiable records still round-robin
+across configured workers using a session-local cursor. Preserved fragments retain the existing
+shared fragment association; reassembled packets use the ordinary reader
+placement policy. A consumer establishes required transport ownership using the
+tuple visible at its own boundary, after any protocol or address restoration.
+A stateless `RawSocket -> IpOverrider -> RawSocket` relay therefore preserves
+parallel processing even for one opaque protocol-50 peer pair.
 
 Each multiqueue source range has one flow rule and one opaque rule per receive
 queue. Opaque rules use independent owned identities and rollback records; only
 one NOTRACK rule is installed per range. Protocol exclusions apply equally to
 both receive families and NOTRACK. Queue identities stay fixed through a run.
-Never round-robin native TCP/UDP flows or replace their fixed steering with CPU
-fanout. Random opaque selection permits reordering between worker readers.
+Preserve fixed kernel TCP/UDP receive steering rather than replacing it with
+CPU fanout. This receive-locality rule does not require software flow ownership
+at the reader. Opaque distribution can reorder packets before they reach a
+consumer's affinity boundary; affinity cannot reconstruct that earlier order.
+Visible single-reader TCP/UDP keeps its per-flow FIFO to avoid creating such gaps
+in ordered input, including segmented ClientHello capture.
 
 Each worker performs a bounded native drain (256 receive/verdict steps or
 256 KiB) and yields. Receive, verdict sends, dispatch admission and retry paths
@@ -608,10 +623,13 @@ generic checksum completion for other metadata and keeps fragment handling
 before worker selection. No accepted record is rejected merely because it cannot
 use worker completion. Compact packet storage and the preflighted checksum plan
 travel through the existing worker FIFO; reader draining remains batched and
-completion cannot alter the selected flow key. Ordinary `GSO_NONE` records of
-either IP family remain accepted. For TCPv4 GSO, the reader validates
-the entire aggregate, selects its worker with the existing flow hash, and
-transfers the aggregate buffer and conversion plan to that worker. Outside the
+completion cannot alter the transport tuple. Ordinary `GSO_NONE` records of
+either IP family remain accepted. For TCPv4 GSO, the reader validates the entire
+aggregate, selects a worker using the ordinary reader-placement policy, and
+transfers the aggregate buffer and conversion plan to that worker. In single-reader
+mode this is the visible TCP flow's hash worker, matching ordinary records of the
+same flow. The selection survives capacity retries, and all segments of the record
+keep it; a later consumer establishes flow ownership. Outside the
 intact delivery path below, the worker allocates independent MTU-sized packets,
 copies headers and payload, uses the GSO payload size, adjusts TCP
 sequence/FIN/PSH/CWR, and completes IPv4 lengths, IDs, and both IPv4 and TCP
@@ -763,8 +781,10 @@ local deadline. No downstream timer epoch or residue receipt controls this owner
 IPv4 identification reuse still has the protocol's inherent delayed-fragment
 ambiguity.
 
-Completed packets retain onward padding and select workers using the ordinary
-whole-packet flow hash. Queued session messages still reject stale generations.
+Completed packets retain onward padding and use ordinary reader placement:
+the receiving worker with multiple queues, or visible native TCP/UDP flow hashing
+and opaque session-local rotation with a single reader. Queued session messages
+still reject stale generations.
 Once delivered, complete packets follow ordinary buffer ownership, including
 delays, duplication and drops; there is no late device-generation receipt. Raw
 mode preserves fragment bytes and boundaries and stages tails until fragment
@@ -974,8 +994,8 @@ is separate and never certifies received bytes.
 With active GSO on this pair, preflighted, assured TCPv4 GSO is delivered intact
 as one complete, unfragmented IPv4 packet of at most 65,535 bytes. PTC's custom pbuf
 wraps the aggregate for lwIP input without userspace segmentation or transport
-checksum completion. The aggregate retains the worker selected by the ordinary
-flow hash and its position in the worker FIFO. lwIP sees one larger TCP segment;
+checksum completion. The aggregate retains its position in the device worker FIFO; PTC establishes
+the current tuple's flow worker internally before stack input. lwIP sees one larger TCP segment;
 no GSO metadata or original segment count is passed into the stack. Unmarked GSO
 uses the existing segmentation path without pre-segmentation transport checksum
 verification. Supported partial GSO seeds retain the kernel pseudoheader
@@ -1061,29 +1081,78 @@ while untrusted ordinary writes use zero metadata and complete IP bytes.
 Invalid generated metadata remains a defect. Other I/O errors
 retain the device's existing transient, packet-local and fatal handling.
 
-## Decoded packet worker affinity
+## Consumer-owned packet worker affinity {#decoded-packet-worker-affinity}
 
-`packet_affinity.h` provides a decoder-owned continuation and bounded shared
-fragment table. IpManipulator's normal protoswap receive paths and PingClient /
-PingServer use it after restoring the native TCP/UDP tuple. Each node handles
-only the bytes it has decoded; capture does not inspect its neighbours or learn
-protocol mappings. Complete TCP/UDP packets use the existing shared flow hash.
-Same-worker and one-worker delivery are inline; foreign delivery is force-queued
-onto the target worker's own packet line. Other decoded protocols stay local.
+`packet_affinity.h` provides a fixed consumer continuation, bounded shared
+fragment storage and one FIFO per destination worker. Complete IPv4 TCP/UDP
+packet-line input selects the existing symmetric flow hash. The consumer decides
+where that requirement begins: device receive steering is a locality choice,
+not a substitute for ownership at a later transformed tuple.
 
-A decoder context has a fixed continuation which must not repeat decoding.
-Queued records retain the target line and owned sbuf, whose request travels with it;
-cancellation destroys the owned buffer without touching worker pools or decoder
-state. Normal runtime quiescence settles worker callbacks/messages before node
-destruction. Context destruction releases staged fragments after that settlement.
+Single-reader native TCP/UDP receive locality must be preserved even when a
+consumer applies affinity later. Assigning ordered segments `1,2,3` to workers
+`0,1,0` can deliver `1,3,2` when worker 1 is delayed. The consumer FIFO cannot
+recover the earlier receive order because segment 2 has not reached it yet.
+ECH-SNI then treats the sequence gap as a capture failure and marks the current
+flow generation passthrough. Keeping each visible flow in one receive FIFO
+prevents this artificial gap; it does not repair network reordering. Opaque
+protocols such as 50 retain parallel distribution. The
+`testReaderSkewPreservesClientHello` ECH regression exercises this requirement
+through the real reader, consumer dispatcher and capture paths.
+
+PTC invokes the dispatcher before its stack entry. IpManipulator installs an
+upstream entry boundary only for `first-sni`, `smuggle-sni`, `overlap-sni`,
+`synfin-sni`, `ech-sni-trick` or `smuggle-fin`; downstream it dispatches after
+protocol/port restoration and before stateful processing. Plain ProtoSwap
+encoding and decoding stay on the arrival worker; protocol/checksum conversion
+does not require a flow owner. PingClient/PingServer and WireGuardDevice also
+forward decoded inner packets on their arrival worker. PacketsToStream and
+StreamToPackets map decoded packets to the receiving stream worker's packet
+line; StreamToPackets rechecks the authorized source generation before
+publication and retains return-carrier rendezvous selection. The next stateful
+consumer establishes its own ownership. TesterClient/TesterServer do so at
+packet input when `packet-ipv4.worker-affine-flow` is enabled, before accessing
+the selected worker's verification state. Stateless relay paths need no affinity,
+and opaque protocols without a native TCP/UDP tuple stay local. CTP retains its
+existing connection-owner lookup and output
+routing rather than adding a generic input hash before the exact-owner lookup.
+
+A `flowAffinityTunnelCreate()` helper is available for an actual chain boundary.
+It is internal, has no JSON-registered node or user setting, and dispatches only
+its constructor-selected upstream or downstream payload direction. Opposite
+payload and lifecycle callbacks pass through. Before forwarding Finish, the
+helper closes that exact packet worker lane and discards its queued payload;
+already-published task/cancel tokens still settle before destruction. It owns its
+metadata and dispatcher, not a neighbour or normal line. Its owner inserts it during mutable construction
+and destroys it after runtime settlement. PTC and IpManipulator use the dispatcher
+internally, preserving their exact processing boundaries and physical adjacency.
+
+Each context accepts at most 512 retained packets and 8 MiB of allocation charge
+across all destinations, counting queue records and the active packet through
+continuation return. Fragment staging has its separate existing bounds. Capacity
+refusal drops the new packet. All accepted local, foreign and reentrant producers
+join the same destination FIFO; a local arrival never bypasses older admitted
+work. An empty local queue can drain synchronously inside an admitted normal
+callback, inheriting its packet-batch scope. Otherwise one coalesced worker token
+yields after 256 packets or 256 KiB and requeues unfinished work; one packet can
+cross the remaining byte quantum. Each deferred drain opens a packet-batch scope
+so consumers retain ACK batching.
+
+A scheduled destination retains its worker packet line; records own their sbufs
+and carry their checksum requests. Worker-message refusal or cancellation drops
+that destination's accepted FIFO. Cancellation uses detached destruction and no
+worker pool or owner-only tunnel state. Context mutex and queue storage remain
+live until producers, callbacks and messages settle. Context destruction then
+releases staged fragments and synchronization storage.
 
 Preserved TCP/UDP fragments use the leading fragment's ports to select the same
 worker as complete packets in that flow. Later fragments arriving first are held
 within the existing shared fragment limits, not hashed independently by IP ID.
 The helper preserves fragment bytes and boundaries; pending fragment checksum
-requests are completed before storage. It never moves normal lines or rebalances
-outbound protocol encoding. A worker handoff preserves flow ownership, but does
-not reconstruct a global packet order across independently running readers.
+requests are completed before storage. It never moves normal lines. Other
+protocols and one-worker execution continue directly. FIFO order is admission
+order at this boundary; the dispatcher cannot reconstruct global packet arrival
+order across independently running readers.
 
 ## ProtoSwap checksum representation
 
@@ -1104,7 +1173,8 @@ Every fragment receives the protocol mapping. Only the fragment containing both
 transport checksum bytes receives the address adjustment, including a later TCP
 fragment after an 8- or 16-byte first fragment. Fragmentation may occur before
 encoding or between endpoints; checksum conversion itself needs no reassembly
-or ordering state. Decoded worker selection uses the fragment association above.
+or ordering state. Plain ProtoSwap forwards decoded fragments on the current
+worker; any required fragment association belongs to the later consumer.
 Fragments of one datagram must receive consistent final addresses. Malformed
 IPv4/transport lengths, partial checksum fields and invalid local fragment
 geometry pass through unchanged, with their pending request preserved. Trailing
@@ -1232,7 +1302,7 @@ manage normal lines behind the packet line instead of closing the packet line.
 worker packet line. `StreamToPackets` borrows normal stream lines and stores its
 parser state on those lines; its packet lines are forwarding targets. Both are
 endpoints for the exact lines they join. Neither may use permanent tunnel bypass:
-payload still requires IPv4 boundary parsing, worker-affinity dispatch and
+payload still requires IPv4 boundary parsing, carrier ownership and
 mapping between different line identities.
 
 Keep their endpoint Pause state. `PacketsToStream` maps stream pressure to the
@@ -1419,9 +1489,10 @@ server data: PingClient <-- Echo Request -- PingServer
 - With reply generation enabled, a request receiver publishes two distinct
   buffers. The generated reply clone travels back toward the request sender,
   while the decoded original continues in the received direction. With it
-  disabled, only the decoded original is published. Decoded TCP/UDP originals
-  resume on their inner flow worker through `packetAffinityForward()`; replies
-  remain on the arrival worker. Other decoded protocols remain local.
+  disabled, only the decoded original is published. Decoded originals and replies
+  remain on the arrival worker. Inner fragments are forwarded immediately with
+  their bytes and boundaries intact; Ping does not hold later fragments for a
+  leading fragment or select a transport-flow worker.
 - The shared codec keeps its checked input APIs. At the nodes' reply and strip
   call sites, the validated envelope, exact independent clone and locally retained
   original already establish success. Assert those caller guarantees rather than
@@ -1524,10 +1595,13 @@ Continue to **[Part 5: Anatomy of a Tunnel & Workflow](./part5-tunnel-anatomy.md
 
 ## Worker-owned lwIP bridge engines
 
-PTC selects the engine of its delivered packet line and verifies exact current
-worker ownership. Preserve producer-side device and packet/stream affinity;
-do not rehash PTC ingress after a tuple transform, since preceding packet-node
-state already belongs to the delivered worker.
+PTC validates a complete IPv4 packet, settles its checksum request, rejects
+fragments and establishes affinity from the current TCP/UDP tuple before any
+engine/netif or flow lookup. Its continuation selects the destination packet
+line's engine and verifies exact current worker ownership. Earlier packet nodes
+establish their own state ownership at their own tuple boundaries; they do not
+select PTC's owner. The dispatcher stays inside PTC, so the immediate TUN topology,
+startup-negotiated checksum trust and certified inline output remain intact.
 
 CTP selects the borrowed normal line's owner engine, which can differ from the
 packet hash worker. Return input resolves the full node flow key, WID and
