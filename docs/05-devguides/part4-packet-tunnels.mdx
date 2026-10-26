@@ -5,7 +5,7 @@ sidebar_label: "Part 4: Packet Tunnels"
 description: "Packet-line semantics, pure packet tunnels, packet/stream bridges, packet-line initialization, and paired-tunnel direction rules for layer-3 work."
 ---
 <!--
-Documentation version: 165
+Documentation version: 166
 -->
 
 # Part 4: Packet Lines & Packet Tunnels
@@ -492,9 +492,10 @@ Worker queues share one 512-packet / 8 MiB allocation-charge dispatch budget and
 one synchronized fragment table with detached storage. Capacity refusal retains
 at most one current record and the bounded fragment-release batch per reader,
 disables native read interest and resumes from coalesced credit notifications.
-The kernel's 65,536-packet queue allowance and requested 64 MiB receive buffering
-are divided over the active queue set, rather than multiplied per worker.
-Kernel socket limits can reduce the actual buffer allowance.
+The baseline kernel allowances of 65,536 packets and 64 MiB of requested receive
+buffering are divided over the active queue set. Startup kernel queue tuning can
+increase them as described below. Kernel socket limits can reduce the actual
+buffer allowance.
 
 Before capture activation, and after owner watchers have detached, the lifecycle
 coordinator alone services inactive queues with NF_ACCEPT. Supervised firewall
@@ -506,6 +507,61 @@ uses NF_DROP and queues detached packets through the bounded session FIFO.
 Normal worker activation is queued behind packet Init; the kernel queues and
 session FIFO buffer traffic during that ownership handoff. See
 [Part 7](./part7-shutdown-and-signals.mdx#10-external-devices-and-lwip).
+
+## Startup kernel queue sizing
+
+TunDevice and RawSocket expose `kernel-queue-tune`, a strict boolean defaulting
+to `true` on Linux and `false` elsewhere. Other platforms accept valid settings
+without changing their queues. Numeric overrides are optional whole numbers in
+`1..INT_MAX`; omission selects automatic sizing, while zero, negatives, fractions,
+strings, booleans and null are invalid. Validate settings even when tuning or
+capture is disabled and on non-Linux platforms.
+
+Tuning uses the final active queue count after fallback and never lowers a larger
+existing allowance. TunDevice's `kernel-queue-length` is packets **per queue**.
+RawSocket's `kernel-queue-packets` and `kernel-receive-buffer` are device-wide
+totals divided over active queues; the latter is requested `SO_RCVBUF` bytes.
+Each explicit value replaces its corresponding automatic target. Explicit values
+and larger existing allowances are not constrained by the automatic caps.
+
+| Configured RAM profile | TUN packets per queue | Capture preferred packets per queue | Capture preferred receive-buffer request per queue |
+| --- | ---: | ---: | ---: |
+| S1 / S2 | 1,024 | 1,024 | 1 MiB |
+| M1 (`client`) | 2,048 | 2,048 | 2 MiB |
+| M2 (`client-larger`) | 4,096 | 2,048 | 2 MiB |
+| L1 / L2 (`server`) | 8,192 | 4,096 | 4 MiB |
+
+For `N` active queues, TUN's automatic target is
+`min(profile_target, 131072 / N)`. Capture retains device-wide baseline totals
+of 65,536 packets and 64 MiB of requested receive buffering. Its automatic
+per-queue target for each resource is
+`max(baseline_total / N, min(profile_preferred, automatic_total_cap / N))`, with
+automatic total caps of 131,072 packets and 128 MiB. An explicit total selects
+`max(baseline_total / N, override_total / N)`. Division is integer division.
+These are startup sizing policies based on the configured RAM profile, not host
+RAM detection or runtime load adaptation. Each device has separate allowances.
+
+With tuning disabled, leave TUN's existing queue length unchanged and retain
+Capture's baseline setup, ignoring valid overrides. Tuning is independent of
+Capture's `skip-sysctl` and core `misc.tcp-tune`; it adds no global sysctl writes.
+The userspace receive FIFO and its 512-packet / 8 MiB allocation-charge budget,
+callback quanta and output backlogs remain separate from kernel queue sizing.
+
+Tuning/query failures are best effort: warn and retain otherwise usable queues.
+An unavailable old TUN value must not cause an unchecked reduction. Startup logs
+must also run when tuning is disabled and report the actual queue count and
+`auto`/`override`/`disabled` source. TUN reports old, requested and read-back
+`txqueuelen`, marking unavailable values. Capture reports ACK-confirmed NFQUEUE
+limits, marking unconfirmed limits unknown, plus requested and read-back
+`SO_RCVBUF`. Linux doubles `SO_RCVBUF` bookkeeping values, and host socket caps
+can reduce the request; neither the requested byte total nor packet count is
+actual RSS or a packet-payload byte budget. Increased depth can absorb bursts
+while adding latency and memory use; it does not establish a throughput gain.
+Before increasing `SO_RCVBUF`, apply the request to a disposable socket in the
+same network namespace and read back its effective buffer. Preserve the current
+queue buffer unless that probe confirms an increase. The probe must be closed
+on every result. This avoids relying on a host sysctl file being exposed in the
+namespace and does not authorize a sysctl change or `SO_RCVBUFFORCE`.
 
 ## Device ingress fragment policy
 
@@ -769,7 +825,8 @@ Rule removal affects future packets. Already-marked or queued packets remain
 untracked. `--queue-bypass` cannot undo NOTRACK; abrupt process death or final
 cleanup failure can leave `WWCAP_NOTRACK_...` rules in `raw PREROUTING` requiring
 administrator removal. This implementation does not reclaim another process's
-rules. `skip-sysctl` suppresses optional tuning only, never either rule kind.
+rules. `skip-sysctl` suppresses Capture's global sysctl tuning batch only, never
+either rule kind or the independent per-device `kernel-queue-tune` setting.
 
 ## Linux raw output conntrack policy
 
