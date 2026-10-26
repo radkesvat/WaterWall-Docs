@@ -80,7 +80,7 @@ responsible for destroying them. It does not create the parent transport line.
     "child-buffer-resume-threshold": 524288,
     "parent-buffer-limit": 536870912,
     "max-children": 10000,
-    "max-live-children": 262144,
+    "max-live-children": 0,
     "initial-child-idle-timeout-ms": 10000,
     "active-child-idle-timeout-ms": 300000,
     "memory-high-watermark-percent": 85,
@@ -194,14 +194,14 @@ from `parent-buffer-limit`, which bounds incoming assembly plus attached child q
 | `child-buffer-limit` | integer | `134217728` | Maximum queue-capacity charge for one paused child. Ordinary allocation is charged; splice uses logical sbuf capacity plus sbuf/alignment overhead. Must be greater than `0`; reaching it closes the child with a MUX `Close` frame. |
 | `child-buffer-resume-threshold` | integer | `524288` | Logical queued-payload low-water mark for sending `FlowResume` after the local child becomes writable. Must be greater than `0`. Its numeric value is capped to `child-buffer-limit`. Raising it resumes the peer earlier but weakens hysteresis and may increase pause/resume cycling. |
 | `parent-buffer-limit` | integer | `536870912` | Per-parent queue-capacity budget for incoming assembly plus attached child queues. Beneficial compaction precedes largest-child/oldest-tie shedding; unrelieved pressure closes this parent. Set to `0` to disable the aggregate budget. |
-| `max-children` | integer | `10000` | Hard maximum attached live children on one parent. Must be positive and no greater than `max-live-children`; historical destroyed CIDs do not count. |
-| `max-live-children` | integer | `262144` | Hard maximum reserved or initialized children across this MuxServer instance, all parents, and all workers. Draining and detached children count until their MuxServer state is destroyed. |
+| `max-children` | integer | `10000` | Hard maximum attached live children on one parent. Must be positive and, when `max-live-children` is nonzero, no greater than that limit; historical destroyed CIDs do not count. |
+| `max-live-children` | integer | `0` | Hard maximum reserved or initialized children across this MuxServer instance, all parents, and all workers. `0` disables this aggregate count ceiling; memory pressure, per-parent limits, and the memory-snapshot fallback ceiling remain active. Draining and detached children count until their MuxServer state is destroyed. |
 | `initial-child-idle-timeout-ms` | integer | `10000` | Idle timeout after `Open` and before the first nonempty Data payload. Must be positive. |
 | `active-child-idle-timeout-ms` | integer | `300000` | Refreshing idle timeout after nonempty payload activity begins. Must be positive and at least the initial timeout. |
 | `memory-high-watermark-percent` | integer | `85` | Close memory admission at or above this host or finite-cgroup usage. Must be in `[1, 99]`. |
 | `memory-low-watermark-percent` | integer | `75` | Reopen only when every applicable usage is at or below this value and reserve headroom recovered. Must be in `[1, 99]` and lower than the high watermark. |
 | `memory-reserve` | integer | By `ram-profile` | Close admission when effective available bytes reach this reserve. Must be in `[0, INT_MAX]`; `0` disables only this byte reserve. |
-| `memory-fallback-max-live-children` | integer | By `ram-profile` | Conservative aggregate ceiling while memory sampling is unsupported, unavailable, or older than one second. Must be positive and no greater than `max-live-children`. |
+| `memory-fallback-max-live-children` | integer | By `ram-profile` | Conservative aggregate ceiling while memory sampling is unsupported, unavailable, or older than one second, including when `max-live-children` is `0`. Must be positive and, when `max-live-children` is nonzero, no greater than that limit. |
 | `detached-buffer-limit` | integer | By `ram-profile` | Per-worker queue-capacity-charge limit for blocked child queues kept after parent loss. Reaching it aborts only the newly detached blocked child. Set to `0` to disable this bound. |
 | `detached-child-limit` | integer | By `ram-profile` | Per-worker count limit for blocked children retained after parent loss. Reaching it aborts only the newly detached blocked child. Set to `0` to disable this bound. |
 | `log-main-line-stats` | boolean | `false` | When enabled, parent lines log best-effort stats every `5000` ms. Parent logical death suppresses normal execution and settles the task as `LineDead` when its queued/timed runner is reached. Worker quiescence actively cancels pending work. Neither path rearms it. |
@@ -269,8 +269,9 @@ Parent-to-child dispatch uses a hash index, so lookup and duplicate detection
 remain average O(1). A duplicate `Open` for any indexed child, including a
 peer-close drain, is a protocol violation and closes that parent.
 
-Before allocation, a fresh Open must pass the per-parent hard limit, the
-per-instance atomic reservation limit, and cached memory admission. Resource
+Before allocation, a fresh Open must pass the per-parent hard limit, any
+configured per-instance count ceiling, and cached memory admission. Aggregate
+reservations remain counted when `max-live-children` is `0`. Resource
 rejection sends `Close(cid)` without creating a child and preserves the parent
 and siblings. A parent has a 1024-rejection burst bucket refilled at 64 tokens
 per second using the owner's monotonic clock; sustained rejected-Open abuse
@@ -286,7 +287,10 @@ constraints use the conservative fallback. Windows uses available physical
 memory. Workers consume only the cached atomic tuple, and the high/low
 watermarks provide hysteresis. Stale or unsupported data uses the profile
 fallback ceiling and cannot reopen a gate previously closed by fresh pressure.
-Memory admission affects new Opens only.
+Memory admission affects new Opens only. With fresh memory data,
+`max-live-children: 0` removes the aggregate child-count ceiling while keeping
+memory admission and `max-children` in force; it does not disable the fallback
+ceiling when fresh data is unavailable.
 
 ## Frame Format
 
