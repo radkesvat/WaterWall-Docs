@@ -1053,6 +1053,19 @@ When sizing a destination buffer from an untrusted or variable payload length:
 - Publish the `sbuf_t` length only after the producer has successfully written or
   validated that many bytes.
 
+`sbufEnsureLeftCapacity(pool, buf, need)` consumes an exclusively owned buffer
+and returns the sole owned result. Sufficient headroom returns the original
+unchanged; otherwise replacement preserves the complete logical payload and
+reserves at least `max(need, large_pool_padding)`. Ordinary input remains ordinary.
+Splice input attempts a sufficiently padded splice destination, with ordinary
+fallback on checkout or transfer refusal, including partial transfer progress.
+It promises byte preservation, not a particular resident/pipe split or copying
+arbitrary metadata flags. The caller supplies representable replacement geometry
+and the owner-worker pool; there are no callbacks. Node padding declarations and
+actual prepend bounds remain the caller's obligations. Trojan UDP checks its
+actual header length before requesting maximum-header replacement padding;
+VLESS UDP requests its fixed two-byte prefix.
+
 ## Buffer Ownership
 
 Buffer lifetime bugs are as common as line lifetime bugs. The rules:
@@ -1083,6 +1096,19 @@ this bookkeeping so later context destruction cannot recycle the payload again.
 `buffer_stream_t` accepts **ordinary resident buffers only**. Use its views,
 CRLF searches, exact/at-least/full reads, and `IdealRead()` only on ordinary
 input. Logical stream entries are storage boundaries, not protocol records.
+In Debug, Push asserts the ordinary-input precondition before copying or retaining input,
+including empty input. `bufferstreamInitEmpty()` initializes a destroyable stream
+without reserving deque storage; its pool and exact-read padding contract match
+`bufferstreamCreate()`, which retains its eager reservation. Both initializers
+require that any previous contents have already been released.
+`bufferstreamGetEntryCount()` counts retained storage entries after coalescing,
+including empty entries. `bufferstreamGetHeadLength()` reports only the first
+entry's logical length, or zero if absent/empty; it exposes no payload pointer.
+`bufferstreamGetCharge()` scans retained allocation charges in O(n), saturating
+at `SIZE_MAX` on overflow. Partial consumption keeps a source's charge until its
+storage is released. Charge excludes deque/pool storage and is not logical byte
+length or RSS. These accessors allocate nothing and make no callbacks; callers
+retain admission and compaction policy.
 Push owns its input and preserves bounded ordinary coalescing: a positive input
 of at most 4 KiB may append to a tail with sufficient spare space. Exact reads
 preserve checked lengths and the explicit `use_left_padding` budget. Deque
@@ -1167,6 +1193,20 @@ Heap exhaustion is fatal. Empty inputs recycle immediately.
 Ordinary bytes, real resident splice prefixes and private pipe bodies maintain
 FIFO order. Push physically removes only missing header bytes from sources and
 recycles exhausted sources. The header cache owns only bytes.
+
+`splicestreamCanAdmit()` conservatively checks current logical bytes (including
+the cached header) plus incoming length and source queue charge against explicit
+limits. Equality is accepted; zero is a literal bound. Empty input adds no charge.
+It borrows both inputs, performs no mutation or reservation, and does not guarantee
+that a later Push succeeds. `splicestreamSettleCharge()` attempts beneficial
+compaction at most once when over its charge limit, then reports whether the
+result fits. It may allocate, materialize pipe bytes and recycle sources even when
+returning false, but preserves header/payload order and makes no callbacks.
+Both helpers require the stream's owner worker. UDP-over-TCP uses conservative
+admission only during nested delivery. KeepAlive retains byte-only nested
+admission followed by Push and charge settlement; SpeedTest settles incomplete
+retention after processing complete frames. BGP retains its byte-only policy.
+Do not turn these helpers into unconditional prechecks on complete top-level batches.
 
 `splicestreamPeekHeader()` returns a borrowed cache pointer only when complete;
 the pointer expires on mutation. Repeated peeks perform no I/O or allocation.
@@ -1823,12 +1863,18 @@ The initial request is 68 bytes for IPv4, 80 for IPv6, or 65 plus domain length,
 at most 320. UDP association uses `0.0.0.0:0`, a 68-byte initial request. The first
 combined UDP output also includes `ATYP ADDR PORT LEN CRLF` for its datagram.
 Subsequent upstream datagrams are wrapped inline; insufficient headroom uses
-`sbufMoveRangeTo()` with full onward padding and preserves its returned pointer.
+`sbufEnsureLeftCapacity()` with maximum-header replacement padding and preserves
+its returned pointer.
 
-Trojan address inspection uses an allocation-free owning value with explicit
+TrojanClient, TrojanServer and Socks5Server share the pure `Internals/SocksAddress`
+codec. Its allocation-free owning value preserves raw address bytes, kind and
+host-order port, with explicit
 incomplete/complete/invalid results; failed decode or capacity-checked encoding
-leaves outputs unchanged. Command, CRLF, port and datagram-size policy remain with
-the caller. Validating a reply source creates no owning routing context and never
+leaves outputs unchanged. Port zero is syntactically valid; empty domains and
+unknown address kinds are invalid. Command, CRLF, endpoint port, datagram-size
+policy, DNS and routing-context conversion remain with callers. Socks5Client's
+reply parser retains its separate acceptance of empty bound-domain replies.
+Validating a Trojan reply source creates no owning routing context and never
 changes the application's destination.
 
 UDP receive caches at most 263 header bytes: 11 for IPv4, 23 for IPv6, or 8 plus
