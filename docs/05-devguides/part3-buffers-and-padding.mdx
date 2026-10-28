@@ -2639,6 +2639,48 @@ padding; application retention follows the default 2 MiB / 1,024-buffer budget,
 independent of pool geometry and splice read sizes. PipeTunnel transfers paired opaque
 buffers across workers under its existing ownership and cancellation contract.
 
+### HTTP receive framing and retention
+
+`HttpClient` and `HttpServer` share callback-free chunk and WebSocket decoders
+in `Internals/HttpCommon`. HTTP/1 chunk bodies and WebSocket data frames drain
+available bytes in at most 16 KiB outputs; a peer-declared length never requires
+retaining the complete body. Publish remaining length, parser phase and WebSocket
+mask position before returning each output. The node owns callbacks, line and
+association checks, protocol completion and closure. A malformed chunk terminator
+can close the line after a body prefix has already been delivered.
+
+Chunk sizes use length-aware hexadecimal parsing up to `INT64_MAX`. The size
+line, including extensions and CRLF, is at most 1,024 bytes. Discarded trailers
+are at most 16,384 bytes in aggregate, including every CRLF and the final empty
+line. Metadata is consumed once into parser state instead of retaining or
+rescanning partial lines. Existing HTTP headers retain their 64 KiB limit through
+the first complete header terminator. WebSocket headers are checked before body
+retention; data frames may declare up to `UINT32_MAX` bytes, while Ping, Pong and
+Close remain complete events with at most 125 body bytes. Mask offsets continue
+across input deliveries and output slices.
+
+The receive cursor owns an active delivery and a separate FIFO for nested input.
+Nested input has inclusive limits of 1 MiB logical bytes, 2 MiB allocation charge
+and 1,024 entries; a popped nested buffer keeps its reservation while its suffix
+remains active. The synchronous outer delivery and one extracted output are
+working storage outside that backlog budget. Consume the outer suffix before
+nested input, in at most 16 KiB pieces. Empty inputs are recycled immediately.
+After processing, ordinary `in_stream` retention is at most 64 KiB. Compact
+storage exceeding the larger of 2 MiB and the best-fit allocation for its actual
+bytes with chain padding, or exceeding 1,024 entries. Empty streams release all
+entries. These are retained-storage limits, not a limit on one immediately
+drainable application delivery.
+
+Unpaired split uploads retain their existing waiting-byte allowance and explicit
+`no-split-upload-buffering-limit` override; their charge compaction uses the same
+best-fit rule for the waiting bytes. Pairing enters the upload receive guard
+before Init or body output, and drains waiting bytes before nested input.
+Cross-worker pairing transfers the buffered prefix, active suffix and nested
+FIFO in that order before retiring source state. Custom raw upgrade waits for
+this receive cursor to drain before permanent bypass. HTTP/2 input is fed to
+nghttp2 in bounded steps, with decoded events drained between calls rather than
+from inside nghttp2 receive callbacks.
+
 ### IPv4 stream codec and batch admission
 
 PacketsToStream and StreamToPackets share `Internals/Ipv4StreamCodec` for
