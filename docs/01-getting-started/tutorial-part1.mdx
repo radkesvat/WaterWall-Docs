@@ -258,6 +258,7 @@ Operational advice:
     "mtu": 1500,
     "splice": true,
     "tcp-tune": true,
+    "tcp-stack-receive-budget": 33554432,
     "try-enabling-bbr": true,
     "libs-path": "libs/"
   }
@@ -271,6 +272,7 @@ Operational advice:
 | `mtu` | integer | `1500` | Construction-time default for per-node MTUs. Must be a whole number in `68..65535`. Invalid values stop startup. |
 | `splice` | boolean | `true` | Allow splice on eligible stream chains. `false` disables splice eligibility for every chain. Platform support and support from every node are still required; packet chains remain ineligible. |
 | `tcp-tune` | boolean | `true` on Linux; `false` otherwise | Best-effort core startup tuning with 128 MiB socket ceilings and TCP autotuning maxima; also raises RAM-based TCP memory thresholds when `splice` is enabled. |
+| `tcp-stack-receive-budget` | integer | `33554432` (32 MiB) | Per-worker shared receive-window target for the userspace TCP stack. `0` disables adaptation; otherwise accepts whole byte counts from `65536` to `1073741824`. |
 | `try-enabling-bbr` | boolean | `true` | Linux-only best-effort attempt to enable TCP BBR if the running kernel reports BBR support. |
 | `libs-path` | string | `"libs/"` | Directory used when loading external tunnel libraries. |
 
@@ -457,6 +459,31 @@ does not persist them in `/etc/sysctl.conf`.
 RawSocket's separate tuning batch, controlled by `skip-sysctl`, tunes backlogs and
 other TCP parameters. The buffer and `tcp_mem` writes above belong exclusively to the core
 `tcp-tune` phase.
+
+### `tcp-stack-receive-budget`
+
+The default is 32 MiB per worker's userspace TCP engine, shared as an advertised
+receive-window target across its network TCP connections. Set `0` to disable
+adaptation and preserve each connection's negotiated receive-window ceiling.
+Each connection's target is the shared budget divided by the connection count,
+bounded by the negotiated receive ceiling
+(4 MiB with window scaling) and a 64 KiB per-flow floor. A configured budget below
+4 MiB can therefore limit even one connection. Bytes already accepted but not yet
+credited consume that flow's share.
+
+This is a queue-pressure target, not a hard memory limit. Previously advertised
+space remains valid while it drains, and the per-flow floor can exceed the shared
+target at high connection counts. Closing a connection redistributes future
+advertisements; an eligible closed window reopens on its owner without waiting
+for new peer traffic. Dormant allocated PCBs and listeners do not consume shares;
+connections that have joined continue to count while idle or awaiting a handshake.
+
+Use a nonzero target to reduce receive queue pressure; smaller targets can reduce
+throughput when many connections share a worker, especially on high-RTT paths.
+Increase the target when those flows need larger windows, or use `0` to retain
+the fixed receive-window policy. The setting does not resize
+lwIP pools, change native socket buffers or tune the host kernel. It is separate
+from `tcp-tune`. See the [worker-engine contract](../05-devguides/part4-packet-tunnels.mdx#worker-owned-lwip-bridge-engines).
 
 ### `try-enabling-bbr`
 

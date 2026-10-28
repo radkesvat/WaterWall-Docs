@@ -1611,6 +1611,10 @@ generation, force-queues detached bytes to that owner, then rechecks the entry,
 engine and exact netif before injection. No flow-registry lock encloses stack
 execution or neighbour publication.
 
+Both bridges disable Nagle on their TCP data PCBs: CTP calls
+`tcp_nagle_disable()` before connecting, and PTC calls it for each accepted child
+before normal-line Init. Neither bridge re-enables Nagle.
+
 lwIP allocation pools remain process-wide. The eight malloc-pool classes in
 `ww/lwip/lwippools.h` reserve four blocks per rounded flow share, about 18.5 MiB
 before allocator overhead at the default TCP/UDP flow targets. This capacity is
@@ -1621,6 +1625,31 @@ Netif indices and generations are engine-local and may coincide across engines.
 Identity includes the engine and exact netif. Multiple nodes may use identical
 tuples on different netifs. Each engine has its own 255-index namespace, including
 its loopback; netif exhaustion refuses the affected attachment promptly.
+
+Each owner engine can use `misc.tcp-stack-receive-budget` as a shared advertised
+TCP receive-window target, defaulting to 32 MiB. Setting `0` disables adaptation
+and membership bookkeeping, retaining each connection's negotiated ceiling.
+With a nonzero target, network connections join when their first output/window
+calculation runs; dormant PCBs and listeners do not
+join; joined idle and half-open connections continue to count. The per-flow target
+is the shared target divided by membership, bounded by the negotiated receive
+capacity and a 64 KiB floor. Accepted, uncredited bytes
+consume that share. Raw `rcv_wnd`, receive-credit return, pool sizes and unread-data
+close semantics remain unchanged.
+
+This target is not a hard aggregate memory cap: existing advertised allowance
+remains acceptable, and per-flow floors can exceed the target. A limited PCB
+preserves its successfully committed logical right edge while future grants
+adjust; failed output cannot enlarge that promise. The actual quantized wire
+edge remains separately recorded for ACK/reopening decisions, and scaled rounding
+does not accumulate across outputs. Purge/free unlink membership once. The engine
+caches its clamped share on membership changes. When a release increases that
+share, eligible closed windows are recalculated at the outer owner-engine boundary
+or synchronous ACK-batch end, collecting ACK intent before any output callback.
+Output pops intent before publication so callback-driven retirement remains safe.
+Quiesced/releasing engines emit no redistribution output. No timer or foreign
+callback root is added. Startup-only configuration is copied into each engine;
+`0` disables adaptation without changing native socket policy.
 
 Both bridges still require complete IPv4 datagrams and reject fragments at input.
 Device reassembly precedes worker selection by default. Output fragmentation and
@@ -1660,6 +1689,10 @@ Device-only traffic does no lwIP batch work, even when another configuration use
 lwIP on the same worker. Output retains each connection's own interface and chain.
 Worker-owned readers enqueue even when the destination is their current worker.
 Linux readers collect a bounded burst before ending their receive-burst scope.
+With one event worker, receive selection returns that worker without redundant
+tuple hashing. Raw Linux collection and delivery share the packet and byte quantum
+constants. Collection leaves the next record unread when its maximum MTU-sized
+extent would exceed the delivery byte quantum.
 An eligible same-worker FIFO then drains inline through the existing ACK quantum,
 so its packets share ACK state without a receive-dispatch self-wake. Other FIFO
 tokens and unfinished quanta remain queued; same-worker input is not delivered
@@ -1672,9 +1705,13 @@ returning; batching introduces no cross-burst timer or delay policy.
 PTC and CTP return each complete deferred delivery or Resume credit amount through
 `wwLwipTcpRecved()` while its owner engine is entered. The helper evaluates
 window-update policy once for the full amount; the standard `tcp_recved()` API
-retains its 16-bit argument. This does not open a batch or change the window
-threshold, ACK timing, or immediate window reopening. Independently returned
-deliveries can still produce separate window updates.
+retains its 16-bit argument. This does not open a batch. Standalone credit-only
+updates use `min(64 KiB, negotiated receive capacity / 4)` while the last
+successful wire advertisement leaves more than that much space. Unknown, closed
+or near-closed windows, pending ordinary ACK intent, recovery/control state and
+retained out-of-order/SACK state use the original update threshold. Ordinary
+cumulative and recovery ACK timing is unchanged. No timer is added.
+Independently returned deliveries can still produce separate window updates.
 
 Eligible receive-credit updates share the queue. Accepted payload that advances
 the receive sequence into an existing out-of-order gap requests an immediate ACK,
