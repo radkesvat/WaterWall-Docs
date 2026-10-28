@@ -730,6 +730,38 @@ before delivering the extracted buffer through a callback, and preserve the
 existing line-reference and association checks around that delivery. Node cleanup
 continues to release the active head and queue.
 
+`bufferRangeGatherPrefix(pool, &active_head, &tail, dst, &filled, needed)` uses
+the same owned-head/unbound-tail cursor to extend caller-owned resident metadata.
+The caller provides storage for both the existing `filled` bytes and the requested
+`needed` extent. Success means `filled >= needed`: revisiting an earlier prefix
+is a successful no-op, without popping or recycling input. Otherwise it consumes
+only the missing prefix bytes, using exact range reads for ordinary and splice
+sources, and recycles exhausted heads through the owner-worker pool. A false
+result means input ran out; copied bytes remain in `dst` and `filled` preserves
+that partial progress for the next call. Following body bytes remain untouched.
+Gathering allocates no storage and invokes no callbacks.
+
+TrojanClient, VlessClient, TrojanServer and VlessServer keep their protocol state,
+header-capacity checks and logical-byte counters outside this helper. Cached
+header bytes remain included in their retained-input count until the node consumes
+that header: UDP extraction subtracts the frame header and body together;
+VlessClient consumes its initial response header separately, and the servers
+remove accepted request metadata before body/output accounting. TrojanServer also
+records the current requested header extent before gathering. The helper never
+changes these counters or chooses the next field. VMess uses active budget
+reservations and cannot use this unbound-queue API.
+
+`bufferRangeRestoreHead(&active_head, &tail)` transfers the unread head to the
+front of the unbound tail and clears the active pointer; a null head is a no-op.
+It does not restore bytes already consumed into metadata. Complete fallback replay
+still prepends the node's cached header before this unread suffix. The caller must
+prove that queue byte totals, allocation charge and entry storage admit restoration.
+The server parsers establish this by restoring a previously admitted head after
+only consuming it, without intervening admission or callbacks. Restoration uses
+the queue's fatal push wrapper under that precondition; queue storage growth and
+ordinary Debug allocation replacement remain possible. Retain no alias to the
+transferred head.
+
 ## Prepending a Header: `sbufShiftLeft`
 
 The whole reason `l_pad` exists is so a tunnel can prepend a protocol header
