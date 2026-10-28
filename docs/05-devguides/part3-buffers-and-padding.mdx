@@ -698,6 +698,42 @@ budget empty and clearing its owner. Recreated queues must attach explicitly aga
 BufferStream accepts ordinary entries only. The fixed-header splice stream owns
 mixed representations for Mux; NIO's internal WIO FIFO stores owned wrappers directly.
 
+#### TCP adapter write accounting
+
+`TcpAdapterCommon/adapter_write_queue.h` in `tunnels/Internals/TcpAdapterCommon/`
+owns the TCP adapters' FIFO, shared budget, active reservation and
+pressure-notification latches.
+Initialize `adapter_write_queue_t` at its final stable address on the owning
+event worker; never copy it while the FIFO or reservation borrows its budget.
+The helper has no socket I/O, line access or callbacks. Buffer recycling can
+still discard private splice bodies. Callers supply the owning worker's pool.
+
+The combined FIFO and active reservation enforce `kAwqMaxRetained` independently
+for logical bytes and canonical queue-capacity charge, with unrestricted entries.
+`awqAdmit()` consumes and clears its buffer argument except for `kAwqWriteNow`,
+which leaves the exact buffer caller-owned with its cost reserved for WIO.
+Refusal recycles the input once. Direct empty input undergoes admission before
+release and recycling without a socket write; blocked empty input stays queued
+and charged. Neither path treats emptiness as permission to bypass admission.
+
+After transfer, WIO owns the buffer independently. `awqRefreshPending()` reduces
+logical bytes using WIO's pending-byte count, never by reading the transferred
+buffer. The original capacity charge and entry remain until a completed write
+or terminal cleanup. `awqNextToWrite()` transfers FIFO accounting into that active
+reservation without admitting or charging it again; empty entries are recycled.
+Socket-write failure remains distinct from successful drain, including when WIO
+defers its close callback. It blocks direct admission so further input joins the
+bounded FIFO until terminal cleanup instead of replacing the active reservation.
+Pressure ordering belongs to the
+[adapter flow contract](./part2-lines-and-callbacks.mdx#flow-control-roles-and-admission).
+
+Terminal flushing uses `awqPopForFinish()` only after node-side callback
+detachment. Each popped entry releases its FIFO cost before transfer to WIO;
+this path creates no active reservation and never requests Resume. `awqDestroy()`
+recycles remaining FIFO ownership and settles active accounting, without touching
+the active buffer. WIO may finish flushing after line-state destruction and
+retains no pointer to the component or its budget.
+
 #### Exact extraction from an active head and queue
 
 `bufferRangeTakeExact(pool, &active_head, &tail, bytes)` in
