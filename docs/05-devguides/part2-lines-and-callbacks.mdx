@@ -1335,8 +1335,8 @@ identical:
 
 | Tunnel | Directional-close state | Why it needs it |
 | --- | --- | --- |
-| `TlsServer` | `upstream_finished`, `downstream_finishing`, `fallback_close_draining` | Sends TLS alert / close and settles delayed fallback before closing |
-| `TrojanServer`, `VlessServer` | `fallback_close_draining` | Settles a delayed fallback batch without reflecting toward the finished previous side |
+| `TlsServer` | `upstream_finished`, `downstream_finishing`, `fallback_close_draining` and shared replay close-drain state | Sends TLS alert / close and settles delayed fallback before closing |
+| `TrojanServer`, `VlessServer`, `VmessServer` | Closing phase and shared replay close-drain state | Settles a delayed fallback batch without reflecting toward the finished previous side |
 | `TcpOverUdpClient` | `can_downstream` | Must finish its reliable-stream teardown before closing |
 | `TcpOverUdpServer` | `can_upstream` | The same, in the opposite direction |
 | `HttpClient`, `HttpServer`, `HttpProxyClient`, `Socks5Server` | `prev_finished`, `next_finished` | Send final protocol bytes before transport close |
@@ -1410,9 +1410,11 @@ deadline before branch Init. Queue the entire initial input before invoking Init
 including the triggering plaintext buffer when applicable. While Init is on the
 stack, later re-entrant input may enqueue behind it, but neither inline payload
 nor scheduled drains may run, including through Resume. After Init survives,
-release this admission barrier and drain ready input in FIFO order, including
-during advisory Pause. A close during Init discards queued input instead of sending payload into an
-unfinished Init callback. Preserve the borrowed line's reference/owner rules.
+clear its initialization barrier before replaying pending Pause, retaining the
+startup FIFO barrier until that notification returns. A close during Init discards
+queued input; a close during the later Pause callback may deliver the initialized
+branch's final batch. Then release startup admission and drain ready input in FIFO
+order, including during advisory Pause. Preserve the borrowed line's reference/owner rules.
 
 Before branch selection, retain only a pending client-side Pause for the branch
 that has not received Init. Resume cancels that pending notification. Once the
@@ -1435,15 +1437,16 @@ For an initialized fallback branch, use this close order:
 1. Mark the previous side finished and publish a fallback-drain gate before any
    final branch `Payload` callback. An empty queue can destroy local state and
    synchronously finish the initialized branch immediately.
-2. For a non-empty bounded FIFO, capture the branch and line pool, detach the
-   queue from line state, and establish that its total fits the destination
-   buffer before coalescing it in FIFO order. An admission limit that already
+2. For a non-empty bounded FIFO, capture the branch and line pool, and establish
+   that its total fits the destination buffer before coalescing it in FIFO order.
+   Detach every entry into the local batch before the neighboring callback;
+   an emptied embedded queue may remain bound to its budget. An admission limit that already
    proves this bound needs only an assertion at the drain, provided no path can
    bypass the limit. One callback bounds the final handoff and its reentrant
    teardown window.
-3. Never flush while branch Init is unfinished. TrojanServer, VlessServer and
-   TlsServer may deliver this final batch through advisory Pause; receiver limits
-   still apply. Recycle any batch disallowed by the node's close gate before
+3. Never flush while branch Init is unfinished. TrojanServer, VlessServer,
+   VmessServer and TlsServer may deliver this final batch through advisory Pause;
+   receiver limits still apply. Recycle any batch disallowed by the node's close gate before
    finishing the branch.
 4. While the final callback runs, absorb supported `Init`, `Est`, `Pause`, and
    `Resume` callbacks, and recycle any returned `Payload`. A callback explicitly
@@ -1464,9 +1467,43 @@ timer state, and branch resources without any `line_t` or line-state reference.
 That is a different design, not an excuse to keep a borrowed line alive.
 
 With delay zero, the safe referenced inline path requires completed branch Init
-and no older FIFO batch or scheduled drain. TrojanServer, VlessServer and TlsServer
-do not gate it on Pause. Retained bytes keep their ordered drain path, so later
+and no older FIFO batch or scheduled drain. TrojanServer, VlessServer, VmessServer
+and TlsServer do not gate it on Pause. Retained bytes keep their ordered drain path, so later
 payload cannot overtake them.
+
+### Shared fallback replay
+
+TrojanServer, VlessServer, VmessServer and TlsServer use
+`Internals/FallbackReplay` for retained replay, batch assembly and delayed delivery
+on their borrowed normal client line. The node still selects the branch,
+reconstructs the exact transcript, sends Init and pending receiver Pause, and owns
+its close policy and line-state destruction. The component does not create or
+destroy a line or introduce a configurable node.
+
+Keep branch initialization separate from a wider input-dispatch barrier. Clear
+the component's Init barrier immediately after branch Init survives, before
+replaying pending Pause. Source Finish during Init discards retained input;
+source Finish during the later Pause callback can deliver the initialized branch's
+final batch. The initial zero-delay transcript is one inline batch. Each node
+selects its subsequent zero-delay dispatch policy explicitly:
+
+| Consumer | Zero-delay input during a replay callback |
+| --- | --- |
+| VlessServer, VmessServer | Retain input for one asynchronous drain on a later loop iteration. |
+| TrojanServer | Retain input for its existing synchronous pump, which sends each queued entry in FIFO order after the active callback returns. |
+| TlsServer | Deliver nested input inline when no older FIFO entry or scheduled drain exists. |
+
+Later input cannot overtake retained bytes. A positive configured delay uses one
+scheduled FIFO drain in every mode, including when jitter chooses zero milliseconds.
+Advisory Pause does not delay due or final batches.
+
+Before closing replay from the previous side, the node must publish its existing
+Closing phase or finished-side guard so downstream Payload, Est, Pause and Resume
+cannot reach the finished source. The component absorbs a branch Finish only during its final
+drain. Destroy node state before sending the remaining branch Finish, and stop
+accessing line/state when replay reports callback-driven retirement. Scheduled
+work retains allocation only; owner cleanup settles retained bytes before pools
+or tunnels are reclaimed, including when accepted work is later canceled.
 
 ### Adapters Flush On Their Own
 
