@@ -363,7 +363,7 @@ checksum/GSO framing, and startup logs both choices. With `multi-queue: false`,
 Linux skips `IFF_MULTI_QUEUE`, eBPF steering and extra queue attachment, and uses
 one queue owned by worker 0. The configured processing worker count remains
 unchanged; complete native TCP/UDP flows retain per-flow receive locality across
-those workers, while opaque records rotate. Consumers still establish any
+those workers, while opaque IPv4 follows the resolved `opaque-flow-mode`. Consumers still establish any
 required ownership at their own processing boundary. Native writes use the same resulting
 queue set. Invalid types, including `null`, are rejected at node construction.
 Other platforms accept the boolean and retain their existing receive arrangement.
@@ -376,25 +376,118 @@ preserves locality; it is not a consumer's proof of ownership after tuple change
 IPv4 header and declared-length bounds
 are checked before reading ports, including when IP options are present.
 
-Complete, structurally valid IPv4 packets other than TCP/UDP use approximate
-round-robin receive queues. Each interface owns a `BPF_MAP_TYPE_PERCPU_ARRAY` with
-one bounded 32-bit cursor per kernel CPU. Ordinary loads, increments and stores
-advance that CPU's cursor modulo the queue count; no `BPF_ATOMIC` instruction is
-needed. Selection adds the CPU ID before reducing modulo the queue count, so CPUs
-need not all begin at queue zero. Overlapping updates can lose a cursor step:
-there is no exact global round-robin sequence or equal-count guarantee.
-All complete packets continue processing on their receiving worker when multiple
-receive queues are active. With one receive queue, complete native TCP/UDP
-records with visible ports use the symmetric flow hash before entering a worker
-FIFO. The same flow stays in one FIFO even when other workers are delayed.
-Opaque or unclassifiable records rotate across workers using the session-local
-cursor. External-reader backends use the same policy. Single-reader classification
-recognizes unfragmented IPv4 and plain IPv6 TCP/UDP with both ports inside the
-declared packet length; it does not walk IPv6 extension headers or guess opaque
-transport fields. Unsupported per-CPU map or steering setup uses the existing
-one-reader fallback. Device readers do not inspect their chain or assign
-transport-state ownership. Consumers that need it select a worker from the tuple
-visible at their processing boundary, including after an earlier decoder.
+Device receive selection uses the shared pure 32-bit worker hash, reduced with
+`hash32 % worker_count`. The full64 flow hash remains separate for carrier
+selection and fragment consistency; it is not truncated or reduced for workers.
+C software, Linux TUN eBPF and Linux capture cBPF use the same endpoint encoding
+and calculation for their shared supported IPv4 domain. Plain IPv6 TCP/UDP
+software selection retains its existing address folding and parsing bounds while
+using the common32 calculation. IPv6 kernel steering, extension-header walking
+and IPv6 opaque-prefix classification are not added.
+
+The worker calculation decodes each IPv4 address as a big-endian 32-bit word
+and each port/prefix as a big-endian 16-bit word, zero-extended to 32 bits.
+All following arithmetic wraps at 32 bits, and shifts are logical:
+
+```text
+E(address, word) = address XOR (word * 0x9E3779B1)
+M(x):
+    x = x XOR (x >> 16)
+    x = x * 0x85EBCA6B
+    return x XOR (x >> 13)
+
+h = (M(E(src_address, src_word)) + M(E(dst_address, dst_word)))
+    XOR protocol XOR fragment_key
+h = h * 0x9E3779B1
+H32 = h XOR (h >> 16)
+worker = H32 % worker_count
+```
+
+Swapping both addresses and their corresponding words leaves the sum unchanged.
+Each mixing step is invertible over 32-bit values: the multipliers are odd,
+and XOR with a logical right shift is reversible. With either encoded endpoint,
+protocol and fragment key fixed, adding that endpoint's mixed value and applying
+the final mix cannot erase changes in the other encoded endpoint. This does not
+make the flow key unique: different address/word pairs can have the same encoding,
+different endpoint pairs can have the same sum, and worker-count reduction also
+allows collisions.
+
+Address/protocol fallback sets both endpoint words and `fragment_key` to zero.
+Device receive selection never includes fragment IDs; the generic software
+worker helper retains its existing fragment classification with
+`fragment_key = 0x10000 | IPv4_ID`. Preserved-fragment association instead uses
+fragment zero's existing whole-packet fields for its stored worker destination,
+separately from the full64 fingerprint.
+
+Fixed H32 examples (`fragment_key = 0`) are:
+
+| Source | Destination | Protocol | H32 |
+| --- | --- | --- | --- |
+| `10.0.0.1:40000` | `10.0.0.2:443` | 6 | `0xC4D8D18A` |
+| `10.0.1.1:40000` | `10.0.1.2:443` | 6 | `0x2DD3FCF0` |
+| `10.0.0.1:10000` | `10.0.0.2:46539` | 6 | `0x79464F88` |
+| `10.0.0.1:42768` | `10.0.0.2:46539` | 6 | `0xAD16E4D0` |
+| `192.0.2.1:0` | `198.51.100.2:0` | 50 | `0x2D2BAE6D` |
+
+The mode-specific capture flow predicates use 61 instructions for prefix and
+64 for peer/spread, within the 64-instruction inline xt_bpf limit. The full64
+calculation and its golden carrier/fingerprint results remain unchanged.
+
+TunDevice and RawSocket share strict `opaque-flow-mode` parsing:
+
+| Requested value | Effective behavior for ordinary opaque IPv4 |
+| --- | --- |
+| Omitted or `prefix` | Hash addresses, protocol and the first four IP-payload bytes as source/destination 16-bit big-endian endpoint fields. |
+| `peer` | Hash only addresses and protocol; ignore payload. |
+| `spread` | Retain the backend's per-packet spreading mechanism. |
+| `auto` | Resolve once before native construction/admission to `peer` at an immediate Ping decoder, otherwise `prefix`. |
+
+Only exact string values are accepted; empty/unknown strings, `null` and all
+other types fail construction on every platform and on write-only RawSocket.
+Embedded NUL bytes in a matching setting name or string value also fail
+construction, including a malformed duplicate after a valid setting.
+Omission remains `prefix` beside a decoder. Requested and effective values are
+kept separately. Explicit values are unchanged. Auto checks only the device's
+physical publication neighbour after topology and packet binding are finalized:
+upstream toward `next` requires exact type `PingServer`; downstream toward `prev`
+requires exact type `PingClient`. Instance names, indirect Ping, wrappers,
+encoding directions and opposite RawSocket endpoints do not qualify. Auto never
+selects `spread`. Thus `TunDevice -> PingClient -> RawSocket` resolves to
+`prefix`/`peer`, and `RawSocket -> PingServer -> TunDevice` to `peer`/`prefix`.
+
+Resolve before TUN construction (which installs kernel steering), or before
+capture BringUp. Backends and reader sessions receive only effective
+`prefix`/`peer`/`spread`, fixed for the active generation and retained through
+single-queue fallback and restart. Queue count, GSO and fragment policy do not
+change mode resolution. Startup logs requested/effective modes, selection reason
+and effective queue count. No reader reevaluates topology or learns traffic keys.
+
+Opaque means Protocol other than TCP 6 and UDP 17. After validating the actual
+IPv4 header length and declared total length, prefix uses exactly the first four
+payload bytes, including when IP options are present. An opaque payload of zero
+through three bytes uses the common address/protocol fallback in prefix and peer
+modes; spread still distributes those short opaque packets. Native TCP/UDP always
+uses ports when at least four transport bytes exist, and the fallback otherwise,
+independent of opaque mode. Do not validate TCP flags, UDP length or transport
+checksums merely to select a worker, or read trailing buffer bytes as a prefix.
+
+A stable prefix keeps a visible flow together; fixed XOR may preserve stability,
+while changing masks and arbitrary encryption need not. Peer groups all opaque
+traffic sharing addresses and protocol, concentrating hidden flows on one worker.
+Ping can pass unrelated traffic through, so automatic peer also groups unrelated
+opaque traffic; mixed traffic may need an explicit setting. These receive keys
+are locality choices; a stateful consumer still selects its owner after decoding
+or tuple rewriting.
+
+Only spread creates TUN's per-interface `BPF_MAP_TYPE_PERCPU_ARRAY` cursor. Each
+CPU advances a bounded 32-bit cursor using ordinary loads/stores, with a CPU-ID
+offset before queue reduction. Overlapping updates can lose a step: exact global
+order and equal queue counts are not guaranteed. Unsupported cursor/steering
+setup uses the existing one-reader fallback. All complete packets continue on
+their receiving worker with multiple queues. A single reader applies the same
+effective policy before worker FIFO admission; spread uses the session cursor.
+External-reader backends use this policy too. Same-key native and deterministic
+opaque packets stay in one destination FIFO even when other workers are delayed.
 
 All IPv4 fragments, including fragment zero, use the symmetric address-pair and
 protocol fallback, excluding ports and fragment IDs. TCP/UDP packets too short
@@ -403,8 +496,8 @@ one datagram therefore has one receive producer. Ordinary packets and fragmented
 datagrams of the same transport flow can have different readers and can reorder
 across those readers. The shared fragment table preserves assembly and processing
 affinity for preserved fragments; completed packets follow the ordinary reader
-placement policy after reassembly. Opaque round robin also
-permits reordering across readers. Kernel write-learned
+placement policy after reassembly. Spread also permits reordering across readers.
+Kernel write-learned
 queue migration remains bypassed. Malformed headers and unsupported IP versions
 select queue zero and retain the existing downstream validation policy.
 
@@ -457,43 +550,37 @@ have been removed and residual packets settled. Incomplete cleanup fails startup
 worker count remains unchanged in either mode. Windows accepts the setting and
 retains its existing capture reader.
 
-Unfragmented IPv4 TCP/UDP records with four transport bytes use a symmetric
-address/port/protocol receive hash. Distinct port pairs between the same two IPs
-can therefore select different readers. All fragments, including fragment zero,
-and short TCP/UDP records retain the address/protocol fallback. Structurally valid
-unfragmented packets of every other protocol use random NFQUEUE selection:
-disjoint classic BPF predicates feed cascading iptables `statistic --mode random`
-rules. For N queues, conditional probabilities are `1/N`, `1/(N-1)` and so on,
-with an unconditional final queue. Each queue has approximately the same share,
-without exact global counts or round-robin order. There is no shared nth-selection
-counter; kernel RNG implementations may still use local locking. This is the
-default and needs no protocol mapping or chain inspection.
-IPv4 length and IHL bounds are checked before ports are read. Steering does not
-validate opaque TCP/UDP contents or checksums. Invalid IPv4 shapes select queue
-zero for ordinary capture validation.
+Unfragmented IPv4 TCP/UDP records with four transport bytes use the common32
+symmetric endpoint hash, matching TUN and consumer affinity for an unchanged
+tuple. All fragments, including fragment zero, and short TCP/UDP records use the
+common address/protocol fallback. Ordinary opaque IPv4 uses the effective mode
+specified above. Prefix and peer are deterministic and install only flow rules.
+Only spread adds disjoint opaque cBPF predicates feeding cascading iptables
+`statistic --mode random` rules. For N queues, conditional probabilities are
+`1/N`, `1/(N-1)` and so on, with an unconditional final queue. Queues have
+approximately the same share, without exact counts or order; there is no shared
+nth-selection counter. Each complete inline cBPF predicate must fit the
+64-instruction xt_bpf limit, including bounds, fragment handling and lane reduction.
 
-The capture hash is a compact 32-bit classic BPF predicate, distinct from TUN's
-64-bit eBPF and WaterWall's consumer affinity. With multiple receive queues,
-complete packets of every protocol begin processing on their reader worker.
-A single receive queue assigns complete visible TCP/UDP flows to their symmetric
-hash worker before dispatch. Opaque or unclassifiable records still round-robin
-across configured workers using a session-local cursor. Preserved fragments retain the existing
-shared fragment association; reassembled packets use the ordinary reader
-placement policy. A consumer establishes required transport ownership using the
-tuple visible at its own boundary, after any protocol or address restoration.
-A stateless `RawSocket -> IpOverrider -> RawSocket` relay therefore preserves
-parallel processing even for one opaque protocol-50 peer pair.
+IPv4 header and declared-length bounds are checked before reading ports/prefix.
+Steering does not validate transport contents or checksums. Invalid IPv4 shapes
+retain queue zero for downstream admission checks. With multiple queues, complete
+packets continue on their reader worker. One receive queue applies the effective
+software policy to complete packets before dispatch. Preserved fragments retain
+the shared fragment association and reassembled packets keep the ordinary reader
+placement policy. Native or decoded transport ownership remains the consumer's
+responsibility. A stateless opaque relay that wants packet-level parallelism
+must explicitly select spread.
 
-Each multiqueue source range has one flow rule and one opaque rule per receive
-queue. Opaque rules use independent owned identities and rollback records; only
-one NOTRACK rule is installed per range. Protocol exclusions apply equally to
-both receive families and NOTRACK. Queue identities stay fixed through a run.
-Preserve fixed kernel TCP/UDP receive steering rather than replacing it with
-CPU fanout. This receive-locality rule does not require software flow ownership
-at the reader. Opaque distribution can reorder packets before they reach a
-consumer's affinity boundary; affinity cannot reconstruct that earlier order.
-Visible single-reader TCP/UDP keeps its per-flow FIFO to avoid creating such gaps
-in ordered input, including segmented ClientHello capture.
+Each multiqueue source range has one flow rule per receive queue; spread adds
+one opaque rule per queue. Opaque rules have independent owned identities and
+rollback records. Only one NOTRACK rule is installed per range. Protocol exclusions
+apply equally to every receive family and NOTRACK. Fixed queue identities,
+source matching, partial rollback, cleanup retry and cleanup-before-single-queue
+fallback remain unchanged; incomplete cleanup fails startup. Deterministic
+eligible packets cannot fall through into a random rule family. Spread can
+reorder packets before consumer admission, and consumer affinity cannot restore
+that earlier order. Stable-key single-reader input retains its per-worker FIFO.
 
 Each worker performs a bounded native drain (256 receive/verdict steps or
 256 KiB) and yields. Receive, verdict sends, dispatch admission and retry paths
@@ -784,14 +871,21 @@ IPv4 identification reuse still has the protocol's inherent delayed-fragment
 ambiguity.
 
 Completed packets retain onward padding and use ordinary reader placement:
-the receiving worker with multiple queues, or visible native TCP/UDP flow hashing
-and opaque session-local rotation with a single reader. Queued session messages
+the receiving worker with multiple queues, or the effective complete-packet
+classification (including opaque mode) with a single reader. Queued session messages
 still reject stale generations.
 Once delivered, complete packets follow ordinary buffer ownership, including
 delays, duplication and drops; there is no late device-generation receipt. Raw
 mode preserves fragment bytes and boundaries and stages tails until fragment
-zero supplies port-based worker affinity, but makes no downstream residue or
-post-publication generation guarantee.
+zero supplies the existing field-classification key, including SCTP support.
+The destination uses the common32 worker hash separately from the unchanged
+full64 consistency fingerprint. TCP, UDP and SCTP fragments use the leading
+fragment's port fields under the existing generic parser. SCTP (protocol 132)
+therefore retains port-based fragment association even though device receive
+classification treats its complete packets as opaque. Other protocols retain
+address/protocol fragment association in every mode, including spread; no
+mode-dependent opaque-prefix fragment association is added. This placement makes
+no downstream residue or post-publication generation guarantee.
 
 Assembly may produce complete datagrams up to 65,535 bytes. Global packet/stream
 and raw-egress limits and device-MTU checks remain; an oversized packet may be
@@ -1087,7 +1181,7 @@ retain the device's existing transient, packet-local and fatal handling.
 
 `packet_affinity.h` provides a fixed consumer continuation, bounded shared
 fragment storage and one FIFO per destination worker. Complete IPv4 TCP/UDP
-packet-line input selects the existing symmetric flow hash. The consumer decides
+packet-line input selects the shared symmetric 32-bit worker hash. The consumer decides
 where that requirement begins: device receive steering is a locality choice,
 not a substitute for ownership at a later transformed tuple.
 
@@ -1098,7 +1192,8 @@ recover the earlier receive order because segment 2 has not reached it yet.
 ECH-SNI then treats the sequence gap as a capture failure and marks the current
 flow generation passthrough. Keeping each visible flow in one receive FIFO
 prevents this artificial gap; it does not repair network reordering. Opaque
-protocols such as 50 retain parallel distribution. The
+receive placement follows the effective device mode; spread retains parallel
+distribution and its possible earlier reordering. The
 `testReaderSkewPreservesClientHello` ECH regression exercises this requirement
 through the real reader, consumer dispatcher and capture paths.
 
