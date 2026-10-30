@@ -979,6 +979,42 @@ deletion against `raw OUTPUT`. Retain pending cleanup for retry during teardown
 and report the mark/comment when it remains unresolved. Abrupt process death
 can leave a rule that an administrator must remove; never flush foreign rules.
 
+## Linux capture receive batching
+
+Each worker-owned NFQUEUE socket uses nonblocking `recvmmsg()` with up to 256
+separate packet buffers. It collects only available datagrams and never waits
+for a batch to fill. Queue-local descriptor arrays and unused buffers are reused.
+The per-queue capacity is the smaller of 256 and its share of an 8 MiB prepared
+buffer allowance, using the pool's queried allocation charge. At least one buffer
+per queue remains available even when that existing baseline exceeds the share.
+This allowance excludes descriptor metadata, pool caches, session FIFO storage
+and the fragment table, which retain their separate bounds.
+
+A newly bound empty queue receives an acknowledged cumulative-verdict capability
+probe before capture rules are installed. A supported queue can settle a received
+FIFO prefix with `NFQNL_MSG_VERDICT_BATCH`, using its last wire packet ID, including
+across ID wraparound. This path requires consecutive IDs modulo 32 bits; gaps use
+explicit verdicts to avoid ambiguous signed sequence comparisons after lost
+notifications. Unsupported queues use nonblocking `sendmmsg()` with explicit
+per-packet verdicts. A batch containing an unrecoverable envelope error uses
+explicit IDs for its remaining known verdict obligations before reporting failure.
+Never read a newer batch while any record in the current batch remains unsettled.
+
+Only a successfully sent DROP permits publication of that packet's buffer.
+Partial verdict sends retain their unsent suffix in order. FIFO capacity refusal
+suspends new native reads and retains bounded batch state until capacity returns.
+Pending verdicts must progress before FIFO admission, independently of delivery
+credits. Native `EAGAIN` may defer their suffix while the committed prefix publishes;
+writable readiness and the absolute verdict deadline remain active even when the
+FIFO is full. Settled or failed verdict I/O cancels its timer rather than repeatedly
+rearming an expired deadline during a delivery stall.
+Each receive callback prepares at most 256 received records or 256 KiB of captured
+input, allowing the final record to cross the byte boundary; it also bounds
+native-call attempts separately.
+A prefetched suffix continues through a worker message without requiring a new
+socket-readiness event. Fragment classification and publication preserve receive
+order. Each packet still follows ordinary packet-line buffer ownership.
+
 ## Linux capture packet validation
 
 Linux NFQUEUE capture must preserve deliberately invalid IPv4/TCP/UDP checksums
