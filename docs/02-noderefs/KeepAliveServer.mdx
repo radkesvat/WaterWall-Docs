@@ -45,7 +45,7 @@ bytes exactly.
 ## What It Does
 
 - Initializes local line state on upstream `Init`.
-- Buffers upstream framed bytes until complete frames are available.
+- Validates upstream frame headers and forwards available normal payload bytes incrementally.
 - Decodes upstream normal frames and forwards their payload to `next`.
 - Answers upstream ping frames by sending downstream pong frames.
 - Ignores upstream pong frames.
@@ -143,13 +143,13 @@ Upstream bytes are accumulated in a `splice_stream_t`. This means a frame can
 arrive split across multiple payload callbacks, or multiple frames can arrive in
 one callback.
 
-The decoder behavior is conservative:
+The decoder:
 
-- waits for more bytes when the prefix or full body has not arrived yet
+- waits only for an incomplete prefix or unavailable body suffix, returning control to the worker
 - closes the borrowed line through its owner when a frame body length outside `1..1,048,577` is seen
 - drops empty normal frames
 - drops unknown frame kinds
-- drains complete frames first, then closes if retained allocation charge still exceeds its limit after compaction
+- drains available body bytes first, then closes if retained allocation charge still exceeds its limit after compaction
 
 ## Buffer And Padding Notes
 
@@ -201,11 +201,17 @@ larger than 1 MiB are split with representation-aware range operations.
 Pipe allocation or capacity pressure may select complete ordinary fallback.
 Pong control frames use ordinary buffers.
 
+Normal application bytes are forwarded as they arrive after the header is
+validated; the decoder does not wait for the complete normal body. A frame can
+produce several Payload callbacks. If the connection ends midway through it,
+its already delivered prefix stays delivered. Control bodies are discarded as
+they arrive, but Ping/Pong actions occur only when the declared body ends.
+
 Nested encoder input stays behind the active payload under shared 8 MiB
 logical-byte and 16 MiB queue-charge reentry bounds, counting the active suffix. The decoder serializes nested input,
 limits nested retained bytes to 8 MiB, and limits retained allocation charge to
 16 MiB, attempting beneficial ordinary compaction before refusing excess charge.
-Complete frames drain before the retained-charge check. Validated frame lengths
+Available body bytes drain before the retained-charge check. Validated frame lengths
 guarantee an incomplete remainder smaller than 1 MiB + 5 bytes, including the header.
 Pause is forwarded promptly and does not interrupt
 that synchronous batch. Pause and Resume relay transparently, including repeats;

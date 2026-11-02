@@ -155,18 +155,18 @@ the first OPEN frame must carry payload bytes after the synthetic OPEN body.
 Downstream bytes are accumulated by the shared `splice_frame_reader_t` over a
 `splice_stream_t`.
 
-For each complete downstream frame, `Bgp4Client`:
+For each downstream frame, `Bgp4Client`:
 
-1. Verifies that the first 16 bytes are all `0xff`.
-2. Reads the 2-byte body length.
-3. Rejects frames whose body length is not larger than the 1-byte type field.
-4. Waits until the full frame is buffered.
-5. Strips marker, length, and type.
-6. Rejects frames with no remaining payload.
-7. Sends the recovered payload downstream to the previous tunnel.
+1. Gathers the 19-byte header and checks the marker, length and non-OPEN type.
+2. Rejects a declared body length that leaves no application payload.
+3. Strips the framing metadata and forwards available payload bytes in order,
+   without waiting for the rest of the frame.
+4. Keeps the current frame's remaining length until its last byte is consumed,
+   then starts reading the next header.
 
-If the frame is incomplete, parsing waits for more bytes. Nested-byte or
-retained-charge refusal closes the line under the limits below.
+An incomplete header or unavailable body suffix returns control to the worker
+until more input arrives. Nested-byte or retained-charge refusal closes the line
+under the limits below.
 
 ## Limits
 
@@ -175,7 +175,7 @@ retained-charge refusal closes the line under the limits below.
 | Maximum body length | `65535` bytes | Includes the 1-byte type. |
 | Maximum ordinary payload body | `65534` bytes | Payload plus type must fit in `65535`. |
 | Nested receive logical bytes | `2162705` | Older retained wire bytes plus nested input, including the cached header. |
-| Retained receive buffer charge | `4325410` | Settled after nested admission and after complete frames drain; beneficial compaction precedes refusal. |
+| Retained receive buffer charge | `4325410` | Settled after nested admission and after available body bytes drain; beneficial compaction precedes refusal. |
 | Queued encoded bytes | `2162705` | Includes generated headers; checked before callbacks. |
 | Queued encoded charge | `8 MiB` | Counts queued encoded buffers before handoff. |
 | Maximum complete wire frame | `65553` bytes | Marker, length, type and body. |
@@ -189,14 +189,15 @@ frame buffers before any callback; pipe creation or transfer pressure selects co
 ordinary best-fit fallback for the affected frame. There is no whole-delivery
 ordinary aggregate.
 
-The decoder caches the 19-byte marker/length/type header and extracts one exact
-body at a time. The server inspects only the ten fixed OPEN bytes and at most
-255 optional bytes, preserving the remaining application's representation. The
+The decoder caches the 19-byte marker/length/type header and forwards available
+application body bytes incrementally. The server first gathers and validates the
+ten fixed OPEN bytes, then consumes at most 255 optional bytes before releasing
+application bytes. The remaining application's representation is preserved. The
 client generates 3–10 optional bytes and subtracts the actual OPEN overhead from
 its first frame's payload room. Empty deliveries emit nothing and do not consume
 OPEN state. Exactly one OPEN is admitted per client line.
 
-The shared fixed-header frame reader drains complete frames from a top-level
+The shared fixed-header frame reader drains available body bytes from a top-level
 receive batch before checking the incomplete remainder. That batch can exceed
 **2,162,705 bytes** (`2 MiB + 65,553`). During a delivery callback, nested input
 must fit that logical-byte limit together with older retained wire bytes,
@@ -206,7 +207,7 @@ limit applies to the incomplete remainder when the outer drain ends. Coalescing
 or one beneficial compaction may release oversized backing storage before
 refusal. Compaction may copy pipe-backed bytes into ordinary memory; the charge
 limit bounds retained storage accounting, not process memory or transient peaks.
-Incoming fragments have no entry-count cap. After complete frames drain, the
+Incoming fragments have no entry-count cap. After available body bytes drain, the
 incomplete remainder is smaller than 65,553 logical bytes.
 
 Encoded output keeps its independent **2,162,705-byte limit**, including generated
@@ -214,16 +215,18 @@ headers, and **8 MiB retained-buffer charge limit**. These limits are independen
 pools, pipe capacity, platform and `misc.splice`. The maximum complete wire frame
 is 65,553 bytes, and a non-OPEN frame carries at most 65,534 application bytes.
 
-Each decoded frame produces its own callback. Both nodes borrow the normal line
-and transform every payload, so neither can permanently bypass itself. Pause and
-Resume use transparent default forwarding in both directions, including repeated
-notifications. Complete admitted frames drain immediately without waiting for
+A decoded frame can produce several Payload callbacks; frame boundaries are not
+application callback boundaries. If the connection ends during a frame, its
+already delivered application prefix stays delivered. Both nodes borrow the
+normal line and transform every payload, so neither can permanently bypass itself.
+Pause and Resume use transparent default forwarding in both directions, including repeated
+notifications. Available admitted bytes drain immediately without waiting for
 Resume. A pump guard per direction preserves FIFO during reentrant callbacks;
 the frame reader retains incomplete input, and the bounded output FIFO keeps
 complete encoded batches ahead of reentrant input. The decoder validates any
 complete FIFO-head header immediately after admission, including nested input;
-only the outer drain delivers frames. Encoded batches pass their byte and frame
-checks before their first callback.
+only the outer drain delivers application bytes. Encoded batches pass their byte
+and charge checks before their first callback.
 Malformed data, retention-limit overflow or queue-capacity refusal closes only
 the borrowed connection through its owner. Finish releases queued buffers and
 pipes before forwarding away from the sender. These behaviors do not guarantee
