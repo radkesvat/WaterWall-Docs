@@ -5,7 +5,7 @@ sidebar_label: "Part 3: Buffers & Padding"
 description: "The sbuf_t buffer model, worker buffer pools, left-padding budgets, and how to prepend protocol headers without breaking chain composition."
 ---
 <!--
-Documentation version: 188
+Documentation version: 189
 -->
 
 # Part 3: Buffers, Padding & Shift Buffers
@@ -1428,6 +1428,26 @@ valid; it settles charge and clears the guard on success. Never resume draining
 after Finish destroyed the reader.
 Reader destruction releases retained input and clears its attached-state marker.
 
+### Deferred next-Init input
+
+`Internals/NextInitGate` preserves ordinary and splice buffers in the startup
+FIFO used by HeaderServer and SoftIpLimiter. Both nodes permit at most 2 MiB of
+queued logical bytes and 8 MiB of queue-capacity charge. These limits cover only
+nested input still in that FIFO; the original already-accepted input passed to
+the opening call is separate working storage. Popping an entry releases its
+queued cost before dispatch. Empty entries consume charge, and there is no
+separate buffer-count limit.
+
+Submission while starting either transfers the buffer into the FIFO and clears
+the caller's pointer, or rejects without changing ownership or queue totals.
+Open-state submission leaves ownership with the caller for direct forwarding.
+Pre-start parsing remains with the node. On rejection the node recycles the
+refused buffer and uses its existing close path. Teardown drains queued buffers through
+the exact line's pool before zeroing the gate; it does not materialize private
+pipe bodies. The gate serializes startup only and retains no payload after
+successful replay. Its [callback and lifetime contract](./part2-lines-and-callbacks.mdx#shared-deferred-next-init-gate)
+applies through Init, pending Pause and every Payload callback.
+
 ### SoftIpLimiter identity and SpeedLimit shaping
 
 SoftIpLimiter materializes each complete delivery through `sbufEnsureOrdinary()`
@@ -1435,8 +1455,8 @@ only while identity admission is undecided. Empty deliveries contribute no ident
 bytes and are recycled before buffering. Its BufferStream stays ordinary and
 replays the original identity bytes and coalesced tail intact. The committed phase
 is published before next Init; nested input retains its private pipe in the
-existing bounded FIFO behind initial replay. Established and passthrough payloads
-in both directions are opaque. Temporary inspection never sets permanent
+shared next-Init gate's bounded FIFO behind initial replay. Established and
+passthrough payloads in both directions are opaque. Temporary inspection never sets permanent
 ordinary-read preferences.
 Both admitted and passthrough startup replay an outstanding early upstream Pause
 after next Init and before the initial bytes. Resume or a newer notification
@@ -1493,8 +1513,8 @@ and the owner releases it once. See Part 7 for cancellation and shutdown orderin
 HeaderServer materializes each complete delivery with `sbufEnsureOrdinary()`
 only while waiting for its port, TCP/UDP protocol, or PROXY protocol header. BufferStream remains
 ordinary, including coalesced application tails. It publishes the established
-phase before next Init; nested input then enters the existing opaque FIFO behind
-the original tail. Constant-port mode and established payloads in both directions
+phase before next Init; nested input then enters the shared next-Init gate's
+opaque FIFO behind the original tail. Constant-port mode and established payloads in both directions
 preserve splice buffers. Temporary parsing does not set permanent ordinary-read
 preferences.
 

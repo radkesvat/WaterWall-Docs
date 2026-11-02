@@ -5,7 +5,7 @@ sidebar_label: "Part 2: Lines & Lifetime"
 description: "The connection lifecycle, re-entrancy hazards, line references, and the clean-finish patterns that keep WaterWall tunnels free of use-after-free bugs."
 ---
 <!--
-Documentation version: 196
+Documentation version: 197
 -->
 
 # Part 2: Lines, Callbacks & Lifetime Safety
@@ -224,6 +224,37 @@ payload or bypassing the node. Keep the startup FIFO guard and a line reference
 across replay, then recheck both logical life and local state: Finish can destroy
 borrowed state while the line remains alive. This pending notification does not
 grant a middle node permission to gate payload replay on Resume.
+
+### Shared deferred next-Init gate
+
+HeaderServer and SoftIpLimiter embed `Internals/NextInitGate` in their borrowed
+normal-line state. The component has no chain position or line ownership. Each
+node can be built independently with this internal dependency; neither depends
+on the other node. Parsing, context/admission decisions, close policy and final
+bypass remain with the node.
+
+The gate distinguishes **waiting**, **starting** and **open**. Waiting retains
+only the latest upstream Pause/Resume while the node prepares the destination
+side. Before opening, the node publishes its forwarding phase and records that
+next Init will be dispatched. The gate enters starting before calling next Init,
+then replays any still-current Pause, the original input and the nested FIFO in
+that order. Starting lasts through every replay callback; input arriving from
+Init, Pause or Payload reentry joins the FIFO behind older input. Open means the
+FIFO is empty and later payloads may forward directly. Pause/Resume during
+starting or open clear stale pending Pause and relay immediately, including
+repeats; they never make replay wait for Resume.
+
+The opening call owns the nullable original buffer and holds a line reference
+through the entire sequence. After every callback it checks logical line life,
+then the node's callback-free validity predicate, before accessing gate state.
+The predicate must also reject a destroyed borrowed state on a still-live line.
+On interruption the gate recycles any undelivered original buffer through the
+captured line pool; the node's destroy path releases queued input. A gone result
+forbids subsequent line/state access. A ready result leaves open state and an
+empty FIFO, with no further callbacks inside the helper. HeaderServer then
+destroys its state and bypasses itself; SoftIpLimiter stays active. See
+[startup retention](./part3-buffers-and-padding.mdx#deferred-next-init-input)
+for bounds and buffer ownership.
 
 ## Line Lifetime: refcount and `alive`
 
