@@ -651,10 +651,14 @@ requires no worker context. TCP adapter pause queues use these same ownership
 rules; final stream delivery order remains the caller's
 responsibility.
 
-A budget tracks logical bytes, canonical queue-capacity charge and entries in O(1).
-Initialize all three limits explicitly: `SIZE_MAX` is unrestricted and zero is a
+A budget tracks logical bytes and canonical queue-capacity charge in O(1).
+Initialize both limits explicitly: `SIZE_MAX` is unrestricted and zero is a
 real zero allowance. Admission checks representability even in unrestricted
-dimensions. Empty buffers consume charge and an entry. Budgets own no buffers,
+dimensions. Empty buffers still consume charge. Finite charge therefore bounds
+retained buffer count indirectly; generic budgets impose no separate count cap.
+Queue length remains available for FIFO operations. Job, packet, engine-descriptor
+and fixed-resource limits belong to their owners, independently of this budget.
+Budgets own no buffers,
 pools, callbacks or flow-control state; each lives at a stable address on its
 owning worker until all attached queues and active reservations have settled.
 Limits remain fixed while in use.
@@ -665,8 +669,8 @@ storage when that queue becomes output storage. Refusal preserves the queue and
 budget unchanged. Initialize the final line-state object before attaching queues
 to embedded budgets; copying a temporary with self-references is invalid.
 
-`bufferqueueTryRebindBudget()` transfers a bound queue's current bytes, charge
-and entries to another live worker-owned budget. Destination refusal changes
+`bufferqueueTryRebindBudget()` transfers a bound queue's current bytes and charge
+to another live worker-owned budget. Destination refusal changes
 neither budget nor the queue; rebinding to the same budget succeeds without
 re-admission. Success changes no buffers, FIFO positions or representations and
 performs no allocation or callbacks. Previously popped reservations keep their
@@ -679,7 +683,7 @@ ownership. When the same scope continues retaining a popped buffer, use
 `bufferqueuePopFrontReserved()` with an empty reservation. It moves accounting to
 the active owner without reducing aggregate usage or attempting new admission.
 Reduce reservation bytes as plaintext or WIO progress is consumed, before reentrant
-callbacks can admit more input. Retained capacity and the entry remain charged
+callbacks can admit more input. Retained capacity remains charged
 until responsibility ends. Release clears the reservation; empty release is safe.
 Never copy one live reservation into two independently released owners.
 
@@ -709,7 +713,7 @@ The helper has no socket I/O, line access or callbacks. Buffer recycling can
 still discard private splice bodies. Callers supply the owning worker's pool.
 
 The combined FIFO and active reservation enforce `kAwqMaxRetained` independently
-for logical bytes and canonical queue-capacity charge, with unrestricted entries.
+for logical bytes and canonical queue-capacity charge.
 `awqAdmit()` consumes and clears its buffer argument except for `kAwqWriteNow`,
 which leaves the exact buffer caller-owned with its cost reserved for WIO.
 Refusal recycles the input once. Direct empty input undergoes admission before
@@ -718,7 +722,7 @@ and charged. Neither path treats emptiness as permission to bypass admission.
 
 After transfer, WIO owns the buffer independently. `awqRefreshPending()` reduces
 logical bytes using WIO's pending-byte count, never by reading the transferred
-buffer. The original capacity charge and entry remain until a completed write
+buffer. The original capacity charge remains until a completed write
 or terminal cleanup. `awqNextToWrite()` transfers FIFO accounting into that active
 reservation without admitting or charging it again; empty entries are recycled.
 Socket-write failure remains distinct from successful drain, including when WIO
@@ -773,20 +777,20 @@ body/output accounting. `bufferreaderTakeChunk()` requires no cached header and
 transfers the next opaque storage chunk, including an admitted empty chunk, or
 returns NULL when none remains. Storage boundaries need not match admissions.
 
-`bufferreaderSettle()` checks the combined active and queued storage charge and
-entry count. Within both inclusive bounds it leaves storage unchanged. Otherwise
+`bufferreaderSettle()` checks the combined active and queued storage charge.
+Within the inclusive charge bound it leaves storage unchanged. Otherwise
 it combines unread bytes in FIFO order, reusing append room and growing assembly
 geometrically within the charge allowance. It preserves splice assembly where
 possible, with complete ordinary fallback on pipe refusal and full onward padding.
 If even ordinary fallback cannot fit, it returns false before consuming input;
-the caller closes and releases retained storage. `max_entries` must be nonzero.
+the caller closes and releases retained storage.
 Cached metadata and logical-byte accounting stay intact. The fixed header cache
 is separate from queue-capacity charge; this charge does not measure RSS or kernel
 pipe memory.
 
 TrojanClient, TrojanServer, VlessClient and VlessServer settle incomplete UDP
-input and nested UDP input above 8 MiB of queue-capacity charge or 1,024 retained
-entries, including the active head. These thresholds do not limit the number of
+input and nested UDP input above 8 MiB of queue-capacity charge, including the
+active head. This threshold does not limit the number of
 fragments in a valid datagram. Drain complete accepted datagrams before settling
 an incomplete remainder; nested input settles before returning to the outer
 parser dispatch. Client settlement applies only to the owned UDP carrier,
@@ -1161,13 +1165,13 @@ storage is released. Charge excludes deque/pool storage and is not logical byte
 length or RSS. These accessors allocate nothing and make no callbacks; callers
 choose admission limits and when to settle retained storage.
 
-`bufferstreamSettleRetained(stream, max_charge, max_entries)` runs on the pool's
+`bufferstreamSettleRetained(stream, max_charge)` runs on the pool's
 owning worker without callbacks. An empty logical stream releases every retained
 buffer, including empty entries. Otherwise it queries the best-fit ordinary
 allocation for the unread bytes with full pool large-buffer padding. The charge
-threshold is `max(max_charge, best_fit_allocation_charge)`; `max_entries` must be
-nonzero. When both charge and entry count fit, storage is unchanged, including at
-equality. Above either threshold, it copies the unread bytes in FIFO order into
+threshold is `max(max_charge, best_fit_allocation_charge)`. When charge fits,
+storage is unchanged, including at equality. Above that threshold, it copies
+the unread bytes in FIFO order into
 one best-fit buffer and releases all old entries. Compaction preserves full
 onward padding without consuming the stream's `use_left_padding` allowance.
 Unrepresentable allocation geometry returns false before changing input or
@@ -1230,7 +1234,7 @@ header immediately after admission, including nested input; OPEN validation and
 the 65,553-byte maximum wire frame remain protocol responsibilities.
 
 BGP encoded output has an independent 2,162,705-byte limit, including generated
-headers, and a 1,024-frame cap. Each encoded batch passes these checks and is
+headers, and an 8 MiB retained-buffer charge limit. Each encoded batch passes these checks and is
 prepared before its first handoff. Both nodes borrow normal lines: default
 Pause/Resume callbacks forward every notification, including repeats, and
 complete admitted frames drain without waiting for Resume. Per-direction pump
@@ -1421,8 +1425,8 @@ Whole grants forward the original wrapper; partial grants pop the source, extrac
 exactly the permitted range through `sbufMoveRangeTo()`, and reinsert its remainder
 before any callback. Splice splits use an independent destination pipe with complete
 ordinary fallback on pipe creation or transfer pressure. Ordinary ranges preserve
-onward pool padding. Each FIFO has explicit logical-byte, queue-capacity-charge and
-entry budgets, including empty entries. Failed admission recycles the rejected
+onward pool padding. Each FIFO has explicit logical-byte and queue-capacity-charge
+budgets, including charge for empty entries. Failed admission recycles the rejected
 buffer and settles both queues before closing the borrowed normal line through
 its owner. Queue pop/extraction/reinsertion invokes no callbacks; remaining ownership
 and accounting are published before a slice is transferred. Reinserting a split
@@ -1438,9 +1442,9 @@ UserController's stream and datagram FIFOs retain original ordinary or splice bu
 Datagrams are never split; zero-length entries retain their FIFO position and transfer once without rate or quota cost.
 Reject datagrams above 65,535 bytes without charging, while preserving any smaller producer bound.
 
-Both directions share line ceilings of 1 MiB logical bytes, 2 MiB actual allocation charge and 256 buffers. One user's
-queues in one AuthenticationClient share 4 MiB, 8 MiB, 1024 buffers and 1024 direction tickets; that client shares 64 MiB,
-128 MiB, 16384 buffers and 16384 tickets. Each line has at most two direction tickets. These are resource bounds, not
+Both directions share line ceilings of 1 MiB logical bytes and 2 MiB actual allocation charge. One user's
+queues in one AuthenticationClient share 4 MiB, 8 MiB and 1024 direction tickets; that client shares 64 MiB,
+128 MiB and 16384 tickets. Each line has at most two direction tickets. These are resource bounds, not
 bandwidth settings. Queues and tickets allocate lazily. Owner-local budget primitives remain owner-local; synchronized
 user/client reservations account shared costs and roll back admission refusal without lock inversion.
 
@@ -1498,7 +1502,7 @@ No generic resident-buffer reserve/copy operation touches a splice body.
 
 Each encoder publishes its active suffix before callbacks and serializes nested
 inputs behind it. Active suffix plus queued nested input share an 8 MiB logical
-reentry limit and at most 1,024 buffers, including the active suffix. Decoders serialize nested input
+and 16 MiB queue-charge reentry limits, including the active suffix. Decoders serialize nested input
 under an 8 MiB logical reentry bound. The shared frame reader drains complete
 top-level frames before checking the 16 MiB retained buffer charge; beneficial
 compaction precedes charge refusal.
@@ -1541,17 +1545,17 @@ absolute frame deadlines and bounded closure when late or coalesced input exceed
 reservation. Protect line lifetime across Pause/Resume, which may synchronously Finish the borrowed line.
 
 AuthenticationServer is an exact-line response endpoint. Its queued and active
-backing responses share one stable budget: 1024 entries, 16 MiB plus the 20-byte
+backing responses share one stable budget: 16 MiB plus the 20-byte
 envelope in logical bytes, and 32 MiB allocation charge. Reserved pop preserves
 active charge; a guarded drain publishes its cursor before callbacks and emits
 at most 16 KiB per stream chunk with full chain padding. Refusal closes that borrowed
 line toward its owner after settling all retained state. One bounded frame, growing
 message, serialized text and output chunk are construction scratch outside that budget;
 see the node reference for the precise envelope and overlap limits. Parser reentry
-storage is also bounded at each authentication endpoint. AuthenticationClient retains the ordinary 32 MiB charge,
-1024-entry and maximum-wire-message limits, with 2 MiB nested headroom. AuthenticationServer grants those limits only
+storage is also bounded at each authentication endpoint. AuthenticationClient retains the ordinary 32 MiB charge
+and maximum-wire-message limits, with 2 MiB nested headroom. AuthenticationServer grants those limits only
 with validated token evidence. Unvalidated server input is bounded to 16 KiB of frame payload plus the 68-byte envelope,
-64 retained fragments, and allocation charge no greater than the larger of 128 KiB and one best-fit pool allocation
+allocation charge no greater than the larger of 128 KiB and one best-fit pool allocation
 for that envelope. Inspect the length/token prefix before waiting for a body, and revalidate at dispatch. Nested bytes
 and the older unread suffix share their applicable allowance; a valid earlier message does not authorize a large
 unvalidated successor. Compact oversized carriers and tiny-fragment runs before returning from admission.
@@ -1574,9 +1578,9 @@ capacity, and overload may close the affected connection. Node-specific gates
 described below are local implementation behavior, not a generic scheduling rule.
 
 Middle tunnels that need an application-data backlog use a default budget of
-**2 MiB logical bytes and 1,024 buffers per retention budget**. Count queued buffers
-and active backlog buffers still retained under that budget; multiple queues
-sharing it do not each receive a separate allowance. This is a hard admission
+**2 MiB logical bytes and 8 MiB queue-capacity charge per retention budget**.
+Account for queued and active backlog buffers still retained under that budget;
+multiple queues sharing it do not each receive a separate allowance. This is a hard admission
 limit, not a universal payload-size limit, a memory/RSS limit or a Pause threshold.
 Do not create a queue on an otherwise-ready synchronous forwarding path just to
 apply the default.
@@ -1584,8 +1588,8 @@ apply the default.
 Protocol parsers, frame allowances, ciphertext shaping and transport/Mux storage
 retain their own explicit bounds. Explicit node-specific application-backlog
 limits take precedence over the default. For example,
-[Socks5Server](../02-noderefs/Socks5Server.mdx) retains its 1 MiB /
-1,024-buffer ordering limit per direction, including active retained tails and
+[Socks5Server](../02-noderefs/Socks5Server.mdx) retains its 1 MiB logical-byte /
+8 MiB queue-charge ordering limit per direction, including active retained tails and
 nested input together. Each negotiation message contains at most 513 metadata
 bytes; complete messages are consumed before waiting for more input. Fragmented
 metadata extraction copies only the protocol prefix, excluding application bytes
@@ -1618,7 +1622,7 @@ are parsed as soon as complete; an incomplete marker retains at most four bytes.
 The following application body has its own inclusive 2 MiB allowance, independent
 of delivery fragmentation or coalescing. Client downstream selection ordering has
 that same byte bound; upstream waiting queues and server temporary input share
-2 MiB and 1,024-buffer bounds with their retained input, including the server body
+2 MiB logical-byte and 8 MiB queue-charge bounds with their retained input, including the server body
 held across next Init. Empty staged TCP input consumes no entries.
 
 Their application FIFOs can retain exclusive private pipes. After protocol setup
@@ -1645,12 +1649,12 @@ TCP CONNECT does not request an ordinary-read preference.
 TrojanClient, TrojanServer, VlessClient and VlessServer also use a **2 MiB logical-byte base
 budget** for their necessary parser state. Input fragments have a byte
 bound plus bounded parser metadata; do not apply an output-datagram count limit to
-fragments of one incomplete frame. Empty queued datagrams consume output entries.
+fragments of one incomplete frame. Empty queued datagrams consume output charge.
 A parser's active head, cached header and queued sources are charged exactly once.
 
 | Necessary retained state | Byte limit |
 | --- | --- |
-| Protocol/order/replay or output backlog in these four nodes | 2,097,152 bytes; 1,024 output/backlog entries |
+| Protocol/order/replay or output backlog in these four nodes | 2,097,152 logical bytes; 8 MiB queue-capacity charge |
 | Trojan UDP input, including partial-frame/header state | 2,162,950 bytes: 2 MiB plus the 65,798-byte maximum incoming frame |
 | TrojanServer initial request assembly | 2,162,950 wire bytes |
 | VlessClient TCP response assembly | 2,097,409 bytes: 2 MiB plus 257 response metadata bytes |
@@ -1669,14 +1673,14 @@ additionally bound entries or allocation charge for decoded datagrams, including
 empty ones. Mux bounds queue charge for retained stream chunks.
 
 TlsClient's pre-handshake application queue and RealityClient's early application
-queue follow the default 2 MiB / 1,024-entry bound. They represent a real protocol wait,
+queue follow the default 2 MiB logical-byte / 8 MiB queue-charge bound. They represent a real protocol wait,
 including application data admitted before TCP Est. Once protocol-ready, their
 plaintext drains progress without waiting for consumer Resume. Reentrant input
 stays behind the active plaintext remainder, and active reservations retain their
-byte/entry charge until consumed and released. Local backlog pressure has its own
+byte and capacity charge until consumed and released. Local backlog pressure has its own
 release path. Keep ciphertext-shaping budgets separate.
 
-TlsServer also bounds pre-handshake backend plaintext to 2 MiB / 1,024 entries.
+TlsServer also bounds pre-handshake backend plaintext to 2 MiB logical bytes / 8 MiB queue charge.
 Equality is admitted; overflow closes the affected line and releases its queued
 buffers. This limit applies even when the handshake deadline is disabled.
 
@@ -1709,8 +1713,8 @@ before returning. Later startup failures, including TlsClient's inner ClientHell
 generation, can then use normal line-state teardown. Only partial initialization
 before that attachment frees BIOs separately.
 
-Each ciphertext BIO admits at most 8 MiB of unread bytes and 1,024 nonempty
-buffers. Equality is accepted; refusal consumes new input and closes the affected
+Each ciphertext BIO admits at most 8 MiB of unread bytes and 32 MiB of retained
+allocation charge. Equality is accepted; refusal consumes new input and closes the affected
 connection through its existing failure path. These are protocol-storage limits,
 separate from application backlogs and record-shaping storage, not RSS guarantees.
 Reset and destruction recycle all retained buffers through the BIO's original
@@ -1764,7 +1768,7 @@ Reserve obtains writable capacity and any required queue slot before sealing;
 commit publishes only the actual ciphertext length and cannot allocate or fail.
 A sealing error cancels the reservation without retrying encryption. New output
 allocations retain onward headroom and prefer aligned ciphertext bodies; appends
-preserve existing tail coalescing. The byte and entry limits still apply.
+preserve existing tail coalescing. The byte and allocation-charge limits still apply.
 
 A reservation is exclusive and synchronous within one SSL operation. Callbacks
 may query SSL state but must not start SSL I/O, replace its BIOs or output
@@ -1812,9 +1816,11 @@ after the driver returns. WaterWall buffers use the exact line's pool and full
 chain padding. Framed output is constructed with its own four-byte prefix; both
 nodes advertise zero additional left padding and `kNodeFlagBlocksSplice`.
 
-The default per-backlog limits are 2 MiB and 1,024 entries. Count queued and
+The default per-backlog limits are 2 MiB and 1,024 QUIC resource entries. These
+entry limits remain local to QUIC rather than part of `buffer_budget_t`. Count queued and
 active application retention together with accepted but unacknowledged engine
-send data, including the opening byte. The engine uses at most 16 KiB per send
+send data, including the opening byte. Carrier admission also counts its queued
+and active input buffers and any partially assembled carrier-body allocation. The engine uses at most 16 KiB per send
 chunk and a FIFO ledger of offsets, lengths and allocation charges; only fully
 acknowledged entries at the front release credit. Partial or out-of-order ACKs
 cannot free later entries across a gap. Each documented backlog also caps
@@ -1859,8 +1865,8 @@ through exact representation helpers, including any resident prefix before its
 private-pipe body; never treat logical length as pointer accessibility. Its
 separate download intro is ordinary. Both intros and the publication guard exist
 before callbacks. Empty input retains the same first-Payload timing. The existing
-Init/intro FIFO may own splice wrappers and retains its inclusive 2 MiB / 1,024
-buffer policy. Later payload in both directions transfers the original wrapper.
+Init/intro FIFO may own splice wrappers and retains its inclusive 2 MiB logical-byte /
+8 MiB queue-charge policy. Later payload in both directions transfers the original wrapper.
 Application Pause/Resume maps directly to the initialized download child,
 including repeats. Before that child exists, the client remembers only a pending
 Pause; an intervening Resume cancels it. Child write pressure remains aggregated
@@ -1884,8 +1890,8 @@ even when the role enum already indicates direct upload. The initial body retain
 its previous admission and is not charged to the new FIFO budget.
 
 The later-input budget has inclusive 2 MiB logical bytes, 2 MiB canonical
-allocation charge, and 1,024 entries. Initialize it and attach its queue at their
-final stable addresses. Empty entries consume charge and entries. Materialize each
+allocation charge. Initialize it and attach its queue at their
+final stable addresses. Empty entries consume charge. Materialize each
 retained splice delivery fully with checked best-fit storage and onward padding;
 refusal closes the association. Ready deliveries have no new cap or transport
 queue. The waiting-map policy and HalfDuplexClient's policy are unchanged.
@@ -1940,10 +1946,11 @@ transport may queue activation until it can physically write.
 
 Retained application replay preserves FIFO through reentry and waits for output
 Resume. Each server half has one budgeted application FIFO with inclusive limits
-of 2 MiB logical bytes and 1,024 buffers, independent of RAM profile. Waiting data
+of 2 MiB logical bytes and 8 MiB queue charge, independent of RAM profile. Waiting data
 and startup retention share that budget; pop releases its cost before handoff.
-Nested admission during one prefix handoff or backlog-drain dispatch has the same
-finite byte and buffer bounds, preventing callbacks from endlessly refilling it.
+Nested admission during one prefix handoff or backlog-drain dispatch separately
+bounds cumulative input to 2 MiB and 1,024 deliveries, preventing callbacks from
+endlessly refilling the FIFO.
 Empty TCP input is recycled without an entry. Refusal closes the waiting half or
 both paired halves through their owners. The separate activation buffer is at most
 65,536 bytes. Reverse handshake fragments are compared incrementally and recycled;
@@ -1958,12 +1965,12 @@ accompanying application's ordinary/private-pipe remainder and forward it after
 destination Init; later deliveries transfer intact. Nested application input
 while destination Init/initial handoff is active stays behind older data in one
 owned FIFO. The original initial body has an active reservation in the same budget
-as queued input: 2 MiB logical bytes and 1,024 buffers, with empty input consuming
-no entries. Release the reservation or pop cost before handoff. Preserve the first
+as queued input: 2 MiB logical bytes and 8 MiB queue charge, with empty input
+recycled immediately. Release the reservation or pop cost before handoff. Preserve the first
 body's identity and queued private pipes. Nested admission across one initial
-dispatch separately has those finite byte and buffer bounds. Close releases the
-initial body, its reservation and all queued entries exactly once. These logical
-budgets are not allocation-charge or physical-memory guarantees; ready direct
+dispatch separately has cumulative bounds of 2 MiB and 1,024 deliveries. Close releases the
+initial body, its reservation and all queued entries exactly once. These budgets
+do not promise physical-memory or kernel-resource bounds; ready direct
 payloads do not enter them.
 
 ### Client first-payload requests
@@ -2064,11 +2071,10 @@ waiting for Est or building a separate ready-output queue. UDP gathers its exact
 length header and extracts one complete body at a time, including every complete
 frame in the accepted input after Pause. Retain the incomplete suffix.
 
-After response completion, nested TCP body input uses the 2 MiB / 1,024-entry
-ordering bound, including any still-local active head once. Publish admission
-before callbacks and release accounting before body transfer. This entry limit
-does not apply to fragments of an incomplete UDP frame or to ready synchronous
-TCP forwarding.
+After response completion, nested TCP body input uses a 2 MiB logical-byte /
+8 MiB queue-charge ordering bound, including any still-local active head once.
+Publish admission before callbacks and release accounting before body transfer.
+Ready synchronous TCP forwarding does not enter that backlog.
 
 Whole suitable bodies transfer directly. Split/mixed bodies use shared exact range
 movement and preserve the returned replacement pointer, unrequested suffix and full
@@ -2105,8 +2111,8 @@ immutable lookup key. New destination-domain storage follows the fatal
 heap-allocation policy. Address encoding checks its complete extent
 before writing and leaves splice bodies untouched.
 
-A necessary association reply FIFO accounts encoded wire bytes and datagram entries
-under the 2 MiB / 1,024 limits. Live initialized backend replies have no Est waiter.
+A necessary association reply FIFO accounts encoded wire bytes and retained
+queue charge under the 2 MiB / 8 MiB limits. Live initialized backend replies have no Est waiter.
 Immutable replies already accepted into the client FIFO belong to that FIFO, not to
 a borrowed backend pointer. Its independent drain honors Pause; inline forwarding
 of an already-admitted backend reply follows the synchronous batch rule.
@@ -2125,21 +2131,20 @@ scheduling refusal leaves retained input owned by replay until node cleanup.
 The node closes the affected line without recycling transferred input again. Its embedded
 FIFO reserves storage lazily and binds to the node's stable replay budget.
 Moving an already-bound transcript preserves its accounting; attaching an
-unbound transcript admits all bytes, allocation charge and entries transactionally.
+unbound transcript admits all bytes and allocation charge transactionally.
 The batch byte limit is inclusive and checked before retention.
 Replay configuration and pool geometry stay immutable while their lines are
 active, so admission also proves the later batch's allocation geometry.
 
 TrojanServer and VlessServer reuse their upstream accounting for replay. With a
-positive intentional delay, replay permits 2 MiB logical bytes, 8 MiB allocation
-charge and 1,024 retained entries. TlsServer's delayed replay permits 1 MiB logical
-bytes, 8 MiB allocation charge and 1,024 entries. These limits are inclusive and
-node-supplied. Zero-delay and authenticated TCP ordering retain their existing
-policies. VmessServer preserves its 2 MiB logical-byte, 1,024-entry and 8 MiB
+positive intentional delay, replay permits 2 MiB logical bytes and 8 MiB allocation
+charge. TlsServer's delayed replay permits 1 MiB logical bytes and 8 MiB allocation
+charge. These limits are inclusive and node-supplied. Zero-delay and authenticated TCP ordering retain their existing
+policies. VmessServer preserves its 2 MiB logical-byte and 8 MiB
 allocation-charge limits.
 
 TLS, Trojan and VLESS opt into pressure compaction for positive-delay replay.
-If ordinary input fits the byte limit but its backing storage or entry count
+If ordinary input fits the byte limit but its backing storage charge
 cannot be admitted, first try coalescing the pending batch and incoming input
 into one best-fit ordinary buffer. Prove that the replacement fits the budget
 before consuming the sources. This also applies to the initial transcript.
@@ -2167,8 +2172,8 @@ Cache successful authentication. Nonzero request addons remain unsupported once 
 post-authentication malformed input closes rather than replays. Remove accepted metadata before body budgeting.
 
 One guarded mixed-input FIFO and popped active head preserve old body bytes across Init and nested input. TCP output
-uses a 2 MiB / 1,024-entry upstream budget; delayed fallback adds the charge limit described above.
-The response-header/reentry FIFO has its own 2 MiB / 1,024-entry budget.
+uses a 2 MiB logical-byte / 8 MiB queue-charge upstream budget, also used for fallback.
+The response-header/reentry FIFO has its own 2 MiB logical-byte / 8 MiB queue-charge budget.
 Attach populated parser storage transactionally only when it becomes output. Parser bytes include cached metadata,
 active head and queued sources exactly once, without an output-entry limit on incomplete UDP fragments.
 
@@ -2217,7 +2222,7 @@ worst-case padding all count. Drop native empty/oversized local UDP without spli
 or request emission. An empty framed record is termination;
 verify its encrypted tag before accepting EOF.
 
-Each client direction has inclusive 2 MiB logical, 1,024-entry and 8 MiB allocation
+Each client direction has inclusive 2 MiB logical and 8 MiB allocation
 charge limits. Active popped buffers and incomplete fragments retain reservations;
 compact fragments when that reduces retained storage. Release reservations and owned
 buffers exactly once on handoff, refusal or close. Separate TX/RX guards retain input
@@ -2258,7 +2263,7 @@ Unexpected reply sources are dropped/counted rather than delivered to another
 association. Server packetaddr owns one bounded destination backend per IP/family/port,
 and encodes replies from that immutable backend target. Queued encoded replies own
 all envelope/payload bytes independently of backend lifetime. Existing per-direction
-byte, entry and allocation budgets remain unchanged by the destination-count limit.
+logical-byte and allocation-charge budgets remain unchanged by the destination-count limit.
 
 ### VmessServer ordinary records and bounded retention
 
@@ -2277,10 +2282,10 @@ encrypted terminal record before accepting it. Raw `none` (`zero` client configu
 only. A UDP reply must fit one record; oversized replies are dropped without splitting.
 Native UDP drops empty replies; packetaddr encodes their nonempty address envelope.
 
-Each unauthenticated carrier retains at most 65,536 logical input bytes and 256 buffers under
+Each unauthenticated carrier retains at most 65,536 logical input bytes under
 the node-wide `auth-pending-max-bytes` allowance. Consumed AuthID/header bytes remain charged to
 that allowance until authentication or fallback selection settles. Per-direction ordering and
-fallback queues have inclusive 2 MiB logical, 1,024-entry and 8 MiB allocation-charge bounds.
+fallback queues have inclusive 2 MiB logical and 8 MiB allocation-charge bounds.
 Popped active buffers retain their reservations across callbacks. Incomplete bodies have one
 bounded ordinary allocation; completed bodies are handed onward before parsing later records.
 No queue is maintained solely because an ordinary TCP consumer sent advisory Pause.
@@ -2445,8 +2450,8 @@ parent_receive_charge = incoming_stream_charge
 
 Each child reads its charge from its queue. Attached queues bind to a budget in
 the stable parent-only state; parent loss rebinds them to their worker's detached
-budget before any outward callback. Both budgets use `SIZE_MAX` in every
-dimension for accounting; the Mux policies below still decide admission and
+budget before any outward callback. Both budgets use `SIZE_MAX` for bytes and charge
+for accounting; the Mux policies below still decide admission and
 closure. Detached child count remains separate from queued entry count. Ordinary
 pop releases queue and aggregate usage before delivery, including during
 reentrant callbacks.
@@ -2765,7 +2770,7 @@ while a half is unpaired. Handshake validation/removal, waiting FIFOs
 and cross-worker handshake replay use ordinary buffers. Handshake completion
 does not permit opaque retention while waiting; only pairing enables unchanged
 splice forwarding after startup FIFO replay. Materialization preserves onward
-padding; application retention follows the default 2 MiB / 1,024-buffer budget,
+padding; application retention follows the default 2 MiB logical-byte / 8 MiB queue-charge budget,
 independent of pool geometry and splice read sizes. PipeTunnel transfers paired opaque
 buffers across workers under its existing ownership and cancellation contract.
 
@@ -2790,14 +2795,13 @@ Close remain complete events with at most 125 body bytes. Mask offsets continue
 across input deliveries and output slices.
 
 The receive cursor owns an active delivery and a separate FIFO for nested input.
-Nested input has inclusive limits of 1 MiB logical bytes, 2 MiB allocation charge
-and 1,024 entries; a popped nested buffer keeps its reservation while its suffix
+Nested input has inclusive limits of 1 MiB logical bytes and 2 MiB allocation charge; a popped nested buffer keeps its reservation while its suffix
 remains active. The synchronous outer delivery and one extracted output are
 working storage outside that backlog budget. Consume the outer suffix before
 nested input, in at most 16 KiB pieces. Empty inputs are recycled immediately.
 After processing, ordinary `in_stream` retention is at most 64 KiB. Compact
 storage exceeding the larger of 2 MiB and the best-fit allocation for its actual
-bytes with chain padding, or exceeding 1,024 entries. Empty streams release all
+bytes with chain padding. Empty streams release all
 entries. These are retained-storage limits, not a limit on one immediately
 drainable application delivery.
 
@@ -2823,7 +2827,7 @@ checksum fields. The wire remains concatenated IPv4 packets within the current
 The node owns the drain, packet publication, heartbeat handling and lifecycle
 checks. A large current delivery is processed before incomplete-input retention
 is settled. Nested callbacks append to a separate FIFO, with 128 KiB logical
-bytes, 2 MiB queue charge and 1,024 entries shared by queued and active nested
+bytes and 2 MiB queue charge shared by queued and active nested
 input. An active nested batch retains its reservation until extraction reaches
 an incomplete suffix. The outer current delivery and one extracted packet are
 synchronous processing storage outside that nested budget. Refusal closes only
@@ -2831,7 +2835,7 @@ the affected normal carrier using its node's ownership/recreation policy.
 
 After each batch, the remaining logical bytes are below the packet bound.
 Compact retained charge above the larger of 128 KiB and the pool's best-fit
-allocation for that suffix, or more than 1,024 retained entries. Empty streams
+allocation for that suffix. Empty streams
 release empty entries. Publish consumption before callbacks, serialize nested
 input after older bytes, and stop on logical death or association replacement.
 Reset and destruction settle both pending and active accounting.
@@ -3068,8 +3072,7 @@ No splice wrapper enters the ordinary parser. This practical scope deliberately
 allows copies for mixed inputs and small chunks.
 
 A delivery is at most 2 MiB. Necessary pending input per direction shares a
-buffer_budget_t bound of 2 MiB logical bytes, 2 MiB queue-capacity charge and
-1,024 entries. Active retained parsing input holds a reservation under the same
+buffer_budget_t bound of 2 MiB logical bytes and 2 MiB queue-capacity charge. Active retained parsing input holds a reservation under the same
 budget; consumption releases bytes before callbacks. The opposite direction has
 its own budget so full upload storage cannot stop response progress. Header and
 framing carry have explicit fixed bounds; they are not general body queues.
