@@ -734,93 +734,84 @@ recycles remaining FIFO ownership and settles active accounting, without touchin
 the active buffer. WIO may finish flushing after line-state destruction and
 retains no pointer to the component or its budget.
 
-#### Exact extraction from an active head and queue
+### Staged buffer reader
 
-`bufferRangeTakeExact(pool, &active_head, &tail, bytes)` in
-`ww/bufio/buffer_queue_range.h` consumes an exact FIFO range from a separately
-owned mutable head followed by an unbound BufferQueue. The caller must establish
-complete availability and representable ordinary output geometry, including full
-pool large-buffer padding, before calling. The active head must be exclusively
-owned and absent from every queue. The queue must remain unbound: this operation
-does not preserve the active reservations required by a budgeted parser.
+`buffer_reader_t` in `ww/bufio/buffer_reader.{h,c}` owns an active buffer and an
+unbound input queue for ordinary or splice bytes. It borrows the line's pool and
+caller-owned header storage; both remain valid through destruction. Initialize
+it in its final line-state location and keep it there. The reader makes no
+callbacks and owns no line reference or reentry guard. Nodes validate protocol
+fields, choose admission limits, serialize callbacks and recheck line and
+association lifetime before continuing. Budget-reserved VMess records use their
+own input accounting and do not use this reader.
 
-The returned buffer is exclusively caller-owned and has the pool's full
-large-buffer left padding available. A suitable exact whole head transfers
-directly; otherwise the helper assembles the requested range. Representation
-selection follows the contributing source wrappers: a splice wrapper selects
-splice assembly even when the requested bytes lie only in its resident prefix.
-Pipe checkout or transfer pressure can instead produce complete ordinary output.
-The helper retains the authoritative replacement destination from every
-`sbufMoveRangeTo()` call, including fallback after partial progress.
+`bufferreaderTryPush()` accepts an inclusive logical-byte limit counting cached
+header bytes as well as unread sources. Success transfers input ownership;
+refusal changes neither input ownership nor reader state. Empty input is a valid
+queue entry, so the node retains its own empty-delivery policy.
 
-Queued buffers are inspected without mutation and popped before consumption.
-Exhausted heads are recycled through the supplied pool; any suffix remains in
-the active head before the untouched queued tail. A zero-byte request returns
-one empty ordinary buffer without consuming or changing either input storage
-location. The operation runs on the pool's owning worker, invokes no callbacks,
-and owns no persistent cursor or cleanup object.
+`bufferreaderGather()` consumes only the requested metadata extent, including
+private-pipe bytes, and recycles exhausted sources through the reader's pool.
+Partial progress stays cached and charged. The requested extent must fit the
+caller-provided header capacity. An already-satisfied extent, including zero,
+is a successful no-op; following body bytes remain untouched. Gathering itself
+allocates no storage. The node chooses the next field and validates its contents.
 
-Protocol metadata, retained-byte and admission policy, authentication, readiness,
-reentry guards and lifecycle remain with the caller. Commit protocol progress
-before delivering the extracted buffer through a callback, and preserve the
-existing line-reference and association checks around that delivery. Node cleanup
-continues to release the active head and queue.
+`bufferreaderTakeBody()` requires complete body availability and representable
+ordinary output geometry, including full pool large-buffer padding. It returns
+one exact body with that padding available, removing both the cached header and
+body from the logical count before returning. A suitable whole head transfers
+directly. Otherwise, any contributing splice wrapper selects splice assembly,
+even when the requested bytes lie only in its resident prefix. Pipe refusal
+falls back to complete ordinary output, preserving any partial transfer progress.
+Unrequested suffix bytes stay owned by the reader. Zero bytes returns a real empty
+ordinary buffer and consumes cached metadata without consuming source body bytes.
 
-`bufferRangeGatherPrefix(pool, &active_head, &tail, dst, &filled, needed)` uses
-the same owned-head/unbound-tail cursor to extend caller-owned resident metadata.
-The caller provides storage for both the existing `filled` bytes and the requested
-`needed` extent. Success means `filled >= needed`: revisiting an earlier prefix
-is a successful no-op, without popping or recycling input. Otherwise it consumes
-only the missing prefix bytes, using exact range reads for ordinary and splice
-sources, and recycles exhausted heads through the owner-worker pool. A false
-result means input ran out; copied bytes remain in `dst` and `filled` preserves
-that partial progress for the next call. Following body bytes remain untouched.
-Gathering allocates no storage and invokes no callbacks.
+`bufferreaderConsumeHeader()` removes only validated metadata. VlessClient uses
+it for its initial response, and the servers use it for accepted requests before
+body/output accounting. `bufferreaderTakeChunk()` requires no cached header and
+transfers the next opaque storage chunk, including an admitted empty chunk, or
+returns NULL when none remains. Storage boundaries need not match admissions.
 
-TrojanClient, VlessClient, TrojanServer and VlessServer keep their protocol state,
-header-capacity checks and logical-byte counters outside this helper. Cached
-header bytes remain included in their retained-input count until the node consumes
-that header: UDP extraction subtracts the frame header and body together;
-VlessClient consumes its initial response header separately, and the servers
-remove accepted request metadata before body/output accounting. TrojanServer also
-records the current requested header extent before gathering. The helper never
-changes these counters or chooses the next field. VMess uses active budget
-reservations and cannot use this unbound-queue API.
+`bufferreaderSettle()` checks the combined active and queued storage charge and
+entry count. Within both inclusive bounds it leaves storage unchanged. Otherwise
+it combines unread bytes in FIFO order, reusing append room and growing assembly
+geometrically within the charge allowance. It preserves splice assembly where
+possible, with complete ordinary fallback on pipe refusal and full onward padding.
+If even ordinary fallback cannot fit, it returns false before consuming input;
+the caller closes and releases retained storage. `max_entries` must be nonzero.
+Cached metadata and logical-byte accounting stay intact. The fixed header cache
+is separate from queue-capacity charge; this charge does not measure RSS or kernel
+pipe memory.
 
-`bufferRangeSettleRetained(pool, &active_head, &tail, max_charge, max_entries)`
-checks the combined active and queued storage without attaching a budget.
-When charge and entries fit, it leaves both owners unchanged. On pressure it
-coalesces unread bytes in FIFO order into the active head and empties the tail,
-leaving cached metadata and logical-byte counters with the caller. It reuses
-append room, grows ordinary storage geometrically when needed and preserves
-splice assembly where possible, with complete ordinary fallback on pipe refusal.
-It invokes no callbacks and preserves full onward padding. If even compact
-ordinary storage cannot fit the supplied charge allowance, it returns false
-without consuming input; the caller closes and releases its retained buffers.
+TrojanClient, TrojanServer, VlessClient and VlessServer settle incomplete UDP
+input and nested UDP input above 8 MiB of queue-capacity charge or 1,024 retained
+entries, including the active head. These thresholds do not limit the number of
+fragments in a valid datagram. Drain complete accepted datagrams before settling
+an incomplete remainder; nested input settles before returning to the outer
+parser dispatch. Client settlement applies only to the owned UDP carrier,
+including its response metadata in VlessClient. Direct TCP keeps its own admission
+rules. Existing logical-byte limits still apply before input is queued.
 
-TrojanClient, TrojanServer, VlessClient and VlessServer apply this check to
-incomplete UDP input and nested UDP input above 8 MiB of queue-capacity charge or
-1,024 retained entries, including the active head. These are compaction
-thresholds, not a limit on the number of fragments a valid datagram may contain.
-Drain complete accepted datagrams before settling an incomplete remainder;
-nested input must settle before returning to the outer dispatch that owns the
-parser. Client settlement applies only to the owned UDP carrier, including its
-response metadata in VlessClient; direct TCP keeps its own admission rules.
-Existing logical-byte limits still apply before input is queued. Complete
-datagrams keep their exact-extraction path and the parser queue remains unbound.
-If compact storage cannot fit the charge allowance, close the affected
-association through its existing cleanup path.
+`bufferreaderMoveToQueue()` transfers input into an initialized, empty, unbound
+destination. With `restore_header=true`, the inspected prefix is restored before
+the unread suffix for exact fallback replay. Otherwise metadata must already be
+consumed. Success empties the reader. Refusal leaves the destination unchanged
+and all bytes owned by the reader, although its active head may have moved into
+its queue; the caller closes and cleans up. Attach an output budget or transfer
+the transcript to FallbackReplay only after this ownership handoff. Server TCP
+ordering queues remain separate from the reader's unbound parser queue.
 
-`bufferRangeRestoreHead(&active_head, &tail)` transfers the unread head to the
-front of the unbound tail and clears the active pointer; a null head is a no-op.
-It does not restore bytes already consumed into metadata. Complete fallback replay
-still prepends the node's cached header before this unread suffix. The caller must
-prove that queue byte totals, allocation charge and entry storage admit restoration.
-The server parsers establish this by restoring a previously admitted head after
-only consuming it, without intervening admission or callbacks. Restoration uses
-the queue's fatal push wrapper under that precondition; queue storage growth and
-ordinary Debug allocation replacement remain possible. Retain no alias to the
-transferred head.
+Clear releases all input while preserving the pool/cache binding. Destroy also
+zeroes the reader. The node owns wiping its header storage. All operations run
+on the pool's owner worker, and the node retains responsibility for callback
+lifetime checks and for recycling extracted buffers it has not transferred onward.
+
+TrojanClient/Server share staged address gathering and UDP-header validation in
+`Internals/TrojanCommon`; VlessClient/Server share UDP length decoding in
+`Internals/VlessCommon`. Authentication, response/request transitions, routing and
+callbacks remain node-local. Each internal library is enabled when either node
+of its own pair is selected; no Trojan node depends on a VLESS node or vice versa.
 
 ## Prepending a Header: `sbufShiftLeft`
 
@@ -2170,7 +2161,7 @@ capabilities.
 ### VlessServer request inspection and replay
 
 VlessServer borrows the client normal line and owns only its fixed-destination UDP backend. It caches at most 278 request
-metadata bytes, consuming only the next required field through shared range helpers. The first callback must contain
+metadata bytes, consuming only the next required field through the staged buffer reader. The first callback must contain
 17 logical bytes (version plus UUID), regardless of resident/pipe boundaries; shorter or empty input takes fallback/reject.
 Cache successful authentication. Nonzero request addons remain unsupported once their advertised bytes arrive;
 post-authentication malformed input closes rather than replays. Remove accepted metadata before body budgeting.
