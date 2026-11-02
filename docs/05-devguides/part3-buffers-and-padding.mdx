@@ -1201,16 +1201,27 @@ allocation arithmetic. Mux parents use an eight-byte header cache; Mux children
 have no receive stream. Bgp4Client and Bgp4Server use a 19-byte cache for marker,
 length and type. BGP OPEN inspection consumes only ten fixed bytes and up to 255
 optional bytes through representation-aware range helpers. Application bodies
-remain eligible for private-pipe extraction and per-frame delivery. BGP uses a
-fixed 2,162,705-byte logical budget per direction and a 1,024-frame output cap;
-incoming fragment count is unrestricted. Both are ordinary middle nodes on a
-borrowed normal line: default Pause/Resume callbacks forward every notification,
-including repeats, and complete admitted frames drain without waiting for Resume.
-Per-direction pump guards preserve FIFO across reentrant callbacks. The receive
-stream retains incomplete input. Each encoded batch is prepared before its first
-handoff, and the output FIFO retains queued frames during reentry. Every input
-still undergoes its applicable retention checks before callbacks, including
-reentrant input. Ongoing framing prevents permanent bypass.
+remain eligible for private-pipe extraction and per-frame delivery. Their shared
+fixed-header frame reader drains complete top-level receive batches before
+settling incomplete storage. Nested input shares a 2,162,705-byte logical budget
+with older retained wire bytes, including the cached header. Admission checks
+those bytes before Push, then settles retained buffer charge to at most 4,325,410
+bytes before returning to the outer drain. The same charge limit applies to the
+incomplete remainder at drain end; coalescing or beneficial compaction precedes
+refusal. A validated incomplete frame is smaller than 65,553 logical bytes;
+assert this derived bound instead of refusing complete top-level batches.
+Incoming fragment count is unrestricted. BGP validates a complete FIFO-head
+header immediately after admission, including nested input; OPEN validation and
+the 65,553-byte maximum wire frame remain protocol responsibilities.
+
+BGP encoded output has an independent 2,162,705-byte limit, including generated
+headers, and a 1,024-frame cap. Each encoded batch passes these checks and is
+prepared before its first handoff. Both nodes borrow normal lines: default
+Pause/Resume callbacks forward every notification, including repeats, and
+complete admitted frames drain without waiting for Resume. Per-direction pump
+guards preserve FIFO across reentrant callbacks. The frame reader retains
+incomplete input, and the output FIFO retains queued frames during reentry.
+Ongoing framing prevents permanent bypass.
 
 `splicestreamDiscardFrame()` consumes the cached header and exactly the requested
 body bytes without producing a payload buffer. Its complete-header/body preconditions
@@ -1257,10 +1268,10 @@ that a later Push succeeds. `splicestreamSettleCharge()` attempts beneficial
 compaction at most once when over its charge limit, then reports whether the
 result fits. It may allocate, materialize pipe bytes and recycle sources even when
 returning false, but preserves header/payload order and makes no callbacks.
-Both helpers require the stream's owner worker. UDP-over-TCP uses conservative
-admission only during nested delivery. KeepAlive retains byte-only nested
-admission followed by Push and charge settlement; SpeedTest settles incomplete
-retention after processing complete frames. BGP retains its byte-only policy.
+Both helpers require the stream's owner worker. UDP-over-TCP, KeepAlive and BGP
+use the shared complete-frame reader described below, which checks nested logical
+bytes before Push and settles charge afterward. SpeedTest settles incomplete
+retention after processing complete frames.
 Do not turn these helpers into unconditional prechecks on complete top-level batches.
 
 `splicestreamPeekHeader()` returns a borrowed cache pointer only when complete;
@@ -1314,6 +1325,60 @@ then append the still-unmoved source range. Return exactly N ordered bytes once,
 leaving unrequested suffixes intact. Missing claimed source bytes or invalid owned
 descriptors remain fatal invariants. Exact transfer primitives live in
 `splice_buffer`, independently of Mux and the event loop.
+
+### Fixed-header frame reader
+
+`splice_frame_reader_t` in `ww/bufio/splice_frame_reader.{h,c}` owns a
+`splice_stream_t`, the active-drain guard, nested logical-byte and retained-charge
+limits, empty-input disposal and output-buffer selection. UdpOverTcpClient,
+UdpOverTcpServer, KeepAliveClient, KeepAliveServer, Bgp4Client and Bgp4Server use
+this reader. It runs on the borrowed pool's owner worker and makes no callbacks
+or line-reference changes.
+Initialize it in the node's Init with a nonzero fixed header size, limits and
+finalized chain splice-output capability. The pool must outlive reader destruction.
+
+`spliceframereaderAdmit()` takes ownership of input on every result. Empty input is recycled
+without starting another drain. While a drain is active, admission first checks
+the stream's existing logical bytes, including cached header bytes, plus incoming
+length against the nested-byte limit. Equality is allowed. A byte-limit refusal
+recycles only the new input, preserving the existing stream. Otherwise Push
+appends input behind older bytes, then charge settlement attempts at most one
+beneficial compaction if retained charge exceeds its limit. This permits a small
+frame in an oversized backing buffer to fit after coalescing or compaction.
+Nested admission returns to the outer drain without delivering frames recursively.
+
+Charge refusal is not transactional: the reader may already own the input and
+may have compacted the complete retained body, including pipe-backed bytes. The
+node must close and destroy its reader after an admission or charge refusal;
+it must not recycle or retry the submitted buffer. These bounds govern retained
+buffer charge, not transient allocation peaks or process memory. Heap exhaustion
+remains fatal. A top-level input batch may exceed the nested-byte or retained-charge
+limits while complete frames drain; charge is settled on the incomplete remainder
+before the drain ends. Do not reject that batch by applying the nested checks
+before processing it.
+
+| Reader users | Nested logical bytes | Retained buffer charge |
+| --- | --- | --- |
+| UdpOverTcpClient and UdpOverTcpServer | 2 MiB | 4 MiB |
+| KeepAliveClient and KeepAliveServer | 8 MiB | 16 MiB |
+| Bgp4Client and Bgp4Server | 2,162,705 bytes | 4,325,410 bytes |
+
+The node still decodes and validates headers, chooses whether to deliver or
+discard each complete body, emits callbacks and closes the line. A borrowed
+header pointer expires on any reader mutation; decode required fields before
+taking or discarding the frame. Frame extraction returns the sole owned body
+buffer with full onward padding. It requests splice output only for a nonempty
+body when enabled; the underlying stream still returns resident-only ranges as
+ordinary buffers and falls back to ordinary output on pipe pressure. Discard
+consumes the complete header and body without producing a payload buffer.
+
+Hold a line reference across callbacks whenever decoding continues afterward,
+then check logical line life and `spliceframereaderIsAttached()` before resuming
+reader operations. A live borrowed line can have retired node state. Call
+`spliceframereaderEndDrain()` only on the normal path while that state remains
+valid; it settles charge and clears the guard on success. Never resume draining
+after Finish destroyed the reader.
+Reader destruction releases retained input and clears its attached-state marker.
 
 ### SoftIpLimiter identity and SpeedLimit shaping
 
@@ -1410,7 +1475,7 @@ KeepAliveClient and KeepAliveServer frame every payload throughout the connectio
 The prefix contains a four-byte big-endian body length and one kind byte. Each
 frame carries at most 1 MiB of payload; length includes the kind, so body length
 is at most 1 MiB + 1. Oversized lengths reject immediately after the header.
-Their five-byte splice-stream cache consumes only frame length and kind; normal
+Their five-byte frame-reader cache consumes only frame length and kind; normal
 bodies can remain in private pipes. Encoders prepend only in advertised real
 headroom, preserving complete wrappers when one frame suffices. Larger payloads
 split through `sbufMoveRangeTo()`, with complete ordinary fallback on pipe pressure.
@@ -1419,11 +1484,14 @@ No generic resident-buffer reserve/copy operation touches a splice body.
 Each encoder publishes its active suffix before callbacks and serializes nested
 inputs behind it. Active suffix plus queued nested input share an 8 MiB logical
 reentry limit and at most 1,024 buffers, including the active suffix. Decoders serialize nested input
-under an 8 MiB logical reentry bound. Complete frames drain before checking the
-16 MiB retained allocation charge; beneficial compaction precedes charge refusal.
+under an 8 MiB logical reentry bound. The shared frame reader drains complete
+top-level frames before checking the 16 MiB retained buffer charge; beneficial
+compaction precedes charge refusal.
 Validated frame lengths and draining guarantee that the incomplete remainder is
 smaller than 1 MiB + 5 bytes, including the cached header. Check this derived bound
-with a Debug assertion. Nested admission also checks the charge bound.
+with a Debug assertion. Nested admission checks logical bytes before Push and
+settles the same charge bound immediately afterward, before returning to the
+outer drain.
 Body lengths outside `1..1,048,577` or refusal close through the normal
 line owner instead of silently losing TCP bytes. Both nodes require L4 on both
 edges and borrow normal lines; a mixed chain does not send its worker packet line
@@ -2614,7 +2682,7 @@ The encoder prepends the two-byte length and hands off the whole owned buffer
 in one callback; input beyond 65,505 bytes is dropped intact. Source protocol
 flags never select a TCP payload mode. Mixed listeners route TCP separately.
 
-Both nodes advertise splice support. Their fixed-header splice stream caches
+Both nodes advertise splice support. Their shared fixed-header frame reader caches
 only the two-byte length, and each complete body is extracted into one owned
 buffer with onward padding. Datagram bodies remain eligible for private pipes;
 neither node sets an ordinary-read preference for UDP. UDP socket fallback
@@ -2631,6 +2699,9 @@ including the two-byte header. Assert this derived bound instead of adding an
 unreachable overflow path. It does not bound allocation charge: a small suffix
 can retain a large backing buffer, so charge checks remain necessary. Parser reentry shares
 2 MiB of retained logical bytes and 4 MiB of charge with the older stream.
+Nested input is byte-checked before Push and charge-settled immediately afterward;
+coalescing or beneficial compaction may release oversized backing storage before
+refusal. The outer drain preserves older-frame-first delivery.
 Complete frames in the synchronous dispatch continue after Pause; hard
 admission refusal, zero data length or Finish stops dispatch and closes a
 borrowed normal carrier through its owner. Neither node discards arbitrary
