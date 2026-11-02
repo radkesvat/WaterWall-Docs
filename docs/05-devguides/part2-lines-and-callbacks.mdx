@@ -5,7 +5,7 @@ sidebar_label: "Part 2: Lines & Lifetime"
 description: "The connection lifecycle, re-entrancy hazards, line references, and the clean-finish patterns that keep WaterWall tunnels free of use-after-free bugs."
 ---
 <!--
-Documentation version: 195
+Documentation version: 196
 -->
 
 # Part 2: Lines, Callbacks & Lifetime Safety
@@ -1864,6 +1864,21 @@ water stops release. A writer held again joins behind remaining waiters. Snapsho
 references protect every member before any callback, followed by logical-life,
 attachment and state checks. No persistent references or second cursor are used.
 
+`MuxCommon/mux_child_flow.h` provides shared child-source reasons and hold-list
+operations. Each node embeds `mux_child_flow_t` in its line state and
+`mux_hold_list_t` in its parent-only state. The entry contains the two borrowed
+hold links, peer pressure, local membership, the last emitted notification and
+the startup guard. The parent list's count measures held children, independently
+of buffer budgets. `muxHoldAdd()` appends once; `muxHoldRemove()` unlinks once and
+clears membership and links. Both are callback-free and allocation-free, preserve
+peer pressure and the notification latch, and require the correct parent list.
+Node-local typed `offsetof` accessors recover the containing state and its existing
+line pointer; entries add neither a line pointer nor a persistent reference.
+Keep the separate all-children list and its order. Remove local membership before
+clearing the parent association, and make repeated removal return before deriving
+a list through a detached child's parent. Decoded-destination `paused` and wire
+`flow_paused_sent` remain node-local states.
+
 Init/Est defers permission callbacks without confusing a recorded reason with an
 emitted Pause. Completion reconciles the current reasons once safe. Peer pressure
 and terminal-close state remain independent; local unlink and terminal paths
@@ -1871,6 +1886,20 @@ remove held-list membership without emitting Resume. A writable empty parent
 must release ready waiters rather than depend on a future transport event.
 TcpListener also preserves a Pause received during accepted-line Init: it enables
 initial reads only if Init returns alive and the source is still unpaused.
+
+`muxChildFlowSync()` computes `peer_flow_paused || parent_write_paused || !child_open`.
+Startup and owner-worker quiescence suppress notification
+without changing its latch. Otherwise a transition publishes the latch before
+retaining the live child across exactly one Pause/Resume dispatch; after that
+callback, the operation only releases the saved reference. Nested notifications
+remain authoritative even if the callback retires child state. Node wrappers
+supply quiescence through `lineGetWID(child_l)` and a constant orientation:
+`kMuxChildrenTowardPrev` uses `tunnelPrevDownStreamPause/Resume` for MuxClient;
+`kMuxChildrenTowardNext` uses `tunnelNextUpStreamPause/Resume` for MuxServer.
+Orientation selects direction only. MuxClient still owns parents and borrows
+children; MuxServer still borrows parents and owns children. Parent references,
+startup reconciliation, output pumps and lifecycle decisions remain in each
+node; a child reference cannot protect its separate parent allocation.
 
 Mux's fixed header cache owns consumed header bytes until the declared body has
 been consumed. Data body bytes reach a writable child incrementally, with no
