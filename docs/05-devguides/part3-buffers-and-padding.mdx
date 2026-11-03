@@ -2395,11 +2395,16 @@ capacity. A maximum frame occupies 1,048,584 wire bytes; a preceding Open adds
 another eight bytes (1,048,592 total). Decoding rejects a larger declaration as
 soon as all eight header bytes arrive, even for unknown CIDs or types, and closes
 only that parent through normal parent-loss cleanup. After a valid Data header,
-the decoder delivers available body bytes incrementally; it does not wait for the
-whole frame. Data for an unknown or closed CID is discarded incrementally. Empty
+the decoder normally delivers available body bytes incrementally. MuxServer
+waits for each child's first nonempty Data frame to arrive completely, then hands
+off its whole body in one Payload or retains it in the child's paused queue.
+VlessServer and TrojanServer can reject credentials split across their first
+Payload callbacks, so this exception preserves the first frame across carrier
+read boundaries. Later Data frames and MuxClient's receive path keep incremental
+delivery. Data for an unknown or closed CID is discarded incrementally. Empty
 Data is consumed without a child Payload callback. Other frame bodies are also
 consumed incrementally, but control effects wait until their declared bodies end.
-Available body bytes and completed controls drain before retained incomplete
+Ready body bytes and completed controls drain before retained incomplete
 input is checked against **1,048,584 bytes**, including its cached header.
 Bytes not yet received do not count as retained input.
 
@@ -2410,13 +2415,17 @@ echoed unchanged by the responder. Each control occupies eight wire bytes;
 Data framing and splice representation remain unchanged. Disabled keepalive
 consumes controls without responding or acknowledging. The serializer uses `mux_wire_header_t`; decoded
 `mux_frame_t` has a 32-bit length and must never be copied as wire bytes.
-Each child is an ordered byte stream with arbitrary Payload boundaries. Both Mux
+Each child is an ordered byte stream, with the first nonempty MuxServer Data
+frame exception above. Other Payload boundaries remain arbitrary. Both Mux
 decoders track the current Data CID and remaining body length, publishing progress
-before child callbacks. Extraction returns only available body bytes: do not shift
-away another eight bytes. One Data frame may produce several callbacks and paused
-children may retain several queue entries for it. Empty Data creates no callback
-or child queue entry. Data for a missing or closing child is discarded as bytes
-arrive. If delivery closes the child partway through a frame, discard the remaining
+before child callbacks. MuxServer also publishes its first-frame completion before
+callbacks, so reentrant input observes the later-frame policy. Extraction returns
+only body bytes: do not shift away another eight bytes. A later Data frame may
+produce several callbacks and paused children may retain several queue entries
+for it. Empty Data creates no callback
+or child queue entry and does not satisfy MuxServer's first-frame condition.
+Data for a missing or closing child is discarded as bytes arrive. If delivery
+closes the child partway through a frame, discard the remaining
 body before decoding the next header. Look up the child again for each chunk;
 do not cache its state pointer in the frame state. Parent receive reentry appends behind current input
 and observes the already-published frame progress. After callbacks, physical
@@ -2431,8 +2440,9 @@ through Data, already delivered bytes stay delivered and accepted queued chunks
 retain their usual detached drain; the missing suffix is not reconstructed.
 Later frames still follow the current frame's body on the shared carrier, so
 incremental delivery does not eliminate transport head-of-line blocking.
-MuxServer treats each accepted nonempty Data chunk as child idle activity; no
-whole-frame wait delays the initial-to-active timeout transition or its refresh.
+MuxServer treats received nonempty Data bytes as child idle activity, including
+bytes retained while waiting for the first frame. That wait does not delay the
+initial-to-active timeout transition or its refresh.
 
 MuxServer reserves each admitted child in one atomic count across all parents
 and workers until its line state is destroyed, including detached and draining
@@ -2485,7 +2495,7 @@ carrier connection; its **children** are the streams multiplexed through it.
 | --- | --- | --- |
 | Splice socket read request | **1 MiB in every profile** | Upper bound per read attempt. A positive short transfer produces a shorter valid buffer; remaining bytes wait for a later read. |
 | Payload in one Mux frame | **1 MiB** | Independent protocol maximum. A larger declaration closes that parent as soon as its complete eight-byte header is decoded. |
-| Retained incomplete input | **1 MiB + 8 bytes** | Received logical bytes, including the cached header. Available Data chunks and complete controls drain first; an oversized remainder closes the parent. Unreceived body bytes do not count. |
+| Retained incomplete input | **1 MiB + 8 bytes** | Received logical bytes, including the cached header. Ready Data chunks and complete controls drain first; an oversized remainder closes the parent. Unreceived body bytes do not count. |
 | `child-buffer-limit` | **128 MiB charge** | One child's queued decoded data. Reaching the limit closes that child. |
 | `parent-buffer-limit` | **512 MiB charge** | Incoming stream plus all attached child queues on one parent. At the limit, try beneficial incoming compaction, then shed largest queued children. Unrelieved pressure closes the parent. |
 | `parent-write-buffer-pause-threshold` | **128 MiB charge** | One outgoing parent FIFO. Reaching it pauses child producers while the FIFO drains. |
@@ -2506,16 +2516,20 @@ remain separate from these buffer boundaries.
 
 `parent-buffer-limit` (512 MiB by default) covers incoming frame assembly plus
 all attached child queues. The stream counter remains separate from the child
-aggregate, and their sum is checked at stable return boundaries. Available Data
+aggregate, and their sum is checked at stable return boundaries. Ready Data
 chunks and complete controls in a coalesced delivery drain first, even if its
 temporary charge exceeds the limit. A paused child retains chunks as they arrive,
 so one Data frame may create several charged queue entries. Cached header bytes
 count toward the independent 1,048,584-byte incomplete-input bound until the body
 ends, but the header cache and stream/queue metadata carry no sbuf charge.
 The declared body bytes still missing from the transport carry no retention charge.
-After an ordinary receive pass drains available input, a partial Data frame needs
-only its cached header and remaining-length state between arrivals. Any accepted
-chunks for paused children belong to their queues, not to frame assembly.
+For an unpaused child, a partial Data frame normally needs only its cached header
+and remaining-length state between arrivals. MuxServer retains the received body
+of the first nonempty frame until it is complete, under the same parent receive
+budget and 1 MiB frame maximum. A configured budget too small for that retained
+input can close the parent after compaction and child shedding; first-frame
+assembly does not bypass the limit. Any decoded chunks retained for paused
+children belong to their queues, not to frame assembly.
 Active splice-head body consumption reduces logical capacity and its charge;
 prefix consumption and ordinary cursor movement do not reduce capacity.
 
@@ -2576,10 +2590,10 @@ carrier socket follows this path:
 flowchart TD
     A["Mux TCP socket"] --> B["Ordinary buffer or splice wrapper with private pipe"]
     B --> C["Incoming stream: gather eight-byte header"]
-    C --> D{"Data body bytes available?"}
+    C --> D{"Data body ready? MuxServer's first nonempty frame must be complete"}
     D -- No --> W["Wait for more socket data"]
     W -. Next delivery .-> B
-    D -- Yes --> E["Extract an available chunk; publish remaining length"]
+    D -- Yes --> E["Extract a ready chunk; publish remaining length"]
     E --> F{"Child writable?"}
     F -- Yes --> G["Forward to child and its write path"]
     F -- No --> H["Retain chunk in child FIFO"]
@@ -2619,9 +2633,11 @@ chunks. Each splice wrapper still owns its own pipe exclusively.
    without requiring the body to become resident. An exhausted source is
    recycled; any remaining body stays in its buffer or pipe while waiting.
 
-3. **Extract available Data bytes.** A complete header is required, but the whole
-   body need not have arrived. Consume at most the current frame's remaining
-   length and publish the new remainder before callbacks. A suitable whole source
+3. **Extract ready Data bytes.** A complete header is required. MuxServer waits
+   for the first nonempty frame's whole body; later frames to a writable child
+   and MuxClient's receive path can deliver available body bytes. Consume at most
+   the current frame's remaining length and publish the new remainder before
+   callbacks. A suitable whole source
    buffer can transfer directly. A chunk spanning inputs or using part of an input
    gets an independent result assembled in order. Pipe bodies can move
    pipe-to-pipe; resident prefixes and ordinary sources copy or write as needed.
@@ -2675,12 +2691,12 @@ chunks. Each splice wrapper still owns its own pipe exclusively.
 | Destination pipe fills during frame assembly | Return a complete ordinary fallback, preserving bytes already moved and appending the remaining source bytes exactly once. |
 | A read of claimed private-pipe bytes is short or interrupted | Accumulate positive progress and retry `EINTR`. EOF, `EAGAIN`, or another failure before the claimed range is complete remains a fatal invariant. This is different from a short socket read. |
 | One small splice buffer would become a larger pooled ordinary buffer | Skip pressure compaction when it would not strictly reduce total incoming charge. Kernel pipe capacity alone does not justify conversion. |
-| One delivery contains complete frames and a partial Data body | Drain available Data bytes and complete controls before checking combined retained receive charge. The limit is not an instantaneous ceiling on the current delivery. |
+| One delivery contains complete frames and a partial Data body | Drain ready Data bytes and complete controls before checking combined retained receive charge. MuxServer keeps a child's incomplete first nonempty frame in the incoming stream. The limit is not an instantaneous ceiling on the current delivery. |
 | A configured parent budget cannot fit retained incomplete input and child queues | After beneficial compaction and available child shedding, close only that parent; do not loop indefinitely or abort the process for ordinary limit pressure. |
 | A child dies while its encoded data is queued to the parent | The parent still owns the admitted output and preserves its ordering until sent or discarded by parent cleanup. |
 | Parent loss interrupts Data after some chunks were accepted | Delivered prefixes remain delivered. Eligible queued chunks detach and can drain independently, subject to their per-worker charge/count limits. The parent's remaining input and outgoing data are discarded. |
 | A callback closes a child or parent during delivery or pressure recovery | Hold the required temporary line reference and recheck logical life/state before continuing. A reference protects allocation life, not permission to use destroyed state. |
-| Empty parent input or a zero-length Data frame | Empty incoming sbufs recycle. A zero-length Data frame is consumed without a child Payload callback or child queue entry; it is neither EOF nor Close. |
+| Empty parent input or a zero-length Data frame | Empty incoming sbufs recycle. A zero-length Data frame is consumed without a child Payload callback or child queue entry; it is neither EOF nor Close and does not satisfy MuxServer's first-frame condition. |
 
 The queue-capacity formula and ownership transitions do not promise that physical
 RAM, descriptors, or fixed inventory capacity fall when a charge is released. Runtime
