@@ -763,25 +763,35 @@ Config changes settle the old rate to the change time before applying the new ca
 Existing managed lines keep cached drains during ordinary client outage or credential rejection; new-login admission
 retains its separate AuthenticationClient gate. Required local timer/continuation failure closes only the affected line.
 
-### Borrowed QUIC session timers
+### QUIC session ownership and timers
 
-QuicClient/QuicServer confine each QUICHE engine, carrier parser and alarm root
-to `lineGetWID()` and that worker's loop. Their clocks use fresh monotonic time
+QuicClient/QuicServer confine each QUICHE engine, carrier parser, paired lines and
+alarm root to their shared owner WID and that worker's loop. Their clocks use fresh monotonic time
 for protocol deadlines/RTT, with wall time reserved for certificate/protocol
-uses. A single owner-loop timer tracks the earliest QUIC alarm or readiness
-deadline with safe upward millisecond rounding and bounded work per dispatch.
+uses. A single owner-loop timer tracks the earliest QUIC alarm, readiness,
+delivery-drain or closing/draining deadline with safe upward millisecond rounding
+and bounded work per dispatch.
 Partial input never extends the total handshake/stream-opening deadline.
 
-The per-worker session registry manages borrowed contexts, not line ownership.
-Quiescence closes new admission and detaches alarm roots on their owner workers
-before acknowledgment. Normal line owners subsequently drain while chains,
-protocol state and pools remain alive; a borrowed registry is not required to
-be empty based on an assumed worker-hook topology order. Final destruction
-requires no sessions, timers or active driver references before shared
-configuration is released. Reentrant Finish detaches local state immediately;
-an active driver frame defers C++ engine deletion until it returns safely.
-No callbacks or alarms may survive retirement, and received Finish never waits
-for acknowledgment from a carrier whose lifetime belongs to another node.
+The per-worker session registry inventories the client's owned carrier lines and
+the server's owned service lines, including sessions whose application already
+detached while delivery remains outstanding. Borrowed application/carrier lines
+remain owned by their original sources. Quiescence closes new admission and
+detaches alarm roots on their owner workers before acknowledgment. Worker drain
+aborts outstanding delivery, detaches the session's links before callbacks,
+finishes still-live endpoints and destroys every owned line while chains and
+pools remain available. It does not wait for network acknowledgment. Drain must
+remain correct regardless of whether the borrowed source or this node's worker
+hook runs first.
+
+Final destruction requires no sessions, timers, owned lines or active driver
+references before shared configuration is released. Reentrant application Finish
+detaches that application immediately while an independently retained carrier
+may continue its bounded delivery. Reentrant carrier Finish aborts the session;
+an active driver frame defers C++ engine deletion until it returns safely. No
+callback or alarm may survive final retirement. A temporary line reference never
+substitutes for logical line ownership or keeps a finished borrowed application
+alive for ACK processing.
 
 ## 9. Timers, watchers, and deferred timer reclamation
 

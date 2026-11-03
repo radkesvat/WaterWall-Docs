@@ -2096,23 +2096,27 @@ obligations through the owned inventories described in Part 7.
 
 ### Raw QUIC transforms
 
-`QuicClient` and `QuicServer` borrow the existing normal line and create neither
-sockets nor companion/application lines. Client upstream plaintext becomes
-next-side carrier data; server upstream carrier data becomes next-side
-plaintext. Their outputs preserve these directions even though the transforms
-have opposite roles. One QUIC v1 connection carries one client-initiated
-bidirectional application stream per line. The client sends encrypted opening
+`QuicClient` borrows its application's normal line and owns a separate carrier
+line. `QuicServer` borrows its carrier's normal line and owns a separate service
+line. Both use the supplied adapters for sockets. Client upstream plaintext
+becomes next-side carrier data; server upstream carrier data becomes next-side
+plaintext on its service line. Outputs preserve these directions even though the
+transforms have opposite roles. One QUIC v1 connection carries one
+client-initiated bidirectional application stream per association. The client sends encrypted opening
 byte `0x00`; the server validates and consumes it before releasing application
 data, including queued server-first output. It is never application data.
 
-Both nodes initialize and publish local state before forwarding next Init once.
+Both nodes initialize and publish local state and companion-line linkage before
+forwarding next Init once on that owned line. Copy routing context before that
+handoff. An owned line receiving Finish must be logically dead before its handler
+returns; borrowed lines remain their creator's responsibility.
 Client handshake startup is independent of Est. Every supported downstream Est
 is relayed, including repeats; authenticated protocol readiness produces no
 extra Est. Application bytes wait under hard budgets until handshake/stream
 readiness, while input and library output are serialized against reentry.
 Neighbor callbacks run after the QUICHE driver call returns. After each callback,
-check both line life and local attachment: Finish may retire this transform on
-a still-live borrowed line.
+check exact line life and local attachment. Application Finish may detach one
+line while the independent session and carrier remain active.
 
 Incoming Pause/Resume relay, including duplicates. Due loss/ACK alarms and ready
 FIFO output continue through advisory Pause. A separate local send-pressure
@@ -2125,16 +2129,30 @@ finite pauses recover when deadlines permit, while prolonged pauses can close
 the association.
 
 A received Finish closes its sender's direction before cleanup and never emits
-back toward that side. Cancel alarms and detach protocol state before forwarding
-away. A local failure settles local state and finishes next before prev under
-the ordinary borrowed-line topology. Neither QUIC node calls `lineDestroy()`.
-Application-side Finish may make a bounded synchronous ready-wire drain only
-toward the still-open carrier, honoring congestion/pacing and guarding every
-reentrant signal against the finished side. No asynchronous reliable-drain
-promise survives received Finish: the line owner
-may destroy it immediately after the handler returns. Final unacknowledged data
-may be lost; the peer has finite deadlines. Application stream FIN/reset closes
-the association after preceding decoded bytes, without application half-close.
+back toward that side. Application-side Finish detaches the application
+immediately; neither payload nor pressure may reach it again. Destroy an owned
+service line before returning from its Finish callback. The independent carrier
+and engine continue delivering accepted output and stream FIN, including when
+application Finish preceded handshake readiness. Do not admit new application
+input while closing. Carrier Finish aborts the session and destroys an owned
+client carrier before returning.
+
+`close-drain-timeout-ms` defaults to 30,000 and accepts integer values
+1–86,400,000. The first local application Finish or peer FIN starts one fixed
+local delivery deadline, including before readiness. Progress, retries and
+duplicate FIN never extend it. Handshake/idle deadlines, carrier loss and process
+shutdown can close earlier. The setting is local, not negotiated.
+
+An ordered PEER_FIN event follows every decoded byte preceding the FIN. Deliver
+those bytes, detach/finish the application, and drain its already accepted
+outgoing bytes before CONNECTION_CLOSE. Application half-close is not exposed.
+After local FIN acknowledgement and peer FIN, retain protocol closing/draining
+state for a separate fixed interval of at most three probe timeouts, capped by
+the configured close-drain timeout. Do not equate acknowledged payload bytes
+with acknowledged FIN. This phase handles late protocol traffic without
+reopening the application; repeated input cannot extend its deadline. Expired
+unconfirmed delivery is logged and retired. Reset or other protocol failure
+aborts the association.
 
 ### SpeedLimit independent drains
 
