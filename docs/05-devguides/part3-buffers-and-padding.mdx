@@ -5,7 +5,7 @@ sidebar_label: "Part 3: Buffers & Padding"
 description: "The sbuf_t buffer model, worker buffer pools, left-padding budgets, and how to prepend protocol headers without breaking chain composition."
 ---
 <!--
-Documentation version: 190
+Documentation version: 192
 -->
 
 # Part 3: Buffers, Padding & Shift Buffers
@@ -3089,6 +3089,53 @@ In debug builds, `BUFFER_WONT_BE_REUSED(x)` swaps a buffer for a fresh duplicate
 and destroys the original, so any stale pointer to the old buffer is caught
 quickly. If you see it in reference tunnels, it marks "this buffer must not be
 touched again after this point."
+
+### TcpOverUdp envelope and retained buffers
+
+`Internals/TcpOverUdpCommon` owns the paired nodes' wire framing and KCP/FEC
+session driver. Its explicitly serialized 40-byte envelope precedes each
+handshake, KCP packet or FEC shard. The configured `send-mtu` is an outgoing
+IPv4 packet budget:
+subtract 20 bytes IPv4, 8 UDP, 40 envelope and, when enabled, 8 FEC before deriving
+KCP MTU. KCP accepts at least 50 bytes and is capped at 64000; an application
+chunk also subtracts its 24-byte KCP header and one-byte internal record flag.
+The minimum configured MTU is therefore 118 without FEC and 126 with FEC.
+
+Incoming KCP packets use the independent 64000-byte protocol limit; FEC shards
+allow up to 64008 bytes, excluding the 40-byte envelope. Never validate input
+against the local `send-mtu`: peers may choose different sending budgets, and
+MTU is not negotiated. Envelope, session identity, FEC geometry and completed
+message validation remain required.
+
+The envelope fixes magic `0x57574b43` (`WWKC`), kinds HELLO=1, CHALLENGE=2,
+CONFIRM=3, READY=4, KCP=5 and FEC=6, a zero reserved byte, network-order 16-bit
+body length and two 16-byte nonces. Exact lengths, kind, identity and negotiated
+FEC geometry are checked before decoder access. Handshake settings are an
+8-byte body: network-order 32-bit close interval, data/parity shard bytes and two
+zero reserved bytes. Golden fixtures live in `tcp_over_udp_session_test`.
+
+Application framing still advertises one byte of left padding and blocks splice.
+Forwarding transfers an entire ordinary sbuf. KCP owns accepted ordered payload;
+there is no second pre-handshake stream queue. Retained nested input uses the
+ordinary budget helpers with 2 MiB logical and 8 MiB allocation-charge bounds,
+without a buffer-count cap. An outer application call copies its complete input
+into KCP before any pressure callback.
+
+KCP/FEC output callbacks stage exact owned encoded datagram bytes. One batch
+covers an update and optional explicit ACK flush; every older batch is handed
+off before another flush starts. Nested input is consumed between handoffs so
+its buffer charge can settle while the older output keeps FIFO priority. The
+checked byte and record ceilings derive from the existing unacknowledged flight,
+at most one send window of queued segments per flush, the current ACK list and
+two probes,
+including the envelope and FEC expansion needed to complete a partial parity
+block. Each handoff creates one ordinary buffer from the owner-worker pool.
+This preserves the configured KCP window and prevents framing expansion or
+pooled buffer capacity from rejecting an otherwise accepted application write.
+Final release settles queued work, staged wire bytes, KCP/FEC state and timers
+before the pool disappears. These internal wire copies and KCP/FEC heap storage
+are separate from sbuf allocation-charge accounting; these bounds do not provide
+a process-wide transport heap budget.
 
 ## A Complete Prepend Example
 

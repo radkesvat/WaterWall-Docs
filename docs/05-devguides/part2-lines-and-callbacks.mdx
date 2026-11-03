@@ -5,7 +5,7 @@ sidebar_label: "Part 2: Lines & Lifetime"
 description: "The connection lifecycle, re-entrancy hazards, line references, and the clean-finish patterns that keep WaterWall tunnels free of use-after-free bugs."
 ---
 <!--
-Documentation version: 197
+Documentation version: 198
 -->
 
 # Part 2: Lines, Callbacks & Lifetime Safety
@@ -1382,8 +1382,7 @@ identical:
 | --- | --- | --- |
 | `TlsServer` | `upstream_finished`, `downstream_finishing`, `fallback_close_draining` and shared replay close-drain state | Sends TLS alert / close and settles delayed fallback before closing |
 | `TrojanServer`, `VlessServer`, `VmessServer` | Closing phase and shared replay close-drain state | Settles a delayed fallback batch without reflecting toward the finished previous side |
-| `TcpOverUdpClient` | `can_downstream` | Must finish its reliable-stream teardown before closing |
-| `TcpOverUdpServer` | `can_upstream` | The same, in the opposite direction |
+| `TcpOverUdpClient`, `TcpOverUdpServer` | Detached application association plus shared session close state | Drain accepted KCP output and retain duplicate CLOSE acknowledgment state on independent carrier/session storage |
 | `HttpClient`, `HttpServer`, `HttpProxyClient`, `Socks5Server` | `prev_finished`, `next_finished` | Send final protocol bytes before transport close |
 
 If your tunnel does **not** send final bytes during `Finish`, it should not carry
@@ -2033,37 +2032,62 @@ aligned line state, then permanently bypass it. Neither Est nor Resume is a
 prerequisite. No callbacks remain for the server after retirement, including
 Finish; the client retains its distinct-line mapping.
 
-### TcpOverUdp local KCP pressure
+### TcpOverUdp ownership, sessions and KCP pressure
 
-TcpOverUdpClient and TcpOverUdpServer borrow normal lines and continuously
-transform stream payloads into KCP datagrams and back, optionally through FEC.
-Their timers and protocol state prevent permanent bypass. Incoming Pause/Resume
-already relay transparently, including repeats, with directional Finish guards;
-they do not stop KCP updates or due output.
+TcpOverUdpClient borrows its application line and creates an owned UDP transport
+line during Init. TcpOverUdpServer borrows the UDP-facing carrier and creates a
+distinct owned service line for each confirmed session. Their KCP/FEC and timer
+state lives outside either application line. Application Finish detaches both
+association links and zeros that line's node state before returning; the server
+also destroys its exact owned service line. No later callback targets that
+retired application. Transport Finish aborts its sessions immediately. Only the
+client destroys its owned transport; the server finishes toward the owner of
+its borrowed carrier after its last session and pending challenge are gone.
 
-KCP/FEC output callbacks enqueue owned datagrams in contexts. Neighboring tunnel
-callbacks run only after the KCP/FEC call returns, because they may destroy the
-protocol state. Preserve this output staging and the subsequent line/handle checks.
+HELLO/CHALLENGE/CONFIRM/READY negotiates fresh independent 128-bit nonces and
+matching FEC settings before server service Init. A 40-byte outer envelope checks
+the full nonce pair before KCP or FEC input. Unknown data cannot create a service;
+duplicate CONFIRM cannot initialize another one. Each carrier permits one pending
+challenge and at most 64 established/closing sessions, including ACK responders.
+Server startup gates KCP delivery until service Init safely begins/completes.
+Actual transport Est remains prompt and separate from handshake readiness.
+Pause/Resume maps onto the associated live line, including repeated notices;
+ordinary advisory pressure never stops protocol updates or due wire output.
 
-Their separate source-pressure latch represents locally queued and unacknowledged
-KCP segments. Reconcile it after KCP update and packet delivery, outside KCP's
-output callback, with the exact line referenced. Publish the latch before sending
-Pause above the configured threshold or Resume below it; equality retains the
-existing state. ACK-only input must be able to release the local hold. Admit the
-complete source payload before any pressure callback so reentrant input cannot
-overtake it. After notification, recheck both line life and the KCP handle: Finish
-may have destroyed this borrowed node's state without destroying the line.
-The automatically derived threshold saturates at `INT_MAX`, matching KCP's signed
-queue-count interface. The send-buffer setting remains an advisory threshold,
-not a hard admission cap.
+Both nodes negotiate `D = min(close-drain-timeout-ms)` with default 30000 and
+integer range `1..INT_MAX`. The first local or peer closing event fixes the send
+deadline at that event plus D; later packets and handshake progress never restart
+it. An earlier application Finish keeps its original timestamp when negotiation
+shortens D. Previously accepted data drains before exactly one CLOSE is queued.
+Only KCP acknowledgment of that CLOSE confirms local sending; a flush, empty
+queue before CLOSE, deadline, transport failure or shutdown does not.
 
-Receive draining distinguishes an empty or incomplete KCP queue (`ikcp_recv`
-returns `-1` or `-2`) from a completed message that exceeds the local large
-buffer (`-3`). The former waits; the latter closes the affected borrowed line.
-A zero-byte message lacks the required frame flag, and an unknown flag is also
-a local protocol failure. A flag-only DATA message remains a harmless discard.
-Settle local state before outward Finish and honor an already-closed direction
-when malformed input reenters a close-frame flush.
+A received CLOSE retires the application exactly once and starts any independent
+accepted-output drain before publishing its KCP ACK. Duplicate CLOSE is handled by
+KCP's ordinary ACK logic. A peer-only responder remains until receipt plus D;
+a confirmed local sender retains ACK-capable state until confirmation plus D.
+These fixed obligations bound retention by 2D from the first closing event.
+Expiration wins at deadline equality. Expired local PUSH output is suppressed,
+including within mixed ACK/PUSH datagrams, while required duplicate ACKs survive.
+ACK-only retention uses a deadline wakeup rather than continuous KCP ticks.
+
+KCP/FEC callbacks stage owned datagrams; neighboring callbacks occur only after
+library calls return. Per-session serialization preserves admitted FIFO work
+across nested callbacks. Hold exact line references and independent session
+lifetime protection around outward callbacks, then recheck logical life and
+association identity. A reference alone cannot keep a finished line usable.
+
+The separate source-pressure latch counts locally queued/unacknowledged KCP
+segments. Admit the entire source payload before a pressure callback. Publish the
+latch before Pause above its threshold or Resume below it; equality retains the
+existing state. ACK-only input can release the hold. The automatic threshold
+saturates at `INT_MAX`; it is advisory and does not impose a hard buffer cap.
+
+Incomplete KCP messages wait. A complete message larger than the local receive
+buffer, a missing flag or an unknown flag is a session-local protocol failure.
+Flag-only DATA remains harmless. Closing receivers never deliver payload or
+repeat Finish to an already retired application. Shutdown aborts all outstanding
+obligations through the owned inventories described in Part 7.
 
 ### Raw QUIC transforms
 
