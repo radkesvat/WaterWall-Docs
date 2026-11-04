@@ -1365,67 +1365,112 @@ mapped upstream packet is decoded exactly once at this node and forwarded native
 
 ## FakeTcpHeader checksum and packet representation
 
-`FakeTcpHeaderClient` and `FakeTcpHeaderServer` insert fake TCP immediately after
-the existing IPv4 header, using its actual IHL. The original native TCP or UDP
-header follows fake TCP; there is no second IPv4 header. Both nodes require an
-explicit integer `payload-protocol`, either `6` or `17`, and peers must agree.
-Native TCP and its carrier both expose protocol 6, so callback orientation,
-not the visible protocol, selects encoding versus decoding. There is no on-wire
-native protocol tag or negotiation; structural validation cannot guarantee
-detection of a settings disagreement.
+`FakeTcpHeaderClient` and `FakeTcpHeaderServer` reuse the existing IPv4 header,
+insert fake TCP immediately after its actual IHL, then insert one byte recording
+the original IPv4 protocol `P`. The native IP payload follows that byte; there is
+no second IPv4 header, footer or protocol setting. One configured pair can carry
+TCP, UDP, ICMP and opaque protocols packet by packet. Native TCP and its carrier
+both expose protocol 6, so callback orientation selects encoding versus decoding.
 
-The codec reuses `updateIpv4TransportChecksumAddresses()` and the zero-address
-convention above without depending on IpManipulator. Encoding completes any
-requested native repair under the native protocol and current addresses, then
-normalizes the native checksum's address contributions to zero/zero. Its native
-protocol and transport-length contributions remain. Fake TCP uses the real
-current addresses and covers the normalized native bytes. Decoding removes
-fake TCP and restores the native checksum contributions of the addresses now in
-the packet. Invalid native checksum residuals survive without a native repair
-request; disabled UDP zero, enabled UDP arithmetic zero and TCP zero retain the
-shared helper's semantics. UDP checksums use the declared UDP length, excluding
-any permitted trailing IP payload padding.
+```text
+native:  [IPv4, protocol P][original IP payload]
+carrier: [same IPv4, protocol 6][fake TCP + options][P: one byte][original IP payload]
+decoded: [same IPv4, protocol P][original IP payload]
+```
 
-A repair request on a carrier applies only to its visible IPv4/fake TCP layer.
-It bypasses visible checksum verification on decode, never framing, ports,
-fragment or length checks, and does not authorize repair of hidden native
-corruption. Successful encode/decode consumes the request. Every refusal must
-leave bytes, headroom, cursor, length and intent unchanged before the node
-recycles its locally owned buffer.
+All protocol byte values `0..255` are representable. TCP requires its minimum
+header and valid data-offset bounds; UDP requires its minimum header and a
+declared length within the native span. ICMP requires its eight-byte base header
+without interpreting type/code. Other protocols receive only exact IPv4 framing
+checks and their bodies remain opaque, including an empty body. Receive requires
+at least one fake TCP payload byte for the tag. A tag-only carrier is valid only
+for opaque protocols; zero is a present, valid tag value. Reserved or unknown
+protocol values imply neither OS nor downstream protocol support.
+
+The codec reuses the shared checksum helpers without depending on IpManipulator.
+Encoding first completes any native repair request under the original protocol
+and current addresses. TCP, UDP and ICMP use the existing full-packet repair
+behavior. For opaque protocols the helper repairs only the IPv4 header; the
+opaque body remains untouched, with no claim that its integrity was repaired.
+
+Only TCP and UDP use `updateIpv4TransportChecksumAddresses()`: encode normalizes
+native checksum address contributions to zero/zero while retaining native
+protocol and transport length. The packet's actual address fields are not zeroed.
+Decode restores the contributions of the current addresses. Invalid native
+checksum residuals survive without native repair; disabled UDP zero, enabled UDP
+arithmetic zero and TCP zero retain the shared helper's semantics. UDP checksum
+coverage uses its declared length, excluding permitted trailing IP payload
+padding. ICMP has no surrounding IPv4-address pseudo-header and receives no
+address adjustment. Without native repair its complete message remains unchanged,
+including checksum bytes and quoted IP headers in error messages. Opaque body
+bytes are also preserved without checksum interpretation or normalization.
+
+Fake TCP uses the real current addresses and protocol 6. Its checksum covers
+its header/options, the protocol byte and the entire native body. The native
+checksum excludes the tag. Decode normally verifies visible IPv4 and fake TCP
+checksums. A carrier repair request makes only those visible checksums
+non-authoritative; it never waives framing, ports, tag presence, native shape,
+fragment or size checks and never authorizes hidden TCP, UDP, ICMP or opaque
+repair. After removing framing, decode restores TCP/UDP address contributions
+and rebuilds only the surviving IPv4 header checksum. Successful encode/decode
+consumes the request. Every refusal must leave bytes, headroom, cursor, length
+and intent unchanged before the node recycles its locally owned buffer.
 
 Source/destination, IPv4 options/IHL, ID, DF, TTL and DSCP/ECN survive. Only
 protocol, total length and IPv4 checksum change; the header checksum is rebuilt
 over the actual IHL. Transit changes remain visible after decode. No original
 addresses are saved: chain configuration must restore the native tuple wherever
 a receiving TUN or connection stack needs it. Address rewriting while encoded
-only needs to adjust visible IPv4/fake TCP; rewriting before encode or after
-decode adjusts ordinary native TCP/UDP. Arbitrary hidden-byte edits require
-understanding the normalization convention.
+adjusts visible IPv4/fake TCP; native TCP/UDP decode consistently with the final
+addresses. Opaque carriage provides no equivalent guarantee for protocols such
+as UDP-Lite or AH that can protect addresses or other header fields. Required
+fields must be preserved/restored or handled by a protocol-aware transform.
+Preserving ICMP quoted bytes does not translate their embedded addresses.
+Arbitrary hidden-byte edits require understanding the native representation.
 
-FakeTcpHeader specifically requires complete, unfragmented IPv4 datagrams at
-both codec entry points: reject MF or nonzero fragment offset without clearing
-them. Reassemble native fragments before encoding and transit-fragmented
-carriers before decoding. This restriction does not apply to ProtoSwap's
+For every original protocol, both codec entry points require complete,
+unfragmented IPv4 datagrams. Encode must reject MF or nonzero fragment offset
+before native transport parsing, repair or mutation, including with repair intent
+and when the fragment is too short for a native header. This drops first, middle
+and final fragments. Decode retains the same MF/offset refusal. DF alone is
+accepted and preserved. Reassemble native fragments before encoding and
+transit-fragmented carriers before decoding; `preserve-fragments` does not make
+fragments admissible. This restriction does not apply to ProtoSwap's
 fragment-aware protocol/checksum conversion described above.
 
-If `F = 20 + outgoing fake TCP options length`, encoded size is native IPv4
-size plus `F`, and the current 1500-byte carrier cap permits `1500 - F` native
-bytes: 1480 without options or 1476 with four option bytes. Both nodes advertise
-60 bytes of left padding. Encoding moves only the existing IPv4 header backward
-by `F`; decoding moves it forward by the received fake header length. Since IHL
-can exceed `F`, movement must be overlap-safe. Peers may use different outgoing
-options, and receiving uses each carrier's data offset. Configure native MTUs for
-the largest outgoing fake header used by either peer. The nodes add no
-fragmentation, PMTU discovery, handshake, retransmission or reliability.
+With actual IPv4 length `H = 20..60`, fake TCP length `F = 20 + options length`
+(`20..60`) and metadata length `M = 1`, total inserted overhead is `O = F + 1`
+(`21..61`). The tag is at `H + received F`, and native bytes begin one byte later.
+Fake TCP's data offset is `F / 4` and excludes the tag. IPv4 total length and fake
+TCP checksum include it. Encoded length is native IPv4 length plus `O`; the
+1500-byte final-packet cap permits `1500 - O` native bytes: 1479 without options,
+1475 with four option bytes, or 1439 with forty. For a 20-byte IPv4 header and
+8-byte UDP header, the corresponding UDP data limits are 1451, 1447 and 1411.
+
+Both nodes advertise 61 bytes of left padding. Encode moves only the existing
+IPv4 header backward by outgoing `O`; decode moves it forward by received `F + 1`
+and advances the cursor by that amount. Native body bytes stay in place and need
+no extra tail space. Header moves must be overlap-safe when IHL exceeds overhead.
+The odd overhead can unalign headers, so use packed headers and unaligned-safe
+byte/endian/checksum operations. The tag changes checksum byte parity; it cannot
+be summed separately from native bytes without accounting for that parity.
+Peers may use different outgoing options; receiving uses each carrier's data
+offset. Configure both peers' native TUN/CTP/PTC and core MTUs for the largest
+outgoing overhead. The nodes add no fragmentation, PMTU discovery, handshake,
+retransmission or reliability.
 
 Client upstream and server downstream encode; client downstream and server
-upstream decode. Each forwards only in its callback direction. They use
-chain-owned worker packet lines, no line state, and never destroy packet lines.
-The per-flow client-port index is computed from the native tuple before
-insertion. Endpoint symmetry gives the same request/reply index only when the
-two encoders see reversed tuples; arbitrary address rewrites may change it.
-Each stable directional tuple still yields stable distribution, and decoding
-checks the configured port range rather than recomputing the native hash.
+upstream decode. Each forwards exactly once in its callback direction or recycles
+once on refusal. They use chain-owned worker packet lines, no line state, and
+never destroy packet lines. The client-port index is computed from the native
+packet before insertion using `deviceFlowWorkerHash()`. The helper recognizes
+TCP/UDP/SCTP ports when present and otherwise uses its existing fallback; no
+per-session ICMP or opaque distribution is promised. Endpoint symmetry gives
+the same request/reply index only when the encoders see reversed tuples;
+arbitrary address rewrites may change it. Decoding checks the configured port
+range rather than recomputing the native hash. `ConnectionToPackets` and
+`PacketsToConnection` remain TCP/UDP-only; direct suitable packet paths such as
+TUN can use broader carriage.
 
 ## Two Kinds of Packet Tunnels
 
