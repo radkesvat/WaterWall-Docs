@@ -1388,9 +1388,9 @@ for opaque protocols; zero is a present, valid tag value. Reserved or unknown
 protocol values imply neither OS nor downstream protocol support.
 
 The recommended defaults are `"sequence": "random_port"`,
-`"increment-sequence": true`, `"acknowledgment": 0` and
-`"increment-acknowledgment": false`. `sequence` accepts an integer
-`0..4294967295`, `"random_node"`, or `"random_port"`. A number seeds every
+`"increment-sequence": true`, `"acknowledgment": 0`,
+`"increment-acknowledgment": false` and `"flags": [{"ack": true, "psh": true}]`.
+`sequence` accepts an integer `0..4294967295`, `"random_node"`, or `"random_port"`. A number seeds every
 client port with that value. `random_node` draws one random 32-bit value for every port to start from;
 `random_port` draws an independent value per port. Draws happen during node
 creation, including when incrementing is disabled; first use and new native
@@ -1402,10 +1402,12 @@ a new sequence on every packet.
 Each node instance owns the selected starting values and, with incrementing
 enabled, a counter for each selected client port, shared safely across all its
 workers. Encoding uses the selected port's current counter, then advances it by
-one protocol byte plus the complete native IPv4 payload length, modulo `2^32`.
-This includes native transport headers and any payload padding, but excludes
-IPv4 and fake TCP headers/options. Native flows and peers sharing a client-port
-slot share its counter; new flows do not reset it. Counters are node state,
+one protocol byte plus the complete native IPv4 payload length, plus one for
+each selected fake SYN or FIN bit, modulo `2^32`. Both bits set add two; other
+flags add none. Payload length includes native transport headers and any
+payload padding, but excludes IPv4 and fake TCP headers/options. SYN/FIN
+consume sequence positions without adding packet bytes. Native flows and peers
+sharing a client-port slot share its counter; new flows do not reset it. Counters are node state,
 never per-line connection state. Ports advance independently, including when
 `random_node` gives them the same starting value.
 
@@ -1460,6 +1462,38 @@ progression. ACK incrementing is a synthetic packet counter, not a real TCP
 acknowledgment or receipt confirmation; random ACKs can deliberately perturb the
 apparent ACK history. Neither adds TCP session tracking, a delivery guarantee
 or a guaranteed benefit against observers or TCP-aware networks.
+
+`flags` is a strict nonempty array of at most 32 objects. Each entry accepts
+only `fin`, `syn`, `rst`, `psh`, `ack`, `urg`, `ece` and `cwr`, with JSON boolean
+values; omitted keys mean false, and `{}` emits zero flag bits. Reject unknown
+or duplicate flag names, embedded NUL characters, non-booleans, non-object
+entries and arrays outside the bound. The default one-entry script is
+`[{"ack": true, "psh": true}]`, retaining ACK|PSH on every carrier. `options`
+remains the independent hexadecimal-options setting.
+
+Each selected client port owns an outgoing script position starting at zero on
+node creation, shared safely across workers, native flows and peers selecting
+that port. A successful encoding consumes its current entry and advances toward
+the last; the position saturates at the final entry, which repeats indefinitely.
+It never loops or restarts for a new native flow. Node recreation resets it.
+Client upstream and server downstream maintain independent scripts; peers may
+use different settings. Rejected encodings consume no script position, sequence
+or ACK increment, or per-packet ACK draw. Later downstream drops do not roll
+these operations back. Worker scheduling and network reordering can change
+wire/arrival order.
+
+Every script entry still encapsulates the native packet that caused encoding.
+SYN does not synthesize a handshake-only packet, and encoding does not wait for
+any reply. FIN/RST never close the node or its packet line, nor do they close
+an encapsulated native connection. Sequence advancement uses the selected fake
+SYN/FIN bits as described above; a later flag rewrite cannot retroactively
+change that reservation. ACK generation and optional ACK incrementing remain
+independent even when the selected ACK bit is false, so the ACK field always
+receives its configured value or mode's output. The carrier checksum covers
+the actual flags, sequence and ACK written. Decode does not interpret flags,
+require an expected script entry, advance script state or compare against local
+outgoing flags; normal geometry and checksum verification still apply. These
+scripts are intentional header patterns, not TCP session or reliability logic.
 
 The codec reuses the shared checksum helpers without depending on IpManipulator.
 Encoding first completes any native repair request under the original protocol
