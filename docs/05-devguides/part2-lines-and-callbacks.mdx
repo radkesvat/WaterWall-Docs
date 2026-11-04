@@ -5,7 +5,7 @@ sidebar_label: "Part 2: Lines & Lifetime"
 description: "The connection lifecycle, re-entrancy hazards, line references, and the clean-finish patterns that keep WaterWall tunnels free of use-after-free bugs."
 ---
 <!--
-Documentation version: 199
+Documentation version: 201
 -->
 
 # Part 2: Lines, Callbacks & Lifetime Safety
@@ -873,8 +873,9 @@ such as "Client", "Server", "Listener", or "Connector":
   nor `lineDestroy()`; it consumes a line created toward the `prev` side. Owning an
   OS resource is not owning a `line_t`.
 - A tunnel routinely **mixes roles**: `MuxClient` owns its parent/carrier line
-  while borrowing every child line; `HttpClient` owns the upload/download
-  transport lines it splits a borrowed main line into; `Socks5Server`,
+  while borrowing every child line; `HttpClient` owns the HTTP/2-capable carrier
+  and the HTTP/1 split upload/download transport lines while borrowing their
+  application/main line; `Socks5Server`,
   `TrojanServer`, and `VlessServer` own UDP remote lines while borrowing the
   client line. Decide per line, in the same handler, before cleaning anything up.
 
@@ -1433,6 +1434,37 @@ directional finish/close state, or — if the tunnel genuinely lacks one and thi
 the final-bytes case — add an explicit directional close flag. As stressed above,
 this is the **only** place such a flag belongs.
 
+### HttpClient HTTP/2 upload completion
+
+An HTTP/2-capable `HttpClient` creates a distinct owned normal carrier during
+application Init. Ordinary HTTP/1, split mode, forced HTTP/1 WebSocket and custom
+raw upgrade retain their existing shapes. Copy routing context and users to the
+carrier before next Init; register it in the owner-worker inventory before any
+callback. Protocol state and retained buffers live on the carrier, while the
+borrowed application state only holds the association.
+
+Application Finish detaches that association and destroys application-side state
+before final output. The application owner may destroy its exact line immediately.
+On the independent carrier, finish accepted input in FIFO order, including input
+awaiting h2c/WebSocket readiness, then emit WebSocket Close where applicable and
+HTTP/2 END_STREAM. Release any application-held carrier read Pause so control
+frames can arrive. Keep reading flow-control/control frames and discard response
+body events after detachment. A normal response END_STREAM does not cancel an
+unfinished upload; reset of the tunnel stream does.
+
+The first application Finish starts `close-drain-timeout-ms` (default 30000,
+integer 1..86400000). Deadline checks use fresh monotonic time and never refresh
+on traffic or progress. Completion, expiry, cancellation and shutdown cancel the
+timer, unlink the carrier and destroy its state before closing the live next
+side and destroying the owned line. Real carrier Finish must return with that
+exact line logically dead, even when it reenters an active output callback.
+Never notify a detached or already-finished application. A line reference keeps
+memory available for post-call checks, not the dead carrier's protocol state.
+
+Successful HTTP/2 upload completion requests bounded socket-only linger from
+TcpConnector. This later adapter phase owns no HTTP state or carrier reference
+and is separate from the HTTP/2 deadline and remote application acknowledgment.
+
 ### HttpServer HTTP/2 response completion
 
 In single-line HTTP/2 mode, `HttpServer` borrows the carrier owner's normal line.
@@ -1609,12 +1641,33 @@ should: send its final protocol bytes, destroy local state, forward `Finish` —
 and then trust the adapter to flush. Do **not** keep protocol state alive just to
 "wait for the socket to drain."
 
-The optional TCP peer write-shutdown diagnostic is implemented on Linux excluding
-Android and Cygwin. It can identify a fallback peer only within the same network
-namespace; unavailable diagnostics return `false`. Android builds use the
-`false`-returning stub, and `TcpConnector` does not enable the diagnostic there.
-Android therefore retains ordinary EOF closure without diagnostic-triggered
-fallback socket lingering.
+### TCP socket close lingering
+
+`lineRequestCloseLinger(line, reason)` requests bounded socket cleanup on that
+exact line. The reason mask distinguishes `kLineCloseLingerProtocolDrain` from
+`kLineCloseLingerPeerWriteShutdown`; either makes `lineShouldLingerOnClose()` true.
+Requests are idempotent owner-worker operations on a live normal line. Use
+`lineClearCloseLinger(line, reason)` only when the condition represented by that
+reason no longer applies; clearing one reason must preserve the other. This
+metadata does not retain the line, change Finish ownership, or automatically
+propagate to associated lines.
+
+HttpClient and HttpServer request the protocol-drain reason after handing off
+their final HTTP/2 output.
+
+TcpListener and TcpConnector use the same socket executor in
+`Internals/TcpAdapterCommon`. `tcpAdapterBeginCloseLinger(io, table)` returns
+false without taking ownership, leaving ordinary close to the caller; true
+transfers the socket and may complete its cleanup inline. On Linux it flushes
+accepted writes for at most `WIO_DEFAULT_CLOSE_TIMEOUT` (60000 ms), then shuts
+down writes and reads/discards
+incoming data for at most 5000 ms of inactivity or 30000 ms total. Input can
+refresh only the idle limit, never the absolute limit. Peer close, errors and
+shutdown may finish cleanup sooner. Other platforms keep ordinary adapter close.
+The detached context owns the socket and its idle-table entry, with no line
+reference, protocol state or callbacks to finished tunnels. These socket limits
+are separate from HTTP/2 flow-control drain deadlines and do not acknowledge
+remote application receipt. This is software-managed cleanup, not `SO_LINGER`.
 
 ### TCP adapter idle deadlines
 
@@ -2034,8 +2087,9 @@ drains connecting output, forwards Est, then rechecks line life and current writ
 pressure before taking Resume: Est can close the line or submit another partial
 write. Socket writes, write-callback installation/detachment, exact-line references,
 idle updates and overflow closure stay in each adapter. TcpListener owns its
-normal line and retains its socket-only fallback linger; TcpConnector borrows the
-line. Terminal flushing emits no Resume and leaves no budget pointer in WIO.
+normal line; TcpConnector borrows the line. Both use the shared socket-only
+linger executor after the line's protocol work ends. Terminal flushing emits no
+Resume and leaves no budget pointer in WIO.
 
 UdpConnector initialization and all per-destination DNS queues attach to one line
 budget, including recreated DNS

@@ -5,7 +5,7 @@ sidebar_label: "Part 7: Application Termination"
 description: "The shutdown controller, worker quiescence protocol, lifecycle-v2 component stages, task settlement, signals, devices, and destruction order."
 ---
 <!--
-Documentation version: 180
+Documentation version: 182
 -->
 
 # Part 7: Application Termination
@@ -1052,6 +1052,15 @@ owner-line drain. `wtimerDelete()` recognizes that state and performs the final
 free exactly once. Loop destruction frees only residual deferred timers after
 drain.
 
+HttpClient's HTTP/2-capable carriers own a similar per-carrier drain timer and
+remain registered in their owner-worker inventory after the application detaches.
+Quiesce-request closes admission; generic loop quiescence detaches timer roots,
+and HttpClient's owner-worker stop closes every retained carrier without waiting
+for the graceful upload deadline. Destroy cancels any retained timer handle before
+freeing HTTP state and removes the inventory entry before terminal callbacks.
+A real carrier Finish returns with its owned line dead. Detached TCP socket linger
+has separate ownership and does not retain that line or its protocol state.
+
 HttpServer's HTTP/2 response-drain deadline is one such per-line owner-loop timer.
 The first service-side Finish starts its fixed deadline; response progress never
 rearms it for a new full allowance. Fresh monotonic checks between outgoing
@@ -1062,6 +1071,16 @@ quiesces timer callbacks and source-owner drain aborts remaining HTTP output
 without waiting for the graceful deadline or preserving a borrowed line's life.
 The later TcpListener socket-only linger owns no HTTP state and remains a
 separate cleanup phase.
+
+Both TCP adapters delegate detached socket lingering to
+`Internals/TcpAdapterCommon`. Its context contains only the socket, the adapter's
+owner-worker idle table and its deadline state; it never retains a line or tunnel
+state. Do not start it after adapter stop or loop quiescence. The idle-table item
+keeps an accepted socket in the adapter's shutdown inventory. Owner-worker stop
+expires that item and frees the socket without waiting for graceful deadlines;
+the socket close callback removes any remaining item and frees the context before
+the idle table is destroyed. Reason flags on a line select this cleanup policy,
+but do not extend the line's logical lifetime or override shutdown admission.
 
 A due one-shot is marked for reclamation before its callback runs. A successful
 `wtimerReset()` revives it. If self-rearm is refused, the callback clears every

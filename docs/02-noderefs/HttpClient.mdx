@@ -6,7 +6,7 @@ description: "Reference documentation for the HttpClient node."
 ---
 
 <!--
-Documentation version: 153
+Documentation version: 154
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/HttpClient/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/HttpClient.mdx, and all files must keep the same documentation version.
 -->
 
@@ -118,6 +118,7 @@ The top-level `settings` object must exist and must not be empty.
 | `method` | `POST` | Request method for non-WebSocket HTTP transport. |
 | `user-agent` | `WaterWall/1.x` | HTTP `User-Agent` value. |
 | `http-version` | HTTP/2 | Protocol mode. Accepts numeric and string aliases. |
+| `close-drain-timeout-ms` | `30000` | Fixed HTTP/2 upload-drain deadline after application Finish, including pending h2c and HTTP/2 WebSocket handshakes. Integer `1..86400000`; progress does not restart it. |
 | `upgrade` | `true` only when `http-version` is `both` | Starts with an HTTP/1.1 upgrade request when allowed. |
 | `upgrade-protocol` | `h2c` | HTTP/1.1 upgrade token. Non-`h2c` tokens switch to raw byte forwarding after `101`. |
 | `upgrade-request-headers` | none | Extra headers sent only on the upgrade request. |
@@ -322,7 +323,13 @@ WebSocket is the exception described above and must be forced to HTTP/1.1.
 - HTTP/2 sends `END_STREAM`
 - WebSocket sends a close frame
 
-The implementation marks the relevant direction as finished before sending final protocol bytes, then destroys local HTTP state before forwarding the real Waterwall `Finish`. This prevents pause/resume or close callbacks caused by final-byte flushing from being reflected back into a side that already finished.
+For HTTP/2-capable configurations, HttpClient creates its own carrier line during `Init` and borrows the application line. The application may close and release its line while the carrier finishes sending bytes already accepted by HttpClient. This also covers an h2c handshake and WebSocket-over-HTTP/2 handshake that is still pending. Ordinary HTTP/1.1, HTTP/1.1 split mode and custom raw upgrades keep their existing line behavior.
+
+The first application `Finish` starts a fixed `close-drain-timeout-ms` deadline, default **30000 ms**. Accepted upload bytes remain in order before the WebSocket close frame, when applicable, and HTTP/2 `END_STREAM`. The carrier continues reading `WINDOW_UPDATE` and other control frames; response-body bytes are discarded after the application closes. Traffic, extra credit and upload progress do not restart the deadline. Expiry drops the unsent remainder and closes the carrier. Peer cancellation, carrier loss and program shutdown also settle the retained upload immediately. A normal response `END_STREAM` alone does not cancel an unfinished upload.
+
+HTTP/2 upload pressure pauses the application above **1 MiB** of pending body bytes and resumes below **256 KiB**, provided the next transport is also ready. The provider queue additionally has hard limits of **16 MiB pending payload** and **16 MiB retained allocation charge**; exceeding either closes that connection. Allocation charge remains counted until its buffer is released, even if part of that buffer has already been sent. These are queue limits, not total upload-size limits. The separate pre-handshake queue retains its **2 MiB payload / 8 MiB allocation-charge** limits.
+
+Successful HTTP/2 draining requests a bounded TCP close linger. On Linux, TcpConnector may retain the detached socket to flush writes already accepted by the adapter and discard unread response/control bytes, then wait for peer closure. HTTP state and the owned carrier line are already released. This socket phase is separate from `close-drain-timeout-ms`; handing bytes to the next tunnel does not acknowledge receipt by the remote application.
 
 On ordinary same-line connections, repeated `Pause`/`Resume` notifications pass through transparently and do not gate ready output. Split connections retain their mapping between the main line and the upload/download transports. HTTP framing, FIFO ordering and retained-input limits still apply.
 
