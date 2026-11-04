@@ -5,7 +5,7 @@ sidebar_label: "Part 2: Lines & Lifetime"
 description: "The connection lifecycle, re-entrancy hazards, line references, and the clean-finish patterns that keep WaterWall tunnels free of use-after-free bugs."
 ---
 <!--
-Documentation version: 198
+Documentation version: 199
 -->
 
 # Part 2: Lines, Callbacks & Lifetime Safety
@@ -1432,6 +1432,45 @@ Do not invent a new `initialized` flag for this. Reuse the tunnel's existing
 directional finish/close state, or — if the tunnel genuinely lacks one and this is
 the final-bytes case — add an explicit directional close flag. As stressed above,
 this is the **only** place such a flag belongs.
+
+### HttpServer HTTP/2 response completion
+
+In single-line HTTP/2 mode, `HttpServer` borrows the carrier owner's normal line.
+After service-side Finish, response DATA and END_STREAM can remain blocked by
+HTTP/2 flow control. Keep the HTTP session only while it still has protocol work
+to produce; continue receiving carrier control frames such as WINDOW_UPDATE.
+Never deliver more request-body payload or other callbacks toward the finished
+service. Discard both newly decoded body data and already queued body events;
+the service may finish synchronously during an earlier event delivery.
+
+Distinguish an active final-byte Finish call from deferred response completion.
+If carrier Finish reenters that active call, record carrier closure and let the
+active call destroy state once. If carrier Finish arrives after that call has
+returned to wait for credit, destroy the retained HTTP state immediately. Do
+not reflect Finish toward either already-finished side. The carrier's owner
+still destroys its line; HttpServer must never retain dirty state until a later
+callback on a logically dead line.
+
+After response DATA and END_STREAM reach the previous tunnel, destroy HTTP state
+and propagate Finish. The Linux TcpListener may retain only a detached socket
+context to finish accepted writes and read/discard residual peer input. That
+context owns no line reference or HTTP state. This is separate from HTTP/2's
+credit wait: a line reference preserves memory, not protocol delivery or logical
+life.
+
+The first service-side Finish starts a fixed `close-drain-timeout-ms` deadline
+(default 30000, integer range 1..86400000) on the line's owner worker. Incoming
+traffic, flow-control credit and response progress never refresh it. Expiry
+discards remaining HTTP output, destroys local state and finishes only the
+still-live carrier direction; the finished service receives no more callbacks.
+Response completion, carrier closure, peer stream cancellation and owner shutdown
+cancel this wait and detach its timer. Do not wait to emit END_STREAM on a
+canceled stream. The deadline applies to ordinary and WebSocket HTTP/2, including
+h2c upgrade; it is independent of carrier idle limits and the later socket-only
+linger. See the [node reference](../02-noderefs/HttpServer.mdx#http2-mode)
+for the current pressure thresholds and adapter timeout limits.
+
+### TLS close and fallback completion
 
 `TlsServer` treats peer TLS `close_notify` as local graceful termination. It marks
 closure before sending upstream `Finish` once to the initialized cleartext branch,

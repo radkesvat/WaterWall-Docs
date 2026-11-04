@@ -6,7 +6,7 @@ description: "Reference documentation for the HttpServer node."
 ---
 
 <!--
-Documentation version: 153
+Documentation version: 154
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/HttpServer/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/HttpServer.mdx, and all files must keep the same documentation version.
 -->
 
@@ -77,6 +77,7 @@ Important defaults:
 | Field | Default | Description |
 |---|---|---|
 | `http-version` | `both` | Protocol mode. Accepts numeric and string aliases. |
+| `close-drain-timeout-ms` | `30000` | Fixed HTTP/2 response-drain deadline after backend Finish, in milliseconds. Integer range: `1` through `86400000`. |
 | `upgrade` | `true` only when `http-version` is `both` | Accepts HTTP/1.1 upgrade requests when allowed. |
 | `upgrade-protocol` | `h2c` | HTTP/1.1 upgrade token. Non-`h2c` tokens switch to raw byte forwarding after `101`. |
 | `upgrade-request-headers` | none | Required headers that must be present in the upgrade request. |
@@ -201,9 +202,9 @@ header-size limit. Paired bodies retain normal HTTP framing validation.
 
 In direct HTTP/2 mode, `HttpServer` accepts one logical HTTP/2 request stream for the Waterwall line:
 
-- request DATA frames become upstream Waterwall payload
+- request DATA frames become upstream Waterwall payload while the next node remains open
 - downstream Waterwall payload becomes response DATA frames
-- request `END_STREAM` is recorded internally and the line remains open until transport close
+- request `END_STREAM` is recorded internally and does not by itself close the Waterwall line
 - downstream `Finish` sends response `END_STREAM`
 
 Important implementation details:
@@ -215,6 +216,44 @@ Important implementation details:
 - WebSocket mode enables `SETTINGS_ENABLE_CONNECT_PROTOCOL`
 
 This node is intentionally a single-stream HTTP transport, not a general HTTP/2 stream multiplexer.
+
+Incoming HTTP/2 bytes are processed in 16 KiB slices. The current implementation requests Pause from the next node
+above 1 MiB of queued response payload and Resume below 256 KiB. These hardcoded thresholds are advisory signals,
+not a hard memory cap: they count bytes not yet copied into DATA frames, not retained buffer capacity. The separate
+queue for application output awaiting protocol readiness has hard limits of 2 MiB of payload and 8 MiB of capacity charge.
+`TcpListener` has separate 16 MiB limits for retained write payload and capacity charge; exceeding either closes the
+connection. Its `large-send-buffer` / `large-recv-buffer` settings affect kernel buffers, not these queue limits.
+
+When the next node finishes, accepted response bytes can still be waiting for the client's flow-control credit.
+`HttpServer` keeps its HTTP/2 state and borrowed carrier line available, processes control frames such as WINDOW_UPDATE,
+and discards further request-body data, including already decoded queued events. It sends no callbacks toward the
+finished next node. Once DATA and response `END_STREAM` have reached the previous node, HTTP state is released and
+Finish is propagated there. This handoff does not confirm receipt by the client.
+
+A carrier disconnect during that wait cancels the pending response and releases HTTP state and queued buffers.
+Peer stream cancellation also aborts the pending response; the node does not wait to finish a canceled stream.
+A disconnect inside an active final-byte callback is settled once by that active close; a later disconnect cleans up
+immediately.
+
+`close-drain-timeout-ms` bounds this wait, with a default of 30000 milliseconds and an integer range of 1 through
+86400000. The deadline starts at the first backend Finish. Incoming traffic, WINDOW_UPDATE and partial response
+progress do not restart it. If response DATA and END_STREAM have not reached the previous node by expiry, the node
+discards the remaining response, frees HTTP state and finishes only the still-live carrier direction. It sends no
+callback toward the finished backend. Completion, carrier closure and stream cancellation cancel the timer;
+process shutdown aborts the wait immediately.
+
+This setting applies to direct HTTP/2, h2c-upgraded HTTP/2 and WebSocket over HTTP/2. HTTP/1.1, split HTTP/1.1 and
+custom raw-upgrade closing behavior is unchanged. It does not introduce a hard response-queue memory cap. The
+carrier's ordinary idle limit remains independent and can close the connection sooner.
+The deadline bounds retained HTTP response work, not the lifetime of the physical TCP socket: bytes already handed
+to the transport follow its ordinary close/write-flush policy. Timeout does not request successful-response linger.
+
+On Linux, successful response completion requests socket-only linger from `TcpListener`. The Waterwall line dies immediately.
+The detached socket has up to 60 seconds to flush accepted writes, then shuts down its write direction and reads/discards
+peer input for up to 5 seconds of inactivity or 30 seconds total. These hardcoded limits apply to successive phases;
+discarding residual input avoids a TCP reset from closing with unread data. Errors, peer closure or process shutdown
+can end this sooner. Other platforms use ordinary adapter close. The separate configurable `TcpListener` idle limits
+are `initial-idle-timeout-ms` (default 60000) and `active-idle-timeout-ms` (default 600000); they do not configure linger.
 
 ## Upgrade Behavior
 
