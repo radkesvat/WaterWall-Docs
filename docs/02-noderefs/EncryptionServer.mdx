@@ -12,6 +12,9 @@ Sync note: Any change to this file must also be applied to WaterWall/tunnels/Enc
 
 # EncryptionServer
 
+The default is stream mode. Set `packet-mode: true` for complete IPv4 TCP/UDP
+packets; that profile encrypts only the transport payload and has no TLS-like header.
+
 `EncryptionServer` is the server-side peer for `EncryptionClient`. It decrypts
 upstream TLS-like application-data records from the client side and encrypts
 downstream payloads in the reverse direction.
@@ -20,7 +23,7 @@ Use it as the matching server node for a WaterWall encrypted stream path.
 
 :::warning
 `EncryptionServer` is not `TlsServer`. It does not perform a TLS handshake, does
-not present certificates, and does not negotiate TLS parameters. It only uses a
+not present certificates, and does not negotiate TLS parameters. In stream mode it uses a
 TLS-like record shape for AEAD-encrypted payload framing.
 :::
 
@@ -44,6 +47,9 @@ preserve the encrypted record bytes end to end.
 
 ## What It Does
 
+The default is stream mode. `packet-mode: true` selects the separate packet
+profile below; this list describes the default stream behavior.
+
 - Derives one 32-byte AEAD key from `password`, `salt`, and `kdf-iterations`.
 - Buffers upstream encrypted bytes until complete records are available.
 - Validates upstream record headers and body lengths.
@@ -54,7 +60,7 @@ preserve the encrypted record bytes end to end.
 - Sends encrypted downstream records to the previous node.
 - Closes both directions on malformed records or AEAD authentication failure.
 
-`EncryptionServer` is a middle stream tunnel. It does not create sockets and it
+In stream mode, `EncryptionServer` is a middle stream tunnel. It does not create sockets and it
 does not create packet lines.
 
 ## Configuration Example
@@ -115,12 +121,13 @@ chain head or chain end.
 
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
-| `algorithm` | string or numeric enum | `chacha20-poly1305` | AEAD algorithm. `method` is accepted as a compatibility alias when `algorithm` is absent. |
+| `packet-mode` | boolean | `false` | Select complete IPv4 TCP/UDP payload encryption, described below. |
+| `algorithm` | string or numeric enum | `chacha20-poly1305` in stream mode; `xchacha20-poly1305` in packet mode | AEAD algorithm. `method` is accepted as a compatibility alias when `algorithm` is absent. |
 | `salt` | string | `waterwall-encryption` | Salt input for the WaterWall key derivation process. Must match the client side. |
 | `kdf-iterations` | integer | `12000` | Key derivation rounds. Must be in range `1` through `1000000`. |
 | `max-frame-size` | integer | `16356` | Maximum plaintext bytes per encrypted record. Must be in range `1` through `16356`. |
 
-Accepted algorithm strings:
+Accepted stream algorithm strings:
 
 | Algorithm | Accepted values |
 | --- | --- |
@@ -133,7 +140,87 @@ WaterWall's dynamic-value enum, but string values are clearer and recommended.
 If AES-GCM is selected and the active crypto backend does not provide AES-GCM,
 startup fails.
 
+## Packet Mode
+
+Set `"packet-mode": true` explicitly when the node receives complete IPv4
+packets. This selects Layer-3 metadata and a stateless packet transform instead
+of the stream record reader. It is not selected merely because a different part
+of the chain has a packet adapter. The default remains `false` for stream use.
+
+```json
+{
+  "packet-mode": true,
+  "algorithm": "xchacha20-poly1305",
+  "password": "replace-with-a-long-random-shared-secret"
+}
+```
+
+Packet mode accepts only XChaCha20-Poly1305, which is also its default when
+`algorithm` is omitted. Stream mode continues to use ChaCha20-Poly1305 or
+AES-GCM and rejects XChaCha20-Poly1305. `max-frame-size` belongs to stream mode
+and is rejected in packet mode; packet data is never split into records.
+`password`, `salt` and `kdf-iterations` still select the shared base key. Packet
+mode hashes the password with SHA-256 for its repeated BLAKE2s KDF key, allowing
+long passwords without exceeding BLAKE2s key limits, then derives separate keys
+for client-to-server and server-to-client traffic.
+Both peers must agree on the password, salt and iteration count.
+
+For each complete, unfragmented IPv4 TCP or UDP packet:
+
+```text
+before: [IPv4 header][TCP/UDP header][transport payload]
+after:  [IPv4 header][TCP/UDP header][24-byte nonce][encrypted payload][16-byte tag]
+```
+
+The actual IPv4 IHL and TCP data offset locate the payload, so IP and TCP options
+remain visible and preserved. There is no TLS-like header and no extra IP header.
+Exactly one packet is produced per accepted input, including an empty transport
+payload. Every encoding uses a fresh nonce from the cryptographic random source;
+packets can be lost or reordered without retaining partial data or preventing
+later decryption. An empty `sbuf_t` is not a complete packet and is dropped.
+
+IP total length, UDP length and visible checksums are updated; sequence,
+acknowledgment, flags, ports and addresses are preserved. IPv4 TCP/UDP checksums
+must normally be valid, with disabled UDP checksum zero accepted and preserved.
+A pending checksum-repair flag authorizes repair of outgoing checksums and makes
+received visible checksums non-authoritative, but never bypasses authentication.
+Explicit repair enables a UDP checksum even when its old value was zero.
+The packet's exposed protocol is authenticated. Mutable IP/transport fields are
+not authenticated, allowing address/port rewriting and normal TTL changes.
+Encryption protects the transport payload, not those visible fields or timing.
+It does not implement replay rejection.
+
+Both directions reject IPv6, fragments (MF or nonzero offset), malformed lengths,
+unsupported visible protocols, trailing buffer bytes, invalid TCP offsets, and
+UDP lengths that differ from the IPv4 payload length. DF alone is accepted.
+Reassemble fragments before this node. Wrong keys and invalid authentication
+tags drop only that packet; the shared packet line stays alive. No failure sends
+`Finish` or destroys a packet line.
+
+The format adds **40 bytes**. The final IPv4 packet must fit `65535` bytes, so
+its plaintext input can be at most `65495` bytes; the real carrier/device path
+can impose a much smaller MTU. The node does not fragment, discover PMTU, adjust
+TCP MSS, or recalculate TCP sequence progression for the expanded payload.
+It advertises 24 bytes of left padding for the nonce; tag space is managed by
+the packet encoder. Native TCP endpoints still own their sequence space, so
+this is not a promise of transparent TCP behavior through arbitrary middleboxes.
+
+For FakeTcpHeader, the most convenient setup is its own optional `password`
+setting. It inserts and configures the appropriate Encryption node privately,
+places encryption after fake-header encoding, and includes the 40 bytes in its
+sequence reservations and 1500-byte carrier limit. The protocol byte and original
+transport header are then encrypted together behind the visible fake TCP header.
+Manually adding a separate Encryption node does not tell FakeTcpHeader to account
+for that extra expansion. See the FakeTcpHeader node references for chain order.
+
+The following record framing, frame limits, buffering and stream lifecycle
+sections describe `packet-mode: false`. Packet mode uses chain-owned packet
+lines, no per-line reader state, and the normal packet-tunnel callback defaults.
+
 ## Key Derivation
+
+This describes the base key. Packet mode derives the two direction-specific keys
+from that base as described above.
 
 Both peers derive the same 32-byte key from:
 
@@ -148,7 +235,7 @@ tunnel instance is destroyed.
 For the encrypted path to work, both sides must use the same `password`, `salt`,
 `kdf-iterations`, and compatible `algorithm`.
 
-## Wire Format
+## Stream Wire Format
 
 Each encrypted payload chunk is encoded as:
 
@@ -167,7 +254,7 @@ Header fields:
 The 5-byte header is used as AEAD associated data. The selected algorithm is not
 sent in the record header; it must be configured consistently on both peers.
 
-## Limits and Padding
+## Stream Limits and Padding
 
 | Value | Size |
 | --- | --- |
@@ -185,7 +272,7 @@ If a downstream plaintext payload is larger than `max-frame-size`, the server
 splits it into multiple encrypted records. Zero-length payload buffers are
 recycled and not forwarded.
 
-## Direction Behavior
+## Stream Direction Behavior
 
 | Direction | Behavior |
 | --- | --- |
@@ -200,7 +287,7 @@ Complete records are drained as they become available; only an incomplete record
 remains buffered between callbacks. Once its header is complete, the record length
 is checked against `max-frame-size` before waiting for the rest of the body.
 
-## Lifecycle Behavior
+## Stream Lifecycle Behavior
 
 On upstream `Init`, the server initializes its per-line read stream and forwards
 upstream `Init` to `next`.
@@ -240,7 +327,7 @@ This node explicitly disables splice for the entire chain through
 | node flags | `kNodeFlagBlocksSplice` |
 | `can_have_prev` | `true` |
 | `can_have_next` | `true` |
-| `layer_group` | `kNodeLayer4` |
-| `layer_group_prev_node` | `kNodeLayer4` |
-| `layer_group_next_node` | `kNodeLayer4` |
-| `required_padding_left` | `17` bytes |
+| `layer_group` | `kNodeLayer4` in stream mode; `kNodeLayer3` in packet mode |
+| `layer_group_prev_node` | `kNodeLayer4` in stream mode; `kNodeLayer3` in packet mode |
+| `layer_group_next_node` | `kNodeLayer4` in stream mode; `kNodeLayer3` in packet mode |
+| `required_padding_left` | `17` bytes in stream mode; `24` bytes in packet mode |

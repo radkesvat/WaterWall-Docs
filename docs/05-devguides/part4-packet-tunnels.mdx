@@ -1376,6 +1376,54 @@ logic. Preserve the post-transition request per duplicate or delayed packet;
 never restore a consumed request from an earlier cached boolean. An already
 mapped upstream packet is decoded exactly once at this node and forwarded native.
 
+## Encryption packet profile
+
+`EncryptionClient` and `EncryptionServer` remain stream record transforms by
+default. Explicit `packet-mode: true` selects Layer-3 metadata, zero line-state
+size and packet-tunnel defaults. Client upstream/server downstream encrypt;
+client downstream/server upstream decrypt. They borrow chain-owned packet lines,
+never create or destroy them, and synchronously forward exactly one accepted
+packet in the original callback direction or recycle a refused packet. Malformed
+input, wrong keys and authentication failure are packet drops, never `Finish`.
+There is no record reader, chunking, retained fragment, per-flow state or timer.
+
+The packet profile only accepts `xchacha20-poly1305`, also its omitted-algorithm
+default. Stream mode retains ChaCha20-Poly1305/AES-GCM and rejects XChaCha;
+`max-frame-size` is rejected in packet mode. Password/salt/iteration derivation
+uses SHA-256(password) as the fixed-size key for repeated BLAKE2s rounds in
+packet mode, producing a base key from which separate client-to-server and
+server-to-client keys are derived. Stream derivation remains unchanged. Each outgoing packet draws a fresh 24-byte nonce from the
+cryptographic random source; opposite directions cannot decrypt one another's
+packets. Nonce independence supports packet loss and reordering, not replay
+rejection.
+
+```text
+plain:     [IPv4][visible TCP/UDP header + options][transport payload]
+encrypted: [IPv4][visible TCP/UDP header + options][nonce:24][ciphertext][tag:16]
+```
+
+There is no TLS-like or second IP header. Actual IPv4 IHL/TCP data offset locate
+the payload. Header/options, addresses, ports, sequence, acknowledgment and flags
+survive; only IPv4 length, UDP length and visible checksums change. The visible
+protocol is AEAD associated data. Mutable IP/transport headers are not protected,
+allowing `IpOverrider`, port rewriting and TTL updates; ciphertext authentication
+does not claim header integrity. Empty transport payload is valid.
+
+Admission requires exact, complete unfragmented IPv4 TCP or UDP, valid TCP header
+bounds, and UDP length exactly equal to IPv4 payload length (no UDP padding).
+Reject MF/nonzero fragment offsets, IPv6, trailing bytes and unsupported visible
+protocols. DF alone is accepted. Ordinary input must have valid visible IPv4 and
+TCP/UDP checksums; disabled UDP checksum zero is accepted and preserved. Checksum
+repair intent authorizes outgoing repair and waives only visible received checksum
+authority, never geometry or AEAD verification. Explicit repair enables a UDP
+checksum even from zero. Successful transforms settle checksum intent.
+
+Expansion is exactly 40 bytes. Final IPv4 length cannot exceed 65535; the generic
+codec does not impose FakeTcpHeader's 1500-byte cap or discover the path MTU.
+It advertises 24 bytes of left padding and manages the tag's required capacity.
+It never adjusts TCP sequence/ACK, MSS or application MTUs. Callers must plan
+payload expansion where sequence or MTU accounting belongs.
+
 ## FakeTcpHeader checksum and packet representation
 
 `FakeTcpHeaderClient` and `FakeTcpHeaderServer` reuse the existing IPv4 header,
@@ -1390,6 +1438,29 @@ native:  [IPv4, protocol P][original IP payload]
 carrier: [same IPv4, protocol 6][fake TCP + options][P: one byte][original IP payload]
 decoded: [same IPv4, protocol P][original IP payload]
 ```
+
+An optional nonempty strict-string `password` creates a private Encryption child
+during chain construction: after FakeTcpHeaderClient, before FakeTcpHeaderServer.
+The child is configured with `packet-mode: true`, `algorithm: "xchacha20-poly1305"`
+and that password, retaining Encryption's default salt/iterations. It participates
+in ordinary layer validation, padding, chain length and destruction. Resolve its
+node type through the registry rather than linking FakeTcpHeader to the optional
+Encryption module. An unavailable required Encryption type must fail startup;
+omitting the password requires no Encryption node and must retain the plain path.
+Reject a manually configured Encryption node immediately after a password-enabled
+FakeTcpHeaderClient or before a password-enabled FakeTcpHeaderServer, preventing
+accidental duplicate encryption.
+
+The child's visible transport is fake TCP, so its encrypted payload is the
+protocol byte plus the entire native IP payload, including native TCP/UDP headers.
+Receive decrypts/authenticates before FakeTcpHeader restores native protocol and
+checksum address contributions. Protocol changes such as ProtoSwap must occur
+after encryption on send and be reversed before decryption on receive. Ordinary
+address rewriting remains valid. The helper adds 40 bytes; FakeTcpHeader owns
+both the sequence reservation and final 1500-byte admission including that known
+expansion. Encryption never edits sequence/ACK. Additional manual transforms
+are not discovered or included automatically. Authentication failure drops one
+packet, without destroying the shared line; neither profile rejects valid replays.
 
 All protocol byte values `0..255` are representable. TCP requires its minimum
 header and valid data-offset bounds; UDP requires its minimum header and a
@@ -1415,7 +1486,8 @@ a new sequence on every packet.
 Each node instance owns the selected starting values and, with incrementing
 enabled, a counter for each selected client port, shared safely across all its
 workers. Encoding uses the selected port's current counter, then advances it by
-one protocol byte plus the complete native IPv4 payload length, plus one for
+one protocol byte plus the complete native IPv4 payload length, plus 40 when its
+password helper is configured, plus one for
 each selected fake SYN or FIN bit, modulo `2^32`. Both bits set add two; other
 flags add none. Payload length includes native transport headers and any
 payload padding, but excludes IPv4 and fake TCP headers/options. SYN/FIN
@@ -1567,6 +1639,11 @@ TCP checksum include it. Encoded length is native IPv4 length plus `O`; the
 1500-byte final-packet cap permits `1500 - O` native bytes: 1479 without options,
 1475 with four option bytes, or 1439 with forty. For a 20-byte IPv4 header and
 8-byte UDP header, the corresponding UDP data limits are 1451, 1447 and 1411.
+With a password, total expansion is `F + 1 + 40`; native limits become 1439,
+1435 and 1399 respectively, and UDP application limits become 1411, 1407 and
+1371. Outgoing admission must reject before reserving sequence, ACK or flag
+state if the final encrypted carrier would exceed 1500. Receive's final-cap
+check must include the 40 bytes already removed by the private decryptor.
 
 Both nodes advertise 61 bytes of left padding. Encode moves only the existing
 IPv4 header backward by outgoing `O`; decode moves it forward by received `F + 1`

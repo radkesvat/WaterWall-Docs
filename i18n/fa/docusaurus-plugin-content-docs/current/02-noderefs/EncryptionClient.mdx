@@ -11,6 +11,9 @@ Documentation version: 153
 
 # EncryptionClient
 
+پیش‌فرض حالت stream است. برای بسته‌های کامل IPv4 TCP/UDP گزینهٔ `packet-mode: true`
+را فعال کنید؛ در آن حالت فقط payload رمز می‌شود و header شبیه TLS وجود ندارد.
+
 `EncryptionClient` بخش کلاینت `EncryptionServer` است. payload‌های upstream را با AEAD رمز می‌کند و در record‌هایی شبیه TLS application data می‌فرستد. در جهت downstream نیز record‌های رمز‌شده را باز می‌کند و payload خام را به node قبلی برمی‌گرداند.
 
 :::warning
@@ -35,6 +38,9 @@ server side: TcpListener -> EncryptionServer -> TcpConnector
 تنظیمات دو طرف باید با هم سازگار باشند و تونل‌های میانی باید بایت‌های record رمز‌شده را بدون تغییر عبور دهند.
 
 ## این نود چه می‌کند؟
+
+رفتار پیش‌فرض stream است؛ فهرست زیر این حالت را توضیح می‌دهد. برای بسته‌های کامل
+IPv4 از حالت بسته‌ای که پایین‌تر آمده استفاده کنید.
 
 - از `password`، `salt` و `kdf-iterations` یک کلید ۳۲ بایتی AEAD می‌سازد.
 - payload‌های upstream را رمز می‌کند.
@@ -104,12 +110,13 @@ server side: TcpListener -> EncryptionServer -> TcpConnector
 
 | گزینه | نوع | پیش‌فرض | توضیح |
 | --- | --- | --- | --- |
-| `algorithm` | string یا numeric enum | `chacha20-poly1305` | الگوریتم AEAD. اگر `algorithm` وجود نداشته باشد، `method` نیز به‌عنوان نام مستعار پذیرفته می‌شود. |
+| `packet-mode` | boolean | `false` | فعال‌کردن رمزنگاری payload بسته‌های کامل IPv4 TCP/UDP. |
+| `algorithm` | string یا numeric enum | `chacha20-poly1305` در stream؛ `xchacha20-poly1305` در حالت بسته‌ای | الگوریتم AEAD. اگر `algorithm` وجود نداشته باشد، `method` نیز به‌عنوان نام مستعار پذیرفته می‌شود. |
 | `salt` | string | `waterwall-encryption` | ورودی salt برای ساخت کلید که باید در سمت سرور یکسان باشد. |
 | `kdf-iterations` | integer | `12000` | تعداد دورهای KDF. بازه معتبر `1` تا `1000000` است. |
 | `max-frame-size` | integer | `16356` | حداکثر plaintext هر record. بازه معتبر `1` تا `16356` است. |
 
-مقدارهای قابل قبول برای `algorithm`:
+مقدارهای قابل قبول برای `algorithm` در حالت stream:
 
 | الگوریتم | مقدارها |
 | --- | --- |
@@ -118,7 +125,76 @@ server side: TcpListener -> EncryptionServer -> TcpConnector
 
 اگر AES-GCM را انتخاب کنید ولی backend فعال رمزنگاری از آن پشتیبانی نکند، راه‌اندازی شکست می‌خورد.
 
+## حالت بسته‌ای
+
+گزینهٔ `"packet-mode": true` را صریحاً برای پردازش بسته‌های کامل IPv4 فعال کنید.
+این حالت، node را به یک تبدیل‌کنندهٔ Layer-3 بدون state مخصوص هر line تبدیل می‌کند؛
+وجود یک packet adapter در بخش دیگری از chain به‌تنهایی این حالت را فعال نمی‌کند.
+پیش‌فرض `false` است و رفتار stream را نگه می‌دارد.
+
+```json
+{
+  "packet-mode": true,
+  "algorithm": "xchacha20-poly1305",
+  "password": "replace-with-a-long-random-shared-secret"
+}
+```
+
+در حالت بسته‌ای فقط `xchacha20-poly1305` پذیرفته می‌شود و اگر `algorithm` حذف شود،
+همین الگوریتم انتخاب می‌شود. حالت stream همچنان ChaCha20-Poly1305 یا AES-GCM را
+می‌پذیرد و XChaCha را رد می‌کند. `max-frame-size` مخصوص stream است و در حالت بسته‌ای
+رد می‌شود. `password`، `salt` و `kdf-iterations` کلید پایه را تعیین می‌کنند و باید
+در دو طرف یکسان باشند. در حالت بسته‌ای SHA-256 رمز به‌عنوان کلید دورهای تکرار
+BLAKE2s استفاده می‌شود تا رمز بلند از محدودیت طول کلید BLAKE2s عبور نکند؛ سپس
+کلیدهای جداگانه برای دو جهت ساخته می‌شود.
+
+```text
+before: [IPv4 header][TCP/UDP header][transport payload]
+after:  [IPv4 header][TCP/UDP header][24-byte nonce][encrypted payload][16-byte tag]
+```
+
+برای هر بستهٔ پذیرفته‌شده دقیقاً یک بسته تولید می‌شود؛ حتی payload خالی TCP/UDP
+معتبر است، ولی buffer خالی یک بسته نیست و حذف می‌شود. header اضافی IP یا TLS-like
+اضافه نمی‌شود. IHL واقعی IPv4 و data offset واقعی TCP محل payload را مشخص می‌کنند؛
+گزینه‌های IP و TCP نیز حفظ می‌شوند. nonce هر بسته از مولد تصادفی رمزنگاری می‌آید؛
+گم‌شدن یا جابه‌جایی بسته‌ها مانع رمزگشایی بسته‌های بعدی نمی‌شود و دادهٔ ناقص نگه
+داشته نمی‌شود.
+
+طول IP، طول UDP و checksumهای قابل مشاهده به‌روز می‌شوند؛ آدرس‌ها، portها، flags،
+sequence و acknowledgment تغییر نمی‌کنند. checksumهای IPv4 و TCP/UDP در حالت عادی
+باید معتبر باشند؛ checksum صفر UDP پذیرفته و حفظ می‌شود. flag درخواست ترمیم checksum
+در ارسال اجازهٔ ترمیم می‌دهد و در دریافت فقط اعتبارسنجی checksumهای آشکار را کنار
+می‌گذارد، نه احراز اصالت را. ترمیم صریح برای UDP صفر نیز checksum فعال تولید می‌کند.
+شمارهٔ پروتکل آشکار احراز اصالت می‌شود؛ فیلدهای متغیر IP/transport احراز اصالت
+نمی‌شوند تا بازنویسی آدرس/port و تغییر معمول TTL ممکن باشد. محافظت مربوط به payload
+است، نه headerهای آشکار، اندازهٔ بسته یا زمان‌بندی. جلوگیری از replay وجود ندارد.
+
+IPv6، fragmentها با MF یا offset غیرصفر، پروتکل آشکار غیر از TCP/UDP، طول نامعتبر،
+بایت اضافه پس از IPv4، data offset نامعتبر TCP و طول UDP متفاوت با payload IPv4
+رد می‌شوند. DF به‌تنهایی مجاز است؛ fragmentها باید پیش از این node بازسازی شوند.
+رمز اشتباه یا tag نامعتبر فقط همان بسته را حذف می‌کند؛ packet line زنده می‌ماند
+و هیچ `Finish` یا تخریب packet line رخ نمی‌دهد.
+
+سربار دقیقاً **۴۰ بایت** است. طول نهایی IPv4 باید حداکثر `65535` باشد، بنابراین
+بستهٔ ورودی plaintext حداکثر `65495` بایت است؛ MTU مسیر یا carrier معمولاً محدودیت
+کوچک‌تری دارد. این node fragmentation، کشف PMTU، تنظیم MSS یا جبران sequence TCP
+برای سربار را انجام نمی‌دهد. `required_padding_left` در این حالت ۲۴ بایت است؛
+فضای tag را encoder مدیریت می‌کند. این قالب تضمین عبور شفاف TCP از هر middlebox نیست.
+
+برای FakeTcpHeader بهتر است `password` همان node را تنظیم کنید. آن node به‌صورت
+خصوصی Encryption مناسب را می‌سازد و پس از ساخت fake TCP رمزنگاری می‌کند؛ در نتیجه
+بایت پروتکل و header اصلی TCP/UDP همراه payload رمز می‌شوند. FakeTcpHeader آن ۴۰
+بایت را در sequence و سقف carrier برابر ۱۵۰۰ حساب می‌کند. اضافه‌کردن دستی Encryption
+به chain باعث نمی‌شود FakeTcpHeader خودکار از سربار آن آگاه شود.
+
+بخش‌های بعدی مربوط به record، buffering، frame limit و lifecycle حالت stream هستند.
+حالت بسته‌ای از packet line متعلق به chain و callbackهای معمول packet tunnel استفاده
+می‌کند و reader یا state مخصوص هر line ندارد.
+
 ## ساخت کلید
+
+این بخش ساخت کلید پایه را توضیح می‌دهد؛ حالت بسته‌ای دو کلید مستقل جهت‌ها را از
+همین کلید پایه مشتق می‌کند.
 
 هر دو peer با استفاده از موارد زیر همان کلید ۳۲ بایتی را می‌سازند:
 
@@ -130,7 +206,7 @@ server side: TcpListener -> EncryptionServer -> TcpConnector
 
 برای کار کردن مسیر رمزشده، هر دو سمت باید `password`، `salt`، `kdf-iterations` یکسان و `algorithm` سازگار داشته باشند.
 
-## فرمت record
+## فرمت record در حالت stream
 
 هر بخش رمز‌شده با این ساختار ارسال می‌شود:
 
@@ -146,7 +222,7 @@ server side: TcpListener -> EncryptionServer -> TcpConnector
 
 header پنج‌بایتی به‌عنوان associated data در AEAD احراز اصالت می‌شود. نام الگوریتم داخل record نوشته نمی‌شود و باید در config دو طرف یکسان باشد.
 
-## محدودیت‌ها و Padding
+## محدودیت‌ها و Padding در حالت stream
 
 | مقدار | اندازه |
 | --- | --- |
@@ -161,7 +237,7 @@ header پنج‌بایتی به‌عنوان associated data در AEAD احرا�
 
 اگر payloadِ upstream از `max-frame-size` بزرگ‌تر باشد، کلاینت آن را میان چند record تقسیم می‌کند. buffer payload صفرطول برای استفاده مجدد برگردانده می‌شود و داده عبور نمی‌کند.
 
-## رفتار جهت‌ها
+## رفتار جهت‌ها در حالت stream
 
 | جهت | رفتار |
 | --- | --- |
@@ -172,7 +248,7 @@ header پنج‌بایتی به‌عنوان associated data در AEAD احرا�
 
 record‌های کامل به‌محض آماده شدن پردازش می‌شوند و فقط record ناقص فعلی بین callbackها در buffer باقی می‌ماند. پس از کامل شدن header، طول record با توجه به `max-frame-size` اعتبارسنجی می‌شود و سپس برای دریافت ادامه body منتظر می‌ماند.
 
-## رفتار Lifecycle
+## رفتار Lifecycle در حالت stream
 
 با دریافت `Init` در upstream، کلاینت stream خواندن مخصوص line را مقداردهی اولیه می‌کند و `Init` را در همان جهت به `next` می‌فرستد.
 
@@ -206,7 +282,7 @@ metadata برگرفته از کد منبع:
 | node flags | `kNodeFlagBlocksSplice` |
 | `can_have_prev` | `true` |
 | `can_have_next` | `true` |
-| `layer_group` | `kNodeLayer4` |
-| `layer_group_prev_node` | `kNodeLayer4` |
-| `layer_group_next_node` | `kNodeLayer4` |
-| `required_padding_left` | `17` bytes |
+| `layer_group` | `kNodeLayer4` در stream؛ `kNodeLayer3` در حالت بسته‌ای |
+| `layer_group_prev_node` | `kNodeLayer4` در stream؛ `kNodeLayer3` در حالت بسته‌ای |
+| `layer_group_next_node` | `kNodeLayer4` در stream؛ `kNodeLayer3` در حالت بسته‌ای |
+| `required_padding_left` | `17` bytes در stream؛ `24` bytes در حالت بسته‌ای |
