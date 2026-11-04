@@ -1387,10 +1387,11 @@ at least one fake TCP payload byte for the tag. A tag-only carrier is valid only
 for opaque protocols; zero is a present, valid tag value. Reserved or unknown
 protocol values imply neither OS nor downstream protocol support.
 
-The recommended defaults are `"sequence": "random_port"` and
-`"increment-sequence": true`. `sequence` accepts an integer `0..4294967295`,
-`"random_node"`, or `"random_port"`. A number seeds every client port with that
-value. `random_node` draws one random 32-bit value for every port to start from;
+The recommended defaults are `"sequence": "random_port"`,
+`"increment-sequence": true`, `"acknowledgment": 0` and
+`"increment-acknowledgment": false`. `sequence` accepts an integer
+`0..4294967295`, `"random_node"`, or `"random_port"`. A number seeds every
+client port with that value. `random_node` draws one random 32-bit value for every port to start from;
 `random_port` draws an independent value per port. Draws happen during node
 creation, including when incrementing is disabled; first use and new native
 flows never initialize or reset them. All 32-bit values, including zero, are
@@ -1414,13 +1415,51 @@ node drops the packet. Counter reservation across workers does not guarantee
 wire or arrival order. The exposed fake TCP checksum must cover the actual
 sequence written. With `increment-sequence` set to `false`, numeric and
 `random_node` modes repeat the one chosen value on every outgoing packet;
-`random_port` repeats the chosen value for the selected port. The configured
-`acknowledgment` is always fixed; receiving packets changes neither outgoing
-counters nor ACK values. Client upstream and server downstream encode
-independently, so peers may use different sequence modes and initial values.
-Decode does not use sequence/ACK values to gate admission or reorder packets.
-These counters provide approximate byte progression, without TCP session
-tracking or a TCP-acceptance guarantee.
+`random_port` repeats the chosen value for the selected port.
+
+`acknowledgment` independently accepts an integer `0..4294967295` (default `0`),
+`"random_node"`, `"random_port"`, or `"random_packet"`. With the default
+`increment-acknowledgment: false`, a number stays fixed. `random_node` draws one
+32-bit ACK during node creation for all ports; `random_port` draws one
+independent ACK per selected client port during creation and retains those
+values across all workers and native flows. New native flows do not reset them.
+ACK draws are separate from sequence draws. All 32-bit values, including zero,
+are possible and independent draws may coincide. `random_packet` draws once
+for each successfully encoded packet, only after every expected refusal.
+
+`increment-acknowledgment` is an optional boolean, default `false`. When `true`,
+numeric, `random_node` and `random_port` choices seed separate ACK counters for
+each selected client port. A successful encoding emits the selected counter's
+current value, then adds exactly one modulo `2^32`, independent of payload size.
+For example, `acknowledgment: 5000` gives `5000`, `5001`, `5002` for successive
+encodings on one port; an omitted acknowledgment starts each port at `0`.
+`random_node` supplies the same initial value to all ports, but their counters
+can diverge as traffic uses different ports. All workers and native flows using
+a port share its counter safely, and new flows never reset it. These counters
+belong to the node, never to a packet line. Worker scheduling and network
+reordering prevent any guarantee of consecutive ACKs on the wire.
+
+`increment-acknowledgment: true` with `acknowledgment: "random_packet"` must be
+rejected, not silently adjusted. Neither ACK setting changes `increment-sequence`;
+both sequence-increment settings remain valid with every valid ACK combination.
+An encoding refusal must consume no ACK draw or sequence/ACK increment, and must
+preserve the buffer. A later downstream drop does not undo these operations.
+The fake TCP checksum must cover the actual ACK and sequence written. For
+`acknowledgment`, only the stated integers and exact strings are valid; numeric
+strings, unsupported strings, booleans, fractions and `null` must be rejected.
+For `increment-acknowledgment`, accept only JSON booleans, rejecting strings,
+numbers and `null`.
+
+Receiving packets changes neither outgoing counters nor ACK values. No mode
+derives ACKs from received bytes. Client upstream and server downstream encode
+independently, so peers may use different sequence and ACK modes or initial
+values. Decode consumes no ACK draw or sequence/ACK increment and does not use
+these fields to gate admission or reorder packets; normal carrier checksum
+verification remains in effect. Sequence counters provide approximate byte
+progression. ACK incrementing is a synthetic packet counter, not a real TCP
+acknowledgment or receipt confirmation; random ACKs can deliberately perturb the
+apparent ACK history. Neither adds TCP session tracking, a delivery guarantee
+or a guaranteed benefit against observers or TCP-aware networks.
 
 The codec reuses the shared checksum helpers without depending on IpManipulator.
 Encoding first completes any native repair request under the original protocol
