@@ -17,4 +17,10 @@ chat UI. Backend credentials belong in the private backend's environment, never
 in this site's configuration. Backend setup and indexing instructions live in
 the private repository's README.
 
+The private backend checks successful GitHub Pages deployments hourly and updates
+the assistant index when documentation changes. Normal docs updates need no local
+indexing commands. To check sooner, run **Sync deployed documentation** from the
+private backend repository's Actions tab. Its credentials and indexing workflow
+remain in that repository.
+
 
