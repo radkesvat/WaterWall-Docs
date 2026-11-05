@@ -17,6 +17,15 @@ chat UI. Backend credentials belong in the private backend's environment, never
 in this site's configuration. Backend setup and indexing instructions live in
 the private repository's README.
 
+The assistant docks beside the documentation on desktop and opens as a full-screen
+dialog on smaller screens. Readers can select a passage while the desktop panel
+is open, draft multiline JSON, and copy suggested code or complete answers.
+Enter inserts a newline; Ctrl/Command + Enter sends a message. Conversations stay
+in memory while navigating the site and reset on reload or **New conversation**.
+Messages are limited to 4,000 characters, with recent turns included within the
+backend's 20,000-character context budget. The waiting indicator shows elapsed
+time; it does not represent streamed reasoning or individual tool activity.
+
 The private backend checks successful GitHub Pages deployments hourly and updates
 the assistant index when documentation changes. Normal docs updates need no local
 indexing commands. To check sooner, run **Sync deployed documentation** from the

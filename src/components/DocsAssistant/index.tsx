@@ -2,6 +2,7 @@ import React, {useEffect, useRef, useState, type ReactNode} from 'react';
 import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import {useLocation} from '@docusaurus/router';
 import styles from './styles.module.css';
+import {Answer, CopyButton} from './Response';
 
 type Source = {title: string; url: string};
 type HistoryMessage = {role: 'user' | 'assistant'; content: string};
@@ -19,23 +20,35 @@ type Exchange = {
   sources?: Source[];
 };
 
+const MAX_MESSAGE_LENGTH = 4000;
 const labels = {
   en: {
-    title: 'Ask WaterWall', subtitle: 'A little help with the docs',
-    close: 'Close assistant', clear: 'Clear conversation',
-    welcome: 'What would you like to understand?',
-    intro: 'Ask about WaterWall, or close this panel and select a passage in the docs to explore it together.',
-    example: 'How do WaterWall chains work?', explain: 'Explain selection',
-    explainPrompt: 'Please explain this selected part of the documentation.',
-    selected: 'Selected documentation', remove: 'Remove selection',
+    title: 'WaterWall Assistant', subtitle: 'Build. Debug. Understand.',
+    close: 'Close assistant', clear: 'New conversation',
+    welcome: 'What are we working on?',
+    intro: 'Bring a configuration, a tricky connection issue, or a part of the docs. Let’s work through it together.',
+    starters: [
+      {title: 'Review a configuration', detail: 'Understand your JSON and refine it.', icon: 'code', prompt: 'Help me review my WaterWall configuration. Explain any problems and suggest the changes needed.\n\n'},
+      {title: 'Work through a problem', detail: 'Trace a connection issue, step by step.', icon: 'route', prompt: 'Help me troubleshoot a WaterWall connection. Here is what I expect, what happens instead, and my configuration:\n\n'},
+      {title: 'Explore a concept', detail: 'Connect the details to the bigger picture.', icon: 'book', prompt: 'Help me understand this part of WaterWall. Explain how it works, when to use it, and show a practical example.\n\n'},
+    ],
+    explain: 'Discuss selection', explainPrompt: 'Please explain this selected part of the documentation and how it applies in practice.',
+    selected: 'Selected passage', remove: 'Remove selection',
     truncated: 'Selection limited to the first 8,000 characters.',
-    attached: 'Selected documentation included', page: 'Current page',
-    question: 'Your question', placeholder: 'Ask a question about WaterWall…',
-    send: 'Send question', cancel: 'Stop', retry: 'Try again',
-    thinking: 'Looking through the documentation…',
-    privacy: 'Your messages, recent conversation, page title and selected text are sent to OpenAI. Do not share passwords, API keys or other secrets.',
-    note: 'AI answers can be mistaken. Check the linked documentation.',
-    sources: 'Documentation sources', you: 'You', assistant: 'WaterWall assistant',
+    attached: 'Selected passage included', page: 'Reading',
+    question: 'Message WaterWall Assistant', placeholder: 'Describe your goal, paste JSON, or ask a follow-up…',
+    selectedPlaceholder: 'What would you like to explore about this passage?',
+    send: 'Send message', cancel: 'Stop', retry: 'Try again',
+    thinking: 'Working on your question', stillThinking: 'Still working on your question',
+    thinkingDetail: 'Complex questions can take a few minutes. You can keep reading while I work.',
+    privacyLabel: 'About this conversation',
+    privacy: 'Your messages, recent conversation, page title and selected text are sent to OpenAI. Do not share passwords, API keys or other secrets. This conversation stays in this tab until you reload or start a new one.',
+    note: 'Check important details against the sources.',
+    sources: 'Documentation sources', you: 'You', assistant: 'WaterWall',
+    copy: 'Copy answer', copyCode: 'Copy code', copied: 'Copied', copyFailed: 'Could not copy. Select and copy the text manually.',
+    shortcut: 'Ctrl / ⌘ + Enter to send', characters: 'characters',
+    tooLong: 'Messages can contain up to 4,000 characters. Paste a smaller section of your configuration.',
+    historyNotice: 'This answer exceeds the conversation context limit. Include the relevant part in your next message.',
     failed: 'Unable to get an answer. Please try again.',
     network: 'Could not reach the assistant. Check your connection and try again.',
     cancelled: 'Request stopped. You can try it again.',
@@ -44,21 +57,32 @@ const labels = {
     unavailable: 'The assistant is temporarily unavailable. Please try again later.',
   },
   fa: {
-    title: 'از واتروال بپرسید', subtitle: 'همراه شما در خواندن مستندات',
-    close: 'بستن دستیار', clear: 'پاک کردن گفتگو',
-    welcome: 'دربارهٔ چه چیزی می‌خواهید بدانید؟',
-    intro: 'دربارهٔ واتروال بپرسید، یا این پنجره را ببندید و بخشی از مستندات را برای توضیح انتخاب کنید.',
-    example: 'زنجیره‌ها در واتروال چگونه کار می‌کنند؟', explain: 'توضیح بخش انتخاب‌شده',
-    explainPrompt: 'لطفاً این بخش انتخاب‌شده از مستندات را توضیح بده.',
-    selected: 'بخش انتخاب‌شده از مستندات', remove: 'حذف بخش انتخاب‌شده',
-    truncated: 'فقط ۸۰۰۰ نویسهٔ اول بخش انتخاب‌شده ارسال می‌شود.',
-    attached: 'بخش انتخاب‌شده از مستندات ضمیمه شده است', page: 'صفحهٔ فعلی',
-    question: 'پرسش شما', placeholder: 'پرسشی دربارهٔ واتروال بنویسید…',
-    send: 'ارسال پرسش', cancel: 'توقف', retry: 'تلاش دوباره',
-    thinking: 'در حال جستجو در مستندات…',
-    privacy: 'پیام‌های شما، گفتگوی اخیر، عنوان صفحه و متن انتخاب‌شده به OpenAI ارسال می‌شود. گذرواژه، کلید API یا اطلاعات محرمانه نفرستید.',
-    note: 'پاسخ هوش مصنوعی ممکن است اشتباه باشد. مستندات پیوندشده را بررسی کنید.',
-    sources: 'منابع مستندات', you: 'شما', assistant: 'دستیار واتروال',
+    title: 'دستیار واتروال', subtitle: 'طراحی، عیب‌یابی و درک عمیق‌تر',
+    close: 'بستن دستیار', clear: 'گفتگوی تازه',
+    welcome: 'روی چه چیزی کار می‌کنیم؟',
+    intro: 'پیکربندی، مشکل اتصال یا بخشی از مستندات را مطرح کنید تا با هم بررسی کنیم.',
+    starters: [
+      {title: 'بررسی پیکربندی', detail: 'فهمیدن و بهبود تنظیمات JSON شما.', icon: 'code', prompt: 'کمکم کن پیکربندی واتروال را بررسی کنم. مشکلات احتمالی و تغییرات لازم را توضیح بده.\n\n'},
+      {title: 'حل یک مشکل', detail: 'بررسی گام‌به‌گام مشکل اتصال.', icon: 'route', prompt: 'کمکم کن اتصال واتروال را عیب‌یابی کنم. انتظار من، اتفاقی که می‌افتد و پیکربندی من به این شکل است:\n\n'},
+      {title: 'شناخت یک مفهوم', detail: 'ارتباط جزئیات با تصویر کلی.', icon: 'book', prompt: 'کمکم کن این بخش واتروال را بفهمم. نحوهٔ کار، کاربرد و یک مثال عملی را توضیح بده.\n\n'},
+    ],
+    explain: 'گفتگو دربارهٔ متن', explainPrompt: 'لطفاً این بخش انتخاب‌شده از مستندات و کاربرد عملی آن را توضیح بده.',
+    selected: 'متن انتخاب‌شده', remove: 'حذف متن انتخاب‌شده',
+    truncated: 'فقط ۸۰۰۰ نویسهٔ اول متن انتخاب‌شده ارسال می‌شود.',
+    attached: 'متن انتخاب‌شده ضمیمه شده است', page: 'در حال مطالعه',
+    question: 'پیام به دستیار واتروال', placeholder: 'هدفتان را توضیح دهید، JSON بچسبانید یا گفتگو را ادامه دهید…',
+    selectedPlaceholder: 'کدام بخش این متن را می‌خواهید بیشتر بررسی کنیم؟',
+    send: 'ارسال پیام', cancel: 'توقف', retry: 'تلاش دوباره',
+    thinking: 'در حال بررسی پرسش شما', stillThinking: 'همچنان در حال بررسی پرسش شما',
+    thinkingDetail: 'پرسش‌های پیچیده ممکن است چند دقیقه زمان ببرند. می‌توانید در این مدت به مطالعه ادامه دهید.',
+    privacyLabel: 'دربارهٔ این گفتگو',
+    privacy: 'پیام‌های شما، گفتگوی اخیر، عنوان صفحه و متن انتخاب‌شده به OpenAI ارسال می‌شود. گذرواژه، کلید API یا اطلاعات محرمانه نفرستید. این گفتگو تا بارگذاری دوبارهٔ صفحه یا شروع گفتگوی تازه در همین زبانه می‌ماند.',
+    note: 'جزئیات مهم را با منابع بررسی کنید.',
+    sources: 'منابع مستندات', you: 'شما', assistant: 'واتروال',
+    copy: 'کپی پاسخ', copyCode: 'کپی کد', copied: 'کپی شد', copyFailed: 'کپی ممکن نشد. متن را انتخاب و دستی کپی کنید.',
+    shortcut: 'Ctrl / ⌘ + Enter برای ارسال', characters: 'نویسه',
+    tooLong: 'هر پیام می‌تواند تا ۴۰۰۰ نویسه داشته باشد. بخش کوچک‌تری از پیکربندی را بچسبانید.',
+    historyNotice: 'این پاسخ از ظرفیت متن گفتگو بزرگ‌تر است. بخش مرتبط را در پیام بعدی بیاورید.',
     failed: 'دریافت پاسخ ممکن نشد. لطفاً دوباره تلاش کنید.',
     network: 'اتصال به دستیار ممکن نشد. اتصال اینترنت خود را بررسی کنید و دوباره تلاش کنید.',
     cancelled: 'درخواست متوقف شد. می‌توانید دوباره تلاش کنید.',
@@ -67,6 +91,24 @@ const labels = {
     unavailable: 'دستیار موقتاً در دسترس نیست. لطفاً بعداً دوباره تلاش کنید.',
   },
 };
+
+function Icon({name, size = 20}: {name: string; size?: number}): ReactNode {
+  const paths: Record<string, ReactNode> = {
+    code: <><path d="m8 7-5 5 5 5m8-10 5 5-5 5m-3-13-2 16" /></>,
+    route: <><circle cx="6" cy="6" r="3" /><circle cx="18" cy="18" r="3" /><path d="M9 6h6a4 4 0 0 1 0 8H9a3 3 0 0 0 0 6h6" /></>,
+    book: <><path d="M12 5v15M12 5C9 3 5 3 2 4v15c4-1 7-1 10 1 3-2 6-2 10-1V4c-3-1-7-1-10 1Z" /></>,
+    close: <path d="m6 6 12 12M18 6 6 18" />,
+    plus: <path d="M12 5v14M5 12h14" />,
+    send: <path d="M12 20V4m-6 6 6-6 6 6" />,
+    arrow: <path d="M5 12h14m-6-6 6 6-6 6" />,
+    chat: <path d="M5 4h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9l-6 3V6a2 2 0 0 1 2-2Z" />,
+  };
+  return <svg width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">{paths[name] || paths.chat}</svg>;
+}
+
+function currentPageTitle(): string {
+  return (document.querySelector('#waterwall-docs-content main h1')?.textContent || document.title).slice(0, 300);
+}
 
 // Keep complete recent turns, within the backend's count and character limits.
 function recentHistory(exchanges: Exchange[]): HistoryMessage[] {
@@ -85,45 +127,14 @@ function recentHistory(exchanges: Exchange[]): HistoryMessage[] {
   return turns.flat();
 }
 
-function InlineText({text}: {text: string}): ReactNode {
-  const parts = text.split(/(`[^`\n]+`|\*\*[^*\n]+\*\*|\[[^\]\n]+\]\([^\s)]+\))/g);
-  return parts.map((part, index) => {
-    if (part.startsWith('`') && part.endsWith('`')) {
-      return <code key={index}>{part.slice(1, -1)}</code>;
-    }
-    if (part.startsWith('**') && part.endsWith('**')) {
-      return <strong key={index}>{part.slice(2, -2)}</strong>;
-    }
-    const link = part.match(/^\[([^\]]+)\]\(([^)]+)\)$/);
-    if (link) {
-      // Only backend-verified citations below become clickable links.
-      return <React.Fragment key={index}>{link[1]}</React.Fragment>;
-    }
-    return <React.Fragment key={index}>{part}</React.Fragment>;
-  });
-}
-
-// Intentionally a small renderer: model output never becomes HTML or MDX.
-function Answer({text}: {text: string}): ReactNode {
-  // Keep large responses readable without running the inline Markdown parser.
-  if (text.length > 60000) return <p>{text}</p>;
-  return text.split(/(```[^\n]*\n[\s\S]*?(?:```|$))/g).map((part, index) => {
-    if (part.startsWith('```')) {
-      const code = part.replace(/^```[^\n]*\n/, '').replace(/```$/, '');
-      return <pre key={index} dir="ltr"><code>{code.trimEnd()}</code></pre>;
-    }
-    return part.split(/\n\s*\n/).filter(Boolean).map((paragraph, paragraphIndex) => (
-      <p key={`${index}-${paragraphIndex}`}><InlineText text={paragraph} /></p>
-    ));
-  });
-}
-
-export default function DocsAssistant({endpoint}: {endpoint: string}): ReactNode {
+export default function DocsAssistant({endpoint, open, onOpenChange}: {
+  endpoint: string; open: boolean; onOpenChange: (open: boolean) => void;
+}): ReactNode {
   const {i18n, siteConfig} = useDocusaurusContext();
   const location = useLocation();
   const locale = i18n.currentLocale === 'fa' ? 'fa' : 'en';
   const copy = labels[locale];
-  const [open, setOpen] = useState(false);
+  const setOpen = onOpenChange;
   const [draft, setDraft] = useState('');
   const [selection, setSelection] = useState('');
   const [selectionTruncated, setSelectionTruncated] = useState(false);
@@ -131,6 +142,10 @@ export default function DocsAssistant({endpoint}: {endpoint: string}): ReactNode
   const [exchanges, setExchanges] = useState<Exchange[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
+  const [inputError, setInputError] = useState('');
+  const [elapsed, setElapsed] = useState(0);
+  const startedAt = useRef(0);
+  const followResponse = useRef(true);
   const dialog = useRef<HTMLDialogElement>(null);
   const launcher = useRef<HTMLButtonElement>(null);
   const textarea = useRef<HTMLTextAreaElement>(null);
@@ -142,12 +157,22 @@ export default function DocsAssistant({endpoint}: {endpoint: string}): ReactNode
   useEffect(() => {
     setSelection('');
     setSelectionTruncated(false);
-    setPageTitle((document.querySelector('article h1')?.textContent || document.title).slice(0, 300));
   }, [location.pathname, location.hash]);
 
   useEffect(() => {
+    // Lazy routes can commit their article after the location effect has run.
+    // Observe the docs, outside the assistant, so the label follows rendered content.
+    const update = () => setPageTitle(currentPageTitle());
+    const observer = new MutationObserver(update);
+    const content = document.getElementById('waterwall-docs-content');
+    if (content) observer.observe(content, {childList: true, characterData: true, subtree: true});
+    observer.observe(document.head, {childList: true, characterData: true, subtree: true});
+    update();
+    return () => observer.disconnect();
+  }, []);
+
+  useEffect(() => {
     function captureSelection() {
-      if (dialog.current?.open) return;
       const selected = window.getSelection();
       if (!selected || selected.isCollapsed || !selected.rangeCount) return;
       const range = selected.getRangeAt(0);
@@ -171,17 +196,47 @@ export default function DocsAssistant({endpoint}: {endpoint: string}): ReactNode
   }, []);
 
   useEffect(() => {
-    if (open) {
-      if (!dialog.current?.open) dialog.current?.showModal();
-      textarea.current?.focus();
-    } else if (dialog.current?.open) {
-      dialog.current.close();
+    if (!open || !dialog.current) return;
+    const element = dialog.current;
+    const mobile = window.matchMedia('(max-width: 999px)');
+    function show() {
+      const focused = document.activeElement as HTMLElement | null;
+      const restore = focused && element.contains(focused) ? focused : textarea.current;
+      if (element.open) element.close();
+      // Desktop stays interactive so readers can select and navigate the docs.
+      if (mobile.matches) element.showModal(); else element.show();
+      restore?.focus({preventScroll: true});
     }
-  }, [open]);
+    function escape(event: KeyboardEvent) {
+      if (event.key === 'Escape' && !event.defaultPrevented) {
+        event.preventDefault(); setOpen(false);
+      }
+    }
+    show();
+    mobile.addEventListener('change', show);
+    document.addEventListener('keydown', escape);
+    return () => {
+      mobile.removeEventListener('change', show);
+      document.removeEventListener('keydown', escape);
+      element.close();
+      launcher.current?.focus({preventScroll: true});
+    };
+  }, [open, setOpen]);
 
   useEffect(() => {
-    if (conversation.current) conversation.current.scrollTop = conversation.current.scrollHeight;
+    if (!open || !conversation.current || !followResponse.current) return;
+    const container = conversation.current;
+    const latest = exchanges[exchanges.length - 1];
+    const answer = latest?.answer && container.querySelector<HTMLElement>(`[data-answer-id="${latest.id}"]`);
+    // Start a long reply at its beginning, while preserving intentional scrollback.
+    container.scrollTop = answer && !busy ? answer.offsetTop - 24 : container.scrollHeight;
   }, [exchanges, busy, error, open]);
+
+  useEffect(() => {
+    if (!busy) return;
+    const timer = window.setInterval(() => setElapsed(Math.floor((Date.now() - startedAt.current) / 1000)), 1000);
+    return () => window.clearInterval(timer);
+  }, [busy]);
 
   useEffect(() => () => activeRequest.current?.abort(), []);
 
@@ -205,6 +260,9 @@ export default function DocsAssistant({endpoint}: {endpoint: string}): ReactNode
     const controller = new AbortController();
     activeRequest.current = controller;
     retryRequest.current = {id, body};
+    startedAt.current = Date.now();
+    setElapsed(0);
+    followResponse.current = true;
     setBusy(true);
     setError('');
     let timedOut = false;
@@ -248,12 +306,13 @@ export default function DocsAssistant({endpoint}: {endpoint: string}): ReactNode
   function submit(event: React.FormEvent) {
     event.preventDefault();
     const message = draft.trim();
-    if (!message || activeRequest.current) return;
+    if (!message || activeRequest.current || message.length > MAX_MESSAGE_LENGTH) return;
+    setInputError('');
     const id = nextId.current++;
     const body: ChatRequest = {
       message,
       history: recentHistory(exchanges),
-      context: {path: `${location.pathname}${location.hash}`.slice(0, 1024), title: pageTitle, selection},
+      context: {path: `${location.pathname}${location.hash}`.slice(0, 1024), title: currentPageTitle(), selection},
       locale,
     };
     setExchanges(current => [...current.slice(-19), {id, question: message, selection: Boolean(selection)}]);
@@ -262,7 +321,7 @@ export default function DocsAssistant({endpoint}: {endpoint: string}): ReactNode
   }
 
   function showAssistant() {
-    setPageTitle((document.querySelector('article h1')?.textContent || document.title).slice(0, 300));
+    setPageTitle(currentPageTitle());
     if (selection && !draft.trim()) setDraft(copy.explainPrompt);
     setOpen(true);
   }
@@ -270,55 +329,80 @@ export default function DocsAssistant({endpoint}: {endpoint: string}): ReactNode
   function clearConversation() {
     if (activeRequest.current) return;
     setExchanges([]);
+    setDraft('');
+    setInputError('');
+    setSelection('');
+    setSelectionTruncated(false);
+    window.getSelection()?.removeAllRanges();
     setError('');
     retryRequest.current = null;
     textarea.current?.focus();
   }
 
+  const latestAnswer = [...exchanges].reverse().find(item => item.answer);
+  const historyTooLong = latestAnswer && latestAnswer.question.length + latestAnswer.answer!.length > 20000;
+
   return (
     <div dir={locale === 'fa' ? 'rtl' : 'ltr'}>
-      <button ref={launcher} type="button" className={styles.launcher}
+      <button ref={launcher} type="button" className={styles.launcher} hidden={open}
         onClick={showAssistant} aria-haspopup="dialog" aria-expanded={open} aria-controls="waterwall-assistant">
-        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-          <path d="M5 4h14a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2H9l-6 3V6a2 2 0 0 1 2-2Z" stroke="currentColor" strokeWidth="1.7" strokeLinejoin="round" />
-          <path d="M7 9h10M7 13h6" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />
-        </svg>
+        <Icon name="chat" />
         {selection ? copy.explain : copy.title}
       </button>
       <dialog ref={dialog} id="waterwall-assistant" className={styles.panel}
-        aria-labelledby="waterwall-assistant-title" aria-describedby="waterwall-assistant-privacy"
-        onCancel={() => setOpen(false)}
-        onClose={() => { setOpen(false); launcher.current?.focus(); }}>
+        aria-labelledby="waterwall-assistant-title"
+        onCancel={event => {event.preventDefault(); setOpen(false);}}>
         <header className={styles.header}>
-          <div><h2 id="waterwall-assistant-title">{copy.title}</h2><span>{copy.subtitle}</span></div>
-          <button type="button" className={styles.iconButton} onClick={() => setOpen(false)} aria-label={copy.close}>
-            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-              <path d="m6 6 12 12M18 6 6 18" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />
-            </svg>
-          </button>
+          <div className={styles.identity}>
+            <span className={styles.brandMark} aria-hidden="true">W</span>
+            <div><h2 id="waterwall-assistant-title">{copy.title}</h2><span>{copy.subtitle}</span></div>
+          </div>
+          <div className={styles.headerActions}>
+            <button type="button" className={styles.iconButton} onClick={clearConversation}
+              disabled={busy || !exchanges.length} aria-label={copy.clear} title={copy.clear}><Icon name="plus" /></button>
+            <button type="button" className={styles.iconButton} onClick={() => setOpen(false)} aria-label={copy.close} title={copy.close}>
+              <Icon name="close" />
+            </button>
+          </div>
         </header>
-        <div className={styles.pageContext} title={pageTitle}>{copy.page}: <strong>{pageTitle}</strong></div>
-        <div ref={conversation} className={styles.conversation} role="log" aria-live="polite" aria-relevant="additions text" aria-label={copy.title}>
+        <div className={styles.pageContext} title={pageTitle}><Icon name="book" size={15} /><span>{copy.page}</span><strong>{pageTitle}</strong></div>
+        <div ref={conversation} className={styles.conversation} role="log" aria-live="polite" aria-relevant="additions text" aria-label={copy.title}
+          onScroll={event => {
+            const element = event.currentTarget;
+            followResponse.current = element.scrollHeight - element.scrollTop - element.clientHeight < 80;
+          }}>
           {!exchanges.length && <div className={styles.welcome}>
-            <span className={styles.welcomeMark} aria-hidden="true">W</span>
+            <span className={styles.welcomeEyebrow}>{copy.subtitle}</span>
             <h3>{copy.welcome}</h3><p>{copy.intro}</p>
-            <button type="button" className={styles.example} onClick={() => { setDraft(copy.example); textarea.current?.focus(); }}>{copy.example}<span aria-hidden="true"> ↗</span></button>
+            <div className={styles.starters}>
+              {copy.starters.map(starter => <button key={starter.icon} type="button" className={styles.starter}
+                onClick={() => {setDraft(starter.prompt); setInputError(''); textarea.current?.focus();}}>
+                <span className={styles.starterIcon}><Icon name={starter.icon} /></span>
+                <span><strong>{starter.title}</strong><span>{starter.detail}</span></span>
+                <Icon name="arrow" size={17} />
+              </button>)}
+            </div>
           </div>}
           {exchanges.map(exchange => <div className={styles.exchange} key={exchange.id}>
             <div className={styles.question}>
               <span className={styles.speaker}>{copy.you}</span><p dir="auto">{exchange.question}</p>
-              {exchange.selection && <small>{copy.attached}</small>}
+              {exchange.selection && <small><Icon name="book" size={12} />{copy.attached}</small>}
             </div>
-            {exchange.answer && <div className={styles.answer}>
-              <span className={styles.speaker}>{copy.assistant}</span>
-              <div dir="auto"><Answer text={exchange.answer} /></div>
+            {exchange.answer && <div className={styles.answer} data-answer-id={exchange.id}>
+              <div className={styles.answerHeading}><span className={styles.miniMark} aria-hidden="true">W</span><span className={styles.speaker}>{copy.assistant}</span></div>
+              <div dir="auto"><Answer text={exchange.answer} copyLabel={copy.copyCode} copiedLabel={copy.copied} copyFailedLabel={copy.copyFailed} /></div>
               {Boolean(exchange.sources?.length) && <nav className={styles.sources} aria-label={copy.sources}>
-                <strong>{copy.sources}</strong>
-                {exchange.sources.map((source, index) => <a key={`${source.url}-${index}`} href={safeUrl(source.url)!} target="_blank" rel="noopener noreferrer">{index + 1}. {source.title}</a>)}
+                <strong><Icon name="book" size={14} />{copy.sources}</strong>
+                <div>{exchange.sources.map((source, index) => <a key={`${source.url}-${index}`} href={safeUrl(source.url)!} target="_blank" rel="noopener noreferrer"><span>{index + 1}</span>{source.title}</a>)}</div>
               </nav>}
+              <div className={styles.answerActions}><CopyButton text={exchange.answer} label={copy.copy} copiedLabel={copy.copied} failedLabel={copy.copyFailed} /></div>
             </div>}
           </div>)}
-          {busy && <p className={styles.status} role="status"><span className={styles.pulse} aria-hidden="true" />{copy.thinking}</p>}
+          {busy && <div className={styles.status} role="status">
+            <div><span className={styles.pulse} aria-hidden="true" /><strong>{elapsed >= 60 ? copy.stillThinking : copy.thinking}</strong>
+              <span className={styles.elapsed} aria-hidden="true" dir="ltr">{Math.floor(elapsed / 60)}:{String(elapsed % 60).padStart(2, '0')}</span></div>
+            <p>{copy.thinkingDetail}</p>
+          </div>}
           {error && <div className={styles.error} role="alert"><p>{error}</p>
             {retryRequest.current && !busy && <button type="button" className={styles.textButton} onClick={() => {
               const request = retryRequest.current;
@@ -328,25 +412,44 @@ export default function DocsAssistant({endpoint}: {endpoint: string}): ReactNode
         </div>
         <form className={styles.composer} onSubmit={submit}>
           {selection && <div className={styles.selection}>
-            <div><strong>{copy.selected}</strong><button type="button" className={styles.textButton} onClick={() => {
+            <div><strong><Icon name="book" size={14} />{copy.selected}</strong><button type="button" className={styles.textButton} onClick={() => {
               setSelection(''); setSelectionTruncated(false); window.getSelection()?.removeAllRanges();
               textarea.current?.focus();
             }}>{copy.remove}</button></div>
             <blockquote dir="auto">{selection}</blockquote>
             {selectionTruncated && <small>{copy.truncated}</small>}
           </div>}
-          <label className={styles.inputLabel} htmlFor="waterwall-assistant-question">{copy.question}</label>
-          <textarea ref={textarea} id="waterwall-assistant-question" value={draft} maxLength={4000}
-            placeholder={copy.placeholder} rows={3} dir="auto" onChange={event => setDraft(event.target.value)}
-            onKeyDown={event => {
-              if (event.key === 'Enter' && !event.shiftKey && !event.nativeEvent.isComposing) { event.preventDefault(); submit(event); }
-            }} />
-          <div className={styles.actions}>
-            <button type="button" className={styles.textButton} onClick={clearConversation} disabled={busy || !exchanges.length}>{copy.clear}</button>
-            {busy ? <button type="button" className={styles.send} onClick={() => activeRequest.current?.abort()}>{copy.cancel}</button>
-              : <button type="submit" className={styles.send} disabled={!draft.trim()}>{copy.send}<span aria-hidden="true"> ↑</span></button>}
+          {historyTooLong && <p className={styles.contextNotice}>{copy.historyNotice}</p>}
+          <div className={styles.inputFrame}>
+            <label className={styles.inputLabel} htmlFor="waterwall-assistant-question">{copy.question}</label>
+            <textarea ref={textarea} id="waterwall-assistant-question" value={draft} maxLength={MAX_MESSAGE_LENGTH}
+              placeholder={selection ? copy.selectedPlaceholder : copy.placeholder} rows={4} dir="auto"
+              aria-describedby={inputError ? 'waterwall-assistant-input-error' : 'waterwall-assistant-shortcut'}
+              aria-invalid={Boolean(inputError)}
+              onChange={event => {setDraft(event.target.value); setInputError('');}}
+              onPaste={event => {
+                const input = event.currentTarget;
+                const length = draft.length - (input.selectionEnd - input.selectionStart) + event.clipboardData.getData('text').length;
+                if (length > MAX_MESSAGE_LENGTH) {event.preventDefault(); setInputError(copy.tooLong);}
+              }}
+              onKeyDown={event => {
+                if (event.key === 'Enter' && (event.ctrlKey || event.metaKey) && !event.nativeEvent.isComposing) {
+                  event.preventDefault(); submit(event);
+                }
+              }} />
+            <div className={styles.actions}>
+              <span className={styles.characterCount} aria-label={`${draft.length} / ${MAX_MESSAGE_LENGTH} ${copy.characters}`}>
+                {draft.length.toLocaleString(locale)} / {MAX_MESSAGE_LENGTH.toLocaleString(locale)}
+              </span>
+              {busy ? <button type="button" className={styles.send} onClick={() => activeRequest.current?.abort()}><span className={styles.stopMark} aria-hidden="true" />{copy.cancel}</button>
+                : <button type="submit" className={styles.send} disabled={!draft.trim()}>{copy.send}<Icon name="send" size={16} /></button>}
+            </div>
           </div>
-          <p id="waterwall-assistant-privacy" className={styles.privacy}>{copy.privacy}</p>
+          {inputError && <p id="waterwall-assistant-input-error" className={styles.inputError} role="alert">{inputError}</p>}
+          <div className={styles.composerMeta}>
+            <span id="waterwall-assistant-shortcut" className={styles.shortcut}>{copy.shortcut}</span>
+            <details className={styles.privacy}><summary>{copy.privacyLabel}</summary><p>{copy.privacy}</p></details>
+          </div>
           <p className={styles.note}>{copy.note}</p>
         </form>
       </dialog>
