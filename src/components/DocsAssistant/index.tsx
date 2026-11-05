@@ -206,7 +206,8 @@ export default function DocsAssistant({endpoint}: {endpoint: string}): ReactNode
     setBusy(true);
     setError('');
     let timedOut = false;
-    const timeout = window.setTimeout(() => { timedOut = true; controller.abort(); }, 100000);
+    // Leave room for the backend's reasoning timeout and Vercel's 300s ceiling.
+    const timeout = window.setTimeout(() => { timedOut = true; controller.abort(); }, 310000);
     try {
       const response = await fetch(endpoint, {
         method: 'POST',
