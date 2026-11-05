@@ -2,7 +2,21 @@ import { themes as prismThemes } from "prism-react-renderer";
 import type { Config } from "@docusaurus/types";
 import type * as Preset from "@docusaurus/preset-classic";
 
+// This is a public endpoint, never an API key. An empty value disables the widget.
+const assistantApiUrl = process.env.DOCS_ASSISTANT_API_URL || "";
+if (assistantApiUrl) {
+  const endpoint = new URL(assistantApiUrl);
+  const localHost = ["localhost", "127.0.0.1", "[::1]"].includes(endpoint.hostname);
+  if (
+    (endpoint.protocol !== "https:" && !(localHost && endpoint.protocol === "http:")) ||
+    endpoint.username || endpoint.password || endpoint.search || endpoint.hash
+  ) {
+    throw new Error("DOCS_ASSISTANT_API_URL must be an HTTPS endpoint (HTTP is allowed on localhost), without credentials, query, or fragment.");
+  }
+}
+
 const config: Config = {
+  customFields: { assistantApiUrl },
   future: {
     v4: true,
     experimental_faster: true,
