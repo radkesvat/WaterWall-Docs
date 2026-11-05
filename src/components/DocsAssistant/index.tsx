@@ -105,6 +105,8 @@ function InlineText({text}: {text: string}): ReactNode {
 
 // Intentionally a small renderer: model output never becomes HTML or MDX.
 function Answer({text}: {text: string}): ReactNode {
+  // Keep large responses readable without running the inline Markdown parser.
+  if (text.length > 60000) return <p>{text}</p>;
   return text.split(/(```[^\n]*\n[\s\S]*?(?:```|$))/g).map((part, index) => {
     if (part.startsWith('```')) {
       const code = part.replace(/^```[^\n]*\n/, '').replace(/```$/, '');
@@ -222,7 +224,7 @@ export default function DocsAssistant({endpoint}: {endpoint: string}): ReactNode
       }
       const result: unknown = await response.json();
       if (!result || typeof result !== 'object' || !('answer' in result)
-          || typeof result.answer !== 'string' || !result.answer.trim() || result.answer.length > 60000) {
+          || typeof result.answer !== 'string' || !result.answer.trim()) {
         setError(copy.failed);
         return;
       }
