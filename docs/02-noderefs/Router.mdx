@@ -78,13 +78,13 @@ TcpListener -> Router
 Route after a proxy server that already parsed destination metadata:
 
 ```text
-Socks5Server -> Router -> TcpConnector
+TcpListener -> Socks5Server -> Router -> TcpConnector
 ```
 
 Route connection lines created from packet traffic:
 
 ```text
-TunDevice -> PacketsToConnection -> Router -> TcpConnector
+TunDevice -> PacketsToConnection -> Router -> TcpUdpConnector
 ```
 
 `Router` is a layer-4 tunnel. It routes WaterWall lines, not raw packets by
@@ -93,71 +93,107 @@ itself. For raw packet chains, first use a packet/connection bridge such as
 
 ## Complete Example
 
-This example uses one inbound listener and sends:
+### Route a local SOCKS proxy through selected outbound paths
 
-- authenticated user `alice` to a premium path
-- TLS traffic for `*.example.org` to a domain-specific path
-- SSH traffic to an SSH path
-- everything else to the default direct path
+This complete node configuration accepts local SOCKS5 CONNECT requests. It rejects
+port 25, sends `*.example.org` through an upstream HTTP proxy, and connects directly
+to other destinations. The SOCKS node supplies the destination; the rules do not
+need payload sniffing or an authenticated username.
 
-```json
-{
-  "name": "inbound",
-  "type": "TcpListener",
-  "settings": {
-    "address": "0.0.0.0",
-    "port": 443,
-    "nodelay": true
-  },
-  "next": "router"
-}
+```text
+TcpListener -> Socks5Server -> Router
+                                 |-- destination port 25 -> BlackHole(active)
+                                 |-- *.example.org -> HttpProxyClient -> TcpConnector(proxy)
+                                 `-- default -> TcpConnector(requested destination)
 ```
-
 ```json
 {
-  "name": "router",
-  "type": "Router",
-  "settings": {
-    "sniffing": [
-      "http1",
-      "tls"
-    ],
-    "rules": [
-      {
-        "username": "alice",
-        "target": "premium_path"
+  "name": "local-socks-routing",
+  "nodes": [
+    {
+      "name": "entry",
+      "type": "TcpListener",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 1080
       },
-      {
-        "destination-domain": [
-          "*.example.org"
-        ],
-        "protocol": "tls",
-        "target": "example_tls_path"
+      "next": "socks"
+    },
+    {
+      "name": "socks",
+      "type": "Socks5Server",
+      "settings": {
+        "no-auth": true,
+        "connect": true,
+        "udp": false
       },
-      {
-        "destination-port": 22,
-        "target": "ssh_path"
+      "next": "route"
+    },
+    {
+      "name": "route",
+      "type": "Router",
+      "settings": {
+        "rules": [
+          {
+            "destination-port": 25,
+            "target": "reject"
+          },
+          {
+            "destination-domain": [
+              "*.example.org"
+            ],
+            "target": "via-proxy"
+          }
+        ]
+      },
+      "next": "direct"
+    },
+    {
+      "name": "reject",
+      "type": "BlackHole",
+      "settings": {
+        "mode": "active"
       }
-    ]
-  },
-  "next": "direct_path"
+    },
+    {
+      "name": "via-proxy",
+      "type": "HttpProxyClient",
+      "settings": {
+        "target-address": "dest_context->address",
+        "port": "dest_context->port"
+      },
+      "next": "proxy-socket"
+    },
+    {
+      "name": "proxy-socket",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "192.0.2.20",
+        "port": 3128
+      }
+    },
+    {
+      "name": "direct",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "dest_context->address",
+        "port": "dest_context->port"
+      }
+    }
+  ]
 }
 ```
+Save this object as a node config file and list it in `core.json.configs`.
+Replace `192.0.2.20:3128` with your HTTP proxy endpoint. The proxy must allow
+CONNECT to the requested destination; add its credentials to `HttpProxyClient`
+when required. The proxy socket's address identifies that proxy, while
+`HttpProxyClient` captures the application's requested destination first.
 
-```json
-{
-  "name": "direct_path",
-  "type": "TcpConnector",
-  "settings": {
-    "address": "203.0.113.10",
-    "port": 443
-  }
-}
-```
-
-Rule targets such as `premium_path`, `example_tls_path`, and `ssh_path` must be
-real node names in the same config. Each target is a branch entry. It can point
-to a connector, a protocol tunnel, a `Bridge`, or another valid chain segment.
+Use a SOCKS client that sends the hostname (for example, curl's
+`--socks5-hostname`) to exercise the domain rule. If the application resolves the
+name locally and sends only an IP address, this metadata-only example cannot
+match `*.example.org`. Rule order matters: the port-25 rejection wins first.
+The no-auth listener is bound to loopback.
 
 ## Required Fields
 

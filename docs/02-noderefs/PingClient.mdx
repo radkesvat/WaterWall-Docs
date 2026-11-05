@@ -31,6 +31,43 @@ TunDevice -> PingClient -> RawSocket
 RawSocket -> PingServer -> TunDevice
 ```
 
+## Deployment Scenarios
+
+The TUN pair above carries inner IPv4 packets between hosts. Give the TUNs
+separate inner addresses, route the intended destinations through them, and
+keep the outer `local-ipv4` / `peer-ipv4` addresses outside the TUN routes.
+Use an inner MTU no greater than `1472` for a 1500-byte outer path; smaller
+outer paths need a smaller inner MTU because Ping adds 28 bytes.
+
+For a fixed TCP service without TUN interfaces, use the connection bridges:
+
+```text
+client: TcpListener -> ConnectionToPackets -> PingClient -> RawSocket
+server: RawSocket -> PingServer -> PacketsToConnection -> TcpConnector
+```
+
+This is a complete chain shape, not a runnable config. For example:
+
+| Component | Configuration role |
+| --- | --- |
+| Client `TcpListener` | Accept application TCP on `127.0.0.1:5000`. |
+| Client `ConnectionToPackets` | Use `source-ipv4: "10.90.0.1"`, `target-address: "10.90.0.2"`, `port: 5300`, and `mtu: 1400`. |
+| Ping pair | Use the hosts' reachable outer addresses as `local-ipv4` / `peer-ipv4`, reversed on the server. These are distinct from `10.90.0.x`. |
+| Each `RawSocket` | Set `capture-filter-mode: "source-ip"`, `capture-ips` to the other host's outer address, and `capture-protocols: [1]` for ICMP. |
+| Server `PacketsToConnection` | Use `mtu: 1400` and point `next` to the TCP connector. |
+| Server `TcpConnector` | Forward to the real service, for example `127.0.0.1:5300`. |
+
+Here `10.90.0.2` is the inner flow destination; the server connector deliberately
+replaces it with the actual backend. Replies return through the same bridges.
+Raw packet I/O still needs its platform permissions, even though this variant
+uses no TUN. The network must carry Echo Requests in both directions, because
+reverse application data also uses requests. Ping itself supplies no encryption;
+use a separate protection layer when the application needs it.
+
+The [Ping-to-lwIP integration fixture](https://github.com/radkesvat/WaterWall/blob/main/tests/cases/ping_server_packets_to_connection_alignment_roundtrip/config.json)
+exercises the bridge composition in-process; it is a test fixture, not a
+replacement for the two hosts' RawSocket and routing configuration.
+
 ## Two Independent Echo Sessions
 
 Ping v2 never puts new application data into an Echo Reply.

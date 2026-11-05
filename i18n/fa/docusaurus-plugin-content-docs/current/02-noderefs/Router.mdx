@@ -70,86 +70,122 @@ TcpListener -> Router
 پس از proxy server‌ای که metadata مقصد را از قبل خوانده است:
 
 ```text
-Socks5Server -> Router -> TcpConnector
+TcpListener -> Socks5Server -> Router -> TcpConnector
 ```
 
 بعد از تبدیل packet به connection:
 
 ```text
-TunDevice -> PacketsToConnection -> Router -> TcpConnector
+TunDevice -> PacketsToConnection -> Router -> TcpUdpConnector
 ```
 
 `Router` یک node لایه ۴ است و line‌های WaterWall را route می‌کند، نه packet‌های خام
 را. اگر در یک packet chain به routing در سطح connection نیاز دارید، ابتدا از
 `PacketsToConnection` استفاده کنید.
 
-## نمونه کامل
+## نمونه کامل {#complete-example}
 
-در این مثال connection‌های یک listener ورودی به این شکل تقسیم می‌شوند:
+### انتخاب مسیر خروجی برای یک SOCKS proxy محلی
 
-- کاربر authenticate‌شده `alice` به مسیر premium
-- TLS برای `*.example.org` به مسیر domain-specific
-- SSH به مسیر SSH
-- بقیه به مسیر direct پیش‌فرض
+این config کامل node‌ها درخواست‌های SOCKS5 CONNECT محلی را می‌پذیرد. پورت 25
+را رد می‌کند، مقصدهای `*.example.org` را از HTTP proxy بالادستی عبور می‌دهد و
+به بقیه مقصدها مستقیم وصل می‌شود. مقصد را SOCKS node مشخص می‌کند؛ این rule‌ها
+به sniff کردن payload یا username احراز هویت‌شده نیاز ندارند.
 
-```json
-{
-  "name": "inbound",
-  "type": "TcpListener",
-  "settings": {
-    "address": "0.0.0.0",
-    "port": 443,
-    "nodelay": true
-  },
-  "next": "router"
-}
+```text
+TcpListener -> Socks5Server -> Router
+                                 |-- destination port 25 -> BlackHole(active)
+                                 |-- *.example.org -> HttpProxyClient -> TcpConnector(proxy)
+                                 `-- default -> TcpConnector(requested destination)
 ```
-
 ```json
 {
-  "name": "router",
-  "type": "Router",
-  "settings": {
-    "sniffing": [
-      "http1",
-      "tls"
-    ],
-    "rules": [
-      {
-        "username": "alice",
-        "target": "premium_path"
+  "name": "local-socks-routing",
+  "nodes": [
+    {
+      "name": "entry",
+      "type": "TcpListener",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 1080
       },
-      {
-        "destination-domain": [
-          "*.example.org"
-        ],
-        "protocol": "tls",
-        "target": "example_tls_path"
+      "next": "socks"
+    },
+    {
+      "name": "socks",
+      "type": "Socks5Server",
+      "settings": {
+        "no-auth": true,
+        "connect": true,
+        "udp": false
       },
-      {
-        "destination-port": 22,
-        "target": "ssh_path"
+      "next": "route"
+    },
+    {
+      "name": "route",
+      "type": "Router",
+      "settings": {
+        "rules": [
+          {
+            "destination-port": 25,
+            "target": "reject"
+          },
+          {
+            "destination-domain": [
+              "*.example.org"
+            ],
+            "target": "via-proxy"
+          }
+        ]
+      },
+      "next": "direct"
+    },
+    {
+      "name": "reject",
+      "type": "BlackHole",
+      "settings": {
+        "mode": "active"
       }
-    ]
-  },
-  "next": "direct_path"
+    },
+    {
+      "name": "via-proxy",
+      "type": "HttpProxyClient",
+      "settings": {
+        "target-address": "dest_context->address",
+        "port": "dest_context->port"
+      },
+      "next": "proxy-socket"
+    },
+    {
+      "name": "proxy-socket",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "192.0.2.20",
+        "port": 3128
+      }
+    },
+    {
+      "name": "direct",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "dest_context->address",
+        "port": "dest_context->port"
+      }
+    }
+  ]
 }
 ```
+این object را در یک فایل node config ذخیره کنید و مسیرش را در `core.json.configs`
+بگذارید. `192.0.2.20:3128` را با endpoint واقعی HTTP proxy جایگزین کنید. آن proxy
+باید CONNECT به مقصد درخواستی را اجازه دهد؛ اگر نیاز دارد، اعتبارنامه‌اش را روی
+`HttpProxyClient` تنظیم کنید. آدرس connector مربوط به proxy است؛ `HttpProxyClient`
+پیش از آن، مقصد درخواستی برنامه را از context برمی‌دارد.
 
-```json
-{
-  "name": "direct_path",
-  "type": "TcpConnector",
-  "settings": {
-    "address": "203.0.113.10",
-    "port": 443
-  }
-}
-```
-
-target‌هایی مانند `premium_path`، `example_tls_path` و `ssh_path` باید نام node‌های
-واقعی در همان config باشند. هر target ورودی یک شاخه است و می‌تواند به یک
-connector، protocol tunnel، `Bridge` یا segment دیگری از chain اشاره کند.
+برای آزمایش rule دامنه، client باید hostname را در درخواست SOCKS بفرستد؛ برای
+نمونه با گزینه‌ی `--socks5-hostname` در curl. اگر برنامه نام را محلی resolve کند
+و فقط IP بفرستد، این نمونه‌ی مبتنی بر metadata نمی‌تواند `*.example.org` را
+تطبیق دهد. ترتیب rule‌ها مهم است: رد پورت 25 زودتر بررسی می‌شود. listener بدون
+authentication فقط به loopback متصل است.
 
 ## فیلدهای اصلی
 
