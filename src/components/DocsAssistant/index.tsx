@@ -3,6 +3,7 @@ import useDocusaurusContext from '@docusaurus/useDocusaurusContext';
 import {useLocation} from '@docusaurus/router';
 import styles from './styles.module.css';
 import {Answer, CopyButton} from './Response';
+import {JobProtocolError, JobTimeoutError, runAssistantJob} from './jobTransport';
 
 type Source = {title: string; url: string};
 type HistoryMessage = {role: 'user' | 'assistant'; content: string};
@@ -47,7 +48,7 @@ const labels = {
     thinking: 'Working on your question', stillThinking: 'Still working on your question',
     thinkingDetail: 'Complex questions can take a few minutes. You can keep reading while I work.',
     privacyLabel: 'About this conversation',
-    privacy: 'Your messages, recent conversation, page title and selected text are sent to OpenAI. Do not share passwords, API keys or other secrets. This conversation stays in this tab until you reload or start a new one.',
+    privacy: 'Your messages, recent conversation, page title and selected text are sent to OpenAI. Background responses may be temporarily stored by OpenAI for about 10 minutes. Do not share passwords, API keys or other secrets. This conversation stays in this tab until you reload or start a new one.',
     note: 'Check important details against the sources.',
     sources: 'Documentation sources', you: 'You', assistant: 'WaterWall',
     copy: 'Copy answer', copyCode: 'Copy code', copied: 'Copied', copyFailed: 'Could not copy. Select and copy the text manually.',
@@ -58,6 +59,7 @@ const labels = {
     network: 'Could not reach the assistant. Check your connection and try again.',
     cancelled: 'Request stopped. You can try it again.',
     timeout: 'The assistant took too long to respond. Please try again.',
+    incomplete: 'The assistant did not return a complete answer. Please try again.',
     limit: 'The assistant has reached a usage limit. Please try again later.',
     unavailable: 'The assistant is temporarily unavailable. Please try again later.',
   },
@@ -83,7 +85,7 @@ const labels = {
     thinking: 'در حال بررسی پرسش شما', stillThinking: 'همچنان در حال بررسی پرسش شما',
     thinkingDetail: 'پرسش‌های پیچیده ممکن است چند دقیقه زمان ببرند. می‌توانید در این مدت به مطالعه ادامه دهید.',
     privacyLabel: 'دربارهٔ این گفتگو',
-    privacy: 'پیام‌های شما، گفتگوی اخیر، عنوان صفحه و متن انتخاب‌شده به OpenAI ارسال می‌شود. گذرواژه، کلید API یا اطلاعات محرمانه نفرستید. این گفتگو تا بارگذاری دوبارهٔ صفحه یا شروع گفتگوی تازه در همین زبانه می‌ماند.',
+    privacy: 'پیام‌های شما، گفتگوی اخیر، عنوان صفحه و متن انتخاب‌شده به OpenAI ارسال می‌شود. پاسخ‌های پس‌زمینه ممکن است حدود ۱۰ دقیقه به‌طور موقت در OpenAI ذخیره شوند. گذرواژه، کلید API یا اطلاعات محرمانه نفرستید. این گفتگو تا بارگذاری دوبارهٔ صفحه یا شروع گفتگوی تازه در همین زبانه می‌ماند.',
     note: 'جزئیات مهم را با منابع بررسی کنید.',
     sources: 'منابع مستندات', you: 'شما', assistant: 'واتروال',
     copy: 'کپی پاسخ', copyCode: 'کپی کد', copied: 'کپی شد', copyFailed: 'کپی ممکن نشد. متن را انتخاب و دستی کپی کنید.',
@@ -94,6 +96,7 @@ const labels = {
     network: 'اتصال به دستیار ممکن نشد. اتصال اینترنت خود را بررسی کنید و دوباره تلاش کنید.',
     cancelled: 'درخواست متوقف شد. می‌توانید دوباره تلاش کنید.',
     timeout: 'دریافت پاسخ بیش از حد طول کشید. لطفاً دوباره تلاش کنید.',
+    incomplete: 'دستیار پاسخ کاملی ارائه نکرد. لطفاً دوباره تلاش کنید.',
     limit: 'سقف استفاده از دستیار تکمیل شده است. لطفاً بعداً دوباره تلاش کنید.',
     unavailable: 'دستیار موقتاً در دسترس نیست. لطفاً بعداً دوباره تلاش کنید.',
   },
@@ -246,7 +249,11 @@ export default function DocsAssistant({endpoint, open, onOpenChange}: {
     return () => window.clearInterval(timer);
   }, [busy]);
 
-  useEffect(() => () => activeRequest.current?.abort(), []);
+  useEffect(() => {
+    const stop = () => activeRequest.current?.abort();
+    window.addEventListener('pagehide', stop);
+    return () => {window.removeEventListener('pagehide', stop); stop();};
+  }, []);
 
   function safeUrl(value: string): string | null {
     try {
@@ -276,18 +283,25 @@ export default function DocsAssistant({endpoint, open, onOpenChange}: {
     setBusy(true);
     setError('');
     let timedOut = false;
-    // Leave room for the backend's reasoning timeout and Vercel's 300s ceiling.
-    const timeout = window.setTimeout(() => { timedOut = true; controller.abort(); }, 310000);
+    // A background job can run for ten minutes across short HTTP requests.
+    const timeout = window.setTimeout(() => { timedOut = true; controller.abort(); }, 660000);
     try {
-      const response = await fetch(endpoint, {
-        method: 'POST',
-        headers: {'Content-Type': 'application/json'},
-        credentials: 'omit',
-        body: JSON.stringify(body),
-        signal: controller.signal,
-      });
+      const response = await runAssistantJob(endpoint, body, controller.signal);
       if (!response.ok) {
-        setError(response.status === 429 ? copy.limit : response.status >= 500 ? copy.unavailable : copy.failed);
+        let code: string | undefined;
+        try {
+          const failure: unknown = await response.json();
+          if (failure && typeof failure === 'object' && !Array.isArray(failure)
+              && 'code' in failure && typeof failure.code === 'string') code = failure.code;
+        } catch (error) {
+          // Platform errors may be HTML or malformed JSON. Never display their text.
+          if (controller.signal.aborted) throw error;
+        }
+        if (controller.signal.aborted) throw new DOMException('Request aborted', 'AbortError');
+        setError(response.status === 429 ? copy.limit
+          : response.status === 504 || code === 'upstream_timeout' ? copy.timeout
+            : code === 'incomplete_response' || code === 'empty_response' ? copy.incomplete
+              : response.status >= 500 ? copy.unavailable : copy.failed);
         return;
       }
       const result: unknown = await response.json();
@@ -304,8 +318,10 @@ export default function DocsAssistant({endpoint, open, onOpenChange}: {
         : [];
       setExchanges(current => current.map(item => item.id === id ? {...item, answer, sources} : item));
       retryRequest.current = null;
-    } catch {
-      setError(controller.signal.aborted ? timedOut ? copy.timeout : copy.cancelled : copy.network);
+    } catch (error) {
+      setError(controller.signal.aborted ? timedOut ? copy.timeout : copy.cancelled
+        : error instanceof JobTimeoutError ? copy.timeout
+          : error instanceof JobProtocolError ? copy.failed : copy.network);
     } finally {
       window.clearTimeout(timeout);
       activeRequest.current = null;

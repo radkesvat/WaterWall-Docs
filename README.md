@@ -30,6 +30,14 @@ Messages are limited to 4,000 characters, with recent turns included within the
 backend's 20,000-character context budget. The waiting indicator shows elapsed
 time; it does not represent streamed reasoning or individual tool activity.
 
+The widget derives `/api/jobs` from the configured `/api/chat` endpoint. It starts
+one background job and polls that same job, allowing longer answers to finish
+across short HTTP requests. Transient polling failures receive up to three
+retries; a job start is never retried automatically. **Stop**, leaving the page,
+or the eleven-minute browser deadline requests cancellation. Job tickets stay
+in memory, and OpenAI may temporarily retain background responses for about ten
+minutes. Deploy the backend's jobs endpoint before publishing this widget.
+
 The private backend checks successful GitHub Pages deployments hourly and updates
 the assistant index when documentation changes. Normal docs updates need no local
 indexing commands. To check sooner, run **Sync deployed documentation** from the
