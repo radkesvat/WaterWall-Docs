@@ -22,6 +22,10 @@ dialog on smaller screens. Readers can select a passage while the desktop panel
 is open, draft multiline JSON, and copy suggested code or complete answers.
 Enter inserts a newline; Ctrl/Command + Enter sends a message. Conversations stay
 in memory while navigating the site and reset on reload or **New conversation**.
+**Standard** is the default response mode for most questions; **Deep** is for
+more involved problems and may take longer. Changing modes preserves the draft,
+conversation, and selected passage. A retry retains its original mode, and
+**New conversation** resets the mode to Standard.
 Messages are limited to 4,000 characters, with recent turns included within the
 backend's 20,000-character context budget. The waiting indicator shows elapsed
 time; it does not represent streamed reasoning or individual tool activity.

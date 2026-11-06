@@ -6,16 +6,19 @@ import {Answer, CopyButton} from './Response';
 
 type Source = {title: string; url: string};
 type HistoryMessage = {role: 'user' | 'assistant'; content: string};
+type ResponseMode = 'standard' | 'deep';
 type ChatRequest = {
   message: string;
   history: HistoryMessage[];
   context: {path: string; title: string; selection: string};
   locale: 'en' | 'fa';
+  mode: ResponseMode;
 };
 type Exchange = {
   id: number;
   question: string;
   selection: boolean;
+  mode: ResponseMode;
   answer?: string;
   sources?: Source[];
 };
@@ -38,6 +41,8 @@ const labels = {
     attached: 'Selected passage included', page: 'Reading',
     question: 'Message WaterWall Assistant', placeholder: 'Describe your goal, paste JSON, or ask a follow-up…',
     selectedPlaceholder: 'What would you like to explore about this passage?',
+    modeLabel: 'Response mode', modeNames: {standard: 'Standard', deep: 'Deep'},
+    modeHints: {standard: 'For most questions and configuration changes.', deep: 'For more involved problems. May take longer.'},
     send: 'Send message', cancel: 'Stop', retry: 'Try again',
     thinking: 'Working on your question', stillThinking: 'Still working on your question',
     thinkingDetail: 'Complex questions can take a few minutes. You can keep reading while I work.',
@@ -72,6 +77,8 @@ const labels = {
     attached: 'متن انتخاب‌شده ضمیمه شده است', page: 'در حال مطالعه',
     question: 'پیام به دستیار واتروال', placeholder: 'هدفتان را توضیح دهید، JSON بچسبانید یا گفتگو را ادامه دهید…',
     selectedPlaceholder: 'کدام بخش این متن را می‌خواهید بیشتر بررسی کنیم؟',
+    modeLabel: 'حالت پاسخ', modeNames: {standard: 'استاندارد', deep: 'عمیق'},
+    modeHints: {standard: 'برای بیشتر پرسش‌ها و تغییرات پیکربندی.', deep: 'برای مسائل پیچیده‌تر. ممکن است بیشتر زمان ببرد.'},
     send: 'ارسال پیام', cancel: 'توقف', retry: 'تلاش دوباره',
     thinking: 'در حال بررسی پرسش شما', stillThinking: 'همچنان در حال بررسی پرسش شما',
     thinkingDetail: 'پرسش‌های پیچیده ممکن است چند دقیقه زمان ببرند. می‌توانید در این مدت به مطالعه ادامه دهید.',
@@ -136,6 +143,7 @@ export default function DocsAssistant({endpoint, open, onOpenChange}: {
   const copy = labels[locale];
   const setOpen = onOpenChange;
   const [draft, setDraft] = useState('');
+  const [mode, setMode] = useState<ResponseMode>('standard');
   const [selection, setSelection] = useState('');
   const [selectionTruncated, setSelectionTruncated] = useState(false);
   const [pageTitle, setPageTitle] = useState('');
@@ -260,6 +268,8 @@ export default function DocsAssistant({endpoint, open, onOpenChange}: {
     const controller = new AbortController();
     activeRequest.current = controller;
     retryRequest.current = {id, body};
+    // A retry keeps its original mode even if the next-message setting changed.
+    setMode(body.mode);
     startedAt.current = Date.now();
     setElapsed(0);
     followResponse.current = true;
@@ -314,8 +324,9 @@ export default function DocsAssistant({endpoint, open, onOpenChange}: {
       history: recentHistory(exchanges),
       context: {path: `${location.pathname}${location.hash}`.slice(0, 1024), title: currentPageTitle(), selection},
       locale,
+      mode,
     };
-    setExchanges(current => [...current.slice(-19), {id, question: message, selection: Boolean(selection)}]);
+    setExchanges(current => [...current.slice(-19), {id, question: message, selection: Boolean(selection), mode}]);
     setDraft('');
     void send(body, id);
   }
@@ -330,6 +341,7 @@ export default function DocsAssistant({endpoint, open, onOpenChange}: {
     if (activeRequest.current) return;
     setExchanges([]);
     setDraft('');
+    setMode('standard');
     setInputError('');
     setSelection('');
     setSelectionTruncated(false);
@@ -383,9 +395,13 @@ export default function DocsAssistant({endpoint, open, onOpenChange}: {
               </button>)}
             </div>
           </div>}
-          {exchanges.map(exchange => <div className={styles.exchange} key={exchange.id}>
+          {exchanges.map(exchange => <div className={styles.exchange} key={exchange.id} data-mode={exchange.mode}>
             <div className={styles.question}>
-              <span className={styles.speaker}>{copy.you}</span><p dir="auto">{exchange.question}</p>
+              <div className={styles.questionHeading}>
+                <span className={styles.speaker}>{copy.you}</span>
+                <span className={styles.modeTag} aria-label={`${copy.modeLabel}: ${copy.modeNames[exchange.mode]}`}>{copy.modeNames[exchange.mode]}</span>
+              </div>
+              <p dir="auto">{exchange.question}</p>
               {exchange.selection && <small><Icon name="book" size={12} />{copy.attached}</small>}
             </div>
             {exchange.answer && <div className={styles.answer} data-answer-id={exchange.id}>
@@ -420,6 +436,17 @@ export default function DocsAssistant({endpoint, open, onOpenChange}: {
             {selectionTruncated && <small>{copy.truncated}</small>}
           </div>}
           {historyTooLong && <p className={styles.contextNotice}>{copy.historyNotice}</p>}
+          <fieldset className={styles.modeSelector} disabled={busy} aria-describedby="waterwall-assistant-mode-description">
+            <legend>{copy.modeLabel}</legend>
+            <div className={styles.modeOptions}>
+              {(['standard', 'deep'] as const).map(value => <label key={value} className={styles.modeOption}>
+                <input type="radio" name="waterwall-assistant-mode" value={value}
+                  checked={mode === value} onChange={() => setMode(value)} />
+                <span>{copy.modeNames[value]}</span>
+              </label>)}
+            </div>
+            <p id="waterwall-assistant-mode-description" className={styles.modeHint}>{copy.modeHints[mode]}</p>
+          </fieldset>
           <div className={styles.inputFrame}>
             <label className={styles.inputLabel} htmlFor="waterwall-assistant-question">{copy.question}</label>
             <textarea ref={textarea} id="waterwall-assistant-question" value={draft} maxLength={MAX_MESSAGE_LENGTH}
