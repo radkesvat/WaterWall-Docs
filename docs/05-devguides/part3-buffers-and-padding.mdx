@@ -64,9 +64,9 @@ head                      data                     data+len       head+capacity
   allocation's lifetime, even after cursor movement.
 - **Current headroom** (`sbufGetHeadroom` = the byte offset from `head` to `data`)
   is how many bytes you can still prepend by shifting left.
-- **Writable capacity** (`sbufGetMaximumWriteableSize` = `capacity - headroom`)
+- **Writable capacity** (`sbufGetWritableCapacity` = `capacity - headroom`)
   is how much you can address forward from the cursor, including current payload.
-- **Tail capacity** (`sbufGetTailCapacity` = `capacity - headroom - len`) is the
+- **Tailroom** (`sbufGetTailroom` = `capacity - headroom - len`) is the
   spare room available to append bytes without growing an ordinary buffer.
   It requires valid ordinary geometry; it is not available for splice buffers.
 
@@ -80,12 +80,19 @@ headroom remains 64 throughout.
 | Call | Returns |
 | --- | --- |
 | `sbufGetLength(b)` | current payload length (`len`) |
-| `sbufGetRawPtr(b)` / `sbufGetMutablePtr(b)` | pointer to the payload start (`data`) |
+| `sbufGetRawPtr(b)` | borrowed `const uint8_t *` to the payload start (`data`) |
+| `sbufGetMutablePtr(b)` | borrowed `uint8_t *` to the payload start; requires mutable `sbuf_t *` |
 | `sbufGetHeadroom(b)` | `size_t` byte offset from `head` to `data`, available to prepend |
-| `sbufGetMaximumWriteableSize(b)` | bytes addressable from the cursor (`capacity - sbufGetHeadroom(b)`) |
-| `sbufGetTailCapacity(b)` | spare append space in an ordinary buffer (`capacity - sbufGetHeadroom(b) - len`) |
+| `sbufGetWritableCapacity(b)` | bytes addressable from the cursor (`capacity - sbufGetHeadroom(b)`) |
+| `sbufGetTailroom(b)` | spare append space in an ordinary buffer (`capacity - sbufGetHeadroom(b) - len`) |
 | `sbufGetTotalCapacity(b)` | full allocation (constant) |
 | `sbufGetInitialHeadroom(b)` | `uint16_t` original aligned `initial_headroom` value |
+
+Read-only accessors and copy/duplicate source parameters accept const buffers.
+The raw pointer supports byte indexing without discarding const; use the mutable
+accessor only when the buffer is owned for mutation. Neither accessor proves
+that a splice body's logical bytes are resident. Const access does not extend
+ownership or lifetime, and queued buffers must still be popped before mutation.
 
 Create and reset set `data` to `head + initial_headroom` and length to zero.
 Reset preserves an ordinary buffer's capacity and initial headroom.
@@ -138,9 +145,13 @@ sbufWriteUI16(b, port);            // aligned 16-bit write at the cursor
 sbufWriteUnAlignedUI32(b, value);  // unaligned 32-bit write
 uint16_t v; sbufReadUI16(b, &v);   // aligned read
 sbufWrite(b, src, n);              // raw copy of n bytes at the cursor
-sbufConsume(b, n);                 // drop n bytes from the payload tail count
+sbufReduceLength(b, n);            // subtract n from len without moving data
 sbufShiftRight(b, n);              // advance cursor: consume n bytes from the front
 ```
+
+`sbufReduceLength()` changes only length; it does not consume front bytes or
+perform pipe I/O. Splice body accounting uses `sbufSpliceConsumeBody()` after
+successful pipe I/O so logical capacity is reduced together with length.
 
 `sbufSlice(source, bytes)` consumes leading ordinary bytes into a new ordinary
 buffer with the source's full original aligned left padding. The caller owns
@@ -669,7 +680,7 @@ peek, reserve, and destroy API. It preserves entries, including empty entries,
 and FIFO order. Logical byte accounting includes each splice buffer's real prefix
 and remaining private-pipe body; it does not count control-storage capacity.
 
-`bufferqueueGetBufLen()` reports logical bytes. `bufferqueueGetCharge()` reports
+`bufferqueueGetLength()` reports logical bytes. `bufferqueueGetCharge()` reports
 the sum of `sbufGetQueueCharge()` for entries still owned by the queue. Both are
 cached O(1) totals, maintained by successful front/back insertion and pop. Empty
 entries contribute charge even though they add no logical bytes. Callers choose
@@ -677,6 +688,10 @@ limits, their accounting scope, Pause/Resume decisions and overflow handling.
 An optional attached `buffer_budget_t` enforces admission across one or more
 queues and active reservations. Unbound queues retain their existing accounting
 without a finite admission policy; parser and Mux policies remain with their owners.
+
+`bufferqueueGetEntryCount()` counts stored buffers, including empty entries.
+Length, entry count and charge queries accept const queues and return `size_t`;
+these quantities remain distinct even when all three are used for admission.
 
 Splice insertion retains the original wrapper and private pipe in every build.
 It neither copies metadata as payload nor converts or consumes the body.
@@ -943,6 +958,13 @@ Rules:
 
 ## Buffer Pools
 
+Generic object-pool item sizes and their getter/constructor arguments use
+`size_t`, including the mutex-protected wrapper. Item size remains bounded by
+`UINT32_MAX`; constructors reject larger requests before allocating metadata or
+installing master callbacks. Cache widths and counts retain their bounded
+`uint32_t` representation. This is separate from buffer-tier sizes and the
+16-bit headroom reservation.
+
 For ordinary runtime buffers, do not `malloc`. Use the worker-local buffer pool so
 allocations are recycled and correctly padded. The pool is reachable from any
 line:
@@ -1168,12 +1190,12 @@ When sizing a destination buffer from an untrusted or variable payload length:
   padding. Request zero only for a locally consumed buffer or a proven
   zero-padding destination.
 - Compare the requested length with actual writable capacity
-  (`sbufGetMaximumWriteableSize()`) in ordinary Release control flow before any
+  (`sbufGetWritableCapacity()`) in ordinary Release control flow before any
   assert-only length mutator (such as `sbufSetLength()`) or write.
 - Publish the `sbuf_t` length only after the producer has successfully written or
   validated that many bytes.
 
-`sbufEnsureLeftCapacity(pool, buf, need)` consumes an exclusively owned buffer
+`sbufEnsureHeadroom(pool, buf, need)` consumes an exclusively owned buffer
 and returns the sole owned result. Sufficient headroom returns the original
 unchanged; otherwise replacement preserves the complete logical payload and
 reserves at least `max(need, large_pool_padding)`. Ordinary input remains ordinary.
@@ -1187,6 +1209,15 @@ actual header length before requesting maximum-header replacement padding;
 VLESS UDP requests its fixed two-byte prefix.
 
 ## Buffer Ownership
+
+Buffer helpers returning the sole owned replacement are marked `WW_MUST_USE`,
+including `sbufReserveSpace()`, `sbufEnsureOrdinary()`,
+`sbufTryEnsureOrdinary()`, `sbufEnsureHeadroom()`, `sbufConcat()`,
+`sbufAppendMerge()`, `sbufMoveRangeTo()` and splice frame movement. Consume their
+returned result according to each ownership contract; the previous allocation
+may have been freed or recycled. Checked conversion still leaves the source
+owned by the caller on refusal. Cursor shifts do not replace storage, so their
+returned pointers remain optional.
 
 Buffer lifetime bugs are as common as line lifetime bugs. The rules:
 
@@ -1213,8 +1244,8 @@ this bookkeeping so later context destruction cannot recycle the payload again.
 
 ### BufferStream representation, inspection, and extraction contracts
 
-`buffer_stream_t` accepts **ordinary resident buffers only**. Use its views,
-CRLF searches, exact/at-least/full reads, and `IdealRead()` only on ordinary
+`buffer_stream_t` accepts **ordinary resident buffers only**. Use its inspection,
+CRLF searches, exact/at-least/full reads, and `bufferstreamTakeChunk()` only on ordinary
 input. Logical stream entries are storage boundaries, not protocol records.
 In Debug, Push asserts the ordinary-input precondition before copying or retaining input,
 including empty input. `bufferstreamInitEmpty()` initializes a destroyable stream
@@ -1223,7 +1254,8 @@ without reserving deque storage; its pool and exact-read padding contract match
 require that any previous contents have already been released.
 `bufferstreamGetEntryCount()` counts retained storage entries after coalescing,
 including empty entries. `bufferstreamGetHeadLength()` reports only the first
-entry's logical length, or zero if absent/empty; it exposes no payload pointer.
+entry's logical length as `size_t`, or zero if absent/empty; it exposes no payload
+pointer. `bufferstreamGetLength()` reports total logical bytes as `size_t`.
 `bufferstreamGetCharge()` scans retained allocation charges in O(n), saturating
 at `SIZE_MAX` on overflow. Partial consumption keeps a source's charge until its
 storage is released. Charge excludes deque/pool storage and is not logical byte
@@ -1238,7 +1270,7 @@ threshold is `max(max_charge, best_fit_allocation_charge)`. When charge fits,
 storage is unchanged, including at equality. Above that threshold, it copies
 the unread bytes in FIFO order into
 one best-fit buffer and releases all old entries. Compaction preserves full
-onward padding without consuming the stream's `use_left_padding` allowance.
+onward padding without consuming the stream's `split_headroom_budget` allowance.
 Unrepresentable allocation geometry returns false before changing input or
 ownership. Heap allocation failure remains fatal.
 
@@ -1250,7 +1282,7 @@ Both retain their existing nested-input budgets and settlement points.
 
 Push owns its input and preserves bounded ordinary coalescing: a positive input
 of at most 4 KiB may append to a tail with sufficient spare space. Exact reads
-preserve checked lengths and the explicit `use_left_padding` budget. Deque
+preserve checked lengths and the explicit `split_headroom_budget` budget. Deque
 insertion failure terminates during push or exact-read remainder retention.
 Both stream implementations operate exclusively on bytes and owned buffers.
 Fragment assembly belongs to the device reader session; no claim, callback, sidecar token,
@@ -1260,7 +1292,16 @@ or hidden padding metadata follows a packet through buffer transforms.
 space before consumption. It appends into sufficient caller-owned ordinary
 storage without growing/replacing it or spending additional headroom.
 
-Views and searches consume no bytes. The delimiter searches inspect all buffered
+`bufferstreamTakeChunk()` transfers the next stored buffer without combining
+entries. It requires positive buffered logical length; a retained empty entry
+can still yield an empty result. The chunk is neither an original Push boundary
+nor a protocol frame. `split_headroom_budget` is an exact byte allowance that
+split exact-read allocations may consume, not a boolean or current headroom.
+
+`bufferstreamCopyBytesAt()` copies ordered bytes into caller-owned storage
+without consuming input or returning a borrowed view. It and the other
+non-mutating queries accept const streams. Byte inspection, copying and searches
+consume no bytes. The delimiter searches inspect all buffered
 ordinary bytes, including delimiters split across entries. `bufferstreamFindCRLF()`
 returns the CR offset; `bufferstreamFindDoubleCRLF()` returns the offset after the
 delimiter. No match leaves the output offset unchanged.
@@ -1420,7 +1461,10 @@ descriptors remain fatal invariants. Exact transfer primitives live in
 logical-byte and retained-charge limits, empty-input disposal and output-buffer
 selection. UdpOverTcpClient, UdpOverTcpServer, KeepAliveClient, KeepAliveServer, Bgp4Client and Bgp4Server use
 this reader. It runs on the borrowed pool's owner worker and makes no callbacks
-or line-reference changes.
+or line-reference changes. Its `nested_byte_limit` and `retained_charge_limit`
+fields are immutable limits, not usage counters. Incoming buffer length uses
+`size_t` for admission accounting; declared frame progress remains bounded
+`uint32_t`, independently of aggregate byte and charge totals.
 Initialize it in the node's Init with a nonzero fixed header size, limits and
 finalized chain splice-output capability. The pool must outlive reader destruction.
 
@@ -2162,7 +2206,7 @@ The initial request is 68 bytes for IPv4, 80 for IPv6, or 65 plus domain length,
 at most 320. UDP association uses `0.0.0.0:0`, a 68-byte initial request. The first
 combined UDP output also includes `ATYP ADDR PORT LEN CRLF` for its datagram.
 Subsequent upstream datagrams are wrapped inline; insufficient headroom uses
-`sbufEnsureLeftCapacity()` with maximum-header replacement padding and preserves
+`sbufEnsureHeadroom()` with maximum-header replacement padding and preserves
 its returned pointer.
 
 TrojanClient, TrojanServer and Socks5Server share the pure `Internals/SocksAddress`
@@ -3297,7 +3341,7 @@ On the downstream side the paired tunnel reads and strips the header with
 - Reusing or reading a buffer after passing it to a forwarding callback.
 - Leaking a buffer on an error/close path.
 - Using a different worker's pool than the line's own.
-- Treating `sbufGetMaximumWriteableSize` as "spare room beyond the payload" — it
+- Treating `sbufGetWritableCapacity` as "spare room beyond the payload" — it
   is room from the cursor, so subtract the current length first.
 
 ### HttpProxyClient framing and retention
