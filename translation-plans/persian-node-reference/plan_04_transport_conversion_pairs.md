@@ -18,8 +18,8 @@ Use the English docs as the source of truth.
 
 | English source | Persian target |
 |---|---|
-| `docs/02-noderefs/TcpOverUdpClient.mdx` | `i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/TcpOverUdpClient.mdx` |
-| `docs/02-noderefs/TcpOverUdpServer.mdx` | `i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/TcpOverUdpServer.mdx` |
+| `docs/02-noderefs/KcpClient.mdx` | `i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/KcpClient.mdx` |
+| `docs/02-noderefs/KcpServer.mdx` | `i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/KcpServer.mdx` |
 | `docs/02-noderefs/UdpOverTcpClient.mdx` | `i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/UdpOverTcpClient.mdx` |
 | `docs/02-noderefs/UdpOverTcpServer.mdx` | `i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/UdpOverTcpServer.mdx` |
 
