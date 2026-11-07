@@ -27,20 +27,23 @@ byte buffer. Its header is exactly 32 bytes and the allocation's data area is
 ```c
 struct sbuf_s
 {
-    uint32_t curpos;       // offset of the current payload start within buf[]
-    uint32_t len;          // current payload length, in bytes
-    uint32_t capacity;     // ordinary: storage capacity; splice: logical geometry
+    uint8_t *data;         // current payload start within head[]
+    size_t   len;          // current payload length, in bytes
+    size_t   capacity;     // ordinary: storage capacity; splice: logical geometry
     uint16_t l_pad;        // reserved left padding (constant once created)
     uint16_t flags;
-    uint8_t  buf[];        // 32-byte aligned data
+    MSVC_ATTR_ALIGNED_32 uint8_t head[] GNU_ATTR_ALIGNED_32;
 };
 ```
 
+`head[]` is the fixed storage base, while `data` moves inside that allocation.
+Lengths, capacities and byte-count APIs use `size_t`; allocation and logical
+capacity remain bounded by `UINT32_MAX` and the target's allocation-size limit.
 For ordinary buffers, the cursor moves inside a fixed allocation. The flag
 `kSbufFlagSplice` gives the payload a different representation, described below.
 
 Fresh and reset ordinary buffers start at padding rounded to 32 bytes. Moving
-`curpos` can change the current payload's alignment; allocation alignment alone
+`data` can change the current payload's alignment; allocation alignment alone
 does not justify aligned loads or stores through `sbufGetRawPtr()` or
 `sbufGetMutablePtr()`. Check the actual address, including any copy offset.
 
@@ -49,19 +52,19 @@ The storage diagram and accessor descriptions here apply to ordinary buffers:
 ```text
    |<-- left capacity -->|<------- payload (len) ------->|<-- writeable tail -->|
    +---------------------+-------------------------------+----------------------+
-buf[0]                curpos                        curpos+len             capacity
+head                  data                         data+len       head+capacity
    |<------ l_pad ------>|
    (reserved padding)
 ```
 
-- **`curpos`** moves left when you prepend (shift left) and right when you consume
+- **`data`** moves left when you prepend (shift left) and right when you consume
   from the front.
-- **`len`** is how many payload bytes are valid starting at `curpos`.
-- **Left capacity** (`sbufGetLeftCapacity` = `curpos`) is how many bytes you can
-  still prepend by shifting left.
-- **Writable capacity** (`sbufGetMaximumWriteableSize` = `capacity - curpos`)
+- **`len`** is how many payload bytes are valid starting at `data`.
+- **Left capacity** (`sbufGetLeftCapacity` = the byte offset from `head` to `data`)
+  is how many bytes you can still prepend by shifting left.
+- **Writable capacity** (`sbufGetMaximumWriteableSize` = `capacity - left_capacity`)
   is how much you can address forward from the cursor, including current payload.
-- **Tail capacity** (`sbufGetTailCapacity` = `capacity - curpos - len`) is the
+- **Tail capacity** (`sbufGetTailCapacity` = `capacity - left_capacity - len`) is the
   spare room available to append bytes without growing an ordinary buffer.
   It requires valid ordinary geometry; it is not available for splice buffers.
 
@@ -70,12 +73,25 @@ buf[0]                curpos                        curpos+len             capac
 | Call | Returns |
 | --- | --- |
 | `sbufGetLength(b)` | current payload length (`len`) |
-| `sbufGetRawPtr(b)` / `sbufGetMutablePtr(b)` | pointer to the payload start (`buf + curpos`) |
-| `sbufGetLeftCapacity(b)` | bytes available to prepend (`curpos`) |
-| `sbufGetMaximumWriteableSize(b)` | bytes addressable from the cursor (`capacity - curpos`) |
-| `sbufGetTailCapacity(b)` | spare append space in an ordinary buffer (`capacity - curpos - len`) |
+| `sbufGetRawPtr(b)` / `sbufGetMutablePtr(b)` | pointer to the payload start (`data`) |
+| `sbufGetLeftCapacity(b)` | byte offset from `head` to `data`, available to prepend |
+| `sbufGetMaximumWriteableSize(b)` | bytes addressable from the cursor (`capacity - left_capacity`) |
+| `sbufGetTailCapacity(b)` | spare append space in an ordinary buffer (`capacity - left_capacity - len`) |
 | `sbufGetTotalCapacity(b)` | full allocation (constant) |
 | `sbufGetLeftPadding(b)` | the original aligned `l_pad` value |
+
+Create and reset set `data` to `head + l_pad`. `sbufDuplicate()` and
+`sbufDuplicateTo()` preserve the source's left capacity by rebasing `data` into
+the destination's own `head[]`; copying the absolute pointer would keep referring
+to the source. `sbufDuplicateByPool()` starts at the destination's original padding.
+Growth may replace and free the allocation, restoring its original padding.
+Use only the returned buffer and reacquire payload pointers after any operation
+that may replace it. Prepending and consuming move `data` without moving bytes.
+
+Use `sbufGetLeftCapacity()` for the cursor offset. On supported flat-address
+targets, it subtracts `uintptr_t` addresses so an offset above `PTRDIFF_MAX`
+remains representable on a 32-bit target. Direct `data - head` pointer subtraction
+does not provide that guarantee.
 
 ### Reading and Writing
 
@@ -134,7 +150,7 @@ both bytes and request. See [packet boundaries in Part 4](./part4-packet-tunnels
 ### Splice payloads: `kSbufFlagSplice`
 
 A splice allocation keeps the common 32-byte `sbuf_t` header and exactly
-32 bytes of control storage plus reserved left padding. Metadata at `buf + l_pad`
+32 bytes of control storage plus reserved left padding. Metadata at `head + l_pad`
 contains its `int pipefd[2]` and actual kernel capacity. A complete `sbuf_t *` is
 itself the master-pool entry: there is no separate pipe record or entry pointer.
 `kSbufFlagSplicePooled` identifies fixed inventory entries and remains set while
@@ -199,7 +215,7 @@ There is no cross-worker cache stealing or waiting for a return.
 Every pooled buffer retains its original aligned `l_pad`. Inventory padding is
 shared through `GSTATE.splice_inventory`. Allocation, recycling, direct destruction
 and padding updates reject a mismatch with a fatal diagnostic in every build,
-before interpreting metadata using an altered offset. `curpos` may still move
+before interpreting metadata using an altered offset. `data` may still move
 within advertised headroom. `sbufCreateSplice(pad_left)` only allocates an unmanaged
 empty representation; it cannot acquire or create an inventory pipe. Its separate
 geometry is useful for explicit representation fixtures, not inventory growth.
@@ -213,12 +229,13 @@ or an existing empty pair; empty-body helpers need no pipe creation.
 The real prefix occupies reserved headroom:
 
 ```text
-prefix_bytes = l_pad - curpos
+prefix_bytes = l_pad - sbufGetLeftCapacity(buf)
 body_bytes   = len - prefix_bytes
 ```
 
-Length and capacity describe logical payload, not resident bytes. Prefix
-consumption advances the cursor; body consumption reduces length and logical
+Length and capacity describe logical payload, not resident bytes. Neither
+`data + len` nor `head + capacity` may be used as a resident end for a splice
+buffer. Prefix consumption advances the cursor; body consumption reduces length and logical
 capacity without advancing into metadata. Prepending within advertised padding
 is permitted. Inspecting or overwriting the kernel-backed body or control storage
 through generic byte accessors is not permitted; those accessors do not add
@@ -827,7 +844,7 @@ write into the freed space:
 ```c
 // Reserve room and move the cursor back by header_len bytes.
 assert(sbufGetLeftCapacity(buf) >= header_len);
-sbufShiftLeft(buf, header_len);     // curpos -= header_len; len += header_len
+sbufShiftLeft(buf, header_len);     // data -= header_len; len += header_len
 
 // Now write the header at the new front.
 sbufWriteUI16(buf, htons(payload_len));
@@ -837,10 +854,10 @@ sbufWriteUI16(buf, htons(payload_len));
 `sbufShiftLeft` asserts that enough left capacity exists:
 
 ```c
-static inline void sbufShiftLeft(sbuf_t *const b, const uint32_t bytes)
+static inline void sbufShiftLeft(sbuf_t *const b, const size_t bytes)
 {
     assert(sbufGetLeftCapacity(b) >= bytes);
-    b->curpos -= bytes;
+    b->data   -= bytes;
     b->len    += bytes;
 }
 ```
@@ -1338,7 +1355,7 @@ owned sources into a new private pipe. Whole suitable wrappers transfer directly
 Ordinary ranges and real prefixes copy/write in order; pipe bodies use nonblocking
 pipe-to-pipe `splice()`. Positive short progress accumulates and EINTR retries.
 Only successful transfers advance lengths; body consumption never moves the cursor
-into metadata at `buf + l_pad`. No descriptors have two owning wrappers.
+into metadata at `head + l_pad`. No descriptors have two owning wrappers.
 
 Pipe destination capacity is fallible: nominal `F_GETPIPE_SZ` does not prove slot
 availability. Creation/growth failure, unsupported destinations and destination
