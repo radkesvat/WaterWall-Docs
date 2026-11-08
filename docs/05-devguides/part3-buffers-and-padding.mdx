@@ -5,7 +5,7 @@ sidebar_label: "Part 3: Buffers & Padding"
 description: "The sbuf_t buffer model, worker buffer pools, left-padding budgets, and how to prepend protocol headers without breaking chain composition."
 ---
 <!--
-Documentation version: 193
+Documentation version: 194
 -->
 
 # Part 3: Buffers, Padding & Shift Buffers
@@ -3423,46 +3423,79 @@ retains the original payload's ACK record charge until acknowledgement. A
 retryable failure after a successful prefix still flushes that prefix so
 acknowledgement can restore progress.
 
-Worker engines share one bounded set of flow/payload pools, including PTC RX
-wrappers. Each engine caches at most 256 free objects per TCP-segment, pooled-heap
-size class and PTC RX-wrapper pool. A cache miss refills up to eight objects from
-the existing backing pool; it does not allocate another copy of that pool or
-increase its process-wide capacity. Warm checkout/return avoids the shared
-allocator mutex. The owner atomically detaches a free list before reading or
-changing it, then publishes the remaining list. Shared-pressure allocation can
-detach published lists from other engines, returning their free objects to the
-backing pool before retrying. A list briefly detached by an in-progress owner
-operation is published again before that operation returns. No pressure path
-traverses another engine's live PCBs or pbufs.
+Worker engines share process-wide, demand-grown flow and payload pools, including
+PTC RX wrappers. Startup `misc.lwip-*` settings select the TCP/UDP PCB, listener,
+segment and RX-wrapper object limits plus a shared allocation-byte budget. Object
+counts and pool statistics use wide accounting; runtime flow targets are not
+multiplied into static arrays or a 16-bit segment inventory. Packet-buffer and
+malloc size classes grow under the byte budget. Reassembly quotas and fixed
+protocol inventories remain separate. `MEM_SIZE`, RAM profiles and TCP window
+ceilings do not enlarge this budget.
 
-An entered engine may cache returned backing-pool storage regardless of which
-worker originally allocated it. An unscoped or unregistered free uses the shared
-allocator, without dereferencing a former owner's cache. Engine destruction
-unregisters and drains its caches under shared protection before releasing the
-engine; backing pools outlive all engines. Engine creation must not reset shared
-allocation metadata. Pool locks cover allocator metadata only; custom destructors
-and local protocol reclamation run after unlocking. Exhaustion still returns
-`NULL`; an engine may reclaim its own eligible protocol objects before refusal.
+Backing storage grows in slabs after reserving their complete requested size,
+including slab/item metadata and alignment. Returned objects and worker-cache
+reservations keep their slab charged until the slab is physically released.
+Before a byte refusal, reclaim published free cache lists and fully free slabs
+across size classes so a previous workload cannot permanently monopolize the
+budget. Live objects never move. A recovery partition of `min(1 MiB, budget / 16)`
+remains inside the same byte ceiling; ordinary storage cannot consume it. Separate
+recovery allocations never enter ordinary caches or feed ordinary payload writes.
+Exhausted bridge ingress may use compact, validated, header-only IPv4 TCP ACK/RST
+storage from this partition. SYN, FIN and payload input do not qualify; FIN can
+retain out-of-order state. PTC preserves its immediate trusted-TUN checksum
+boundary; other packets require valid checksums. Only narrow stack control-header
+allocation sites may use recovery memory. Never elevate an entire input scope:
+a TCP sent callback can synchronously flush pending application payload.
+For an RX-wrapper limit above one, reserve `min(256, max(1, limit / 16))`
+wrapper slots inside that total; a one-slot override has no recovery slot. The
+production CTP handoff allowance reserves 1 MiB and 256 entries within its
+16 MiB / 4096 totals. The private handoff helper only partitions inventories
+with at least sixteen bytes and sixteen entries. Ordinary admission is tried
+first; eligible recovery input/output can fall back without enlarging either
+ceiling. Recovery object and byte inventories remain bounded and may still
+refuse excess control traffic. Actual allocator OOM remains fatal; budget or object-limit
+refusal remains `NULL`/`ERR_MEM` with the existing protocol retry, backpressure
+and packet/flow refusal behavior.
 
-Pool `used`/`max` statistics include objects reserved in local caches as well as
-live objects; they describe storage checked out from the backing pool. Heap-byte
-statistics continue to count live requested bytes. `pbuf` reference protection,
-shared heap-byte statistics, ports, packet IDs and reassembly quotas keep their
-existing synchronization. Allocator overflow/sanity diagnostics and memp-available
-hooks use the uncached implementation so their per-operation checks remain intact.
+Each engine caches at most 256 free objects per TCP-segment, pooled-heap size
+class and PTC RX-wrapper pool. A cache miss refills up to eight objects from the
+shared backing storage. Warm checkout/return avoids shared allocator protection.
+Only atomically detached free storage may be reclaimed from another engine;
+never traverse its live PCBs or pbufs. Engine destruction unregisters and drains
+its caches under shared protection. An unscoped or foreign free uses shared
+allocation metadata without dereferencing its former engine. Allocator locks
+must not enclose custom destructors, neighbor calls or worker posts.
+
+CTP packet handoff reserves its full allocation charge against both its node
+budget and the shared lwIP byte budget before allocation. Delivery, refusal,
+cancellation and final custom-pbuf release settle both once. PTC additionally
+charges the full sbuf allocation retained by each input custom pbuf until that
+pbuf is freed, including when its sbuf transfers to receive staging. This charges
+retained input capacity and padding, not just packet length. The budget is not a
+process RSS limit: allocator-private overhead, engine/port control tables,
+worker-buffer caches, normal-line/application queues and storage after ownership
+passes beyond the charged lifetime remain outside it. Existing per-flow queue
+limits and receive-window adaptation continue to apply independently.
+
+The read-only `stack-stats` operation on either bridge reports the same shared
+capacity domain. Pool `held`/`peak_held` include cached free reservations as well
+as live objects; they must not be presented as active connection counts. Byte
+and entry refusal counters distinguish exhaustion causes. Snapshot rendering
+occurs after the shared metadata copy; handlers never traverse live protocol
+objects. Pool descriptors and custom registration metadata survive shared-runtime
+reinitialization; finalization releases all slabs only after engines and external
+reservations have settled. A second node must not reset an existing RX pool.
 
 The Unix `SYS_ARCH_PROTECT` guard uses the project's hybrid `wmutex_t`.
 Exclusive shared bootstrap initializes it before allocator use, and shared
 finalization destroys it after all engines and retained buffers have settled.
 Thread-local nesting acquires the mutex only on the outermost entry and releases
-it on the matching final exit. This protects shared metadata; it does not add a
-TCP/IP core lock around worker-local protocol execution.
+it on the matching final exit. This does not add a TCP/IP protocol core lock.
 
 Each active engine separately owns 17 timeout records and its control tables.
-This control overhead does not multiply TCP, UDP, listener, segment, pbuf or heap
-capacities. IPv4 and IPv6 reassembly retain separate process-wide pbuf allowances.
-PTC and CTP detached drain lists are worker-local, but each node retains its
-aggregate 4,096-object and 16 MiB allowance with exact reservation rollback.
+IPv4 and IPv6 reassembly retain separate process-wide pbuf allowances. PTC and
+CTP detached drain lists are worker-local, but each node retains its aggregate
+4,096-object and 16 MiB allowance with exact reservation rollback.
 
 Each TCP PCB caches its owner-local unacknowledged-segment tail, avoiding a list
 walk before ordinary output. The non-owning pointer is null exactly when that

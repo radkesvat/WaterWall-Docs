@@ -6,7 +6,7 @@ description: "راهنمای node PacketsToConnection در WaterWall."
 ---
 
 <!--
-Documentation version: 162
+Documentation version: 163
 -->
 
 # PacketsToConnection
@@ -470,6 +470,120 @@ closing فقط رو به جلو هستند؛ deadline delivery/FIN ‏۳۰ ثا�
 
 tunnel برای هر payload، framing header اضافه نمی‌کند و به left padding نیاز ندارد. در صورت امکان buffer‌های ورودی packet در pbuf‌های lwIP قرار می‌گیرند؛ packet‌های خروجی نیز از worker buffer pool مربوط به packet line یا، در صورت نیاز، از یک buffer تازه با padding کافی گرفته می‌شوند.
 
+## ظرفیت
+
+همه‌ی نمونه‌های `ConnectionToPackets` و `PacketsToConnection` در یک فرایند از
+allocator قابل‌رشد lwIP و سقف‌های مشترک استفاده می‌کنند. این فیلدها را زیر
+`misc` در `core.json` تنظیم کنید، نه در `settings` نود:
+
+| تنظیم هسته | پیش‌فرض استاندارد | منبع |
+| --- | ---: | --- |
+| `lwip-memory-budget` | `536870912` (512 MiB) | حافظه‌ی pool و حافظه‌ی نگه‌داری‌شده‌ی محاسبه‌شده برای stack |
+| `lwip-max-tcp-flows` | `65536` | وضعیت اتصال TCP، شامل handshake و اتصال‌های در حال بسته‌شدن |
+| `lwip-max-udp-flows` | `65536` | وضعیت اتصال UDP |
+| `lwip-max-tcp-listeners` | `1024` | اشیای listener در TCP |
+| `lwip-max-tcp-segments` | `1048576` | segmentهای ارسال، ارسال مجدد و دریافت TCP |
+| `lwip-max-rx-wrappers` | `262144` | wrapperهای PTC برای نگه‌داری بسته‌ی ورودی |
+
+سقف تعداد، عدد صحیح در بازه‌ی `1..4294967295` را می‌پذیرد. بودجه‌ی بایت از
+`1048576` تا مقدار کوچک‌تر از `SIZE_MAX` پلتفرم و `9223372036854775807` است.
+مقدار نامعتبر راه‌اندازی را متوقف می‌کند و تغییر تنظیم به restart نیاز دارد.
+build سفارشی می‌تواند پیش‌فرض TCP، UDP و listener را تغییر دهد؛ مقدار صریح در
+تنظیمات هسته اولویت دارد. افزایش `workers` این سقف‌ها را ضرب نمی‌کند و
+`ram-profile` آن‌ها را تغییر نمی‌دهد.
+
+حافظه با تقاضا و در چارچوب سقف بایت و تعداد رشد می‌کند. بودجه، slabهای pool،
+header و alignment، اشیای آزاد رزروشده در cache worker، حافظه‌ی handoff بسته‌ی
+CTP در هر دو جهت و buffer ورودی PTC تا زمانی که custom pbuf آن را نگه می‌دارد
+شامل می‌شود. cache آزاد تا هنگام بازپس‌گیری در بودجه حساب می‌شود. همه‌ی flowهای
+مجاز یا کل بودجه‌ی بایت از ابتدا تخصیص داده نمی‌شوند.
+
+در بودجه‌ی بایت `B`، allocator مقدار `R = min(1048576, floor(B / 16))` بایت
+را برای ترافیک بازیابی کنار می‌گذارد. داده‌ی عادی و cache آن حداکثر `B - R`
+مصرف می‌کنند؛ فقط ACK/RST معتبر و واجد شرایط TCP بدون payload و خروجی
+ACK/RST/keepalive در TCP از مسیر مستقل بازیابی استفاده می‌کنند. به این ترتیب وقتی ظرفیت
+عادی پر است، acknowledgement هنوز می‌تواند داده‌ی صف ارسال را آزاد کند. این
+فضا داخل همان بودجه است، حافظه‌ی ازپیش‌تخصیص‌یافته یا بودجه‌ی اضافه نیست.
+ترافیک بازیابی هم محدود است و پس از پرشدن فضای خودش می‌تواند رد شود.
+
+سقف RX wrapper برابر `L` شامل سهم بازیابی هم هست: برای `L > 1`، تعداد
+`min(256, max(1, floor(L / 16)))` slot برای بازیابی کنار گذاشته می‌شود و
+`L = 1` سهم رزروشده ندارد. پیش‌فرض `262144` یعنی حداکثر `261888` wrapper عادی
+و `256` wrapper بازیابی. تعداد و سقف pool در API هر دو دسته را شامل می‌شوند.
+CTP نیز داخل سقف ثابت handoff هر instance، یعنی ۱۶ MiB و ۴۰۹۶ تخصیص، سهم
+۱ MiB و ۲۵۶ تخصیص برای بازیابی نگه می‌دارد؛ سهم عادی ۱۵ MiB و ۳۸۴۰ تخصیص است.
+ورودی بسته و handoff ابتدا پذیرش عادی را امتحان می‌کنند و فقط بسته‌ی واجد
+شرایط بازیابی در صورت نیاز به سهم رزروشده می‌رود. SYN، FIN و payload برنامه
+همچنان از ظرفیت عادی استفاده می‌کنند.
+
+این بودجه سقف RSS فرایند نیست. صف pending/ACK برنامه، receive staging پس از
+پایان مالکیت pbuf، وضعیت line و نود، جدول‌های کنترلی engine و port، bufferهای
+مستقل و منابع kernel حافظه‌ی دیگری مصرف می‌کنند. سقف handoff هر CTP برابر
+۱۶ MiB و ۴۰۹۶ تخصیص و محدودیت صف هر flow، دریافت خارج از ترتیب و closer در هر
+دو bridge مستقل باقی می‌مانند. `tcp-stack-receive-budget` هدف پنجره‌ی دریافت
+اعلام‌شده‌ی هر worker است و سقف allocator را افزایش نمی‌دهد. پنجره‌ی ارسال یا
+دریافت سقف پروتکل است، نه حافظه‌ی رزروشده برای هر اتصال.
+
+نرسیدن ظرفیت می‌تواند اتصال تازه را نپذیرد، بسته را کنار بگذارد یا write مربوط
+به TCP را تا برگشت منابع به تأخیر بیندازد؛ رفتار به مسیر مربوط بستگی دارد.
+شکست واقعی تخصیص heap همچنان fatal است. ظرفیت را براساس flow و ترافیک هم‌زمان،
+شامل handshake و اتصال‌های در حال بسته‌شدن، تعیین کنید؛ هر کاربر می‌تواند
+flowهای زیادی داشته باشد. زنجیره‌ی `TunDevice -> PacketsToConnection` هم از
+همین allocator استفاده می‌کند.
+
+هر worker همچنان ۲۵۵ index برای netif دارد که loopback و نودهای متصل در آن
+شریک‌اند. تمام‌شدن آن ساخت interface را رد می‌کند. ورودی بسته باید datagram
+کامل IPv4 باشد؛ افزایش pool پذیرش fragment یا سیاست reassembly را تغییر نمی‌دهد.
+
+## API ظرفیت (`stack-stats`)
+
+هر دو bridge عملیات فقط‌خواندنی `stack-stats` را ثبت می‌کنند. به client در
+APIServer مجوز دقیق config، node و operation بدهید و از client معمول API با
+framing استاندارد آن برای فرستادن درخواستی مانند نمونه‌ی زیر استفاده کنید:
+
+```json
+{
+  "id": "capacity-1",
+  "auth": {"client": "monitor", "token": "<configured token>"},
+  "selector": {"config": "edge", "node": "ptc"},
+  "operation": "stack-stats",
+  "content_type": "application/json",
+  "body_encoding": "utf8",
+  "body": "{}"
+}
+```
+
+selector و اطلاعات دسترسی را با مقادیر پیکربندی‌شده جایگزین کنید. بدنه باید
+یک object خالی JSON با حداکثر ۶۴ بایت، شامل whitespace مجاز JSON، باشد.
+فیلد اضافی، داده‌ی انتهایی و NUL پذیرفته نمی‌شود. پاسخ JSON با UTF-8 داخل body
+نتیجه‌ی معمول API قرار می‌گیرد و وضعیت کل فرایند را نشان می‌دهد، نه فقط نود یا
+worker انتخاب‌شده.
+
+| فیلد پاسخ | معنی |
+| --- | --- |
+| `scope`، `dynamic` | مقدار `"process"` و قابل‌رشد بودن poolها |
+| `memory_budget`، `reserved_bytes`، `peak_reserved_bytes` | سقف تنظیم‌شده، حافظه‌ی محاسبه‌شده‌ی فعلی و بیشینه‌ی آن |
+| `recovery_headroom`، `recovery_bytes`، `external_recovery_bytes`، `recovery_refusals` | فضای بازیابی داخل سقف، حافظه‌ی محاسبه‌شده‌ی فعلی آن، زیرمجموعه‌ی external آن و تعداد رد درخواست به علت ظرفیت بایت بازیابی |
+| `external_bytes`، `external_refusals` | حافظه‌ی handoff در CTP و ورودی نگه‌داری‌شده با pbuf در PTC و رزروهای ردشده‌ی آن |
+| `byte_refusals`، `reclaimed_bytes` | رد درخواست به علت بودجه‌ی بایت و حافظه‌ی بازپس‌گرفته‌شده زیر فشار |
+| `limits` | سقف مؤثر TCP/UDP، listener، segment و RX wrapper |
+| `pools` | نام و اندازه‌ی هر شیء، سقف، تعداد تخصیص‌یافته/نگه‌داشته‌شده، بیشینه‌ی نگه‌داری، بایت رزروشده و رد درخواست تعداد/بایت در هر pool |
+| `ports.tcp`، `ports.udp` | رزروهای فعلی و بیشینه، رد درخواست و رزروهای scoped/unscoped |
+
+مجموع بایت‌ها و شمارنده‌های تجمعی برای حفظ دقت به شکل رشته‌ی دهدهی هستند؛
+تعداد اشیا و سقف آن‌ها integer JSON است. `reserved_bytes` حافظه‌ی بازیابی را
+هم شامل می‌شود و `external_bytes` شامل `external_recovery_bytes` است؛ این
+زیرمجموعه‌ها را دوباره جمع نکنید. `held_includes_worker_caches` برابر
+true است: `held` و `peak_held` اشیای آزاد رزروشده در cache worker را هم حساب
+می‌کنند و تعداد اتصال زنده نیستند. بخش ظرفیت و پورت هرکدام زیر قفل خود snapshot
+محدود می‌گیرند؛ کل پاسخ یک سرشماری اتمیک ترافیک نیست.
+
+خروجی handler حداکثر ۳۲ KiB است و سقف پاسخ، بودجه‌ی حافظه‌ی کاری و deadline
+درگاه را رعایت می‌کند. بدنه‌ی نامعتبر، در صورت جا شدن پاسخ خطا در این حدود،
+`expected_empty_object` برمی‌گرداند؛ رد پاسخ به علت محدودیت می‌تواند بدنه‌ی خالی
+داشته باشد. قبل از تغییر سقف، با شمارنده‌ی رد تعداد در هر pool، رد بودجه‌ی بایت
+و رد پورت، منبع محدودکننده را مشخص کنید.
+
 ## نکات تخصصی و محدودیت‌ها
 
 - `PacketsToConnection` یک policy engine برای NAT نیست. فقط flow‌ها را بازسازی و به‌صورت line‌های WaterWall ارائه می‌کند؛ اگر به filtering یا انتخاب مسیر نیاز دارید، node‌های routing یا policy را پس از آن قرار دهید.
@@ -482,7 +596,7 @@ tunnel برای هر payload، framing header اضافه نمی‌کند و به
 - packet-line `Finish` در طول runtime نقض قرارداد به حساب می‌آید.
 - IPv6 و ICMP فعلاً کنار گذاشته می‌شوند.
 - هر engine دارای ۲۵۵ index برای netif است که loopback و node‌های همان worker از آن استفاده می‌کنند؛ exhaustion ساخت interface را سریع رد می‌کند.
-- pool‌های سراسری default برای ۲۰۴۸ flow TCP، ‏۲۰۴۸ flow UDP، ‏۳۲ datagram reassembly و ۳۲۰ listener ساخته می‌شوند و Linux Release تقریباً `9.6 MB` BSS دارد.
+- wrapper ورودی PTC زیر سقف `lwip-max-rx-wrappers` و بودجه‌ی بایت رشد می‌کند؛ sbuf تا آزادشدن pbuf یا انتقال به receive staging جداگانه محاسبه می‌شود. سقف per-PCB دریافت خارج از ترتیب برقرار است و نرسیدن ظرفیت، بسته را با warning دارای rate limit کنار می‌گذارد.
 - packet‌هایی که پس از IPv4 total length بایت اضافه دارند کنار گذاشته می‌شوند؛ زیرا پیاده‌سازی به برابری دقیق طول `sbuf` و IP total length نیاز دارد.
 
 ## تفاوت با PacketsToStream
@@ -525,15 +639,15 @@ poolهای مشترک می‌توانند پیش از رسیدن یک flow به 
 
 runtime برای هر event worker معمولی حداکثر یک engine خام lwIP را هنگام نخستین
 استفاده می‌سازد. همهٔ bridge‌های همان worker آن را share می‌کنند؛ thread جداگانهٔ
-stack و core mutex وجود ندارد. PTC مالک packet تحویل‌شده را حفظ می‌کند و CTP مالک
+stack و core mutex وجود ندارد. PTC مالک flow را از tuple فعلی بسته انتخاب می‌کند و CTP مالک
 normal line برنامه را. پاسخ CTP پس از lookup کامل tuple/WID/generation به owner
 queue می‌شود و engine و netif دقیق دوباره بررسی می‌شوند. callback همسایهٔ فاقد تضمین enqueue-only همیشه
 deferred است، حتی روی همان worker.
 
-Pool‌های flow/payload با همان ظرفیت سراسری باقی می‌مانند. هر engine فعال control
-storage مستقل و ۱۷ timeout record دارد؛ worker استفاده‌نشده engine ندارد. انتخاب
-خودکار port‌های TCP و UDP از حساب مشترک جداگانه استفاده می‌کند و اشغال تا آزادشدن
-PCB، شامل TIME_WAIT، باقی می‌ماند. ID‌های تولیدی IPv4 و fragment IPv6 sequence
+poolهای قابل‌رشد flow/payload از سقف‌های سراسری بالا استفاده می‌کنند. هر engine
+فعال control storage مستقل و ۱۷ timeout record دارد؛ worker استفاده‌نشده engine ندارد.
+رزرو پورت اتصال CTP براساس tuple کامل است و تا آزادشدن PCB، شامل TIME_WAIT،
+باقی می‌ماند؛ رزرو unconnected همچنان همان شماره‌ی پورت را محافظه‌کارانه کنار می‌گذارد. ID‌های تولیدی IPv4 و fragment IPv6 sequence
 مشترک جداگانه دارند و wrap محدود قبلی حفظ می‌شود. Drain list محلی worker است ولی
 سقف هر node همچنان ۴۰۹۶ object و ۱۶ MiB است. قفل pool/quota هیچ traversal یا output
 stack را دربر نمی‌گیرد. Fake DNS در PTC یک mutex مشترک node برای transaction و کپی
