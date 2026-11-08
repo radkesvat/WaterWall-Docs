@@ -1,0 +1,293 @@
+---
+sidebar_position: 3
+title: "ProtoSwap"
+sidebar_label: "ProtoSwap"
+description: "Forward a TCP service through a raw IPv4 tunnel using protocol-number swapping and XOR obfuscation."
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# ProtoSwap
+
+This example forwards a TCP listener in Iran to a service on Kharej. The packet
+path changes IPv4's protocol number from TCP (`6`) to `50` while crossing the
+network, then restores TCP before delivering the packet to the other host's OS.
+Both peers apply matching XOR obfuscation.
+
+```text
+Users -> Iran :443 -> TCP to 10.10.0.2:443
+      -> TUN / ProtoSwap / XOR -> raw IPv4 protocol 50
+      -> XOR / ProtoSwap / TUN -> Kharej service on 10.10.0.1:443
+```
+
+Protocol `50` is the IP protocol field, **not a TCP or UDP port**. These packets
+are not valid IPsec ESP, even though ESP normally uses that number. Firewalls and
+providers must allow the actual packet format. XOR provides no cryptographic
+authentication or encryption; keep the application's own TLS where needed.
+
+## Before starting
+
+Use the [common setup](./overview.mdx) for `core.json`, variable syntax, and
+startup. Save the selected tab as `config_iran.json` or `config_kharej.json` and
+load that filename from `core.json`. Both TUN interfaces explicitly use MTU
+`1400`.
+
+| Value | Meaning |
+| --- | --- |
+| `ip_server_iran` | Replace `192.0.2.10` with Iran's public IPv4 address. |
+| `ip_server_kharej` | Replace `198.51.100.20` with Kharej's public IPv4 address. |
+| `port_listen_iran` | User-facing TCP listener, `443` here. |
+| `port_service_kharej` | TCP port served on Kharej, `443` here. |
+| `protoswap_tcp_to_number` | Matching mapped IP protocol number on both hosts, `50` here. |
+
+The public addresses must belong to the corresponding hosts and be directly
+reachable. This configuration does not provide NAT traversal. If you change the
+protocol number, change it on both peers; the capture filters use the same
+variable. Do not select TCP (`6`) or UDP (`17`), and do not reuse a protocol
+already carrying other traffic between these servers.
+
+On Kharej, run the application on `0.0.0.0:443` or, after the TUN exists,
+`10.10.0.1:443`. A service bound only to `127.0.0.1` cannot receive these packets.
+There is no Kharej `TcpListener` or `TcpConnector` in this configuration: decoded
+packets go directly to the local application through the TUN.
+
+Use Linux with TUN support, raw sockets, and permission to configure interfaces
+and capture rules (normally root; the required capabilities include
+`CAP_NET_ADMIN` and `CAP_NET_RAW`). Install `iproute2`, `iptables`, and
+`iptables-save`; NFQUEUE and the kernel `bpf` match are needed for capture. See
+[RawSocket](../../noderefs/RawSocket) for details.
+
+## Configurations
+
+<Tabs groupId="tunnel-location">
+<TabItem value="iran" label="Iran" default>
+
+Save as `config_iran.json`:
+
+```json
+{
+  "name": "iran-tcp-protoswap",
+  "variables": {
+    "ip_server_iran": "192.0.2.10",
+    "ip_server_kharej": "198.51.100.20",
+    "port_listen_iran": 443,
+    "port_service_kharej": 443,
+    "protoswap_tcp_to_number": 50
+  },
+  "nodes": [
+    {
+      "name": "users_inbound",
+      "type": "TcpListener",
+      "settings": {
+        "address": "0.0.0.0",
+        "port": $port_listen_iran$,
+        "nodelay": true
+      },
+      "next": "tcp-out"
+    },
+    {
+      "name": "tcp-out",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "10.10.0.2",
+        "port": $port_service_kharej$,
+        "nodelay": true
+      }
+    },
+    {
+      "name": "my tun",
+      "type": "TunDevice",
+      "settings": {
+        "device-name": "wtun1",
+        "device-ip": "10.10.0.1/24",
+        "device-mtu": 1400
+      },
+      "next": "ipovsrc"
+    },
+    {
+      "name": "ipovsrc",
+      "type": "IpOverrider",
+      "settings": {
+        "up": {
+          "source-ip": {
+            "ipv4": $ip_server_iran$
+          },
+          "dest-ip": {
+            "ipv4": $ip_server_kharej$
+          }
+        },
+        "down": {
+          "source-ip": {
+            "ipv4": "10.10.0.2"
+          },
+          "dest-ip": {
+            "ipv4": "10.10.0.1"
+          }
+        }
+      },
+      "next": "ip-manipulator"
+    },
+    {
+      "name": "ip-manipulator",
+      "type": "IpManipulator",
+      "settings": {
+        "protoswap-tcp": $protoswap_tcp_to_number$
+      },
+      "next": "obfuscator-c"
+    },
+    {
+      "name": "obfuscator-c",
+      "type": "ObfuscatorClient",
+      "settings": {
+        "method": "xor",
+        "xor_key": 90,
+        "skip": "transport"
+      },
+      "next": "rd"
+    },
+    {
+      "name": "rd",
+      "type": "RawSocket",
+      "settings": {
+        "capture-filter-mode": "source-ip",
+        "capture-ip": $ip_server_kharej$,
+        "capture-protocols": [
+          $protoswap_tcp_to_number$
+        ]
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+<TabItem value="kharej" label="Kharej">
+
+Save as `config_kharej.json`:
+
+```json
+{
+  "name": "kharej-tcp-protoswap",
+  "variables": {
+    "ip_server_iran": "192.0.2.10",
+    "ip_server_kharej": "198.51.100.20",
+    "protoswap_tcp_to_number": 50
+  },
+  "nodes": [
+    {
+      "name": "my tun2",
+      "type": "TunDevice",
+      "settings": {
+        "device-name": "wtun1",
+        "device-ip": "10.10.0.1/24",
+        "device-mtu": 1400
+      },
+      "next": "ipcorrect"
+    },
+    {
+      "name": "ipcorrect",
+      "type": "IpOverrider",
+      "settings": {
+        "up": {
+          "source-ip": {
+            "ipv4": $ip_server_kharej$
+          },
+          "dest-ip": {
+            "ipv4": $ip_server_iran$
+          }
+        },
+        "down": {
+          "source-ip": {
+            "ipv4": "10.10.0.2"
+          },
+          "dest-ip": {
+            "ipv4": "10.10.0.1"
+          }
+        }
+      },
+      "next": "ip-manipulator"
+    },
+    {
+      "name": "ip-manipulator",
+      "type": "IpManipulator",
+      "settings": {
+        "protoswap-tcp": $protoswap_tcp_to_number$
+      },
+      "next": "obfuscator-s"
+    },
+    {
+      "name": "obfuscator-s",
+      "type": "ObfuscatorServer",
+      "settings": {
+        "method": "xor",
+        "xor_key": 90,
+        "skip": "transport"
+      },
+      "next": "rdin"
+    },
+    {
+      "name": "rdin",
+      "type": "RawSocket",
+      "settings": {
+        "capture-filter-mode": "source-ip",
+        "capture-ip": $ip_server_iran$,
+        "capture-protocols": [
+          $protoswap_tcp_to_number$
+        ]
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+</Tabs>
+
+## Routing and capture
+
+Each host assigns `10.10.0.1/24` to its own `wtun1`. The local TCP stack sees the
+remote endpoint as `10.10.0.2`. `IpOverrider` changes these addresses to the public
+addresses for transmission and restores each host's private view for delivery.
+Reserve `10.10.0.0/24` on both hosts, and use a free TUN device name.
+
+After startup, check that the connected route selects `wtun1` on both hosts:
+
+```bash
+ip -4 route get 10.10.0.2
+```
+
+The peer's public address must continue to route through the physical network.
+No default route is installed by this example. Allow input from `wtun1` to the
+Kharej service in its host firewall. `TunDevice` disables Linux reverse-path
+filtering for its own interface and the global `all` setting at startup; see
+[TunDevice's caveats](../../noderefs/TunDevice) for the
+scope and persistence of that change.
+
+The raw capture filters intercept only protocol `50` from the selected peer
+address. Other protocols keep their normal host path, but **all** protocol-`50`
+traffic from that peer is captured, including any real ESP traffic. The filter
+provides no authentication.
+
+Keep the node order and matching `xor_key: 90` / `skip: "transport"` settings on
+both sides. XOR runs after protocol encoding on output and before protocol
+decoding on input. Because protocol `50` is no longer identified as TCP,
+`skip: "transport"` leaves only the IPv4 header clear on the wire.
+
+If users' TLS should terminate on Iran, insert a configured
+[TlsServer](../../noderefs/TlsServer) between `users_inbound` and `tcp-out`,
+and update `users_inbound.next` to that node. The Kharej application must then
+accept the plaintext protocol. Otherwise the configuration passes application
+TLS through unchanged.
+
+## Start and check
+
+Start WaterWall on Kharej and Iran using the
+[common command](./overview.mdx#start-the-tunnel), then start the Kharej service
+on `0.0.0.0:443` or `10.10.0.1:443` (or your chosen `port_service_kharej`).
+Confirm the TUN routes above and connect the service's normal client to Iran's
+`port_listen_iran`.
+
+If connections stall, check the service's bind address, the matching protocol
+number and XOR settings, and whether the path passes raw IPv4 protocol `50`.
+Opening TCP port `50` does not allow IP protocol `50`.

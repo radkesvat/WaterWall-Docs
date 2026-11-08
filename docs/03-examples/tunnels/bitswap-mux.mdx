@@ -1,0 +1,1081 @@
+---
+sidebar_position: 2
+title: "BitSwap with Mux"
+sidebar_label: "BitSwap with Mux"
+description: "Forward TCP services through a raw IPv4 tunnel with TCP flag swapping, XOR obfuscation, and multiplexing."
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# BitSwap with Mux
+
+This example forwards users' TCP connections from Iran to a service in Kharej.
+`MuxClient` combines those connections into a fixed number of TCP carriers; the
+packet tunnel swaps TCP flags and applies XOR to their payloads between the two
+servers. `MuxServer` separates the connections before forwarding them to the
+service.
+
+```text
+Users -> Iran :443 -> MuxClient -> TCP over the packet tunnel
+      -> Kharej :443 -> MuxServer -> 127.0.0.1:2083
+```
+
+Choose which TCP flag to swap with `PSH` on the upload path from Iran to Kharej:
+`CWR`, `RST`, or `SYN`. The download path from Kharej to Iran uses `PSH` ↔ `RST`
+in every variant. Both directions restore the flags before delivering packets
+to the receiving OS.
+
+| Variant | Upload: Iran → Kharej | Download: Kharej → Iran |
+| --- | --- | --- |
+| PSH ↔ CWR | `PSH` ↔ `CWR` | `PSH` ↔ `RST` |
+| PSH ↔ RST | `PSH` ↔ `RST` | `PSH` ↔ `RST` |
+| PSH ↔ SYN | `PSH` ↔ `SYN` | `PSH` ↔ `RST` |
+
+Using `RST` instead of `CWR` can perform much better on some networks. Using
+`SYN` instead of `CWR` sometimes performs better too. Results depend on the
+network path, so try these variants on your own connection.
+
+The XOR key is `90` on every obfuscator. XOR and multiplexing provide no
+cryptographic authentication or encryption; retain the application's own TLS
+when it needs those properties.
+
+## Before starting
+
+Use the [common setup](./overview.mdx) for `core.json`, variable syntax, and
+startup. Save the selected tab as `config_iran.json` or `config_kharej.json` and
+load that filename from `core.json`. The configuration explicitly sets each TUN
+MTU to `1400`.
+
+| Value | Meaning |
+| --- | --- |
+| `ip_server_iran` | Replace `192.0.2.10` with Iran's public IPv4 address. |
+| `ip_server_kharej` | Replace `198.51.100.20` with Kharej's public IPv4 address. |
+| Iran `port_to_listen` | User-facing TCP port, `443` here. |
+| Iran `port_to_connect_to_kharej` / Kharej `port_to_listen` | Matching WaterWall carrier port, `443` here. |
+| `final_ip` / `final_port` | Kharej's application backend, `127.0.0.1:2083` here. |
+| `each_worker_mux_connections_count` | Carrier connections per Iran worker, `8` here. |
+
+These public addresses must belong to the corresponding hosts. This example
+assumes direct IPv4 reachability; it does not configure NAT traversal. The path
+must pass the modified TCP packets, including their unusual flag combinations.
+
+Run on Linux with TUN support, raw sockets, and permission to configure the
+interfaces and capture rules (normally as root; `CAP_NET_ADMIN` and
+`CAP_NET_RAW` are required capabilities). Install `iproute2`, `iptables`, and
+`iptables-save`; the kernel must support NFQUEUE and the `bpf` match used by
+protocol capture filters. See [RawSocket](../../noderefs/RawSocket) for the
+capture requirements.
+
+:::warning Capture includes other TCP between the servers
+Each receiving `RawSocket` captures **all TCP from the other server's public
+address**, regardless of port. That includes direct SSH or HTTPS between these
+two addresses. Use a separate management path. The outgoing raw sockets use
+empty settings to disable capture; they do not need a dummy capture address.
+:::
+
+## Configurations
+
+Select the **same flag variant on both hosts**, then choose the Iran or Kharej
+tab for that host's complete configuration. Changing variants requires updating
+Iran's upload encoder and Kharej's matching download decoder together.
+
+<Tabs groupId="bitswap-flag">
+<TabItem value="cwr" label="PSH ↔ CWR" default>
+
+Upload: `PSH` ↔ `CWR`. Download: `PSH` ↔ `RST`.
+
+<Tabs groupId="tunnel-location">
+<TabItem value="iran" label="Iran" default>
+
+Save as `config_iran.json`:
+
+```json
+{
+  "name": "iran-tcp-bitswap-mux",
+  "variables": {
+    "ip_server_iran": "192.0.2.10",
+    "ip_server_kharej": "198.51.100.20",
+    "port_to_listen": 443,
+    "port_to_connect_to_kharej": 443,
+    "each_worker_mux_connections_count": 8
+  },
+  "nodes": [
+    {
+      "name": "users_inbound",
+      "type": "TcpListener",
+      "settings": {
+        "address": "0.0.0.0",
+        "port": $port_to_listen$,
+        "nodelay": true
+      },
+      "next": "mux-client"
+    },
+    {
+      "name": "mux-client",
+      "type": "MuxClient",
+      "settings": {
+        "mode": "fixed-connections-count",
+        "per-worker-connections-count": $each_worker_mux_connections_count$
+      },
+      "next": "tcp-out"
+    },
+    {
+      "name": "tcp-out",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "10.10.0.2",
+        "port": $port_to_connect_to_kharej$,
+        "nodelay": true
+      }
+    },
+    {
+      "name": "my tun",
+      "type": "TunDevice",
+      "settings": {
+        "device-name": "wtun1",
+        "device-ip": "10.10.0.1/24",
+        "device-mtu": 1400
+      },
+      "next": "ipovsrc"
+    },
+    {
+      "name": "ipovsrc",
+      "type": "IpOverrider",
+      "settings": {
+        "up": {
+          "source-ip": {
+            "ipv4": $ip_server_iran$
+          },
+          "dest-ip": {
+            "ipv4": $ip_server_kharej$
+          }
+        },
+        "down": {
+          "source-ip": {
+            "ipv4": "10.10.0.2"
+          },
+          "dest-ip": {
+            "ipv4": "10.10.0.1"
+          }
+        }
+      },
+      "next": "splitter"
+    },
+    {
+      "name": "splitter",
+      "type": "PacketSplitStream",
+      "settings": {
+        "up": "obfuscator-c",
+        "down": "obfuscator-s"
+      }
+    },
+    {
+      "name": "obfuscator-c",
+      "type": "ObfuscatorClient",
+      "settings": {
+        "method": "xor",
+        "xor_key": 90,
+        "skip": "transport"
+      },
+      "next": "ip-manipulator-up"
+    },
+    {
+      "name": "ip-manipulator-up",
+      "type": "IpManipulator",
+      "settings": {
+        "up-tcp-bit-psh": "packet->cwr",
+        "up-tcp-bit-cwr": "packet->psh"
+      },
+      "next": "rd"
+    },
+    {
+      "name": "rd",
+      "type": "RawSocket",
+      "settings": {}
+    },
+    {
+      "name": "obfuscator-s",
+      "type": "ObfuscatorServer",
+      "settings": {
+        "method": "xor",
+        "xor_key": 90,
+        "skip": "transport"
+      },
+      "next": "ip-manipulator"
+    },
+    {
+      "name": "ip-manipulator",
+      "type": "IpManipulator",
+      "settings": {
+        "dw-tcp-bit-psh": "packet->rst",
+        "dw-tcp-bit-rst": "packet->psh"
+      },
+      "next": "rd2"
+    },
+    {
+      "name": "rd2",
+      "type": "RawSocket",
+      "settings": {
+        "capture-filter-mode": "source-ip",
+        "capture-ip": $ip_server_kharej$,
+        "capture-protocols": [
+          6
+        ]
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+<TabItem value="kharej" label="Kharej">
+
+Save as `config_kharej.json`:
+
+```json
+{
+  "name": "kharej-tcp-bitswap-mux",
+  "variables": {
+    "ip_server_iran": "192.0.2.10",
+    "ip_server_kharej": "198.51.100.20",
+    "port_to_listen": 443,
+    "final_ip": "127.0.0.1",
+    "final_port": 2083
+  },
+  "nodes": [
+    {
+      "name": "users_inbound",
+      "type": "TcpListener",
+      "settings": {
+        "address": "0.0.0.0",
+        "port": $port_to_listen$,
+        "nodelay": true
+      },
+      "next": "mux-s"
+    },
+    {
+      "name": "mux-s",
+      "type": "MuxServer",
+      "settings": {},
+      "next": "tcp-out"
+    },
+    {
+      "name": "tcp-out",
+      "type": "TcpConnector",
+      "settings": {
+        "address": $final_ip$,
+        "port": $final_port$,
+        "nodelay": true
+      }
+    },
+    {
+      "name": "my tun2",
+      "type": "TunDevice",
+      "settings": {
+        "device-name": "wtun2",
+        "device-ip": "10.20.0.1/24",
+        "device-mtu": 1400
+      },
+      "next": "ipcorrect"
+    },
+    {
+      "name": "ipcorrect",
+      "type": "IpOverrider",
+      "settings": {
+        "up": {
+          "source-ip": {
+            "ipv4": "10.10.0.2"
+          },
+          "dest-ip": {
+            "ipv4": "10.10.0.1"
+          }
+        },
+        "down": {
+          "source-ip": {
+            "ipv4": "10.10.0.2"
+          },
+          "dest-ip": {
+            "ipv4": "10.10.0.1"
+          }
+        }
+      },
+      "next": "obfuscator-s"
+    },
+    {
+      "name": "obfuscator-s",
+      "type": "ObfuscatorServer",
+      "settings": {
+        "method": "xor",
+        "xor_key": 90,
+        "skip": "transport"
+      },
+      "next": "ip-manipulator-in"
+    },
+    {
+      "name": "ip-manipulator-in",
+      "type": "IpManipulator",
+      "settings": {
+        "dw-tcp-bit-psh": "packet->cwr",
+        "dw-tcp-bit-cwr": "packet->psh"
+      },
+      "next": "rdin"
+    },
+    {
+      "name": "rdin",
+      "type": "RawSocket",
+      "settings": {
+        "capture-filter-mode": "source-ip",
+        "capture-ip": $ip_server_iran$,
+        "capture-protocols": [
+          6
+        ]
+      }
+    },
+    {
+      "name": "my tun",
+      "type": "TunDevice",
+      "settings": {
+        "device-name": "wtun1",
+        "device-ip": "10.10.0.1/24",
+        "device-mtu": 1400
+      },
+      "next": "ipovsrc"
+    },
+    {
+      "name": "ipovsrc",
+      "type": "IpOverrider",
+      "settings": {
+        "up": {
+          "source-ip": {
+            "ipv4": $ip_server_kharej$
+          },
+          "dest-ip": {
+            "ipv4": $ip_server_iran$
+          }
+        },
+        "down": {
+          "source-ip": {
+            "ipv4": "10.10.0.2"
+          },
+          "dest-ip": {
+            "ipv4": "10.10.0.1"
+          }
+        }
+      },
+      "next": "obfuscator-c"
+    },
+    {
+      "name": "obfuscator-c",
+      "type": "ObfuscatorClient",
+      "settings": {
+        "method": "xor",
+        "xor_key": 90,
+        "skip": "transport"
+      },
+      "next": "ip-manipulator"
+    },
+    {
+      "name": "ip-manipulator",
+      "type": "IpManipulator",
+      "settings": {
+        "up-tcp-bit-psh": "packet->rst",
+        "up-tcp-bit-rst": "packet->psh"
+      },
+      "next": "rd"
+    },
+    {
+      "name": "rd",
+      "type": "RawSocket",
+      "settings": {}
+    }
+  ]
+}
+```
+
+</TabItem>
+</Tabs>
+
+</TabItem>
+<TabItem value="rst" label="PSH ↔ RST">
+
+Upload: `PSH` ↔ `RST`. Download: `PSH` ↔ `RST`.
+
+<Tabs groupId="tunnel-location">
+<TabItem value="iran" label="Iran" default>
+
+Save as `config_iran.json`:
+
+```json
+{
+  "name": "iran-tcp-bitswap-mux",
+  "variables": {
+    "ip_server_iran": "192.0.2.10",
+    "ip_server_kharej": "198.51.100.20",
+    "port_to_listen": 443,
+    "port_to_connect_to_kharej": 443,
+    "each_worker_mux_connections_count": 8
+  },
+  "nodes": [
+    {
+      "name": "users_inbound",
+      "type": "TcpListener",
+      "settings": {
+        "address": "0.0.0.0",
+        "port": $port_to_listen$,
+        "nodelay": true
+      },
+      "next": "mux-client"
+    },
+    {
+      "name": "mux-client",
+      "type": "MuxClient",
+      "settings": {
+        "mode": "fixed-connections-count",
+        "per-worker-connections-count": $each_worker_mux_connections_count$
+      },
+      "next": "tcp-out"
+    },
+    {
+      "name": "tcp-out",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "10.10.0.2",
+        "port": $port_to_connect_to_kharej$,
+        "nodelay": true
+      }
+    },
+    {
+      "name": "my tun",
+      "type": "TunDevice",
+      "settings": {
+        "device-name": "wtun1",
+        "device-ip": "10.10.0.1/24",
+        "device-mtu": 1400
+      },
+      "next": "ipovsrc"
+    },
+    {
+      "name": "ipovsrc",
+      "type": "IpOverrider",
+      "settings": {
+        "up": {
+          "source-ip": {
+            "ipv4": $ip_server_iran$
+          },
+          "dest-ip": {
+            "ipv4": $ip_server_kharej$
+          }
+        },
+        "down": {
+          "source-ip": {
+            "ipv4": "10.10.0.2"
+          },
+          "dest-ip": {
+            "ipv4": "10.10.0.1"
+          }
+        }
+      },
+      "next": "splitter"
+    },
+    {
+      "name": "splitter",
+      "type": "PacketSplitStream",
+      "settings": {
+        "up": "obfuscator-c",
+        "down": "obfuscator-s"
+      }
+    },
+    {
+      "name": "obfuscator-c",
+      "type": "ObfuscatorClient",
+      "settings": {
+        "method": "xor",
+        "xor_key": 90,
+        "skip": "transport"
+      },
+      "next": "ip-manipulator-up"
+    },
+    {
+      "name": "ip-manipulator-up",
+      "type": "IpManipulator",
+      "settings": {
+        "up-tcp-bit-psh": "packet->rst",
+        "up-tcp-bit-rst": "packet->psh"
+      },
+      "next": "rd"
+    },
+    {
+      "name": "rd",
+      "type": "RawSocket",
+      "settings": {}
+    },
+    {
+      "name": "obfuscator-s",
+      "type": "ObfuscatorServer",
+      "settings": {
+        "method": "xor",
+        "xor_key": 90,
+        "skip": "transport"
+      },
+      "next": "ip-manipulator"
+    },
+    {
+      "name": "ip-manipulator",
+      "type": "IpManipulator",
+      "settings": {
+        "dw-tcp-bit-psh": "packet->rst",
+        "dw-tcp-bit-rst": "packet->psh"
+      },
+      "next": "rd2"
+    },
+    {
+      "name": "rd2",
+      "type": "RawSocket",
+      "settings": {
+        "capture-filter-mode": "source-ip",
+        "capture-ip": $ip_server_kharej$,
+        "capture-protocols": [
+          6
+        ]
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+<TabItem value="kharej" label="Kharej">
+
+Save as `config_kharej.json`:
+
+```json
+{
+  "name": "kharej-tcp-bitswap-mux",
+  "variables": {
+    "ip_server_iran": "192.0.2.10",
+    "ip_server_kharej": "198.51.100.20",
+    "port_to_listen": 443,
+    "final_ip": "127.0.0.1",
+    "final_port": 2083
+  },
+  "nodes": [
+    {
+      "name": "users_inbound",
+      "type": "TcpListener",
+      "settings": {
+        "address": "0.0.0.0",
+        "port": $port_to_listen$,
+        "nodelay": true
+      },
+      "next": "mux-s"
+    },
+    {
+      "name": "mux-s",
+      "type": "MuxServer",
+      "settings": {},
+      "next": "tcp-out"
+    },
+    {
+      "name": "tcp-out",
+      "type": "TcpConnector",
+      "settings": {
+        "address": $final_ip$,
+        "port": $final_port$,
+        "nodelay": true
+      }
+    },
+    {
+      "name": "my tun2",
+      "type": "TunDevice",
+      "settings": {
+        "device-name": "wtun2",
+        "device-ip": "10.20.0.1/24",
+        "device-mtu": 1400
+      },
+      "next": "ipcorrect"
+    },
+    {
+      "name": "ipcorrect",
+      "type": "IpOverrider",
+      "settings": {
+        "up": {
+          "source-ip": {
+            "ipv4": "10.10.0.2"
+          },
+          "dest-ip": {
+            "ipv4": "10.10.0.1"
+          }
+        },
+        "down": {
+          "source-ip": {
+            "ipv4": "10.10.0.2"
+          },
+          "dest-ip": {
+            "ipv4": "10.10.0.1"
+          }
+        }
+      },
+      "next": "obfuscator-s"
+    },
+    {
+      "name": "obfuscator-s",
+      "type": "ObfuscatorServer",
+      "settings": {
+        "method": "xor",
+        "xor_key": 90,
+        "skip": "transport"
+      },
+      "next": "ip-manipulator-in"
+    },
+    {
+      "name": "ip-manipulator-in",
+      "type": "IpManipulator",
+      "settings": {
+        "dw-tcp-bit-psh": "packet->rst",
+        "dw-tcp-bit-rst": "packet->psh"
+      },
+      "next": "rdin"
+    },
+    {
+      "name": "rdin",
+      "type": "RawSocket",
+      "settings": {
+        "capture-filter-mode": "source-ip",
+        "capture-ip": $ip_server_iran$,
+        "capture-protocols": [
+          6
+        ]
+      }
+    },
+    {
+      "name": "my tun",
+      "type": "TunDevice",
+      "settings": {
+        "device-name": "wtun1",
+        "device-ip": "10.10.0.1/24",
+        "device-mtu": 1400
+      },
+      "next": "ipovsrc"
+    },
+    {
+      "name": "ipovsrc",
+      "type": "IpOverrider",
+      "settings": {
+        "up": {
+          "source-ip": {
+            "ipv4": $ip_server_kharej$
+          },
+          "dest-ip": {
+            "ipv4": $ip_server_iran$
+          }
+        },
+        "down": {
+          "source-ip": {
+            "ipv4": "10.10.0.2"
+          },
+          "dest-ip": {
+            "ipv4": "10.10.0.1"
+          }
+        }
+      },
+      "next": "obfuscator-c"
+    },
+    {
+      "name": "obfuscator-c",
+      "type": "ObfuscatorClient",
+      "settings": {
+        "method": "xor",
+        "xor_key": 90,
+        "skip": "transport"
+      },
+      "next": "ip-manipulator"
+    },
+    {
+      "name": "ip-manipulator",
+      "type": "IpManipulator",
+      "settings": {
+        "up-tcp-bit-psh": "packet->rst",
+        "up-tcp-bit-rst": "packet->psh"
+      },
+      "next": "rd"
+    },
+    {
+      "name": "rd",
+      "type": "RawSocket",
+      "settings": {}
+    }
+  ]
+}
+```
+
+</TabItem>
+</Tabs>
+
+</TabItem>
+<TabItem value="syn" label="PSH ↔ SYN">
+
+Upload: `PSH` ↔ `SYN`. Download: `PSH` ↔ `RST`.
+
+<Tabs groupId="tunnel-location">
+<TabItem value="iran" label="Iran" default>
+
+Save as `config_iran.json`:
+
+```json
+{
+  "name": "iran-tcp-bitswap-mux",
+  "variables": {
+    "ip_server_iran": "192.0.2.10",
+    "ip_server_kharej": "198.51.100.20",
+    "port_to_listen": 443,
+    "port_to_connect_to_kharej": 443,
+    "each_worker_mux_connections_count": 8
+  },
+  "nodes": [
+    {
+      "name": "users_inbound",
+      "type": "TcpListener",
+      "settings": {
+        "address": "0.0.0.0",
+        "port": $port_to_listen$,
+        "nodelay": true
+      },
+      "next": "mux-client"
+    },
+    {
+      "name": "mux-client",
+      "type": "MuxClient",
+      "settings": {
+        "mode": "fixed-connections-count",
+        "per-worker-connections-count": $each_worker_mux_connections_count$
+      },
+      "next": "tcp-out"
+    },
+    {
+      "name": "tcp-out",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "10.10.0.2",
+        "port": $port_to_connect_to_kharej$,
+        "nodelay": true
+      }
+    },
+    {
+      "name": "my tun",
+      "type": "TunDevice",
+      "settings": {
+        "device-name": "wtun1",
+        "device-ip": "10.10.0.1/24",
+        "device-mtu": 1400
+      },
+      "next": "ipovsrc"
+    },
+    {
+      "name": "ipovsrc",
+      "type": "IpOverrider",
+      "settings": {
+        "up": {
+          "source-ip": {
+            "ipv4": $ip_server_iran$
+          },
+          "dest-ip": {
+            "ipv4": $ip_server_kharej$
+          }
+        },
+        "down": {
+          "source-ip": {
+            "ipv4": "10.10.0.2"
+          },
+          "dest-ip": {
+            "ipv4": "10.10.0.1"
+          }
+        }
+      },
+      "next": "splitter"
+    },
+    {
+      "name": "splitter",
+      "type": "PacketSplitStream",
+      "settings": {
+        "up": "obfuscator-c",
+        "down": "obfuscator-s"
+      }
+    },
+    {
+      "name": "obfuscator-c",
+      "type": "ObfuscatorClient",
+      "settings": {
+        "method": "xor",
+        "xor_key": 90,
+        "skip": "transport"
+      },
+      "next": "ip-manipulator-up"
+    },
+    {
+      "name": "ip-manipulator-up",
+      "type": "IpManipulator",
+      "settings": {
+        "up-tcp-bit-psh": "packet->syn",
+        "up-tcp-bit-syn": "packet->psh"
+      },
+      "next": "rd"
+    },
+    {
+      "name": "rd",
+      "type": "RawSocket",
+      "settings": {}
+    },
+    {
+      "name": "obfuscator-s",
+      "type": "ObfuscatorServer",
+      "settings": {
+        "method": "xor",
+        "xor_key": 90,
+        "skip": "transport"
+      },
+      "next": "ip-manipulator"
+    },
+    {
+      "name": "ip-manipulator",
+      "type": "IpManipulator",
+      "settings": {
+        "dw-tcp-bit-psh": "packet->rst",
+        "dw-tcp-bit-rst": "packet->psh"
+      },
+      "next": "rd2"
+    },
+    {
+      "name": "rd2",
+      "type": "RawSocket",
+      "settings": {
+        "capture-filter-mode": "source-ip",
+        "capture-ip": $ip_server_kharej$,
+        "capture-protocols": [
+          6
+        ]
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+<TabItem value="kharej" label="Kharej">
+
+Save as `config_kharej.json`:
+
+```json
+{
+  "name": "kharej-tcp-bitswap-mux",
+  "variables": {
+    "ip_server_iran": "192.0.2.10",
+    "ip_server_kharej": "198.51.100.20",
+    "port_to_listen": 443,
+    "final_ip": "127.0.0.1",
+    "final_port": 2083
+  },
+  "nodes": [
+    {
+      "name": "users_inbound",
+      "type": "TcpListener",
+      "settings": {
+        "address": "0.0.0.0",
+        "port": $port_to_listen$,
+        "nodelay": true
+      },
+      "next": "mux-s"
+    },
+    {
+      "name": "mux-s",
+      "type": "MuxServer",
+      "settings": {},
+      "next": "tcp-out"
+    },
+    {
+      "name": "tcp-out",
+      "type": "TcpConnector",
+      "settings": {
+        "address": $final_ip$,
+        "port": $final_port$,
+        "nodelay": true
+      }
+    },
+    {
+      "name": "my tun2",
+      "type": "TunDevice",
+      "settings": {
+        "device-name": "wtun2",
+        "device-ip": "10.20.0.1/24",
+        "device-mtu": 1400
+      },
+      "next": "ipcorrect"
+    },
+    {
+      "name": "ipcorrect",
+      "type": "IpOverrider",
+      "settings": {
+        "up": {
+          "source-ip": {
+            "ipv4": "10.10.0.2"
+          },
+          "dest-ip": {
+            "ipv4": "10.10.0.1"
+          }
+        },
+        "down": {
+          "source-ip": {
+            "ipv4": "10.10.0.2"
+          },
+          "dest-ip": {
+            "ipv4": "10.10.0.1"
+          }
+        }
+      },
+      "next": "obfuscator-s"
+    },
+    {
+      "name": "obfuscator-s",
+      "type": "ObfuscatorServer",
+      "settings": {
+        "method": "xor",
+        "xor_key": 90,
+        "skip": "transport"
+      },
+      "next": "ip-manipulator-in"
+    },
+    {
+      "name": "ip-manipulator-in",
+      "type": "IpManipulator",
+      "settings": {
+        "dw-tcp-bit-psh": "packet->syn",
+        "dw-tcp-bit-syn": "packet->psh"
+      },
+      "next": "rdin"
+    },
+    {
+      "name": "rdin",
+      "type": "RawSocket",
+      "settings": {
+        "capture-filter-mode": "source-ip",
+        "capture-ip": $ip_server_iran$,
+        "capture-protocols": [
+          6
+        ]
+      }
+    },
+    {
+      "name": "my tun",
+      "type": "TunDevice",
+      "settings": {
+        "device-name": "wtun1",
+        "device-ip": "10.10.0.1/24",
+        "device-mtu": 1400
+      },
+      "next": "ipovsrc"
+    },
+    {
+      "name": "ipovsrc",
+      "type": "IpOverrider",
+      "settings": {
+        "up": {
+          "source-ip": {
+            "ipv4": $ip_server_kharej$
+          },
+          "dest-ip": {
+            "ipv4": $ip_server_iran$
+          }
+        },
+        "down": {
+          "source-ip": {
+            "ipv4": "10.10.0.2"
+          },
+          "dest-ip": {
+            "ipv4": "10.10.0.1"
+          }
+        }
+      },
+      "next": "obfuscator-c"
+    },
+    {
+      "name": "obfuscator-c",
+      "type": "ObfuscatorClient",
+      "settings": {
+        "method": "xor",
+        "xor_key": 90,
+        "skip": "transport"
+      },
+      "next": "ip-manipulator"
+    },
+    {
+      "name": "ip-manipulator",
+      "type": "IpManipulator",
+      "settings": {
+        "up-tcp-bit-psh": "packet->rst",
+        "up-tcp-bit-rst": "packet->psh"
+      },
+      "next": "rd"
+    },
+    {
+      "name": "rd",
+      "type": "RawSocket",
+      "settings": {}
+    }
+  ]
+}
+```
+
+</TabItem>
+</Tabs>
+
+</TabItem>
+</Tabs>
+
+## How the packet paths fit together
+
+On Iran, `wtun1` owns `10.10.0.1/24`. The connector targets `10.10.0.2`, so
+Linux routes its carrier packets into `wtun1`. `IpOverrider` replaces the private
+addresses with the public server addresses, and `PacketSplitStream` selects the
+upload branch. Replies arrive on the download branch, have their private
+addresses restored, and are injected back through `wtun1`.
+
+Kharej deliberately uses two TUN devices. Incoming packets are decoded and
+injected through `wtun2` (`10.20.0.1/24`), with destination `10.10.0.1`, the local
+address owned by `wtun1`. Linux delivers them to the local listener. Replies to
+`10.10.0.2` follow `wtun1`'s connected route and use the separate download encoder.
+The private addresses describe each host's local view; both hosts owning
+`10.10.0.1` on their own TUN is intentional.
+
+Reserve `10.10.0.0/24` on both hosts and `10.20.0.0/24` on Kharej for this example,
+and do not reuse existing `wtun1` or `wtun2` interfaces. Check the connected route
+after startup:
+
+```bash
+ip -4 route get 10.10.0.2
+```
+
+It should select `wtun1` on each host. Neither example installs a system default
+route. Allow the relevant TUN input and local TCP listener in the host firewall.
+The Kharej listener binds `0.0.0.0`; restrict access to its carrier port from
+unwanted public clients. `TunDevice` disables Linux reverse-path filtering for
+its own interface and the global `all` setting during startup; see
+[TunDevice's caveats](../../noderefs/TunDevice) for the
+scope and persistence of that change.
+
+To terminate users' TLS on Iran, insert a configured
+[TlsServer](../../noderefs/TlsServer) **between `users_inbound` and
+`mux-client`**, and change `users_inbound.next` to its name. Its `next` must remain
+`mux-client`, and the backend must expect the resulting plaintext protocol.
+Leaving the chain as shown passes the application's TLS through to the backend.
+
+## Start and check
+
+Start the destination service on Kharej's `final_ip:final_port`, then start
+WaterWall on Kharej and Iran using the [common command](./overview.mdx#start-the-tunnel).
+Confirm the TUN routes above, then point the service's normal client at Iran's
+`port_to_listen`. For example, an Xray client should use Iran's public IP and
+port while keeping the protocol settings expected by the Kharej backend.
+
+If connections stall, check the matching carrier ports, the service bind address,
+and whether the network passes the modified TCP flags. Both sides must use the
+matching flag swaps and XOR key shown here.
