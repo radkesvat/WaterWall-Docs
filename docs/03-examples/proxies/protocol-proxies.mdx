@@ -1,0 +1,465 @@
+---
+sidebar_position: 4
+title: "VLESS, VMess, and Trojan over TLS"
+sidebar_label: "VLESS / VMess / Trojan"
+description: "Complete client and server configurations for a local SOCKS5 proxy carried over VLESS, VMess, or Trojan with TLS."
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# VLESS, VMess, and Trojan over TLS
+
+Turn a local SOCKS5 port into a remote proxy connection. Your application chooses
+the destination through SOCKS5; WaterWall encodes that destination in VLESS,
+VMess, or Trojan and carries it to the server over TLS. The server authenticates
+the request and opens the final TCP connection.
+
+```text
+Application -> 127.0.0.1:1080 -> Socks5Server -> protocol Client -> TlsClient
+            -> TCP :443 -> TlsServer -> protocol Server -> requested destination
+```
+
+These examples accept **TCP CONNECT only**. UDP is disabled on both the local
+SOCKS entry and the remote protocol server. Use the [SOCKS routing and Mux example](./socks-mux.mdx)
+to see how TCP and direct UDP take separate paths.
+
+## Before starting
+
+Follow the [common setup](./overview.mdx), using one WaterWall process on the
+client and another on the server. Save the selected side as `config.json`
+beside its `core.json`. Choose the same protocol tab on both hosts.
+
+| Value | Replace with |
+| --- | --- |
+| `198.51.100.20` | The proxy server's reachable IP address. |
+| `tunnel.example.com` | The hostname covered by the server's TLS certificate. |
+| Certificate and key paths | Your certificate chain and matching private key on the server. |
+| Example UUID | A fresh UUID shared by the VLESS or VMess client and server. |
+| Example Trojan password | A strong password shared by the Trojan client and server. |
+
+Allow incoming **TCP 443** on the server. Keep certificate verification enabled;
+the certificate must be valid for the configured SNI and trusted by the client.
+For VMess, keep both machines' clocks synchronized because its authentication is
+time-sensitive.
+
+The local SOCKS listener uses no authentication and binds to `127.0.0.1`.
+Applications on that machine use SOCKS5 at `127.0.0.1:1080`. A remote-DNS option
+such as curl's `--socks5-hostname` sends the requested hostname through the proxy
+for resolution at the server.
+
+## Choose a protocol
+
+| Protocol | What this example uses |
+| --- | --- |
+| VLESS | Base VLESS v0 with UUID authentication and TLS for transport protection; no Vision or flow extensions. |
+| VMess | Modern VMess AEAD authentication with `aes-128-gcm` body security, carried inside TLS. |
+| Trojan | Password authentication with TLS; configure the raw password on both ends. |
+
+VMess limits each connection to 65,536 input bytes before authentication
+completes, including its protocol overhead. A large initial burst can therefore
+be rejected; larger transfers can proceed after authentication. See
+[VmessServer](../../noderefs/VmessServer) for its authentication and queue limits.
+
+<Tabs groupId="proxy-protocol">
+<TabItem value="vless" label="VLESS" default>
+
+<Tabs groupId="proxy-side">
+<TabItem value="client" label="Client" default>
+
+Save as `config.json` on the client:
+
+```json
+{
+  "name": "vless-client",
+  "nodes": [
+    {
+      "name": "local-socks",
+      "type": "TcpListener",
+      "next": "socks",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 1080
+      }
+    },
+    {
+      "name": "socks",
+      "type": "Socks5Server",
+      "next": "vless",
+      "settings": {
+        "no-auth": true,
+        "connect": true,
+        "udp": false
+      }
+    },
+    {
+      "name": "vless",
+      "type": "VlessClient",
+      "next": "tls",
+      "settings": {
+        "uuid": "11111111-2222-4333-8444-555555555555",
+        "address": "dest_context->address",
+        "port": "dest_context->port",
+        "protocol": "tcp",
+        "domain-strategy": "do-not-resolve-domains"
+      }
+    },
+    {
+      "name": "tls",
+      "type": "TlsClient",
+      "next": "server",
+      "settings": {
+        "sni": "tunnel.example.com",
+        "verify": true
+      }
+    },
+    {
+      "name": "server",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "198.51.100.20",
+        "port": 443,
+        "nodelay": true
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+<TabItem value="server" label="Server">
+
+Save as `config.json` on the server:
+
+```json
+{
+  "name": "vless-server",
+  "nodes": [
+    {
+      "name": "public-tls",
+      "type": "TcpListener",
+      "next": "tls",
+      "settings": {
+        "address": "0.0.0.0",
+        "port": 443,
+        "nodelay": true
+      }
+    },
+    {
+      "name": "tls",
+      "type": "TlsServer",
+      "next": "vless",
+      "settings": {
+        "cert-file": "/etc/waterwall/fullchain.pem",
+        "key-file": "/etc/waterwall/privkey.pem"
+      }
+    },
+    {
+      "name": "vless",
+      "type": "VlessServer",
+      "next": "destination",
+      "settings": {
+        "uuid": "11111111-2222-4333-8444-555555555555",
+        "connect": true,
+        "udp": false
+      }
+    },
+    {
+      "name": "destination",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "dest_context->address",
+        "port": "dest_context->port",
+        "nodelay": true
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+</Tabs>
+
+</TabItem>
+<TabItem value="vmess" label="VMess">
+
+<Tabs groupId="proxy-side">
+<TabItem value="client" label="Client" default>
+
+Save as `config.json` on the client:
+
+```json
+{
+  "name": "vmess-client",
+  "nodes": [
+    {
+      "name": "local-socks",
+      "type": "TcpListener",
+      "next": "socks",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 1080
+      }
+    },
+    {
+      "name": "socks",
+      "type": "Socks5Server",
+      "next": "vmess",
+      "settings": {
+        "no-auth": true,
+        "connect": true,
+        "udp": false
+      }
+    },
+    {
+      "name": "vmess",
+      "type": "VmessClient",
+      "next": "tls",
+      "settings": {
+        "uuid": "11111111-2222-4333-8444-555555555555",
+        "address": "dest_context->address",
+        "port": "dest_context->port",
+        "protocol": "tcp",
+        "security": "aes-128-gcm",
+        "domain-strategy": "do-not-resolve-domains"
+      }
+    },
+    {
+      "name": "tls",
+      "type": "TlsClient",
+      "next": "server",
+      "settings": {
+        "sni": "tunnel.example.com",
+        "verify": true
+      }
+    },
+    {
+      "name": "server",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "198.51.100.20",
+        "port": 443,
+        "nodelay": true
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+<TabItem value="server" label="Server">
+
+Save as `config.json` on the server:
+
+```json
+{
+  "name": "vmess-server",
+  "nodes": [
+    {
+      "name": "public-tls",
+      "type": "TcpListener",
+      "next": "tls",
+      "settings": {
+        "address": "0.0.0.0",
+        "port": 443,
+        "nodelay": true
+      }
+    },
+    {
+      "name": "tls",
+      "type": "TlsServer",
+      "next": "vmess",
+      "settings": {
+        "cert-file": "/etc/waterwall/fullchain.pem",
+        "key-file": "/etc/waterwall/privkey.pem"
+      }
+    },
+    {
+      "name": "vmess",
+      "type": "VmessServer",
+      "next": "destination",
+      "settings": {
+        "uuid": "11111111-2222-4333-8444-555555555555",
+        "connect": true,
+        "udp": false
+      }
+    },
+    {
+      "name": "destination",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "dest_context->address",
+        "port": "dest_context->port",
+        "nodelay": true
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+</Tabs>
+
+</TabItem>
+<TabItem value="trojan" label="Trojan">
+
+<Tabs groupId="proxy-side">
+<TabItem value="client" label="Client" default>
+
+Save as `config.json` on the client:
+
+```json
+{
+  "name": "trojan-client",
+  "nodes": [
+    {
+      "name": "local-socks",
+      "type": "TcpListener",
+      "next": "socks",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 1080
+      }
+    },
+    {
+      "name": "socks",
+      "type": "Socks5Server",
+      "next": "trojan",
+      "settings": {
+        "no-auth": true,
+        "connect": true,
+        "udp": false
+      }
+    },
+    {
+      "name": "trojan",
+      "type": "TrojanClient",
+      "next": "tls",
+      "settings": {
+        "password": "replace-with-a-strong-password",
+        "address": "dest_context->address",
+        "port": "dest_context->port",
+        "protocol": "tcp",
+        "domain-strategy": "do-not-resolve-domains"
+      }
+    },
+    {
+      "name": "tls",
+      "type": "TlsClient",
+      "next": "server",
+      "settings": {
+        "sni": "tunnel.example.com",
+        "verify": true
+      }
+    },
+    {
+      "name": "server",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "198.51.100.20",
+        "port": 443,
+        "nodelay": true
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+<TabItem value="server" label="Server">
+
+Save as `config.json` on the server:
+
+```json
+{
+  "name": "trojan-server",
+  "nodes": [
+    {
+      "name": "public-tls",
+      "type": "TcpListener",
+      "next": "tls",
+      "settings": {
+        "address": "0.0.0.0",
+        "port": 443,
+        "nodelay": true
+      }
+    },
+    {
+      "name": "tls",
+      "type": "TlsServer",
+      "next": "trojan",
+      "settings": {
+        "cert-file": "/etc/waterwall/fullchain.pem",
+        "key-file": "/etc/waterwall/privkey.pem"
+      }
+    },
+    {
+      "name": "trojan",
+      "type": "TrojanServer",
+      "next": "destination",
+      "settings": {
+        "password": "replace-with-a-strong-password",
+        "connect": true,
+        "udp": false
+      }
+    },
+    {
+      "name": "destination",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "dest_context->address",
+        "port": "dest_context->port",
+        "nodelay": true
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+</Tabs>
+
+</TabItem>
+</Tabs>
+
+## Use the proxy
+
+After starting both processes, try a request from the client machine:
+
+```bash
+curl --socks5-hostname 127.0.0.1:1080 https://example.com/
+```
+
+The protocol client's `dest_context->address` and `dest_context->port` refer to
+the destination requested by your application. The last client-side
+`TcpConnector` always connects to the **proxy server**. On the server, the exit
+connector uses the destination decoded from the authenticated request.
+
+## Connecting another proxy application
+
+The server configurations use their base protocols over TCP and TLS, without
+WaterWall-specific Mux framing. A compatible external client can use these
+settings instead of the WaterWall client configuration:
+
+| Setting | Value |
+| --- | --- |
+| Server and port | Your server address, TCP `443`. |
+| TLS / server name | TLS enabled, `tunnel.example.com`, certificate verification enabled. |
+| Transport | TCP; WebSocket and protocol-specific multiplexing disabled. |
+| VLESS credential and options | Your UUID; encryption `none`; no flow / Vision. |
+| VMess credential and options | Your UUID; AEAD / `alterId: 0`; security `aes-128-gcm`. |
+| Trojan credential | Your shared raw password. |
+
+Only the row for your selected protocol applies. External clients must support
+that base protocol; unsupported extensions such as XUDP or Mux.Cool are not
+enabled here.
+
+When both ends run WaterWall, the [Mux example](./socks-mux.mdx) shows how to share
+carrier connections. It requires a matching `MuxClient` / `MuxServer` placement;
+WaterWall Mux is a separate protocol from client applications' built-in
+multiplexing options.
+
+For another carrier, continue to [WebSocket over TLS](./websocket.mdx),
+[QUIC](./quic.mdx), or [KCP](./kcp.mdx). See the detailed node references for
+[VLESS](../../noderefs/VlessClient), [VMess](../../noderefs/VmessClient),
+and [Trojan](../../noderefs/TrojanClient).

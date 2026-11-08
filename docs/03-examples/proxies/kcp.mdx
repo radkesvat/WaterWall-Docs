@@ -1,0 +1,236 @@
+---
+sidebar_position: 6
+title: "Proxy over KCP and TLS"
+sidebar_label: "KCP transport"
+description: "Complete SOCKS5-to-VLESS proxy configurations with Mux, verified TLS and KCP over UDP, including optional FEC."
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Proxy over KCP and TLS
+
+KCP turns a UDP path into a reliable, ordered byte stream. This example puts TLS
+over that stream, then uses Mux to share it across VLESS proxy requests. Your
+applications connect to a local SOCKS5 port and select their own destinations.
+
+```text
+Client: TcpListener → Socks5Server → VlessClient → MuxClient → TlsClient → KcpClient → UdpConnector
+Server: UdpListener → KcpServer → TlsServer → MuxServer → VlessServer → TcpConnector → requested destination
+```
+
+Use the [common setup](./overview.mdx). Save each side as `config.json`, replace
+`198.51.100.20` with the server address, and replace the example UUID on both ends.
+Install a trusted certificate for `tunnel.example.com` and its matching private
+key on the server. Allow incoming **UDP 4000**.
+
+The local listener binds to `127.0.0.1:1080` and supports SOCKS5 TCP `CONNECT`.
+Application UDP is disabled. The UDP packets between the WaterWall processes
+carry KCP; they are separate from SOCKS5 `UDP ASSOCIATE` traffic.
+
+## Client and server
+
+<Tabs groupId="proxy-side" defaultValue="client">
+<TabItem value="client" label="Client">
+
+```json title="config.json — client"
+{
+  "name": "socks-vless-mux-tls-kcp-client",
+  "nodes": [
+    {
+      "name": "local-socks",
+      "type": "TcpListener",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 1080,
+        "nodelay": true
+      },
+      "next": "socks"
+    },
+    {
+      "name": "socks",
+      "type": "Socks5Server",
+      "settings": {
+        "no-auth": true,
+        "connect": true,
+        "udp": false
+      },
+      "next": "vless"
+    },
+    {
+      "name": "vless",
+      "type": "VlessClient",
+      "settings": {
+        "uuid": "11111111-2222-4333-8444-555555555555",
+        "address": "dest_context->address",
+        "port": "dest_context->port",
+        "protocol": "tcp",
+        "domain-strategy": "do-not-resolve-domains"
+      },
+      "next": "mux"
+    },
+    {
+      "name": "mux",
+      "type": "MuxClient",
+      "settings": {
+        "mode": "fixed-connections-count",
+        "per-worker-connections-count": 2
+      },
+      "next": "tls"
+    },
+    {
+      "name": "tls",
+      "type": "TlsClient",
+      "settings": {
+        "sni": "tunnel.example.com",
+        "verify": true,
+        "alpns": ["http/1.1"]
+      },
+      "next": "kcp"
+    },
+    {
+      "name": "kcp",
+      "type": "KcpClient",
+      "settings": {
+        "send-mtu": 1400,
+        "fec": false,
+        "kcp-no-congestion-control": false
+      },
+      "next": "server"
+    },
+    {
+      "name": "server",
+      "type": "UdpConnector",
+      "settings": {
+        "address": "198.51.100.20",
+        "port": 4000
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+<TabItem value="server" label="Server">
+
+```json title="config.json — server"
+{
+  "name": "socks-vless-mux-tls-kcp-server",
+  "nodes": [
+    {
+      "name": "kcp-in",
+      "type": "UdpListener",
+      "settings": {
+        "address": "0.0.0.0",
+        "port": 4000
+      },
+      "next": "kcp"
+    },
+    {
+      "name": "kcp",
+      "type": "KcpServer",
+      "settings": {
+        "send-mtu": 1400,
+        "fec": false,
+        "kcp-no-congestion-control": false
+      },
+      "next": "tls"
+    },
+    {
+      "name": "tls",
+      "type": "TlsServer",
+      "settings": {
+        "cert-file": "/etc/waterwall/fullchain.pem",
+        "key-file": "/etc/waterwall/privkey.pem",
+        "select-alpns": ["http/1.1"]
+      },
+      "next": "mux"
+    },
+    {
+      "name": "mux",
+      "type": "MuxServer",
+      "settings": {},
+      "next": "vless"
+    },
+    {
+      "name": "vless",
+      "type": "VlessServer",
+      "settings": {
+        "uuid": "11111111-2222-4333-8444-555555555555",
+        "connect": true,
+        "udp": false
+      },
+      "next": "destination"
+    },
+    {
+      "name": "destination",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "dest_context->address",
+        "port": "dest_context->port",
+        "nodelay": true
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+</Tabs>
+
+## Why this order matters
+
+VLESS encodes the requested destination separately for each Mux child. Mux
+combines those streams; TLS encrypts the combined bytes; KCP carries the TLS
+records reliably over UDP. The server reverses that sequence before making
+one outbound TCP connection for each requested destination.
+
+KCP provides no encryption or server authentication. Keep the TLS nodes and
+`verify: true` to protect the proxy credentials and payload. TLS needs KCP's
+reconstructed stream: placing `TlsClient` between `KcpClient` and `UdpConnector`
+would give TLS raw KCP packets instead. The `http/1.1` ALPN setting agrees on
+both peers; it does not turn the enclosed proxy traffic into HTTP.
+
+Mux also needs reliable, ordered bytes. Its two parent connections per worker
+share the TLS/KCP setup across child requests. Children on the same parent share
+that ordered stream, so loss can delay them together. With the common two-worker
+setup there can be up to four active parent transports. For application UDP from
+SOCKS5, follow the [Router example](./socks-mux.mdx) instead of sending raw datagrams
+into Mux.
+
+## Packet size and optional FEC
+
+`send-mtu: 1400` is KCP's **IPv4-based outgoing packet budget**, including fixed
+allowances for IPv4, UDP and WaterWall's session envelope. It is not an
+application payload size or path-MTU discovery. This leaves some headroom on a
+1500-byte path, but outer tunnels, IPv6 and smaller paths may require a lower
+setting. See [KcpClient](../../noderefs/KcpClient) for the exact overhead formula.
+
+Both configurations explicitly enable KCP congestion control with
+`kcp-no-congestion-control: false`. Start here on a shared internet connection;
+changing windows, retransmission timings or congestion control changes resource
+use and traffic behavior, so measure on your actual path.
+
+For a lossy path, you can try forward error correction (FEC). Replace the `kcp`
+node's settings object on **both peers** with:
+
+```json title="KcpClient.settings and KcpServer.settings — optional FEC"
+{
+  "send-mtu": 1400,
+  "fec": true,
+  "fec-data-shards": 10,
+  "fec-parity-shards": 3,
+  "kcp-no-congestion-control": false
+}
+```
+
+These shard counts must match on both ends. A full block adds three parity
+shards for ten data shards: about 30% extra parity traffic plus framing. FEC may
+reduce the need to wait for retransmission when some packets are lost; it also
+uses bandwidth and cannot guarantee recovery from sustained or bursty loss.
+Compare it with FEC disabled and with the [QUIC example](./quic.mdx) using your
+normal workload. Neither UDP transport is universally faster than TCP.
+
+See [KcpServer](../../noderefs/KcpServer),
+[TlsClient](../../noderefs/TlsClient) and
+[MuxClient](../../noderefs/MuxClient) for further settings.

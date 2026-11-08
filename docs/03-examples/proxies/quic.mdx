@@ -1,0 +1,207 @@
+---
+sidebar_position: 5
+title: "Proxy over QUIC"
+sidebar_label: "QUIC transport"
+description: "A local SOCKS5 proxy carried through VLESS, Mux and encrypted QUIC over UDP, with complete client and server configurations."
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Proxy over QUIC
+
+Give local applications a SOCKS5 proxy while carrying their TCP connections to
+your server over UDP. VLESS carries each requested destination and authenticates
+the proxy user; Mux shares QUIC transports across those requests. QUIC supplies
+encryption, reliable delivery and congestion control.
+
+```text
+Client: TcpListener → Socks5Server → VlessClient → MuxClient → QuicClient → UdpConnector
+Server: UdpListener → QuicServer → MuxServer → VlessServer → TcpConnector → requested destination
+```
+
+Use the [common setup](./overview.mdx), then save the matching configuration
+below as `config.json` on each machine. Replace `198.51.100.20` with the server
+address, replace the example UUID on both ends, and install the server's
+certificate and matching private key. The certificate must cover
+`tunnel.example.com`, and its issuer must be trusted by the client. Allow incoming
+**UDP 4433** on the server.
+
+The local SOCKS5 listener accepts TCP `CONNECT` only and binds to `127.0.0.1:1080`.
+Applications use that local proxy; only WaterWall's QUIC traffic crosses the UDP
+transport. This example does not enable SOCKS5 `UDP ASSOCIATE`.
+
+## Client and server
+
+<Tabs groupId="proxy-side" defaultValue="client">
+<TabItem value="client" label="Client">
+
+```json title="config.json — client"
+{
+  "name": "socks-vless-mux-quic-client",
+  "nodes": [
+    {
+      "name": "local-socks",
+      "type": "TcpListener",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 1080,
+        "nodelay": true
+      },
+      "next": "socks"
+    },
+    {
+      "name": "socks",
+      "type": "Socks5Server",
+      "settings": {
+        "no-auth": true,
+        "connect": true,
+        "udp": false
+      },
+      "next": "vless"
+    },
+    {
+      "name": "vless",
+      "type": "VlessClient",
+      "settings": {
+        "uuid": "11111111-2222-4333-8444-555555555555",
+        "address": "dest_context->address",
+        "port": "dest_context->port",
+        "protocol": "tcp",
+        "domain-strategy": "do-not-resolve-domains"
+      },
+      "next": "mux"
+    },
+    {
+      "name": "mux",
+      "type": "MuxClient",
+      "settings": {
+        "mode": "fixed-connections-count",
+        "per-worker-connections-count": 2
+      },
+      "next": "quic"
+    },
+    {
+      "name": "quic",
+      "type": "QuicClient",
+      "settings": {
+        "sni": "tunnel.example.com",
+        "verify": true,
+        "protocol": "h3",
+        "carrier-mode": "datagram",
+        "max-packet-size": 1350
+      },
+      "next": "server"
+    },
+    {
+      "name": "server",
+      "type": "UdpConnector",
+      "settings": {
+        "address": "198.51.100.20",
+        "port": 4433
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+<TabItem value="server" label="Server">
+
+```json title="config.json — server"
+{
+  "name": "socks-vless-mux-quic-server",
+  "nodes": [
+    {
+      "name": "quic-in",
+      "type": "UdpListener",
+      "settings": {
+        "address": "0.0.0.0",
+        "port": 4433
+      },
+      "next": "quic"
+    },
+    {
+      "name": "quic",
+      "type": "QuicServer",
+      "settings": {
+        "cert-file": "/etc/waterwall/fullchain.pem",
+        "key-file": "/etc/waterwall/privkey.pem",
+        "protocol": "h3",
+        "carrier-mode": "datagram",
+        "max-packet-size": 1350
+      },
+      "next": "mux"
+    },
+    {
+      "name": "mux",
+      "type": "MuxServer",
+      "settings": {},
+      "next": "vless"
+    },
+    {
+      "name": "vless",
+      "type": "VlessServer",
+      "settings": {
+        "uuid": "11111111-2222-4333-8444-555555555555",
+        "connect": true,
+        "udp": false
+      },
+      "next": "destination"
+    },
+    {
+      "name": "destination",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "dest_context->address",
+        "port": "dest_context->port",
+        "nodelay": true
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+</Tabs>
+
+## Why Mux goes before QUIC
+
+Each WaterWall QUIC connection exposes one reliable application stream. Putting
+`MuxClient` before `QuicClient` lets several proxy requests share that stream.
+On the server, `QuicServer` restores the stream before `MuxServer` separates the
+requests. `VlessClient` sits inside each Mux child so its destination header
+belongs to that request; Mux alone does not send destination metadata.
+
+The Mux setting allows two parent transports **per worker**. With the common
+two-worker setup, that means up to four active QUIC parent connections. Children
+on one parent share its ordered stream and loss recovery; this is not one native
+QUIC stream per proxy request.
+
+Do not move Mux onto the raw UDP side of QUIC. Mux needs an ordered, reliable
+stream, while UDP can lose or reorder packets. Here QUIC provides that stream
+before Mux consumes it. For SOCKS5 application UDP, see the
+[SOCKS5 and Router example](./socks-mux.mdx).
+
+## Certificates, packet size and compatibility
+
+`QuicClient` already performs a TLS 1.3 handshake, so this chain needs no separate
+TLS nodes. Keep `verify: true`. For a private CA, add a `ca-file` path to
+`QuicClient.settings` pointing to the trusted PEM bundle; it replaces the bundled
+trust roots. The `sni` names the certificate, while `UdpConnector.address` selects
+the server's network address.
+
+`max-packet-size: 1350` limits the emitted QUIC datagram, excluding UDP and IP
+headers. This is a different budget from KCP's `send-mtu`. Choose a value that
+fits the whole path, accounting for any outer tunnel; the supported range is
+1200–1452 bytes.
+
+Both peers must agree on `protocol` and `carrier-mode`. Here `h3` is the ALPN
+identifier for WaterWall's raw stream mapping. This configuration is for a
+WaterWall peer: it does not implement HTTP/3, Hysteria or another QUIC proxy
+protocol. UDP must pass through your network; compare it with the TLS/TCP and
+[KCP](./kcp.mdx) examples on your own connection before choosing a transport.
+
+See [QuicClient](../../noderefs/QuicClient),
+[QuicServer](../../noderefs/QuicServer) and
+[MuxClient](../../noderefs/MuxClient) for the available settings.

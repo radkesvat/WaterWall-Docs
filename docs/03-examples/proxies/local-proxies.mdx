@@ -1,0 +1,187 @@
+---
+sidebar_position: 2
+title: "Local SOCKS5 and HTTP proxies"
+sidebar_label: "SOCKS5 & HTTP"
+description: "Complete local SOCKS5 TCP/UDP and HTTP forward-proxy configurations, with application commands and authentication guidance."
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Local SOCKS5 and HTTP proxies
+
+Give applications a local proxy and let WaterWall connect to each requested
+destination. These examples use direct outbound connections from the machine
+running WaterWall. For a remote exit, continue with
+[SOCKS5, Router, and Mux](./socks-mux.mdx).
+
+Use the [common setup](./overview.mdx), then save one of the complete
+configurations below as `config.json`. Both listeners bind to `127.0.0.1` for
+applications on the same machine.
+
+<Tabs groupId="local-proxy-protocol" defaultValue="socks">
+<TabItem value="socks" label="SOCKS5 (TCP + UDP)">
+
+```text
+Application -> TcpUdpListener :1080 -> Socks5Server -> TcpUdpConnector -> Destination
+```
+
+`CONNECT` carries TCP. `UDP ASSOCIATE` creates a separate datagram relay while
+the application's SOCKS TCP control connection stays open.
+
+```json title="config.json"
+{
+  "name": "local-socks5",
+  "nodes": [
+    {
+      "name": "local-listener",
+      "type": "TcpUdpListener",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 1080,
+        "nodelay": true
+      },
+      "next": "socks"
+    },
+    {
+      "name": "socks",
+      "type": "Socks5Server",
+      "settings": {
+        "no-auth": true,
+        "connect": true,
+        "udp": true,
+        "ipv4": "127.0.0.1"
+      },
+      "next": "direct"
+    },
+    {
+      "name": "direct",
+      "type": "TcpUdpConnector",
+      "settings": {
+        "address": "dest_context->address",
+        "port": "dest_context->port",
+        "nodelay": true
+      }
+    }
+  ]
+}
+```
+
+Set the application's SOCKS5 proxy to `127.0.0.1:1080`. For example:
+
+```bash
+curl --noproxy "" --proxy socks5h://127.0.0.1:1080 https://example.com/
+```
+
+`socks5h` passes the hostname to WaterWall for resolution; `socks5` makes curl
+resolve it first. This curl command exercises TCP, not SOCKS UDP. An application
+must support SOCKS5 `UDP ASSOCIATE` to use the UDP path.
+
+The `ipv4` setting is the UDP relay address advertised to the application.
+The relay **port is allocated dynamically** and returned in the SOCKS reply;
+applications must use that returned port. Sending UDP directly to port `1080`
+does not establish a SOCKS association. `TcpUdpListener` provides the dynamic
+UDP endpoint; replacing it with `TcpListener` requires disabling SOCKS UDP.
+
+See [Socks5Server](../../noderefs/Socks5Server),
+[TcpUdpListener](../../noderefs/TcpUdpListener), and
+[TcpUdpConnector](../../noderefs/TcpUdpConnector).
+
+</TabItem>
+<TabItem value="http" label="HTTP proxy (HTTP + CONNECT)">
+
+```text
+Application -> TcpListener :8080 -> HttpProxyServer -> TcpConnector -> Destination
+```
+
+Ordinary HTTP requests use the forward-proxy interface. HTTPS applications use
+`CONNECT` and then perform their own TLS handshake with the destination through
+the proxy. WaterWall does not need the destination website's certificate.
+
+```json title="config.json"
+{
+  "name": "local-http-proxy",
+  "nodes": [
+    {
+      "name": "local-listener",
+      "type": "TcpListener",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 8080,
+        "nodelay": true
+      },
+      "next": "http-proxy"
+    },
+    {
+      "name": "http-proxy",
+      "type": "HttpProxyServer",
+      "settings": {
+        "no-auth": true
+      },
+      "next": "direct"
+    },
+    {
+      "name": "direct",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "dest_context->address",
+        "port": "dest_context->port",
+        "nodelay": true
+      }
+    }
+  ]
+}
+```
+
+Set the application's HTTP proxy to `http://127.0.0.1:8080`:
+
+```bash
+curl --noproxy "" --proxy http://127.0.0.1:8080 http://example.com/
+curl --noproxy "" --proxy http://127.0.0.1:8080 https://example.com/
+```
+
+The first command exercises HTTP forwarding; the second exercises CONNECT.
+This proxy does not expose UDP or an HTTP/2 or HTTP/3 proxy interface.
+Use [HttpProxyServer](../../noderefs/HttpProxyServer) for this service;
+`HttpServer` is a different node used for carrying WaterWall traffic in HTTP
+framing.
+
+</TabItem>
+</Tabs>
+
+## Authentication and remote access
+
+The examples allow unauthenticated local access. Keep the listeners on loopback
+for this use. To serve other machines, configure authentication and network
+access controls before changing the bind address. For SOCKS UDP, also set
+`ipv4` to the address reachable by clients and allow the dynamically allocated
+UDP relay ports through any firewall or NAT.
+
+SOCKS5 username/password authentication uses an
+[AuthenticationClient](../../noderefs/AuthenticationClient): replace `no-auth`
+with `auth-client-node-name` referencing that configured node. Store each
+account's SOCKS credential pair as `username:password` in the authentication
+server's user `password` field. Inline `users`, `username`, and `password`
+settings on `Socks5Server` are not supported. See
+[AuthenticationServer](../../noderefs/AuthenticationServer) for the account
+service and [account management](../api/authentication-users) for user
+administration.
+
+HTTP proxy authentication supports the same account-service approach, or a
+local `users` array of username/password pairs in place of `no-auth`.
+Local HTTP users provide authentication without account quotas, usage tracking,
+or expiry; see the [HttpProxyServer local-users example](../../noderefs/HttpProxyServer).
+SOCKS password authentication and HTTP Basic do not encrypt credentials by
+themselves. Use a protected connection when accessing a proxy across an
+untrusted network.
+
+## Where to add a remote transport
+
+The connector's `dest_context->address` and `dest_context->port` follow the
+destination requested by the application. Replacing these with one fixed
+address would send every request to that one service.
+
+To use a remote exit, a proxy protocol such as VLESS carries that requested
+destination across the transport; the final client-side connector then points
+to the remote WaterWall server. [The Mux example](./socks-mux.mdx) demonstrates
+both roles and separates SOCKS TCP from direct UDP before adding Mux.
