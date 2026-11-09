@@ -5,7 +5,7 @@ sidebar_label: "Part 2: Lines & Lifetime"
 description: "The connection lifecycle, re-entrancy hazards, line references, and the clean-finish patterns that keep WaterWall tunnels free of use-after-free bugs."
 ---
 <!--
-Documentation version: 201
+Documentation version: 203
 -->
 
 # Part 2: Lines, Callbacks & Lifetime Safety
@@ -121,10 +121,14 @@ an uncertified neighbour.
 
 ### Router and SniffRouter retirement
 
-Both routers borrow the source owner's normal line. Router can choose a route
-during Init when all rules depend only on existing metadata; payload-dependent
-rules and SniffRouter defer branch Init until classification. Publish the selected
-route and the startup replay guard before calling branch Init. Reentrant upstream
+Both routers borrow the source owner's normal line. During Init, Router evaluates
+the leading metadata-only rules in order and can commit the first match without
+waiting for unrelated protocol or attribute rules later in the table. It stops
+at the first payload-dependent rule; a later metadata rule cannot overtake that
+decision. Explicit domain sniffing still defers classification so its destination
+observation and rewrite occur before branch Init. SniffRouter also defers branch
+Init until classification. Publish the selected route and the startup replay
+guard before calling branch Init. Reentrant upstream
 input must wait until that Init returns and follow the original classified bytes.
 Keep the guard through every replay handoff so newer input cannot overtake the
 retained suffix. Finish clears local state; an outer replay must stop even when
@@ -2616,6 +2620,27 @@ Downstream Init and upstream Est retain the normal constructor's rejection polic
 this is a node-specific contract, not a rule for reverse/Bridge or companion lines.
 Payload, Pause/Resume and Finish still operate in both ordinary directions.
 
+Explicit DomainResolver nodes choose native, direct or chain DNS. Native uses the
+existing worker channel; direct and chain reuse one custom-socket c-ares channel
+per instance and owner worker. The application line is borrowed. The transport
+owns separately created **normal DNS lines**, including in a packet-containing
+chain. Publish their exact-line transport association and owner inventory before
+outward Init, and dispatch every DNS Est, Payload, Pause, Resume and Finish to
+that owner. Never forward a DNS callback to an application's prev. Receiving
+Finish destroys the exact owned DNS line before returning, without reflecting
+Finish to the sender. DNS lines stay active while the channel owns them;
+application bypass must not retire their transport state.
+
+A query and a c-ares connection have different lifetimes: queries may multiplex
+or reuse one DNS transport. Abandoning an application invalidates only its
+line-bound completion; the shared wrapper settles that retained reference once
+without canceling unrelated queries. Custom-channel submission uses the same
+line lifetime/shutdown guards as the native line helper. Cache and hosts-file
+completion may be synchronous. The virtual backend applies `ARES_AI_NOSORT` so
+address sorting cannot create connections to resolved application destinations;
+WaterWall applies the configured address-selection strategy afterward. Native
+lookup hints remain unchanged.
+
 The resolver keeps one authoritative upstream backlog through next Init. The
 Open phase permits downstream Est and replies immediately; an Init guard serializes
 new upstream input behind older DNS input. DNS completion releases that FIFO
@@ -2627,7 +2652,7 @@ to next once Init starts. Failures before next Init finish only prev; internal
 failures after it starts finish both initialized sides. Received Finish destroys
 local state first and propagates only away from its sender.
 
-On a normal line, the resolver permanently bypasses itself once next Init has
+On an application normal line, the resolver permanently bypasses itself once next Init has
 returned, its pending FIFO is empty, and its local hold and neighbour pressure
 notifications have settled. Neither direction needs to be unpaused when the
 permissions already match. Destroy the entire resolver state, including embedded

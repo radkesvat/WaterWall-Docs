@@ -5,7 +5,7 @@ sidebar_label: "Part 5: Anatomy & Workflow"
 description: "The on-disk layout of a WaterWall tunnel, what each file owns, node.c metadata, the create/line-state patterns, HTTP constraints, and the implementation workflow."
 ---
 <!--
-Documentation version: 189
+Documentation version: 192
 -->
 
 # Part 5: Anatomy of a Tunnel & Workflow
@@ -336,9 +336,27 @@ application protocols; route-control bits carry a one-shot internal instruction
 such as an already-negotiated SOCKS UDP relay endpoint. A Router starting a new
 sniffing window must call `addresscontextClearDetectedProtocols()`, which clears
 only observed protocol bits. `addresscontextClearOptionalFlags()` is the full
-reset for a caller that genuinely replaces the context. The designated outbound
-adapter consumes route-control metadata exactly once and clears it after setup;
+reset for a caller that genuinely replaces the context. The first logical proxy destination selector or designated outbound
+adapter consumes route-control destination metadata exactly once and clears it after setup;
 rules must never treat route-control bits as sniffed protocols.
+
+`address_context_t.resolver_dns` is an independent origin bit for resolver-generated
+DNS, accessed through `addresscontextSetResolverDns()` and
+`addresscontextIsResolverDns()`. It does not identify arbitrary application DNS.
+Full `addresscontextCopy()` preserves it. Reset, full endpoint replacement and
+`addresscontextClearOptionalFlags()` clear it; `addresscontextClearDetectedProtocols()`
+and `addresscontextSetOnlyProtocol()` preserve it. Router starts a new sniffing
+window without erasing this bit and can match `resolver-dns` at Init. Preserve
+it on the logical DNS flow when copying that flow's destination. An independently
+created outer VPN carrier and unrelated application context remain unmarked.
+Generated DNS endpoints also carry the existing one-shot destination pin. The
+first logical proxy selector honors the pinned address, port and exact TCP/UDP
+instead of its configured target, then consumes the pin before an independent
+outer carrier chooses its server. TcpConnector and UdpConnector honor a pin
+for their own exact transport and refuse a mismatch; TCP pin handling disables
+CIDR destination randomization while preserving selected socket options.
+Resolver origin and destination pin have different lifetimes: consuming the pin
+does not erase the logical DNS marker.
 
 Framework-owned worker messages, timers, WIO callbacks, and async DNS requests
 settle before component destruction under lifecycle-v2, so those contexts may
@@ -635,7 +653,7 @@ configurations remain excluded globally.
 ### External-node ABI
 
 External libraries must export `waterwallNodeLifecycleAbiVersion()` returning
-`WW_EXTERNAL_NODE_ABI_VERSION`, currently `8`. The loader rejects missing or
+`WW_EXTERNAL_NODE_ABI_VERSION`, currently `9`. The loader rejects missing or
 mismatched descriptors before resolving or invoking a node getter. Rebuild
 external libraries against the current headers: `line_t` stores four inline
 64-bit active-tunnel mask words for chains of up to 256 instances. Packet checksum
@@ -644,6 +662,9 @@ requests use
 longer contains that state or its old inline accessors. `socket_filter_option_t` is
 passed by value and no longer includes `shared_balance_table`. Balancing state
 belongs to private SocketManager filters, not the public options structure.
+The worker-owned `dns_resolver_t` includes custom transport readiness state and
+is embedded in public `worker_t`; external nodes must use the matching worker
+layout when accessing worker resources.
 `WW_EXTERNAL_NODE_LIFECYCLE_ABI_VERSION` remains an alias for this complete gate;
 the lifecycle callback semantics themselves are unchanged.
 
@@ -723,6 +744,36 @@ exists, configured-next validation, its own insertion and onward traversal.
 Check startup failure after insertion before continuing. A nested `onChain` may
 merge and destroy the supplied chain; reacquire it through `tunnelGetChain()`
 before subsequent work, as with ordinary chaining.
+
+### DomainResolver DNS side branches
+
+The resolver's application `next` keeps its existing SameAs layer behavior.
+A direct or distinct chain DNS branch has a private L4 head in the same assembled
+chain. Its downstream callbacks use normal dispatch helpers to reach the resolver's
+exact-line owner; its DNS edge does not impose L4 on the separate application
+edge. Children participate in normal chain indexing, state reservation, padding,
+layer solving and central lifecycle traversal. The resolver destroys its private
+head/connector only after worker callbacks and owned lines settle. Do not drive
+an already-indexed child through a second parent lifecycle traversal.
+
+Direct mode loads the registered `TcpUdpConnector` factory instead of adding a
+reverse static dependency on connectors. It constructs fresh destination-context
+address/port settings; the connector's own preparation hooks and native resolver
+remain intact. Never inherit the parent's direct/chain settings into those helpers:
+a numeric server bypasses runtime DNS but cannot stop constructor recursion.
+A missing factory rejects direct mode while native remains available.
+
+Chain mode uses the configured ordinary `next` as its DNS entry when `dns-next`
+is omitted; application and separately owned DNS lines share that entry without
+sharing their destinations or lifetimes. An explicit nonempty `dns-next` overrides
+only DNS egress, and naming the ordinary next explicitly remains supported.
+Resolve the selected entry through the existing branch-entry mechanism after
+private predecessors have been inserted. A distinct branch must be unowned by
+another predecessor; arbitrary earlier Routers and existing bound VPN paths are
+rejected. Omitting `mode` still selects native DNS.
+Detect structural self-references/cycles before nested chaining, and validate the
+solved DNS entry as L4. A numeric or independently bootstrapped outer VPN endpoint
+is required; topology validation cannot detect every runtime bootstrap dependency.
 
 ### The lifecycle-v2 shutdown stages
 

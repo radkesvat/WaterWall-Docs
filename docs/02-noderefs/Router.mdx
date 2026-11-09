@@ -6,7 +6,7 @@ description: "Reference documentation for the Router node."
 ---
 
 <!--
-Documentation version: 153
+Documentation version: 156
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/Router/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/Router.mdx, and all files must keep the same documentation version.
 -->
 
@@ -35,12 +35,18 @@ flowchart LR
 Think of `Router` as an early selector when it can be, and a deferred branch
 selector when it must inspect bytes:
 
-- If no rule or root setting needs payload inspection, it evaluates the line's
-  source/destination metadata, network, and credential facts during `Init` and
-  initializes the selected branch immediately.
-- A rule needing protocol detection, HTTP Host/:authority, TLS/QUIC SNI, or HTTP
-  `Upgrade` waits for the first upstream payload and buffers those bytes while
-  deciding.
+- With no root `sniffing`, Router evaluates the leading metadata-only rules
+  during `Init`. It skips nonmatches and initializes the first matching branch,
+  even if later rules need payload inspection. If every rule is metadata-only
+  and none matches, it uses the default `next` immediately.
+- Reaching the first rule containing `protocol` or `attributes` stops this
+  initial scan. Router does not skip it to reach a later metadata match. A rule
+  combining metadata and those conditions still waits for payload.
+- Explicit root `sniffing` preserves payload-based classification so domain
+  observation or rewriting happens before branch Init. Deferred lines buffer
+  upstream bytes while deciding.
+- A metadata-evaluation error closes the line; it does not select a later rule
+  or fall through to the default route.
 - After a deferred rule wins, it initializes the selected branch and replays the
   buffered bytes to that branch.
 - The decision is made once per connection. Later payloads go directly through
@@ -52,16 +58,17 @@ If no rule matches, the connection uses the node's top-level `next`. That `next`
 is the default route.
 
 At `Init`, Router clears stale observed-protocol bits while preserving separate
-one-shot route-control metadata. This lets a protocol tunnel carry an already
+one-shot route-control metadata and the resolver-generated DNS marker. This lets
+a protocol tunnel carry an already
 negotiated destination through Router to its designated outbound adapter without
 making that metadata available to `protocol` rules.
 
 :::warning
-Rules that need sniffing still need the client side to send first. For
-server-first or handshake clients that need downstream establishment before
-their first write, use only metadata-only rules (for example `network`, ports,
-addresses, or credentials) and leave root `sniffing`, `protocol`, and
-`attributes` out of that Router.
+A payload-dependent decision needs the client side to send first. For a
+server-first flow or DNS transport that needs establishment before writing,
+place its matching metadata rule before any `protocol` or `attributes` rule and
+leave root `sniffing` off. Later payload rules do not delay the early match;
+an earlier payload rule or explicit root sniffing does.
 :::
 
 ## Typical Placement
@@ -263,6 +270,7 @@ Unknown fields inside a rule are ignored with a warning. A rule with only
 | `destination-port-range` | two-integer array | Inclusive destination port range. |
 | `destination-domain` | string or array | Destination domain, including sniffed HTTP Host/:authority or TLS/QUIC SNI when root `sniffing` is enabled and domain sniffing is allowed for the line. Supports exact, wildcard, `*`, and `geosite:<list>`. |
 | `network` | string or array | Destination transport flags: `tcp`, `udp`, `icmp`, `packet`. Comma-combined strings like `"tcp,udp"` are accepted. |
+| `resolver-dns` | boolean | Resolver-generated logical DNS traffic (`true`) or lines without that marker (`false`); available at Init without sniffing. |
 | `protocol` | string or array | Protocol detected from first payload: `http1`, `tls`, `bittorrent`. |
 | `attributes` | non-empty array | Sniffed boolean attributes. Currently supports `http_upgrade_present`. |
 | `username` | string or array | Exact case-sensitive match against authenticated credential markers on the line. |
@@ -400,7 +408,7 @@ For IP-only destinations, enable root `sniffing` so Router can read HTTP
 Host/:authority or TLS/QUIC SNI and store the observed value in `dest_ctx.domain`
 for `destination-domain` matching while preserving the IP endpoint.
 
-## Network And Protocol Conditions
+## Network And Metadata Conditions {#network-and-protocol-conditions}
 
 ### `network`
 
@@ -422,6 +430,63 @@ Supported values:
 
 You can use one string, an array of strings, or comma-combined strings. Values
 inside the field are OR-combined.
+
+### `resolver-dns`
+
+`resolver-dns` matches the origin marker on UDP and TCP DNS lines created by an
+explicit `DomainResolver` in `direct` or `chain` mode. Use `true` for those lines
+and `false` for lines without the marker. Only JSON booleans are accepted.
+
+This condition reads existing metadata; it neither inspects DNS payload nor
+enables sniffing. It does not identify arbitrary client DNS, TUN traffic, or
+traffic merely because it uses port 53. It is separate from `network` and the
+sniffed `protocol` condition.
+
+Place the DNS rule before payload-dependent rules when DNS must route at Init.
+For example, this Router fragment sends resolver traffic to `dns_vless`, while
+other traffic can continue to the later TLS rule or the default route:
+
+```json
+{
+  "name": "router",
+  "type": "Router",
+  "settings": {
+    "rules": [
+      { "resolver-dns": true, "target": "dns_vless" },
+      { "protocol": "tls", "target": "tls_application" }
+    ]
+  },
+  "next": "application_out"
+}
+```
+
+Define `dns_vless`, `tls_application` and `application_out` as the corresponding
+outbound branches. Set the explicit resolver's `mode` to `chain`, its `next` to
+`router`, and its `servers` to numeric DNS endpoints. Omit `dns-next` to send both
+application lines and separate DNS lines to this Router. An explicit
+`dns-next: "router"` is equivalent; another entry name overrides only DNS egress.
+The DNS branch must carry UDP and TCP fallback. Use a secure wrapper if this branch needs encryption; plain VLESS
+does not encrypt traffic.
+
+With no root `sniffing`, the leading DNS rule commits during Init, even though
+the later `protocol: "tls"` rule needs payload. A non-DNS line fails the first
+rule and waits at the TLS rule. Moving the TLS rule above the DNS rule makes DNS
+wait too: Router never skips an earlier payload-dependent rule to reach a later
+metadata match. A rule combining `resolver-dns` with `protocol` or `attributes`
+also needs payload. Explicit root `sniffing` still defers classification so its
+domain observation/rewrite can run; omit it on this Router when DNS needs early
+establishment.
+
+Router preserves the marker when clearing detected protocols at Init. Whole
+context copies retain it for the same logical DNS flow; full endpoint replacement
+or context reset clears it. The original application and an independently
+created outer VPN carrier are unmarked. VlessClient retains the logical DNS
+target while its separate UDP-over-TCP carrier uses its own unmarked context.
+
+Router matching is optional. An explicit resolver can point `dns-next` directly
+to VlessClient or another suitable branch; see the DomainResolver chain example.
+
+## Payload Conditions
 
 ### `protocol`
 
@@ -825,7 +890,7 @@ Source-backed behavior:
 
 | Callback | Behavior |
 | --- | --- |
-| upstream `Init` | Initializes Router line state and clears observed-protocol bits, preserving route-control metadata. Metadata-only rules select and initialize their branch here. |
+| upstream `Init` | Initializes Router line state and clears observed-protocol bits, preserving route-control metadata and resolver DNS origin. Without root sniffing, selects the first match in the leading metadata-only rule prefix; reaching a payload rule defers selection. |
 | first upstream `Payload` | If routing needs payload inspection, buffers and sniffs bytes, evaluates rules, initializes the selected branch and replays buffered bytes. Otherwise forwards to the branch selected during Init. |
 | later upstream `Payload` | Goes directly to the selected target or default `next`. |
 | upstream `Pause` / `Resume` | Forwarded to the selected branch, including duplicates; ignored before selection. They do not gate payload replay. |
@@ -1004,10 +1069,11 @@ to. Use it for multiport listener routing.
 
 ### Routing server-first protocols
 
-Router initializes a branch during `Init` when its configured rules use only
-metadata already on the line. If any configured rule or root setting needs
-payload sniffing, Router instead waits for the first upstream payload; such a
-configuration cannot initialize a server-first path until client data arrives.
+With no root `sniffing`, a matching rule in the leading metadata-only prefix
+initializes its branch during `Init`, even if later rules inspect payload.
+Place the server-first rule in that prefix. An earlier `protocol`/`attributes`
+rule, or explicit root `sniffing`, still waits for upstream bytes and cannot
+establish that path before the client sends.
 
 ## Node Metadata
 

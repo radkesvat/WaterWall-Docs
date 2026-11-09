@@ -6,7 +6,7 @@ description: "راهنمای node Router در WaterWall."
 ---
 
 <!--
-Documentation version: 153
+Documentation version: 156
 -->
 
 # Router
@@ -33,12 +33,17 @@ flowchart LR
 `Router` شاخهٔ مناسب را در اولین فرصت انتخاب می‌کند؛ فقط وقتی تصمیم به بررسی payload
 نیاز داشته باشد، منتظر رسیدن داده می‌ماند:
 
-- اگر هیچ rule یا تنظیم اصلی به بررسی payload نیاز نداشته باشد، در `Init`
-  بر پایه metadata مبدأ/مقصد، نوع شبکه و credential‌ها شاخه را انتخاب و همان‌جا
-  مقداردهی اولیه می‌کند.
-- rule‌ای که به تشخیص protocol، HTTP Host/:authority، TLS/QUIC SNI یا HTTP
-  `Upgrade` نیاز دارد منتظر نخستین upstream payload می‌ماند و آن بایت‌ها را تا
-  زمان تصمیم‌گیری در buffer نگه می‌دارد.
+- در نبود root `sniffing`، ruleهای metadata-only ابتدای فهرست در `Init` بررسی
+  می‌شوند. Router از nonmatch عبور می‌کند و اولین match را همان‌جا Init می‌کند، حتی
+  اگر ruleهای بعدی به payload نیاز داشته باشند. اگر همه ruleها metadata-only باشند
+  و هیچ‌کدام match نشوند، `next` پیش‌فرض بلافاصله انتخاب می‌شود.
+- با رسیدن به اولین rule دارای `protocol` یا `attributes`، بررسی اولیه متوقف می‌شود.
+  Router برای رسیدن به match متادیتای بعدی از آن عبور نمی‌کند. ترکیب metadata با این
+  شرط‌ها در یک rule نیز منتظر payload می‌ماند.
+- root `sniffing` صریح همچنان تصمیم را وابسته به payload نگه می‌دارد تا مشاهده یا
+  بازنویسی دامنه پیش از Init شاخه انجام شود. line تأخیری داده‌های upstream را تا
+  زمان تصمیم در buffer نگه می‌دارد.
+- خطای ارزیابی metadata، line را می‌بندد؛ rule بعدی یا مسیر پیش‌فرض جایگزین آن نمی‌شود.
 - پس از match شدن یک rule تأخیری، شاخه انتخابی را مقداردهی اولیه می‌کند و
   بایت‌های bufferشده را روی همان شاخه دوباره پخش می‌کند.
 - برای هر connection فقط یک‌بار تصمیم می‌گیرد و payload‌های بعدی مستقیم از همان
@@ -49,11 +54,12 @@ flowchart LR
 مسیر پیش‌فرض است.
 
 :::warning
-rule‌های نیازمند sniffing همچنان باید ابتدا از client داده بگیرند. برای
-protocol‌های server-first یا client‌هایی که پیش از نخستین write به downstream
-establishment نیاز دارند، فقط از rule‌های metadata-only (برای نمونه `network`،
-port، address یا credential) استفاده کنید و `sniffing`، `protocol` و
-`attributes` را در آن Router نیاورید.
+تصمیم وابسته به payload نیاز دارد client ابتدا داده بفرستد. برای جریان
+server-first یا transport DNS که پیش از write به establishment نیاز دارد، rule
+متادیتای مطابق آن را پیش از هر rule دارای `protocol` یا `attributes` بگذارید و
+root `sniffing` را خاموش نگه دارید. ruleهای payload بعدی این match زودهنگام را عقب
+نمی‌اندازند؛ اما rule وابسته به payload در جایگاه قبلی یا root sniffing صریح چنین
+اثری دارد.
 :::
 
 ## جایگاه رایج
@@ -253,6 +259,7 @@ authentication فقط به loopback متصل است.
 | `destination-port-range` | آرایه دو عددی | بازه بسته برای destination port. |
 | `destination-domain` | string یا array | domain مقصد، از جمله domain sniff شده از HTTP Host/:authority یا TLS/QUIC SNI وقتی root `sniffing` فعال باشد و domain sniffing برای line مجاز باشد؛ همچنین wildcard `*` یا `geosite:<list>`. |
 | `network` | string یا array | فلگ‌های transport: `tcp`، `udp`، `icmp`، `packet`. ترکیب مثل `"tcp,udp"` هم قبول می‌شود. |
+| `resolver-dns` | boolean | ترافیک منطقی DNS تولیدشده توسط resolver با `true` و line بدون این marker با `false`؛ بدون sniffing در Init در دسترس است. |
 | `protocol` | string یا array | protocol تشخیص داده‌شده از payload اول: `http1`، `tls`، `bittorrent`. |
 | `attributes` | array غیرخالی | مشخصات boolean sniff شده. فعلاً فقط `http_upgrade_present`. |
 | `username` | string یا array | match دقیق و case-sensitive روی marker‌های credential authenticated شده روی line. |
@@ -387,7 +394,7 @@ IP‌های تکی به شکل host route در نظر گرفته می‌شوند
 Host/:authority یا TLS/QUIC SNI را در `dest_ctx.domain` ذخیره کند و
 شرط `destination-domain` بتواند برقرار شود، بدون آن‌که IP endpoint اصلی پاک شود.
 
-## شرط‌های Network و protocol {#شرطهای-network-و-protocol}
+## شرط‌های Network و Metadata {#شرطهای-network-و-protocol}
 
 ### `network`
 
@@ -408,6 +415,64 @@ Host/:authority یا TLS/QUIC SNI را در `dest_ctx.domain` ذخیره کند 
 - `packet`
 
 می‌توانید یک string، آرایه‌ای از string‌ها یا string‌های جداشده با comma بدهید. مقدارهای داخل این فیلد با رابطه OR بررسی می‌شوند.
+
+### `resolver-dns`
+
+این شرط نشانگر مبدأ تولید ترافیک را در lineهای DNS روی UDP و TCP تطبیق می‌دهد؛
+lineهایی که یک DomainResolver صریح در حالت `direct` یا `chain` می‌سازد. مقدار `true`
+برای این lineها و `false` برای lineهای بدون نشانگر است. فقط boolean واقعی JSON
+پذیرفته می‌شود.
+
+شرط از metadata موجود استفاده می‌کند؛ payload مربوط به DNS را بررسی نمی‌کند و
+sniffing را فعال نمی‌کند. DNS دلخواه client، ترافیک TUN یا صرفاً ترافیک پورت ۵۳ را
+تشخیص نمی‌دهد. این نشانگر از `network` و شرط `protocol` که با sniffing مشخص می‌شود
+جداست.
+
+وقتی DNS باید در Init مسیریابی شود، rule آن را پیش از ruleهای وابسته به payload
+بگذارید. این قطعه Router، ترافیک resolver را به `dns_vless` می‌فرستد؛ ترافیک دیگر
+می‌تواند با rule بعدی TLS یا مسیر پیش‌فرض هدایت شود:
+
+```json
+{
+  "name": "router",
+  "type": "Router",
+  "settings": {
+    "rules": [
+      { "resolver-dns": true, "target": "dns_vless" },
+      { "protocol": "tls", "target": "tls_application" }
+    ]
+  },
+  "next": "application_out"
+}
+```
+
+شاخه‌های خروجی `dns_vless`، `tls_application` و `application_out` را نیز تعریف کنید.
+در resolver صریح، `mode` را `chain`، مقدار `next` را `router` و `servers` را
+endpointهای عددی DNS قرار دهید. با حذف `dns-next`، lineهای برنامه و lineهای جداگانهٔ
+DNS هر دو وارد همین Router می‌شوند. نوشتن `dns-next: "router"` نیز همین نتیجه را
+دارد؛ نام ورودی دیگری در این فیلد فقط مسیر DNS را تغییر می‌دهد. شاخهٔ DNS باید UDP و fallback به TCP را حمل کند. برای رمزنگاری از پوشش
+امن مناسب استفاده کنید؛ VLESS ساده رمزنگاری ندارد.
+
+وقتی root `sniffing` وجود ندارد، rule اول DNS در همان Init تصمیم می‌گیرد، حتی اگر
+rule بعدی `protocol: "tls"` به payload نیاز داشته باشد. line غیر DNS از rule اول
+عبور می‌کند و در rule TLS منتظر می‌ماند. اگر rule TLS را بالاتر بگذارید، DNS هم
+منتظر می‌ماند: Router برای رسیدن به match متادیتای بعدی، یک rule وابسته به payload
+را رد نمی‌کند. ترکیب `resolver-dns` با `protocol` یا `attributes` در یک rule نیز
+به payload نیاز دارد. root `sniffing` صریح همچنان تصمیم را عقب می‌اندازد تا مشاهده
+یا بازنویسی دامنه انجام شود؛ اگر DNS به establishment زودهنگام نیاز دارد، آن را
+روی این Router تنظیم نکنید.
+
+پاک‌کردن مشاهده‌های protocol در Init نشانگر را از بین نمی‌برد. کپی کامل context
+برای همان جریان منطقی DNS آن را حفظ می‌کند؛ جایگزینی کامل endpoint یا reset آن را
+پاک می‌کند. برنامهٔ اصلی و carrier بیرونی مستقلی که ساخته می‌شود نشانگر ندارند.
+VlessClient مقصد منطقی DNS را نگه می‌دارد، ولی carrier جداگانهٔ UDP-over-TCP context
+بدون نشانگر خودش را دارد.
+
+تطبیق با Router اختیاری است. `dns-next` در resolver صریح می‌تواند مستقیم به
+VlessClient یا شاخهٔ مناسب دیگری اشاره کند؛ نمونهٔ chain در راهنمای DomainResolver
+را ببینید.
+
+## شرط‌های Payload
 
 ### `protocol`
 
@@ -780,7 +845,7 @@ TcpListener -> Router
 
 | callback | رفتار |
 | --- | --- |
-| upstream `Init` | state داخلی را مقداردهی اولیه و فقط بیت‌های protocol تشخیص‌داده‌شده را از `dest_ctx.optional_flags` پاک می‌کند؛ metadata کنترل مسیر یک‌بارمصرف حفظ می‌شود. اگر هیچ rule یا تنظیمی به sniffing payload نیاز نداشته باشد، شاخه انتخابی همین‌جا آماده می‌شود. |
+| upstream `Init` | state داخلی را مقداردهی اولیه و فقط بیت‌های protocol تشخیص‌داده‌شده را از `dest_ctx.optional_flags` پاک می‌کند؛ metadata کنترل مسیر یک‌بارمصرف و marker مبدأ DNS حفظ می‌شوند. در نبود root sniffing، اولین match در بخش ابتدایی ruleهای metadata-only همین‌جا شاخه را آماده می‌کند؛ رسیدن به rule وابسته به payload بررسی اولیه را متوقف می‌کند. |
 | اولین upstream `Payload` | اگر تصمیم به بررسی payload نیاز داشته باشد، داده را buffer و بررسی می‌کند، rule‌ها را ارزیابی و شاخهٔ انتخابی را مقداردهی اولیه می‌کند و سپس داده را بازپخش می‌کند؛ در غیر این صورت آن را به شاخهٔ انتخاب‌شده در Init می‌فرستد. |
 | payload‌های بعدی upstream | مستقیم به target انتخابی یا default `next` می‌روند. |
 | upstream `Pause` / `Resume` | پس از انتخاب route، حتی در صورت تکرار، به شاخهٔ انتخابی می‌روند؛ پیش از انتخاب نادیده گرفته می‌شوند و مانع بازپخش payload نیستند. |
@@ -951,7 +1016,7 @@ Host/:authority یا TLS/QUIC SNI sniff کرده باشد.
 
 ### routing برای protocol‌های server-first {#routing-برای-protocolهای-server-first}
 
-وقتی rule‌ها فقط metadata موجود روی line را می‌خواهند، `Router` شاخه را در `Init` آماده می‌کند. اگر هر rule یا تنظیم اصلی به sniffing payload نیاز داشته باشد، تصمیم تا نخستین upstream payload عقب می‌افتد؛ چنین config‌ای تا رسیدن داده client نمی‌تواند شاخه server-first را مقداردهی اولیه کند.
+در نبود root `sniffing`، اولین rule مطابق در بخش metadata-only ابتدای فهرست، شاخه را در همان Init آماده می‌کند؛ ruleهای payload در ادامه مانعی نیستند. rule جریان server-first را در همان بخش ابتدایی بگذارید. وجود rule دارای `protocol` یا `attributes` پیش از آن، یا root `sniffing` صریح، همچنان تصمیم را تا دریافت دادهٔ upstream عقب می‌اندازد.
 
 `Router` header تازه‌ای به ابتدای payload اضافه نمی‌کند و به left padding نیاز ندارد.
 

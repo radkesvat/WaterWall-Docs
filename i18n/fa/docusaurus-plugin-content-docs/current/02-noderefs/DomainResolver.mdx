@@ -6,140 +6,519 @@ description: "راهنمای node DomainResolver در WaterWall."
 ---
 
 <!--
-Documentation version: 159
+Documentation version: 162
 -->
 
 # DomainResolver
 
-`DomainResolver` یک node داخلی برای کاربردهای پیشرفته است که پیش از عبور دادن `Init`، نام domain مقصد line را به IP تبدیل می‌کند.
+`DomainResolver` نام دامنهٔ مقصد برنامه را به IP تبدیل می‌کند و سپس اتصال را به
+node بعدی می‌فرستد. با انتخاب `native`، `direct` یا `chain` مشخص می‌کنید درخواست‌های
+DNS همین resolver از چه مسیری ارسال شوند.
 
-در config‌های معمول لازم نیست این node را دستی اضافه کنید. node‌های سطح بالاتری مانند `TcpConnector`، `UdpConnector`، `Router`، `Socks5Client`، `VlessClient` و `TrojanClient` در صورت نیاز آن را داخل خودشان می‌سازند و تنظیم می‌کنند. ابتدا از تنظیمات عمومی همان node‌ها استفاده کنید، مگر اینکه عمداً chain سفارشی‌ای می‌سازید که خودش `line->routing_context.dest_ctx` را مقداردهی می‌کند.
-
-## کاری که انجام می‌دهد
-
-`DomainResolver` فقط context آدرس مقصد را می‌خواند و به‌روزرسانی می‌کند:
-
-```text
-line->routing_context.dest_ctx
-```
-
-اگر مقصد از ابتدا IP باشد یا قبلاً resolve شده باشد، `Init` بی‌درنگ عبور داده می‌شود. اگر مقصد نام domain باشد، درخواست DNS به‌صورت async روی worker فعلی انجام می‌شود؛ سپس strategy انتخاب آدرس اعمال و IP برگزیده در `dest_ctx` نوشته می‌شود و در پایان `Init` که منتظر مانده بود عبور می‌کند.
-
-این node:
-
-- socket باز نمی‌کند
-- line جدید نمی‌سازد
-- payload را تغییر نمی‌دهد
-- بایتی از پروتکل به buffer اضافه نمی‌کند
-- `src_ctx` را resolve نمی‌کند
-
-## جایگاه رایج
-
-### resolve کردن مقصد proxy پیش از مسیریابی مبتنی بر IP
+این node را پس از node تعیین‌کنندهٔ مقصد، مانند `Socks5Server`، و پیش از مصرف‌کنندهٔ
+آدرس resolve‌شده قرار دهید:
 
 ```text
-TcpListener -> Socks5Server -> Router(resolve-domains=true)
-                                 |-- destination IP rule -> BlackHole(active)
-                                 `-- default -> TcpConnector
+TcpListener -> Socks5Server -> DomainResolver -> application next
 ```
-SOCKS5 در اینجا hostname و پورت درخواستی را مشخص می‌کند. `Router` با
-`resolve-domains: true` پیش از بررسی ruleهای IP یک DomainResolver داخلی می‌سازد.
-آدرس و پورت connector نهایی را از context مقصد بخوانید. به این ترتیب policy مبتنی
-بر IP می‌تواند hostname ارسالی برنامه را بررسی کند.
 
-[نمونه کامل Router](./Router.mdx#complete-example) را مبنا قرار دهید؛ شرط دامنه را
-با `destination-ip` موردنظر عوض کنید و `resolve-domains` را روی Router فعال کنید.
-resolver دوم را دستی اضافه نکنید.
+برای درخواست `example.com:443`، line برنامه منتظر DNS می‌ماند، IP منتخب را می‌گیرد
+و با همان پورت ۴۴۳ به `next` ادامه می‌دهد. در حالت‌های `direct` و `chain`، lineهای
+جداگانهٔ DNS به سرور DNS تنظیم‌شده وصل می‌شوند؛ مقصد یا payload برنامه با آن‌ها
+جایگزین نمی‌شود.
 
-جایگذاری دستی برای مصرف‌کننده‌ی سفارشی است که آدرس resolve‌شده لازم دارد و خودش
-این helper را نمی‌سازد. آن را بعد از node تعیین‌کننده‌ی context مقصد و پیش از مصرف‌کننده
-بگذارید. قطعه پایین فقط چنین helper دستی را تعریف می‌کند؛ connectorهای عادی هم دامنه
-مقصد خود را با تنظیم عمومی `domain-strategy` resolve می‌کنند.
+مقصدی که از ابتدا IP باشد یا قبلاً resolve شده باشد، بی‌درنگ عبور می‌کند. بایت‌های
+payload برنامه تغییر نمی‌کنند و فقط `dest_ctx` resolve می‌شود، نه `src_ctx`.
 
-## نمونه تنظیمات
+## انتخاب حالت DNS
+
+| حالت | مسیر ارسال DNS | کاربرد |
+| --- | --- | --- |
+| `native` | resolver موجود c-ares روی worker، با socket بومی و تنظیمات DNS در core. | رفتار عادی DNS بدون ساخت شاخهٔ جداگانه. |
+| `direct` | connector خصوصی TCP/UDP در WaterWall، به سرورهای DNS صریح شما. | استفاده از lineهای WaterWall بدون تنظیم یک chain خروجی جدا. |
+| `chain` | lineهای متعلق به resolver وارد `next` معمولی یا override اختیاری `dns-next` می‌شوند. | عبور DNS از proxy، مسیر VPN یا chain مناسب دیگری که انتخاب می‌کنید. |
+
+پیش‌فرض `native` است. حالت‌های `native` و `direct` به‌خودی‌خود DNS را رمز نمی‌کنند.
+در `chain`، محافظت از DNS به شاخهٔ انتخاب‌شده بستگی دارد؛ نام این حالت به‌تنهایی
+رمزنگاری ایجاد نمی‌کند.
+
+## تنظیمات مشترک
+
+| فیلد | پیش‌فرض | معنی |
+| --- | --- | --- |
+| `next` در node | — | ادامهٔ مسیر برنامه و ورودی پیش‌فرض DNS در `chain`. |
+| `settings.mode` | `native` | یکی از `native`، `direct` یا `chain`. |
+| `settings.strategy` | `core-settings` | روش انتخاب آدرس از نتیجه‌های DNS. |
+| `settings.verbose` | `false` | ثبت آغاز lookup در سطح debug مربوط به DNS؛ آدرس منتخب از logger عادی DNS استفاده می‌کند. |
+| `settings.servers` | — | در `direct` و `chain` اجباری و در `native` ممنوع. |
+| `settings.dns-next` | `next` در حالت `chain` | نام غیرخالی و اختیاری برای تغییر ورودی DNS در `chain`؛ در دو حالت دیگر ممنوع. |
+
+حذف object مربوط به `settings`، حالت native و پیش‌فرض‌های مشترک را انتخاب می‌کند.
+اگر `settings` نوشته شود، باید object باشد.
+
+برای `strategy` از یکی از رشته‌های زیر استفاده کنید:
+
+| مقدار | انتخاب آدرس |
+| --- | --- |
+| `core-settings` | استفاده از `dns.domain-strategy` در `core.json`. |
+| `accept-dns-returned-order` | نخستین نتیجهٔ قابل استفادهٔ IPv4 یا IPv6. |
+| `prefer-ipv4` | اولویت IPv4 و در نبود آن IPv6. |
+| `prefer-ipv6` | اولویت IPv6 و در نبود آن IPv4. |
+| `only-ipv4` | پذیرش فقط نتیجهٔ IPv4. |
+| `only-ipv6` | پذیرش فقط نتیجهٔ IPv6. |
+
+parser مشترک، مقدارهای عددی داخلی strategy را نیز می‌پذیرد. انتخاب آدرس از حالت
+transport مربوط به DNS مستقل است.
+
+## حالت Native
+
+وقتی تنظیمات DNS در core مسیر موردنیاز شما را فراهم می‌کند، از `native` استفاده
+کنید. lookupها channel موجود resolver روی worker مالک را به اشتراک می‌گذارند.
+c-ares از socket بومی استفاده می‌کند و درخواست وارد شاخهٔ DNS انتخاب‌شده توسط این
+node نمی‌شود. سرورها، منبع lookup، retry و cache از تنظیمات core می‌آیند. اگر فهرست
+سرور در core مشخص نشده باشد، c-ares از پیکربندی معمول resolver سیستم استفاده می‌کند.
+
+`mode` را `native` بگذارید یا حذف کنید. گزینه‌های DNS را در `core.json` تنظیم کنید،
+نه در `servers` یا `dns-next` این node. هر دو فیلد در native رد می‌شوند تا تنظیمی
+بی‌صدا نادیده گرفته نشود.
+
+### نمونه Native
+
+این فایل کامل nodeها یک proxy محلی SOCKS5 برای TCP می‌سازد. resolver صریح نام مقصد
+را resolve می‌کند و سپس `application-out` به IP آن وصل می‌شود. فایل را به‌عنوان
+پیکربندی node ذخیره و از `core.json` معرفی کنید.
 
 ```json
 {
-  "name": "resolve-domain",
-  "type": "DomainResolver",
-  "settings": {
-    "strategy": "prefer-ipv4",
-    "verbose": false
-  },
-  "next": "outbound"
+  "name": "dns-native",
+  "nodes": [
+    {
+      "name": "local-in",
+      "type": "TcpListener",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 1080
+      },
+      "next": "socks"
+    },
+    {
+      "name": "socks",
+      "type": "Socks5Server",
+      "settings": {
+        "no-auth": true,
+        "connect": true
+      },
+      "next": "resolve"
+    },
+    {
+      "name": "resolve",
+      "type": "DomainResolver",
+      "settings": {
+        "mode": "native",
+        "strategy": "prefer-ipv4"
+      },
+      "next": "application-out"
+    },
+    {
+      "name": "application-out",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "dest_context->address",
+        "port": "dest_context->port"
+      }
+    }
+  ]
 }
 ```
 
-## فیلدها
+برای انتخاب سرور مشخص در native، فیلد `dns` زیر را به `core.json` موجود اضافه کنید.
+آدرس نمونه را با resolver واقعی خود جایگزین کنید:
 
-| فیلد | نوع | اجباری | توضیح |
-|---|---|---|---|
-| `type` | string | بله | باید `DomainResolver` باشد. |
-| `settings` | object | خیر | object تنظیمات اختیاری؛ اگر نوشته شود باید از نوع object باشد. |
-| `next` | string | معمولاً | node‌ای که پس از resolve شدن مقصد، `Init` را در جهت upstream می‌گیرد. |
+```json
+{
+  "dns": {
+    "servers": ["203.0.113.53:53"]
+  }
+}
+```
 
-این node فقط `Init` در جهت upstream و `Est` در جهت downstream را می‌پذیرد. `Init` در جهت downstream و `Est` در جهت upstream با رفتار پیش‌فرض سازنده رد می‌شوند. payload، Pause/Resume و Finish همچنان در هر دو جهت معنای معمول خود را دارند.
+بسیاری از nodeها از قبل helper داخلی DomainResolver با DNS بومی دارند. برای استفادهٔ
+عادی، تنظیم `domain-strategy` همان node یا `resolve-domains` در Router ممکن است کافی
+باشد. resolver صریح زمانی مفید است که جای آن را پیش از routing یا مصرف‌کنندهٔ دیگر
+به‌طور مشخص انتخاب می‌کنید.
 
-## تنظیمات
+## حالت Direct
 
-| گزینه | پیش‌فرض | توضیح |
-|---|---|---|
-| `strategy` | مقدار core در `dns.domain-strategy` | روش انتخاب نتیجه DNS. یکی از `core-settings`، `accept-dns-returned-order`، `prefer-ipv4`، `prefer-ipv6`، `only-ipv4` یا `only-ipv6`. |
-| `verbose` | `false` | آغاز resolve را در لاگ debug ثبت می‌کند. آدرس resolve‌شده همچنان در logger عادی debug مربوط به DNS ثبت می‌شود. |
+وقتی می‌خواهید DNS از connectorهای WaterWall عبور کند و تنظیمات ساده بماند، از
+`direct` استفاده کنید. resolver یک شاخهٔ خصوصی `TcpUdpConnector` برای DNS می‌سازد.
+شما فقط endpoint عددی سرورهای DNS را می‌دهید؛ نیازی به ساخت node جداگانه برای
+connector DNS یا تنظیم `dns-next` نیست.
 
-`strategy` می‌تواند string یا یکی از مقادیر داخلی مورد قبول parser مشترک domain-strategy باشد.
+```text
+application -> DomainResolver -> application next
+                    |
+                    +-> private TCP/UDP connector -> DNS server
+```
 
-## جریان اجرا
+درخواست UDP و fallback به TCP هر دو از همین شاخهٔ خصوصی عبور می‌کنند. برنامه فقط
+پس از موفقیت resolution به `next` اصلی ادامه می‌دهد. این حالت transport معمولی DNS
+را به کار می‌برد و VPN یا رمزنگاری اضافه نمی‌کند.
 
-هنگام دریافت `Init` از upstream:
+### نمونه Direct
 
-1. state مربوط به line آماده می‌شود.
-2. `dest_ctx` بررسی می‌شود
-3. اگر نیازی به DNS نباشد، `Init` در جهت upstream به `next` می‌رود.
-4. اگر DNS لازم باشد، node وارد state مربوط به resolving می‌شود و callback برمی‌گردد.
-5. پس از پایان DNS، آدرس انتخاب‌شده در `dest_ctx` نوشته می‌شود.
-6. `Init` منتظرمانده در جهت upstream عبور داده می‌شود.
-7. payload‌هایی که هنگام DNS در صف مانده‌اند، به‌ترتیب ارسال می‌شوند.
+این فایل کامل همان ورودی محلی SOCKS5 برای TCP را دارد، اما DNS از connector خصوصی
+resolver می‌رود. `203.0.113.53` را با IP قابل دسترس سرور DNS جایگزین کنید، فایل nodeها
+را ذخیره و از `core.json` معرفی کنید. شاخهٔ DNS جداگانه‌ای در تنظیمات لازم نیست.
 
-payload در جهت downstream پس از آغاز `Init` node بعدی مستقیماً به node قبلی فرستاده می‌شود؛ این شامل پاسخ‌هایی است که در همان callback مربوط به Init دریافت می‌شوند.
+```json
+{
+  "name": "dns-direct",
+  "nodes": [
+    {
+      "name": "local-in",
+      "type": "TcpListener",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 1080
+      },
+      "next": "socks"
+    },
+    {
+      "name": "socks",
+      "type": "Socks5Server",
+      "settings": {
+        "no-auth": true,
+        "connect": true
+      },
+      "next": "resolve"
+    },
+    {
+      "name": "resolve",
+      "type": "DomainResolver",
+      "settings": {
+        "mode": "direct",
+        "strategy": "prefer-ipv4",
+        "servers": [
+          "203.0.113.53:53"
+        ]
+      },
+      "next": "application-out"
+    },
+    {
+      "name": "application-out",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "dest_context->address",
+        "port": "dest_context->port"
+      }
+    }
+  ]
+}
+```
 
-## Pending Payload
+connector خصوصی باید در build موجود باشد. در نبود آن، ساخت حالت direct با پیام
+خطا متوقف می‌شود؛ native همچنان قابل استفاده است. شکل `servers` و گزینه‌های ارث‌برده
+از core در بخش مربوط به سرورها آمده است.
 
-payload در جهت upstream فقط هنگام DNS، ورودی re-entrant در `Init` node مجاور یا وجود داده قدیمی‌تر در صف نگه داشته می‌شود. پیش از افزودن داده، هم طول منطقی و هم هزینه حافظه buffer‌ها با سقف `2 MiB` برای هر line بررسی می‌شود. سرریز پیش از `Init` node بعدی فقط سمت prev و پس از آن هر دو جهت بازشده را می‌بندد.
+## حالت Chain
 
-پس از بازشدن مسیر، `Est` مربوط به transport بدون تأخیر عبور می‌کند. تخلیه صف با ترتیب FIFO و با رعایت Pause مصرف‌کننده انجام می‌شود؛ ورودی re-entrant از دادهٔ قدیمی‌تر جلو نمی‌زند. Pause دریافت‌شده هنگام DNS پس از بازشدن مسیر مجاور نیز معتبر می‌ماند.
+برای ارسال DNS از nodeهای tunnel تنظیم‌شدهٔ خود از `chain` استفاده کنید. `mode` را
+`chain` بگذارید و endpointهای عددی سرور DNS را در `servers` بنویسید. به‌طور پیش‌فرض،
+resolver، lineهای جداگانهٔ DNS را وارد `next` معمولی خودش می‌کند؛ همان ورودی‌ای که
+بعداً line برنامهٔ resolve‌شده وارد آن می‌شود. برای این مسیر مشترک، `dns-next` لازم
+نیست.
+
+حتی وقتی nodeهای مسیر یکی هستند، مقصد و طول عمر lineها جداست. زمانی که درخواست
+برنامه منتظر آدرس است، resolver یک line DNS با مقصد سرور DNS تنظیم‌شده می‌سازد.
+پس از دریافت پاسخ، line برنامه با IP منتخب و پورت سرویس اصلی خود ادامه می‌دهد.
+DNS جای payload برنامه را نمی‌گیرد.
+
+DNS روی UDP و fallback به TCP هر دو از همان ورودی انتخاب‌شده می‌گذرند؛ مسیر بعدی
+باید هر دو را پشتیبانی کند. Router می‌تواند با `resolver-dns` این lineها را تشخیص
+دهد؛ اگر همهٔ lineها باید وارد یک مسیر proxy شوند، وجود Router الزامی نیست.
+
+### نمونه Chain: Router مشترک و VLESS روی TLS
+
+این پیکربندی کامل client، SOCKS5 روی TCP و UDP را می‌پذیرد، تمام DNS تولیدشده توسط
+resolver را از VPN می‌فرستد، مقصدهای برنامه در ایران را مستقیم و بقیهٔ ترافیک برنامه
+را از VPN عبور می‌دهد:
+
+```text
+TcpUdpListener -> Socks5Server -> DomainResolver -> Router
+                                                    |
+                      DNS first, then default -------+-> VlessClient -> TlsClient -> TcpConnector
+                                                    |
+                      application IP in geoip:ir ----+-> TcpUdpConnector
+```
+
+```json
+{
+  "name": "dns-and-application-routing",
+  "nodes": [
+    {
+      "name": "local-in",
+      "type": "TcpUdpListener",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 1080
+      },
+      "next": "socks"
+    },
+    {
+      "name": "socks",
+      "type": "Socks5Server",
+      "settings": {
+        "no-auth": true,
+        "connect": true,
+        "udp": true,
+        "ipv4": "127.0.0.1"
+      },
+      "next": "resolve"
+    },
+    {
+      "name": "resolve",
+      "type": "DomainResolver",
+      "settings": {
+        "mode": "chain",
+        "servers": [
+          "203.0.113.53:53"
+        ],
+        "strategy": "prefer-ipv4"
+      },
+      "next": "router"
+    },
+    {
+      "name": "router",
+      "type": "Router",
+      "settings": {
+        "geoip-db-path": "/var/lib/waterwall/GeoLite2-Country.mmdb",
+        "rules": [
+          {
+            "resolver-dns": true,
+            "target": "vpn-client"
+          },
+          {
+            "destination-ip": "geoip:ir",
+            "target": "direct-out"
+          }
+        ]
+      },
+      "next": "vpn-client"
+    },
+    {
+      "name": "direct-out",
+      "type": "TcpUdpConnector",
+      "settings": {
+        "address": "dest_context->address",
+        "port": "dest_context->port"
+      }
+    },
+    {
+      "name": "vpn-client",
+      "type": "VlessClient",
+      "settings": {
+        "uuid": "5783a3e7-e373-51cd-8642-c83782b807c5",
+        "address": "dest_context->address",
+        "port": "dest_context->port",
+        "protocol": "dest_context->protocol",
+        "domain-strategy": "do-not-resolve-domains"
+      },
+      "next": "vpn-tls"
+    },
+    {
+      "name": "vpn-tls",
+      "type": "TlsClient",
+      "settings": {
+        "sni": "vpn.example.net",
+        "verify": true
+      },
+      "next": "vpn-out"
+    },
+    {
+      "name": "vpn-out",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "198.51.100.20",
+        "port": 443
+      }
+    }
+  ]
+}
+```
+
+این فایل nodeها را ذخیره و از `core.json` معرفی کنید. پیش از اجرا:
+
+- `203.0.113.53` را با IP عددی سرور DNS قابل دسترس از سمت VLESS server جایگزین کنید.
+  `198.51.100.20`، UUID و SNI را نیز با endpoint و مشخصات واقعی VPN عوض کنید. این IPها
+  فقط آدرس نمونه در مستندات هستند.
+- `geoip-db-path` را روی فایل قابل خواندن پایگاه کشور MaxMind قرار دهید. برای بررسی
+  `geoip:ir` این فایل لازم است. IPای که در پایگاه نباشد با این شرط match نمی‌شود و
+  از مسیر VPN پیش‌فرض می‌رود.
+- سمت سرور مسیر `TcpListener -> TlsServer -> VlessServer -> TcpUdpConnector` را
+  با همان UUID، گواهی معتبر برای `vpn.example.net` و دستورهای TCP و UDP در VLESS
+  آماده کنید. راهنمای VlessServer و TlsServer تنظیمات آن‌ها را توضیح می‌دهد.
+
+در این نمونه، `next` در resolver برابر `router` است و `dns-next` نوشته نشده است؛
+پس هر دو نوع line وارد یک Router می‌شوند:
+
+1. line DNS نشانگر `resolver-dns: true` دارد. rule اول، مستقل از کشور سرور DNS،
+   آن را به `vpn-client` می‌فرستد. این rule هم درخواست UDP و هم fallback روی TCP را
+   پوشش می‌دهد.
+2. پس از موفقیت DNS، line اصلی برنامه با IP منتخب وارد Router می‌شود و نشانگر DNS
+   ندارد. اگر آن IP با ایران تطبیق داشته باشد، `geoip:ir` آن را به `direct-out`
+   می‌فرستد؛ در غیر این صورت `next` در Router آن را وارد `vpn-client` می‌کند.
+3. درخواست SOCKS که از ابتدا IP دارد lookup لازم ندارد و مستقیم به همین تصمیم
+   مسیریابی برنامه می‌رسد.
+
+rule مربوط به DNS را اول نگه دارید تا پیش از rule کشور برنده شود و IP سرور DNS به
+مسیر مستقیم فرستاده نشود. این Router فقط metadata را بررسی می‌کند و root `sniffing`
+ندارد؛ پس بدون انتظار برای payload، مسیر را در Init انتخاب می‌کند. به این ترتیب
+line مربوط به DNS روی TCP پیش از نوشتن query توسط c-ares برقرار می‌شود.
+
+`protocol: "dest_context->protocol"` به VlessClient اجازه می‌دهد DNS روی UDP و TCP و
+همچنین جریان‌های برنامهٔ انتخاب‌شده را حمل کند. مقصد منطقی، سرور DNS یا مقصد برنامه
+است؛ `vpn-out` جداگانه به سرور بیرونی VPN با IP عددی وصل می‌شود. TLS این ارتباط
+بیرونی را رمز می‌کند؛ VLESS ساده رمزنگاری ندارد.
+
+### Bootstrap و شکست مسیر
+
+endpoint بیرونی VPN باید پیش از آماده‌شدن DNS محافظت‌شده قابل استفاده باشد. آدرس
+عددی `vpn-out.address`، نیاز به DNS برای ساخت خود مسیر DNS را حذف می‌کند. hostname
+برای آن endpoint به مسیر bootstrap مستقل و صریح نیاز دارد؛ VPN در دسترس‌نبوده
+نمی‌تواند نام سرور خودش را از طریق خودش resolve کند.
+
+ردشدن route، timeout یا شکست اتصال VPN باعث نمی‌شود این resolver از DNS بومی یا
+شاخهٔ مستقیم برنامه در Router دوباره تلاش کند. تلاش مجدد روی سرور DNS صریح دیگری
+ممکن است، اما از همان chain انتخاب‌شده انجام می‌شود.
+
+### شاخهٔ جداگانهٔ DNS به‌صورت اختیاری
+
+فقط وقتی DNS باید از ورودی متفاوتی نسبت به برنامه شروع شود، `dns-next` را تنظیم
+کنید. این قطعهٔ resolver از شاخهٔ جداگانهٔ `dns-vless` برای DNS استفاده می‌کند و
+برنامه را به `application-out` ادامه می‌دهد:
+
+```json
+{
+  "name": "resolve",
+  "type": "DomainResolver",
+  "settings": {
+    "mode": "chain",
+    "servers": [
+      "203.0.113.53:53"
+    ],
+    "dns-next": "dns-vless"
+  },
+  "next": "application-out"
+}
+```
 
 
-اولین ورودی نگهداری‌شده پس از ثبت مالکیت FIFO و حسابداری، فقط source آغازکننده را
-Pause می‌کند. این دلیل محلیِ انتظار DNS یا ترتیب داده از Pause دریافتی جداست و
-پیشرفت DNS یا transport در حال Init را متوقف نمی‌کند. این توقف در callback‌های
-تخلیه نیز حفظ می‌شود و تنها پس از خالی‌شدن FIFO و اجازه مصرف‌کننده مجاور آزاد
-می‌شود. Pause/Resume re-entrant نمی‌تواند از داده قبلی جلو بزند، دلیل فشار دیگری
-را پاک کند یا پس از Finish دوباره کار ایجاد کند.
+`application-out` و شاخهٔ `dns-vless` را که به predecessor دیگری متصل نیست در همان
+پیکربندی تعریف کنید. برای نمونه، شاخهٔ DNS می‌تواند
+`VlessClient -> TlsClient -> TcpConnector` باشد و همان شرایط bootstrap عددی و
+پشتیبانی UDP/TCP بالا را رعایت کند. وجود Router در هیچ‌کدام از دو مسیر اجباری نیست.
 
-پس از بازگشت `Init` node بعدی، خالی‌شدن FIFO و تکمیل اعلان‌های فشار محلی،
-این node برای line معمولی به‌طور دائمی bypass می‌شود. ابتدا تمام state مربوط به
-resolver، از جمله حافظهٔ آماده‌سازی داخلی، آزاد و صفر می‌شود. مصرف‌کنندگان این
-حافظه باید دادهٔ لازم را در همان `Init` مصرف یا کپی کنند؛ پس از آن در دسترس نیست.
-callbackهای بعدی مستقیماً بین همسایه‌ها عبور می‌کنند و `Finish` بعدی به resolver
-نمی‌رسد. lineهای packet دائمی worker همچنان فعال می‌مانند.
+اگر `dns-next` را می‌نویسید، باید نام node غیرخالی باشد. نوشتن همان نام `next` نیز
+پشتیبانی می‌شود و مانند حذف فیلد، ورودی مشترک را انتخاب می‌کند. این override فقط
+ورودی DNS را تغییر می‌دهد و `next` برنامه را عوض نمی‌کند.
 
-## رفتار در خطا
+شاخهٔ جدا نباید از قبل به predecessor دیگری تعلق داشته باشد. ارجاع به خود، چرخهٔ
+ساختاری، predecessor متعارض و ورودی DNS غیر L4 در startup رد می‌شوند. helperهای
+خصوصی پیش از node نیز هنگام تعیین ورودی قابل فراخوانی لحاظ می‌شوند. این قابلیت
+اشتراک آزاد یک chain موجود VPN میان چند predecessor نیست و بررسی ساختار، همهٔ
+وابستگی‌های چرخه‌ای bootstrap در زمان اجرا را تشخیص نمی‌دهد.
 
-در شرایط زیر line رد می‌شود:
+## سرورها و گزینه‌های DNS در Direct و Chain
 
-- مقصد نه آدرس IP باشد و نه domain معتبر.
-- ثبت درخواست async DNS شکست بخورد.
-- DNS برای `strategy` تنظیم‌شده هیچ آدرس قابل استفاده‌ای برنگرداند
-- صف payload‌های pending از سقف تعیین‌شده بگذرد.
+`servers` باید ۱ تا ۳۲ endpoint عددی داشته باشد. شکل‌های مجاز:
 
-`DomainResolver` خودش درخواست DNS را دوباره امتحان نمی‌کند. این کار باید در node سطح بالاتر یا در طراحی transport انجام شود.
+| endpoint | معنی |
+| --- | --- |
+| `192.0.2.53` | آدرس IPv4 با پورت‌های DNS در core. |
+| `192.0.2.53:5353` | آدرس IPv4 با پورت ۵۳۵۳ برای هر دو UDP و TCP. |
+| `2001:db8::53` | آدرس IPv6 با پورت‌های DNS در core. |
+| `[2001:db8::53]:5353` | آدرس IPv6 با پورت ۵۳۵۳ برای هر دو UDP و TCP. |
 
-## متادیتای نود
+در نبود پسوند پورت، `dns.udp-port` و `dns.tcp-port` از core اعمال می‌شوند؛ پیش‌فرض
+هر دو ۵۳ است. hostname، scope رابط، آدرس نامعتبر و پورت صفر یا خارج از محدوده رد
+می‌شوند.
 
-`DomainResolver` یک node پشتیبان شفاف و داخلی است: state هر line را نگه می‌دارد، اما line ایجاد یا نابود نمی‌کند و بایت‌های payload را تغییر نمی‌دهد.
+این حالت‌ها تنظیمات retry، timeout، cache، flags، search-domain، lookup/hosts-file،
+EDNS، پورت، rotation و failover مربوط به c-ares را از core می‌گیرند. فهرست صریح سرورها
+جای کشف سرور core را می‌گیرد. گزینه‌های تنظیم‌شدهٔ `socket-send-buffer-size`،
+`socket-receive-buffer-size`، `sortlist` و `resolvconf-path` رد می‌شوند، چون این backend
+آن نیازها را پشتیبانی نمی‌کند.
 
-metadata برگرفته از کد منبع:
+هر instance صریح resolver روی هر worker، channel و cache قابل استفادهٔ مجدد دارد.
+درخواست ناموفق ممکن است روی سرور تنظیم‌شدهٔ دیگری تکرار شود، اما هرگز به DNS بومی
+یا mode دیگری برنمی‌گردد. بستن یک درخواست برنامه، درخواست‌های دیگر همان channel را
+لغو نمی‌کند.
+
+## مقصد DNS و تطبیق در Router
+
+lineهای ساخته‌شدهٔ DNS مقصد قطعی سرور DNS و نوع دقیق UDP یا TCP را حمل می‌کنند.
+اولین انتخاب‌کنندهٔ مقصد منطقی proxy یا adapter خروجی، حتی اگر target ثابت دیگری
+داشته باشد، همین endpoint را به کار می‌برد. سپس pin یک‌بارهٔ مقصد مصرف می‌شود تا
+connector بیرونی مستقل، سرور VPN خودش را طبق تنظیمات انتخاب کند. connector مختص
+یک transport، مقصد پین‌شده با transport ناسازگار را رد می‌کند.
+
+lineهای UDP و TCP مربوط به DNS خودکار نشانگر `resolver-dns` دارند. Router می‌تواند
+این metadata را بدون بررسی payload DNS تطبیق دهد. استفاده از این شرط اختیاری است؛
+حالت chain می‌تواند بدون Router مستقیم وارد proxy مناسب شود. نشانگر همراه مقصد منطقی DNS می‌ماند و پاک‌سازی
+مشاهده‌های protocol در Router آن را حذف نمی‌کند. برنامهٔ اصلی و carrier بیرونی
+مستقل VPN نشانگر را ندارند. این نشانگر به معنی تشخیص DNS دلخواه برنامه، packetهای
+TUN یا صرفاً ترافیک پورت ۵۳ نیست.
+
+## محدودهٔ اثر Mode
+
+mode فقط lookupهای همین DomainResolver صریح را کنترل می‌کند. helperهای ضمنی در
+connectorها، Router، proxy clientها و ConnectionToPackets همچنان native هستند.
+فراخوانی‌های مستقیم DNS در worker/line، DNS مقصدهای UdpConnector و DNS خروجی
+UdpStatelessSocket نیز backend بومی خود را نگه می‌دارند. مقصد عددی یا قبلاً
+resolve‌شده lookup دیگری لازم ندارد.
+
+پس انتخاب chain همهٔ DNSهای WaterWall را محافظت نمی‌کند، DNS سیستم را تغییر نمی‌دهد
+و DNS برنامه‌های ورودی از TUN را رهگیری نمی‌کند. lookupهای دیگر و bootstrap ارتباط
+بیرونی را نیز با policy موردنظر تنظیم کنید.
+
+## رفتار اجرا و خطا
+
+هنگام `Init` در جهت upstream، state مربوط به line برنامه آماده می‌شود. اگر DNS لازم
+باشد، `Init` node بعدی تا انتخاب آدرس نگه داشته می‌شود. سپس Init عبور می‌کند و payload
+برنامه که در صف مانده، به ترتیب FIFO ارسال می‌شود. پاسخ‌های downstream و `Est` از
+زمان آغاز Init بعدی می‌توانند عبور کنند، حتی اگر هم‌زمان در همان callback ساخته شوند.
+
+ورودی نگه‌داشته‌شدهٔ برنامه برای هر line هم سقف ۲ MiB بایت منطقی و هم سقف ۲ MiB
+هزینهٔ حافظهٔ تخصیص‌یافته دارد. اولین ورودی در صف، source خودش را Pause می‌کند. این
+دلیل محلی انتظار DNS یا ترتیب داده از Pause دریافتی جداست و خود تبادل DNS را متوقف
+نمی‌کند. تخلیهٔ FIFO فشار مصرف‌کننده را رعایت می‌کند و ورودی re-entrant از دادهٔ
+قدیمی‌تر جلو نمی‌زند. سرریز یا شکست resolution فقط جهت‌هایی را می‌بندد که Init
+گرفته‌اند. Finish ابتدا state محلی را پاک می‌کند و هیچ callbackی به سمت ارسال‌کنندهٔ
+همان Finish بازنمی‌گرداند.
+
+اگر مقصد نه IP معتبر باشد نه domain، ثبت درخواست شکست بخورد یا هیچ پاسخ با strategy
+انتخابی سازگار نباشد، resolution شکست می‌خورد. خطای transport و timeout در direct و
+chain نیز باعث fallback به DNS بومی نمی‌شود.
+
+پس از بازگشت Init بعدی، خالی‌شدن FIFO برنامه و تکمیل اعلان‌های فشار، line معمولی
+برنامه برای همیشه resolver را bypass می‌کند. ابتدا کل state آن، از جمله حافظهٔ
+prepare-hook، نابود و صفر می‌شود؛ مصرف‌کنندگان داخلی باید این حافظه را در همان Init
+استفاده کنند. lineهای DNS نزد مالک transport خود می‌مانند و callbackهای DNS هرگز به
+node قبلی برنامه نمی‌رسند. lineهای packet دائمی همچنان متعلق به chain هستند و
+resolver آن‌ها را نابود نمی‌کند.
+
+resolver، line برنامه را قرض می‌گیرد و مالک lineهای معمولی جداگانهٔ DNS است. در
+quiescence روی worker مالک، پذیرش lookup بسته، ریشه‌های readiness/timer جدا و
+callbackهای c-ares و referenceهای نگه‌داشته‌شده تسویه می‌شوند. پاک‌سازی channel تا
+وقتی همسایه‌ها و poolها زنده‌اند lineهای DNS را می‌بندد. worker stop حافظهٔ transport
+خاموش‌شده و نابودی نهایی node تنظیمات و فرزندهای خصوصی را آزاد می‌کند.
+
+## متادیتای Node
+
+یال برنامه یک middle node شفاف است و نمی‌تواند head یا tail زنجیره باشد. یال جانبی
+DNS جداگانه به L4 محدود می‌شود. Init در جهت upstream و Est در جهت downstream
+پشتیبانی می‌شوند؛ Init در جهت downstream و Est در جهت upstream رفتار رد پیش‌فرض
+سازنده را دارند. Payload، Pause/Resume و Finish معنای عادی دوطرفهٔ خود را حفظ می‌کنند.
 
 | ویژگی | مقدار |
 | --- | --- |
@@ -149,4 +528,4 @@ metadata برگرفته از کد منبع:
 | `layer_group` | `kNodeLayerAnything` |
 | `layer_group_prev_node` | `kNodeLayerSameAsNext` |
 | `layer_group_next_node` | `kNodeLayerSameAsPrev` |
-| `required_padding_left` | `0` bytes |
+| `required_padding_left` | `0` بایت |
