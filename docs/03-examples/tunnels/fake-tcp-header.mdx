@@ -1,0 +1,768 @@
+---
+sidebar_position: 15
+title: "Fake TCP header tunnel"
+sidebar_label: "Fake TCP header"
+description: "Complete Iran and Kharej FakeTcpHeader configurations for a TCP service or TUN-based UDP and GRE traffic, with password and MTU guidance."
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Fake TCP header tunnel
+
+Use `FakeTcpHeaderClient` and `FakeTcpHeaderServer` to carry IPv4 packets
+between Iran and Kharej with a TCP-looking header. Choose **TCP service
+(packet bridges)** to forward a TCP application, or **UDP and GRE (TunDevice)**
+to create real TUN interfaces and send other IPv4 packet protocols through them.
+
+The original packet's protocol is recorded separately for every packet. UDP,
+TCP, ICMP, GRE, and other IPv4 protocols can therefore share one FakeTcpHeader
+pair. The receiving node removes the fake TCP header and restores that protocol.
+This does not establish a real TCP transport connection or add retransmission,
+ordering, or reliable delivery to UDP or GRE. Original TCP still uses its own
+TCP handshake and retransmissions inside the carrier.
+
+## MTU is your responsibility
+
+:::warning Keep the complete carrier within the size limit
+Choose an MTU that keeps the **complete packet after all added headers and
+encryption at or below 1500 bytes**, and below the actual path MTU if it is
+smaller. Apply this budget in **both directions**:
+
+```text
+native IPv4 packet length + 20 + fake TCP option bytes + 1
+  + (40 when password is enabled) <= min(1500, path MTU)
+```
+
+The native packet length already includes its original IPv4 header. There is
+no second IPv4 header added by FakeTcpHeader. The extra byte records the
+original IP protocol; a password adds a 24-byte nonce and a 16-byte tag.
+
+| Fake TCP options | Added bytes, no password | Maximum native MTU, no password | Added bytes, with password | Maximum native MTU, with password |
+| --- | --- | --- | --- | --- |
+| 0 bytes | 21 | 1479 | 61 | 1439 |
+| 4 bytes | 25 | 1475 | 65 | 1435 |
+| 40 bytes | 61 | 1439 | 101 | 1399 |
+
+These limits assume a 1500-byte path and no further transforms. The examples
+use native MTU `1400`, a password, and no fake TCP options: the largest carrier
+is `1461` bytes. Adding 40 option bytes would make it **1501 bytes**; lower the
+native MTU to at most `1399` in that case. Include any other encapsulation in
+your budget too.
+
+FakeTcpHeader does not discover PMTU, adjust TCP MSS, or fragment oversized
+packets. Its encoder and decoder reject IPv4 fragments. Device reassembly can
+produce a complete packet, but that packet must still fit the size limit.
+Keep UDP datagrams and any nested tunnels within the native MTU; do not rely
+on fragmentation to make an oversized packet work.
+:::
+
+## Before starting
+
+Follow the [common setup](./overview.mdx) for `core.json`, variable syntax,
+and startup. For this guide, change **`misc.mtu` to `1400` in `core.json` on
+both hosts**, matching `native_mtu` below. Each packet bridge or TUN also sets
+its own MTU explicitly. If you lower that budget, change the core and node
+settings together.
+
+These are Linux examples. Run WaterWall with raw-socket and firewall-management
+permissions, normally as root with `CAP_NET_RAW` and `CAP_NET_ADMIN`. Install
+`iproute2`, `iptables`, and `iptables-save`; the kernel must support NFQUEUE
+and the `bpf` match (`xt_bpf`) used by the capture filter. The TUN variant also
+needs `/dev/net/tun` and TUN support. Its optional GRE check needs kernel GRE
+support. The application checks below use `curl` for TCP or Python 3 for UDP.
+
+Use real IPv4 addresses assigned to the two servers. The examples assume direct
+IPv4 reachability and configure no NAT traversal. Allow the configured fake
+TCP server/client ports between these addresses in both directions, and allow
+the selected user-facing TCP or UDP port on Iran. A network that requires an
+ordinary TCP session may refuse this TCP-looking packet transport.
+
+:::warning Capture also intercepts ordinary TCP from the peer
+Each `RawSocket` captures **all IPv4 TCP from the opposite public IP**,
+regardless of port, and removes it from the normal host stack. SSH, HTTPS,
+or other ordinary TCP between these two addresses will also be intercepted.
+Use another management path while the tunnel is active. A packet rejected
+because its fake ports do not match is dropped; it does not return to the
+kernel's TCP stack.
+:::
+
+Both examples enable the same `password` on the two FakeTcpHeader nodes.
+Replace `REPLACE_WITH_SHARED_PASSWORD` with a long random shared secret.
+WaterWall creates the encryption helper internally; do not add another
+Encryption node. To use the plain carrier, remove the **`password` setting
+from both nodes**. An empty string or `null` is invalid. Password encryption
+protects the carried contents, with no replay protection or delivery guarantee;
+the visible IP and fake TCP headers remain available for routing.
+
+## Set the addresses
+
+Edit the `variables` objects and keep the unquoted `$variable$` references as
+written. Match the shared settings on both hosts.
+
+| Variable | What to enter |
+| --- | --- |
+| `ip_server_iran` / `ip_server_kharej` | Assigned public IPv4 addresses; replace `192.0.2.10` and `198.51.100.20` in both configurations. |
+| `inner_ip_iran` / `inner_ip_kharej` | Fixed native endpoint addresses, `10.90.0.1` and `10.90.0.2`. Use an unused subnet. |
+| `fake_server_port` | Fake TCP server port, `40000`, identical on both hosts. |
+| `fake_client_ports` | Inclusive fake TCP client port range, `[40001, 40016]`, identical on both hosts. It must exclude the server port. |
+| `password` | The same nonempty secret on both hosts. |
+| `native_mtu` | Complete native IPv4 packet budget, `1400`, on both hosts. See the warning above. |
+| `user_port` | Iran's application entry: TCP `443` in the bridge variant, UDP `5300` in the TUN variant. |
+| `tunnel_port` | Native application destination port, `5300`. This is separate from the fake TCP ports. |
+| `final_ip` / `final_port` | Kharej's actual backend: TCP `127.0.0.1:80` or UDP `127.0.0.1:5300`. |
+| `tun_name` | TUN variant only: unused local interface name, `wwfake0`. |
+| `tun_cidr` | TUN variant only: `10.90.0.1/30` on Iran and `10.90.0.2/30` on Kharej. Keep these consistent with the inner IP variables. |
+
+FakeTcpHeader reuses the packet's existing IPv4 header; it does not save the
+original IP addresses. `IpOverrider` changes them to the public endpoints on
+send and restores the fixed inner pair on receive. These configurations
+therefore carry packets **between those two native endpoint addresses**.
+They do not automatically preserve arbitrary original source/destination IPs
+or create a general routed VPN. GRE below can carry another IP packet inside
+its payload, preserving that nested packet's addresses.
+
+Keep the public peer reachable through the physical network. When changing
+the inner subnet, update both inner IP variables, both TUN CIDRs when used,
+and the check commands together. Only the local TUN address is assigned on
+each host; do not also assign its peer address locally.
+
+## Configurations
+
+Choose the same variant on both hosts and save one configuration per host.
+Both variants explicitly use no fake TCP options (`"options": ""`). The
+`RawSocket` inputs reassemble fragments before decoding, using the normal
+`fragment-policy: "reassemble"` behavior.
+
+<Tabs groupId="fake-tcp-mode" defaultValue="bridges">
+<TabItem value="bridges" label="TCP service (packet bridges)">
+
+The packet bridges generate and recover native TCP in userspace:
+
+```text
+Iran:   TcpListener -> ConnectionToPackets -> FakeTcpHeaderClient -> IpOverrider -> RawSocket
+Kharej: RawSocket -> IpOverrider -> FakeTcpHeaderServer -> PacketsToConnection -> TcpConnector
+```
+
+Iran opens a native flow from `inner_ip_iran` to
+`inner_ip_kharej:tunnel_port`. Kharej recovers that flow and connects to
+`final_ip:final_port`. These inner addresses need no host interface assignments,
+routes, NAT, or separate inner TCP listener. The bridges support TCP/UDP;
+use the TUN variant for GRE and other packet protocols.
+
+<Tabs groupId="tunnel-location" defaultValue="iran">
+<TabItem value="iran" label="Iran">
+
+Save as `config_iran.json` on Iran.
+
+```json title="config_iran.json"
+{
+  "name": "iran-fake-tcp-bridges",
+  "variables": {
+    "ip_server_iran": "192.0.2.10",
+    "ip_server_kharej": "198.51.100.20",
+    "inner_ip_iran": "10.90.0.1",
+    "inner_ip_kharej": "10.90.0.2",
+    "fake_server_port": 40000,
+    "fake_client_ports": [40001, 40016],
+    "password": "REPLACE_WITH_SHARED_PASSWORD",
+    "native_mtu": 1400,
+    "user_port": 443,
+    "tunnel_port": 5300
+  },
+  "nodes": [
+    {
+      "name": "users_inbound",
+      "type": "TcpListener",
+      "settings": {
+        "address": "0.0.0.0",
+        "port": $user_port$,
+        "nodelay": true
+      },
+      "next": "connection_to_packets"
+    },
+    {
+      "name": "connection_to_packets",
+      "type": "ConnectionToPackets",
+      "settings": {
+        "source-ipv4": $inner_ip_iran$,
+        "target-address": $inner_ip_kharej$,
+        "port": $tunnel_port$,
+        "mtu": $native_mtu$
+      },
+      "next": "fake_tcp_client"
+    },
+    {
+      "name": "fake_tcp_client",
+      "type": "FakeTcpHeaderClient",
+      "settings": {
+        "server-port": $fake_server_port$,
+        "client-port-range": $fake_client_ports$,
+        "password": $password$,
+        "options": ""
+      },
+      "next": "carrier_addresses"
+    },
+    {
+      "name": "carrier_addresses",
+      "type": "IpOverrider",
+      "settings": {
+        "up": {
+          "source-ip": { "ipv4": $ip_server_iran$ },
+          "dest-ip": { "ipv4": $ip_server_kharej$ }
+        },
+        "down": {
+          "source-ip": { "ipv4": $inner_ip_kharej$ },
+          "dest-ip": { "ipv4": $inner_ip_iran$ }
+        }
+      },
+      "next": "raw_transport"
+    },
+    {
+      "name": "raw_transport",
+      "type": "RawSocket",
+      "settings": {
+        "capture-filter-mode": "source-ip",
+        "capture-ips": [$ip_server_kharej$],
+        "capture-protocols": [6],
+        "fragment-policy": "reassemble"
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+<TabItem value="kharej" label="Kharej">
+
+Save as `config_kharej.json` on Kharej.
+
+```json title="config_kharej.json"
+{
+  "name": "kharej-fake-tcp-bridges",
+  "variables": {
+    "ip_server_iran": "192.0.2.10",
+    "ip_server_kharej": "198.51.100.20",
+    "inner_ip_iran": "10.90.0.1",
+    "inner_ip_kharej": "10.90.0.2",
+    "fake_server_port": 40000,
+    "fake_client_ports": [40001, 40016],
+    "password": "REPLACE_WITH_SHARED_PASSWORD",
+    "native_mtu": 1400,
+    "final_ip": "127.0.0.1",
+    "final_port": 80
+  },
+  "nodes": [
+    {
+      "name": "raw_transport",
+      "type": "RawSocket",
+      "settings": {
+        "capture-filter-mode": "source-ip",
+        "capture-ips": [$ip_server_iran$],
+        "capture-protocols": [6],
+        "fragment-policy": "reassemble"
+      },
+      "next": "carrier_addresses"
+    },
+    {
+      "name": "carrier_addresses",
+      "type": "IpOverrider",
+      "settings": {
+        "up": {
+          "source-ip": { "ipv4": $inner_ip_iran$ },
+          "dest-ip": { "ipv4": $inner_ip_kharej$ }
+        },
+        "down": {
+          "source-ip": { "ipv4": $ip_server_kharej$ },
+          "dest-ip": { "ipv4": $ip_server_iran$ }
+        }
+      },
+      "next": "fake_tcp_server"
+    },
+    {
+      "name": "fake_tcp_server",
+      "type": "FakeTcpHeaderServer",
+      "settings": {
+        "server-port": $fake_server_port$,
+        "client-port-range": $fake_client_ports$,
+        "password": $password$,
+        "options": ""
+      },
+      "next": "packets_to_connection"
+    },
+    {
+      "name": "packets_to_connection",
+      "type": "PacketsToConnection",
+      "settings": {
+        "mtu": $native_mtu$
+      },
+      "next": "outbound_to_service"
+    },
+    {
+      "name": "outbound_to_service",
+      "type": "TcpConnector",
+      "settings": {
+        "address": $final_ip$,
+        "port": $final_port$,
+        "nodelay": true
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+</Tabs>
+
+See [ConnectionToPackets](../../noderefs/ConnectionToPackets) and
+[PacketsToConnection](../../noderefs/PacketsToConnection) for the bridge
+settings. An inner-address ping cannot test this TCP-service variant.
+
+</TabItem>
+<TabItem value="tun" label="UDP and GRE (TunDevice)">
+
+This variant creates a TUN on each host and forwards a UDP service into it
+using WaterWall itself:
+
+```text
+Iran UDP:      UdpListener -> UdpConnector to 10.90.0.2:5300
+Iran packets:  TunDevice -> FakeTcpHeaderClient -> IpOverrider -> RawSocket
+
+Kharej packets: RawSocket -> IpOverrider -> FakeTcpHeaderServer -> TunDevice
+Kharej UDP:     UdpListener on 10.90.0.2:5300 -> UdpConnector to backend
+```
+
+Iran's UDP connector emits native UDP from `10.90.0.1` to `10.90.0.2`.
+The connected subnet route sends those packets into `wwfake0`; FakeTcpHeader
+makes them TCP-looking on the physical network. Kharej restores UDP and
+injects it into its TUN, where the private UDP listener receives it. Replies
+follow the reverse path.
+
+WaterWall assigns only `10.90.0.1/30` to Iran's TUN and `10.90.0.2/30` to
+Kharej's. `route-table: "off"` leaves extra system-route installation disabled;
+Linux still creates the connected subnet route. WaterWall creates the TUN
+before binding Kharej's private listener. This socket forwarding example
+needs no manual routes, host IP forwarding, or NAT. Allow the inner UDP
+listener on Kharej's TUN firewall and inner ICMP for the ping checks.
+
+These packet chains also carry ICMP, GRE, and other IPv4 protocols between
+the fixed inner endpoints. No packet/connection bridges interpret those
+packets. Broader protocol carriage does not mean that every protocol's
+address-dependent integrity fields can survive arbitrary address rewriting;
+use the endpoint pair shown here.
+
+<Tabs groupId="tunnel-location" defaultValue="iran">
+<TabItem value="iran" label="Iran">
+
+Save as `config_iran.json` on Iran.
+
+```json title="config_iran.json"
+{
+  "name": "iran-fake-tcp-tun",
+  "variables": {
+    "ip_server_iran": "192.0.2.10",
+    "ip_server_kharej": "198.51.100.20",
+    "inner_ip_iran": "10.90.0.1",
+    "inner_ip_kharej": "10.90.0.2",
+    "fake_server_port": 40000,
+    "fake_client_ports": [40001, 40016],
+    "password": "REPLACE_WITH_SHARED_PASSWORD",
+    "native_mtu": 1400,
+    "tun_name": "wwfake0",
+    "tun_cidr": "10.90.0.1/30",
+    "user_port": 5300,
+    "tunnel_port": 5300
+  },
+  "nodes": [
+    {
+      "name": "users_inbound",
+      "type": "UdpListener",
+      "settings": {
+        "address": "0.0.0.0",
+        "port": $user_port$
+      },
+      "next": "udp_to_kharej"
+    },
+    {
+      "name": "udp_to_kharej",
+      "type": "UdpConnector",
+      "settings": {
+        "address": $inner_ip_kharej$,
+        "port": $tunnel_port$
+      }
+    },
+    {
+      "name": "inner_tun",
+      "type": "TunDevice",
+      "settings": {
+        "device-name": $tun_name$,
+        "device-ip": $tun_cidr$,
+        "device-mtu": $native_mtu$,
+        "route-table": "off",
+        "gso": false,
+        "fragment-policy": "reassemble"
+      },
+      "next": "fake_tcp_client"
+    },
+    {
+      "name": "fake_tcp_client",
+      "type": "FakeTcpHeaderClient",
+      "settings": {
+        "server-port": $fake_server_port$,
+        "client-port-range": $fake_client_ports$,
+        "password": $password$,
+        "options": ""
+      },
+      "next": "carrier_addresses"
+    },
+    {
+      "name": "carrier_addresses",
+      "type": "IpOverrider",
+      "settings": {
+        "up": {
+          "source-ip": { "ipv4": $ip_server_iran$ },
+          "dest-ip": { "ipv4": $ip_server_kharej$ }
+        },
+        "down": {
+          "source-ip": { "ipv4": $inner_ip_kharej$ },
+          "dest-ip": { "ipv4": $inner_ip_iran$ }
+        }
+      },
+      "next": "raw_transport"
+    },
+    {
+      "name": "raw_transport",
+      "type": "RawSocket",
+      "settings": {
+        "capture-filter-mode": "source-ip",
+        "capture-ips": [$ip_server_kharej$],
+        "capture-protocols": [6],
+        "fragment-policy": "reassemble"
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+<TabItem value="kharej" label="Kharej">
+
+Save as `config_kharej.json` on Kharej.
+
+```json title="config_kharej.json"
+{
+  "name": "kharej-fake-tcp-tun",
+  "variables": {
+    "ip_server_iran": "192.0.2.10",
+    "ip_server_kharej": "198.51.100.20",
+    "inner_ip_iran": "10.90.0.1",
+    "inner_ip_kharej": "10.90.0.2",
+    "fake_server_port": 40000,
+    "fake_client_ports": [40001, 40016],
+    "password": "REPLACE_WITH_SHARED_PASSWORD",
+    "native_mtu": 1400,
+    "tun_name": "wwfake0",
+    "tun_cidr": "10.90.0.2/30",
+    "tunnel_port": 5300,
+    "final_ip": "127.0.0.1",
+    "final_port": 5300
+  },
+  "nodes": [
+    {
+      "name": "raw_transport",
+      "type": "RawSocket",
+      "settings": {
+        "capture-filter-mode": "source-ip",
+        "capture-ips": [$ip_server_iran$],
+        "capture-protocols": [6],
+        "fragment-policy": "reassemble"
+      },
+      "next": "carrier_addresses"
+    },
+    {
+      "name": "carrier_addresses",
+      "type": "IpOverrider",
+      "settings": {
+        "up": {
+          "source-ip": { "ipv4": $inner_ip_iran$ },
+          "dest-ip": { "ipv4": $inner_ip_kharej$ }
+        },
+        "down": {
+          "source-ip": { "ipv4": $ip_server_kharej$ },
+          "dest-ip": { "ipv4": $ip_server_iran$ }
+        }
+      },
+      "next": "fake_tcp_server"
+    },
+    {
+      "name": "fake_tcp_server",
+      "type": "FakeTcpHeaderServer",
+      "settings": {
+        "server-port": $fake_server_port$,
+        "client-port-range": $fake_client_ports$,
+        "password": $password$,
+        "options": ""
+      },
+      "next": "inner_tun"
+    },
+    {
+      "name": "inner_tun",
+      "type": "TunDevice",
+      "settings": {
+        "device-name": $tun_name$,
+        "device-ip": $tun_cidr$,
+        "device-mtu": $native_mtu$,
+        "route-table": "off",
+        "gso": false,
+        "fragment-policy": "reassemble"
+      }
+    },
+    {
+      "name": "tunnel_inbound",
+      "type": "UdpListener",
+      "settings": {
+        "address": $inner_ip_kharej$,
+        "port": $tunnel_port$
+      },
+      "next": "outbound_to_service"
+    },
+    {
+      "name": "outbound_to_service",
+      "type": "UdpConnector",
+      "settings": {
+        "address": $final_ip$,
+        "port": $final_port$
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+</Tabs>
+
+See [TunDevice](../../noderefs/TunDevice) for interface and routing settings.
+
+### Carry GRE through the TUN
+
+After both WaterWall instances are running, create a GRE tunnel whose native
+endpoints are the fixed TUN addresses. This demonstrates carrying IPv4 protocol
+`47`, rather than only UDP or TCP. Use unused interface names and subnets, and
+adapt the commands if you changed the example addresses.
+
+On Iran:
+
+```bash
+sudo ip tunnel add wwgre0 mode gre local 10.90.0.1 remote 10.90.0.2 dev wwfake0 ttl 64
+sudo ip address add 10.91.0.1/30 dev wwgre0
+sudo ip link set dev wwgre0 mtu 1376 up
+```
+
+On Kharej:
+
+```bash
+sudo ip tunnel add wwgre0 mode gre local 10.90.0.2 remote 10.90.0.1 dev wwfake0 ttl 64
+sudo ip address add 10.91.0.2/30 dev wwgre0
+sudo ip link set dev wwgre0 mtu 1376 up
+```
+
+Allow GRE from the inner peer through each TUN firewall and ICMP on the GRE
+interfaces, then check from Iran:
+
+```bash
+ping -c 3 10.91.0.2
+```
+
+The native GRE packet goes through `wwfake0`, crosses the physical network
+with the fake TCP header, and returns to protocol 47 before Linux processes it.
+The nested packet between `10.91.0.1` and `10.91.0.2` remains inside the GRE
+payload, so its addresses are preserved.
+
+This GRE setup adds a 20-byte IPv4 header and a four-byte GRE header around
+each nested packet. `1376 = 1400 - 24` keeps that complete native GRE packet
+within the example's native MTU. Lower the GRE MTU if you lower `native_mtu`
+or add IPv4/GRE options, keys, checksums, or any other headers. The
+FakeTcpHeader/password overhead still applies outside that native packet.
+
+Remove the optional GRE device on each host when finished:
+
+```bash
+sudo ip tunnel del wwgre0
+```
+
+### Forward external UDP with iptables instead
+
+As an alternative to WaterWall's Iran UDP forwarding chain, Linux can forward
+one public UDP service into the TUN. Remove **only Iran's `UdpListener` and its
+`UdpConnector`** from the TUN variant. Keep both hosts' packet chains and
+Kharej's private `UdpListener -> UdpConnector` chain running.
+
+The rules below accept traffic only from `USER_CIDR`. Replace it with your
+users' source IPv4 address or CIDR, and replace `eth0` with Iran's public network
+interface. Run these commands as root on Iran after the TUN is up. These are
+**shell variables**, separate from WaterWall's JSON variables: `USER_PORT`
+matches `user_port`, and `SERVICE_PORT` matches the private `tunnel_port`.
+
+```bash
+WAN_IF=eth0
+IRAN_IP=192.0.2.10
+USER_CIDR=203.0.113.30/32
+USER_PORT=5300
+SERVICE_PORT=5300
+TUN_IF=wwfake0
+IRAN_TUN_IP=10.90.0.1
+KHAREJ_TUN_IP=10.90.0.2
+
+FAKE_TCP_PREVIOUS_IP_FORWARD=$(sysctl -n net.ipv4.ip_forward)
+sysctl -w net.ipv4.ip_forward=1
+
+iptables -t nat -A PREROUTING \
+  -i "$WAN_IF" -s "$USER_CIDR" -d "$IRAN_IP" \
+  -p udp --dport "$USER_PORT" \
+  -j DNAT --to-destination "${KHAREJ_TUN_IP}:${SERVICE_PORT}"
+
+iptables -t nat -A POSTROUTING \
+  -o "$TUN_IF" -s "$USER_CIDR" -d "$KHAREJ_TUN_IP" \
+  -p udp --dport "$SERVICE_PORT" \
+  -j SNAT --to-source "$IRAN_TUN_IP"
+
+iptables -I FORWARD 1 \
+  -i "$WAN_IF" -o "$TUN_IF" \
+  -s "$USER_CIDR" -d "$KHAREJ_TUN_IP" \
+  -p udp --dport "$SERVICE_PORT" \
+  -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT
+
+iptables -I FORWARD 1 \
+  -i "$TUN_IF" -o "$WAN_IF" \
+  -s "$KHAREJ_TUN_IP" -d "$USER_CIDR" \
+  -p udp --sport "$SERVICE_PORT" \
+  -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+```
+
+DNAT changes the destination to Kharej's private listener. Linux's connected
+route then sends it through `wwfake0`; `REDIRECT` would instead target the local
+host. SNAT is required because the packet chains restore the fixed
+`10.90.0.1 -> 10.90.0.2` tuple: they do not save arbitrary users' IP addresses.
+Connection tracking translates the reply back to the original user. See the
+[Netfilter target reference](https://ipset.netfilter.org/iptables-extensions.man.html)
+for DNAT/SNAT and the [Linux forwarding setting](https://docs.kernel.org/networking/ip-sysctl.html#proc-sys-net-ipv4-variables)
+for `ip_forward`.
+
+Kharej's private UDP listener still forwards the received traffic to `final_ip`
+and `final_port`. Allow that private listener in Kharej's input firewall. Users
+connect to Iran's public IPv4 address and `USER_PORT`; do not run the replaced
+Iran WaterWall listener at the same time.
+
+To remove this example's rules, run the following in the **same shell** so the
+variables and saved forwarding value are still available. It removes only the
+rules above and restores the previous forwarding setting; it does not flush
+your firewall. Existing connection-tracking entries expire normally.
+
+```bash
+iptables -t nat -D PREROUTING \
+  -i "$WAN_IF" -s "$USER_CIDR" -d "$IRAN_IP" \
+  -p udp --dport "$USER_PORT" \
+  -j DNAT --to-destination "${KHAREJ_TUN_IP}:${SERVICE_PORT}"
+
+iptables -t nat -D POSTROUTING \
+  -o "$TUN_IF" -s "$USER_CIDR" -d "$KHAREJ_TUN_IP" \
+  -p udp --dport "$SERVICE_PORT" \
+  -j SNAT --to-source "$IRAN_TUN_IP"
+
+iptables -D FORWARD \
+  -i "$WAN_IF" -o "$TUN_IF" \
+  -s "$USER_CIDR" -d "$KHAREJ_TUN_IP" \
+  -p udp --dport "$SERVICE_PORT" \
+  -m conntrack --ctstate NEW,ESTABLISHED -j ACCEPT
+
+iptables -D FORWARD \
+  -i "$TUN_IF" -o "$WAN_IF" \
+  -s "$KHAREJ_TUN_IP" -d "$USER_CIDR" \
+  -p udp --sport "$SERVICE_PORT" \
+  -m conntrack --ctstate ESTABLISHED,RELATED -j ACCEPT
+
+sysctl -w "net.ipv4.ip_forward=$FAKE_TCP_PREVIOUS_IP_FORWARD"
+```
+
+</TabItem>
+</Tabs>
+
+## Run and check
+
+Start the application backend in Kharej, then start WaterWall on Kharej
+followed by Iran. Use the [common startup command](./overview.mdx#start-the-tunnel)
+with the required privileges:
+
+```bash
+sudo ./Waterwall --config:core.json
+```
+
+For the **TCP-service variant**, with an HTTP backend at Kharej's
+`127.0.0.1:80`, connect to Iran's user entry:
+
+```bash
+curl http://192.0.2.10:443/
+```
+
+Port `443` here is a TCP entry and does not add HTTPS. Use the normal client
+for your backend application and adapt its address and port as needed.
+
+For the **TUN variant**, use your actual UDP application or run this small
+UDP echo backend on Kharej before starting WaterWall:
+
+```bash
+python3 - <<'PY'
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+    sock.bind(("127.0.0.1", 5300))
+    while True:
+        data, peer = sock.recvfrom(65535)
+        sock.sendto(data, peer)
+PY
+```
+
+From a client that can reach Iran, send one datagram after both servers start:
+
+```bash
+python3 - <<'PY'
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+    sock.settimeout(5)
+    sock.sendto(b"WaterWall UDP check", ("192.0.2.10", 5300))
+    data, _ = sock.recvfrom(65535)
+    assert data == b"WaterWall UDP check", data
+    print(data.decode())
+PY
+```
+
+Stop the echo backend with Ctrl+C. If you changed the UDP variables, update
+the backend and client commands accordingly. Keep UDP application payloads
+within `native_mtu - 28` for ordinary 20-byte IPv4 and eight-byte UDP headers:
+`1372` bytes with the example MTU. Larger datagrams can exceed the carrier's
+packet budget even when the local socket accepts them.
+
+On Iran, check the **TUN variant's** route and inner peer separately:
+
+```bash
+ip route get 10.90.0.2
+ping -c 3 10.90.0.2
+```
+
+The route should use `wwfake0` with source `10.90.0.1`. Reverse the inner
+addresses to check from Kharej. The TCP bridge variant has no host TUN and
+must be checked through its application instead.
+
+If traffic does not pass, check the shared password and fake ports, the
+`IpOverrider` rules in both directions, capture startup in the WaterWall logs,
+the selected peer public IP, and firewall permissions. Check the actual
+packet-size budget in both directions before increasing an MTU. Ensure the
+Kharej backend is listening on the protocol and address for the chosen variant.
+
+See [FakeTcpHeaderClient](../../noderefs/FakeTcpHeaderClient),
+[FakeTcpHeaderServer](../../noderefs/FakeTcpHeaderServer),
+[IpOverrider](../../noderefs/IpOverrider), and
+[RawSocket](../../noderefs/RawSocket) for node settings and packet limits.
+For an ICMP carrier with similar service/TUN choices, see the
+[Ping tunnel example](./ping.mdx).

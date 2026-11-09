@@ -1,0 +1,467 @@
+---
+sidebar_position: 14
+title: "Ping tunnel"
+sidebar_label: "Ping"
+description: "Complete Iran and Kharej configurations for a TCP service over ICMP Echo, using connection bridges or TunDevice."
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Ping tunnel
+
+Forward a TCP service from Iran to Kharej using `PingClient` and `PingServer`.
+Users connect to Iran over TCP, and WaterWall carries the traffic between the
+servers inside IPv4 ICMP Echo Requests. Kharej forwards the recovered TCP stream
+to the application, `127.0.0.1:80` in these examples.
+
+```mermaid
+flowchart LR
+    Users[Users] -->|TCP :443| Iran[Iran: PingClient]
+    Iran <-->|ICMP Echo Requests| Kharej[Kharej: PingServer]
+    Kharej -->|TCP| Service[127.0.0.1:80]
+```
+
+Choose **Connection bridges (no TUN)** for a fixed TCP service using
+`ConnectionToPackets` and `PacketsToConnection`. The **TunDevice** variant
+provides the same service through real TUN interfaces and can also carry other
+inner IPv4 packets between those interfaces. Both variants use the same Ping
+carrier, with no Mux or additional transport nodes.
+
+Ping provides no encryption or peer authentication. Keep the application's own
+TLS when it needs those properties.
+
+## Before starting
+
+Use the [common setup](./overview.mdx) for `core.json`, variable syntax, and
+startup. Leave `misc.mtu` at `1500` on both servers. These configurations
+explicitly set the inner MTU to `1400`: Ping adds a 28-byte IPv4/ICMP wrapper,
+so the outer path must carry at least `1428` bytes without fragmentation. The
+maximum supported inner packet is `1472` bytes on a 1500-byte outer path.
+Lower `tunnel_mtu` on both hosts if your path needs a smaller value.
+
+These are Linux examples. Run WaterWall with permission to use raw sockets and
+manage capture rules, normally as root with `CAP_NET_RAW` and `CAP_NET_ADMIN`.
+Install `iproute2`, `iptables`, and `iptables-save`; the kernel must support
+NFQUEUE and the `bpf` match (`xt_bpf`) used by the ICMP capture filter. The
+TunDevice variant also needs `/dev/net/tun` and TUN support. The connection
+bridges themselves need no TUN, but their RawSocket transport still needs these
+raw-packet and firewall permissions.
+
+Use actual IPv4 addresses assigned to the two servers. Each Ping node checks
+the received outer source and destination against `peer-ipv4` and `local-ipv4`.
+The examples assume direct IPv4 reachability and do not configure NAT traversal.
+Allow ICMP **Echo Requests in both directions** through the network and host
+firewalls, as well as user TCP connections to Iran's `user_port`. Return data
+also travels in fresh Echo Requests; allowing only Echo Replies back to Iran
+is insufficient.
+
+Both configurations set `send-replies: false`. This disables optional outer
+Echo Reply acknowledgements; application data still travels in both directions.
+RawSocket captures and removes the selected peer ICMP from the host stack, so
+no kernel Echo Reply suppression sysctl is needed.
+
+Each RawSocket captures **all IPv4 ICMP from the other server's address**,
+including ordinary ping and ICMP errors from that peer. Ordinary outer-address
+ping is therefore unsuitable as a health check while the tunnel is active.
+The `[1]` protocol filter leaves TCP and UDP between the servers in the normal
+host stack. See [RawSocket](../../noderefs/RawSocket) for capture behavior.
+
+## Set the addresses
+
+Edit the `variables` objects and leave the unquoted `$variable$` references as
+written. Public addresses, inner addresses, interface names, and service ports
+have separate roles:
+
+| Variable | Where | What to enter |
+| --- | --- | --- |
+| `ip_server_iran` | Both variants, both hosts | Iran's assigned public IPv4; replace `192.0.2.10`. |
+| `ip_server_kharej` | Both variants, both hosts | Kharej's assigned public IPv4; replace `198.51.100.20`. |
+| `user_port` | Iran | User-facing TCP port, `443` here. |
+| `inner_ip_iran` | Iran connection bridge | Virtual source IPv4, `10.90.0.1` here. No host interface is assigned this address in the bridge variant. |
+| `inner_ip_kharej` | Iran connection bridge; both TUN configurations | Inner destination IPv4, `10.90.0.2` here. For TUN, it must match Kharej's `tun_cidr` address. |
+| `tunnel_port` | Iran connection bridge; both TUN configurations | Inner TCP destination port, `5300` here. This is not an ICMP or public transport port. |
+| `tunnel_mtu` | Both hosts | Inner IPv4 packet budget, `1400` here. |
+| `final_ip` / `final_port` | Kharej | Real TCP application backend, `127.0.0.1:80` here. |
+| `tun_name` | TUN variant, both hosts | TUN interface name, `wwping0` here. Choose an unused name on each host. |
+| `tun_cidr` | TUN variant, both hosts | Iran: `10.90.0.1/30`; Kharej: `10.90.0.2/30`. Keep distinct addresses in the same unused subnet. |
+
+Choose inner addresses that do not overlap either host's existing networks.
+When changing the TUN subnet, update both `tun_cidr` values and every
+`inner_ip_kharej` value together. Keep the public peer reachable through the
+physical network rather than through the TUN.
+
+## Configurations
+
+Choose the **same variant on both servers**, then select the Iran or Kharej tab
+for that server's complete configuration. Save one configuration per host.
+
+<Tabs groupId="ping-mode" defaultValue="bridges">
+<TabItem value="bridges" label="Connection bridges (no TUN)">
+
+The bridges create and recover inner TCP packets in userspace:
+
+```text
+Iran:   TcpListener -> ConnectionToPackets -> PingClient -> RawSocket
+Kharej: RawSocket -> PingServer -> PacketsToConnection -> TcpConnector
+```
+
+`ConnectionToPackets` opens an inner TCP flow from `inner_ip_iran` to
+`inner_ip_kharej:tunnel_port`. Kharej's `PacketsToConnection` accepts that flow,
+and the final connector selects `final_ip:final_port` as its real destination.
+The inner destination does not need a host IP assignment or a separate TCP
+listener in this variant. Responses return through the same bridges.
+
+<Tabs groupId="tunnel-location" defaultValue="iran">
+<TabItem value="iran" label="Iran">
+
+Save as `config_iran.json` on the Iran server.
+
+```json title="config_iran.json"
+{
+  "name": "iran-ping-bridges",
+  "variables": {
+    "ip_server_iran": "192.0.2.10",
+    "ip_server_kharej": "198.51.100.20",
+    "inner_ip_iran": "10.90.0.1",
+    "inner_ip_kharej": "10.90.0.2",
+    "user_port": 443,
+    "tunnel_port": 5300,
+    "tunnel_mtu": 1400
+  },
+  "nodes": [
+    {
+      "name": "users_inbound",
+      "type": "TcpListener",
+      "settings": {
+        "address": "0.0.0.0",
+        "port": $user_port$,
+        "nodelay": true
+      },
+      "next": "connection_to_packets"
+    },
+    {
+      "name": "connection_to_packets",
+      "type": "ConnectionToPackets",
+      "settings": {
+        "source-ipv4": $inner_ip_iran$,
+        "target-address": $inner_ip_kharej$,
+        "port": $tunnel_port$,
+        "mtu": $tunnel_mtu$
+      },
+      "next": "ping_client"
+    },
+    {
+      "name": "ping_client",
+      "type": "PingClient",
+      "settings": {
+        "local-ipv4": $ip_server_iran$,
+        "peer-ipv4": $ip_server_kharej$,
+        "send-replies": false
+      },
+      "next": "raw_transport"
+    },
+    {
+      "name": "raw_transport",
+      "type": "RawSocket",
+      "settings": {
+        "capture-filter-mode": "source-ip",
+        "capture-ips": [$ip_server_kharej$],
+        "capture-protocols": [1]
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+<TabItem value="kharej" label="Kharej">
+
+Save as `config_kharej.json` on the Kharej server.
+
+```json title="config_kharej.json"
+{
+  "name": "kharej-ping-bridges",
+  "variables": {
+    "ip_server_iran": "192.0.2.10",
+    "ip_server_kharej": "198.51.100.20",
+    "tunnel_mtu": 1400,
+    "final_ip": "127.0.0.1",
+    "final_port": 80
+  },
+  "nodes": [
+    {
+      "name": "raw_transport",
+      "type": "RawSocket",
+      "settings": {
+        "capture-filter-mode": "source-ip",
+        "capture-ips": [$ip_server_iran$],
+        "capture-protocols": [1]
+      },
+      "next": "ping_server"
+    },
+    {
+      "name": "ping_server",
+      "type": "PingServer",
+      "settings": {
+        "local-ipv4": $ip_server_kharej$,
+        "peer-ipv4": $ip_server_iran$,
+        "send-replies": false
+      },
+      "next": "packets_to_connection"
+    },
+    {
+      "name": "packets_to_connection",
+      "type": "PacketsToConnection",
+      "settings": {
+        "mtu": $tunnel_mtu$
+      },
+      "next": "outbound_to_service"
+    },
+    {
+      "name": "outbound_to_service",
+      "type": "TcpConnector",
+      "settings": {
+        "address": $final_ip$,
+        "port": $final_port$,
+        "nodelay": true
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+</Tabs>
+
+No host routes, IP forwarding, or NAT rules are required for this socket-to-socket
+variant. It forwards TCP services; the connection bridges do not handle inner
+ICMP, so an inner-address ping cannot test it. See
+[ConnectionToPackets](../../noderefs/ConnectionToPackets) and
+[PacketsToConnection](../../noderefs/PacketsToConnection) for bridge settings.
+
+</TabItem>
+<TabItem value="tun" label="TunDevice">
+
+This variant uses the kernel TCP stack and one TUN interface per host:
+
+```text
+Iran service:   TcpListener -> TcpConnector to 10.90.0.2:5300
+Iran packets:   TunDevice -> PingClient -> RawSocket
+
+Kharej packets: RawSocket -> PingServer -> TunDevice
+Kharej service: TcpListener on 10.90.0.2:5300 -> TcpConnector to backend
+```
+
+WaterWall assigns `10.90.0.1/30` to Iran's TUN and `10.90.0.2/30` to Kharej's
+TUN. Linux creates the connected subnet route, so Iran's TCP connector reaches
+Kharej's private listener through the tunnel. `route-table: "off"` leaves
+additional system-route installation disabled; this fixed-service setup needs
+no manual routes, default-route changes, IP forwarding, or NAT.
+
+The Ping nodes create the outer public-address headers while preserving the
+inner packet, so no `IpOverrider` is needed. Kharej's TCP listener binds only
+its inner TUN address. WaterWall creates the TUN before binding that listener.
+Allow inner TCP on `tunnel_port` through Kharej's TUN firewall, and allow inner
+ICMP on both TUNs if you want to use the ping check below.
+
+<Tabs groupId="tunnel-location" defaultValue="iran">
+<TabItem value="iran" label="Iran">
+
+Save as `config_iran.json` on the Iran server.
+
+```json title="config_iran.json"
+{
+  "name": "iran-ping-tun",
+  "variables": {
+    "ip_server_iran": "192.0.2.10",
+    "ip_server_kharej": "198.51.100.20",
+    "inner_ip_kharej": "10.90.0.2",
+    "tun_name": "wwping0",
+    "tun_cidr": "10.90.0.1/30",
+    "user_port": 443,
+    "tunnel_port": 5300,
+    "tunnel_mtu": 1400
+  },
+  "nodes": [
+    {
+      "name": "users_inbound",
+      "type": "TcpListener",
+      "settings": {
+        "address": "0.0.0.0",
+        "port": $user_port$,
+        "nodelay": true
+      },
+      "next": "tcp_to_kharej"
+    },
+    {
+      "name": "tcp_to_kharej",
+      "type": "TcpConnector",
+      "settings": {
+        "address": $inner_ip_kharej$,
+        "port": $tunnel_port$,
+        "nodelay": true
+      }
+    },
+    {
+      "name": "inner_tun",
+      "type": "TunDevice",
+      "settings": {
+        "device-name": $tun_name$,
+        "device-ip": $tun_cidr$,
+        "device-mtu": $tunnel_mtu$,
+        "route-table": "off",
+        "gso": false
+      },
+      "next": "ping_client"
+    },
+    {
+      "name": "ping_client",
+      "type": "PingClient",
+      "settings": {
+        "local-ipv4": $ip_server_iran$,
+        "peer-ipv4": $ip_server_kharej$,
+        "send-replies": false
+      },
+      "next": "raw_transport"
+    },
+    {
+      "name": "raw_transport",
+      "type": "RawSocket",
+      "settings": {
+        "capture-filter-mode": "source-ip",
+        "capture-ips": [$ip_server_kharej$],
+        "capture-protocols": [1]
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+<TabItem value="kharej" label="Kharej">
+
+Save as `config_kharej.json` on the Kharej server.
+
+```json title="config_kharej.json"
+{
+  "name": "kharej-ping-tun",
+  "variables": {
+    "ip_server_iran": "192.0.2.10",
+    "ip_server_kharej": "198.51.100.20",
+    "inner_ip_kharej": "10.90.0.2",
+    "tun_name": "wwping0",
+    "tun_cidr": "10.90.0.2/30",
+    "tunnel_port": 5300,
+    "tunnel_mtu": 1400,
+    "final_ip": "127.0.0.1",
+    "final_port": 80
+  },
+  "nodes": [
+    {
+      "name": "raw_transport",
+      "type": "RawSocket",
+      "settings": {
+        "capture-filter-mode": "source-ip",
+        "capture-ips": [$ip_server_iran$],
+        "capture-protocols": [1]
+      },
+      "next": "ping_server"
+    },
+    {
+      "name": "ping_server",
+      "type": "PingServer",
+      "settings": {
+        "local-ipv4": $ip_server_kharej$,
+        "peer-ipv4": $ip_server_iran$,
+        "send-replies": false
+      },
+      "next": "inner_tun"
+    },
+    {
+      "name": "inner_tun",
+      "type": "TunDevice",
+      "settings": {
+        "device-name": $tun_name$,
+        "device-ip": $tun_cidr$,
+        "device-mtu": $tunnel_mtu$,
+        "route-table": "off",
+        "gso": false
+      }
+    },
+    {
+      "name": "tunnel_inbound",
+      "type": "TcpListener",
+      "settings": {
+        "address": $inner_ip_kharej$,
+        "port": $tunnel_port$,
+        "nodelay": true
+      },
+      "next": "outbound_to_service"
+    },
+    {
+      "name": "outbound_to_service",
+      "type": "TcpConnector",
+      "settings": {
+        "address": $final_ip$,
+        "port": $final_port$,
+        "nodelay": true
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+</Tabs>
+
+See [TunDevice](../../noderefs/TunDevice) for interface and routing settings.
+
+</TabItem>
+</Tabs>
+
+## Run and check
+
+Start the TCP application in Kharej, then start WaterWall on Kharej followed by
+Iran. Run the [common startup command](./overview.mdx#start-the-tunnel) with
+the required privileges, for example:
+
+```bash
+sudo ./Waterwall --config:core.json
+```
+
+For the example HTTP backend on Kharej port `80`, connect to Iran's user entry:
+
+```bash
+curl http://192.0.2.10:443/
+```
+
+Replace the Iran IP and port if you changed them. Port `443` here is a TCP entry;
+it does not add HTTPS. Use your application's normal client when the backend is
+Xray or another protocol.
+
+For the **TunDevice variant only**, check the inner route and ping from Iran:
+
+```bash
+ip route get 10.90.0.2
+ping -c 3 10.90.0.2
+```
+
+The route should use `wwping0` with source `10.90.0.1`. Reverse the inner
+addresses to check from Kharej. Adapt these commands if you changed the subnet
+or interface name. The connection-bridge variant has no host inner interface
+and must be checked using a TCP application instead.
+
+If the application cannot connect, check these points:
+
+- Both servers use the same variant, the correct outer public addresses, and
+  RawSocket capture of the opposite source address with `capture-protocols: [1]`.
+- Firewalls and the network carry Echo Requests in both directions. Check
+  WaterWall's network logs for capture startup, permissions, or rejected packets.
+- Both inner MTUs fit the outer path after the 28-byte wrapper; Ping does not
+  perform PMTU discovery or fragment an oversized carrier.
+- Kharej can reach `final_ip:final_port`. In the TUN variant, also check the
+  connected subnet route, matching inner TCP port, and TUN firewall rules.
+
+See [PingClient](../../noderefs/PingClient) and
+[PingServer](../../noderefs/PingServer) for the carrier settings and limits.
