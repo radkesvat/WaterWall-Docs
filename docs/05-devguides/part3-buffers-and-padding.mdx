@@ -79,7 +79,9 @@ headroom remains 64 throughout.
 
 | Call | Returns |
 | --- | --- |
-| `sbufGetLength(b)` | current payload length (`len`) |
+| `sbufGetLength(b)` | logical payload length (`len`), including a splice body |
+| `sbufGetResidentView(b)` | borrowed `sbuf_read_view_t` containing the current `data` pointer and immediately readable `length` |
+| `sbufGetResidentPrefixLength(b)` | immediately readable byte count, without obtaining a pointer |
 | `sbufGetRawPtr(b)` | borrowed `const uint8_t *` to the payload start (`data`) |
 | `sbufGetMutablePtr(b)` | borrowed `uint8_t *` to the payload start; requires mutable `sbuf_t *` |
 | `sbufGetHeadroom(b)` | `size_t` byte offset from `head` to `data`, available to prepend |
@@ -93,6 +95,38 @@ The raw pointer supports byte indexing without discarding const; use the mutable
 accessor only when the buffer is owned for mutation. Neither accessor proves
 that a splice body's logical bytes are resident. Const access does not extend
 ownership or lifetime, and queued buffers must still be popped before mutation.
+
+`sbufGetResidentView()` pairs the current pointer with its resident bound:
+
+```c
+sbuf_read_view_t view = sbufGetResidentView(buf);
+for (size_t i = 0; i < view.length; ++i)
+{
+    inspectByte(view.data[i]); // inspection does not mutate or transfer buf
+}
+```
+
+| Buffer state | `view.data` | `view.length` |
+| --- | --- | --- |
+| Ordinary payload | Current `data` | Complete active payload length |
+| Splice prefix followed by pipe body | Current `data` | Only the resident prefix before metadata |
+| Splice body with no prefix | Metadata boundary | Zero, even with positive logical length |
+| Empty buffer | Current `data`, possibly an ordinary one-past position | Zero |
+
+The view is a borrowed snapshot. Reacquire it after mutation and discard it before
+storage replacement, destruction, recycling, or ownership transfer. It does not
+extend lifetime, synchronize threads, or certify alignment. Never dereference an
+empty view. The accessor performs no allocation, copying, materialization,
+consumption, syscalls, callbacks, or ownership transfer; it does not expose private
+pipe metadata as payload. Both resident accessors live in `shiftbuffer.h` and work
+without platform splice support. They require valid geometry; corrupt state is a
+programmer error, not an empty-view result.
+
+A zero-length view is not EOF and does not prove that more network input is
+needed: logical bytes may already reside in a private pipe. Use staged gathering,
+range helpers, or explicit materialization when parsing requires those bytes.
+Raw accessors remain valid for exposed splice prefixes, but supply no readable
+length by themselves.
 
 Create and reset set `data` to `head + initial_headroom` and length to zero.
 Reset preserves an ordinary buffer's capacity and initial headroom.
@@ -136,6 +170,12 @@ callbacks or returns an error sentinel. The result may be ignored when no raw
 pointer is needed. Returning a pointer establishes neither alignment nor that
 `len` bytes are resident; splice bodies still require their dedicated helpers.
 
+Prepending extends length before filling the exposed region. Keep that interval
+private: initialize every new byte synchronously before inspection, queue
+publication, callbacks, or ownership handoff. This requires a guaranteed complete
+fill; a producer that can fail or return a short result must commit only its actual
+successful output instead.
+
 ### Reading and Writing
 
 Aligned and unaligned integer helpers exist for header fields:
@@ -157,6 +197,136 @@ successful pipe I/O so logical capacity is reduced together with length.
 buffer with the source's full original aligned left padding. The caller owns
 both the result and the remaining source, including when the source becomes empty.
 
+### Appending Ordinary Payloads
+
+The append helpers combine tailroom validation, destination calculation, and
+length update without allocating or replacing storage:
+
+```c
+uint8_t *sbufAppendSpaceInPlace(sbuf_t *buf, size_t bytes);
+uint8_t *sbufTryAppendSpaceInPlace(sbuf_t *buf, size_t bytes);
+void sbufAppendBytesInPlace(sbuf_t *restrict buf,
+                            const void *restrict source, size_t bytes);
+bool sbufTryAppendBytesInPlace(sbuf_t *restrict buf,
+                              const void *restrict source, size_t bytes);
+```
+
+Every form requires a non-null, exclusively mutable ordinary buffer with valid
+geometry, including for zero bytes. Splice input and corrupt geometry are
+programmer errors; `Try` does not turn them into ordinary refusal. Non-`Try`
+forms require sufficient tailroom and assert it in Debug. The checked forms
+validate tailroom in every build and refuse before any write or mutation. Room
+is checked before adding to length or forming the requested end pointer, so an
+oversized request cannot wrap into apparent success.
+
+All four preserve the allocation address, cursor, capacity, current and initial
+headroom, previous payload, and flags, including checksum intent. They perform
+no allocation, recentering, compaction, callbacks, pipe I/O, recycling, or ownership
+transfer. Append starts have no extra alignment guarantee.
+
+`Space` returns the old payload end and immediately extends length by `bytes`.
+The exposed bytes remain uninitialized. Use it only for a guaranteed complete,
+synchronous fill before any inspection, queue publication, callback, or ownership
+handoff. For example, encoding a `uint32_t value` after establishing room for a
+four-byte footer:
+
+```c
+assert(sbufGetTailroom(buf) >= 4);
+uint8_t *footer = sbufAppendSpaceInPlace(buf, 4);
+footer[0] = (uint8_t) (value >> 24);
+footer[1] = (uint8_t) (value >> 16);
+footer[2] = (uint8_t) (value >> 8);
+footer[3] = (uint8_t) value;
+// The complete appended region is now initialized and may be observed.
+```
+
+A zero-byte space append changes nothing and returns the current tail, which
+may be a valid one-past pointer; do not dereference it. The checked form returns
+`NULL` only for insufficient tailroom. Positive results must be fully initialized;
+obtaining space alone does not certify readable payload. Returned pointers are
+borrowed and must be discarded before replacement, recycling, destruction, or
+ownership transfer.
+
+`Bytes` validates room, copies exactly `bytes` with `memoryCopy`, then extends
+length. A positive copy requires a non-null readable source range that does not
+alias the destination allocation; self-appending is outside the contract. A
+zero-byte copy succeeds, accepts a null source, and skips the copy primitive.
+The source stays unchanged and caller-owned; its flags are not copied. Use the
+checked copy when tailroom shortage is an expected outcome:
+
+```c
+if (sbufTryAppendBytesInPlace(buf, encoded, encoded_length))
+{
+    // The copied bytes are initialized and included in buf's length.
+}
+else
+{
+    // Insufficient tailroom: buf's fields and storage are unchanged.
+    // Choose the caller's existing growth, queueing, or refusal path.
+}
+```
+
+Keep short or failing producers on a reserve/produce/commit sequence. Native
+receives, TLS/BIO reservations, compression, and deferred I/O must publish only
+actual successful output; they cannot use space append to precommit a maximum.
+`sbufReserveSpace()` takes the required **total payload capacity from the cursor**,
+not an increment or spare-tail count. Establish representable geometry, retain
+its returned buffer, and reacquire pointers after growth. For an already validated
+positive receive request within the OS interface's limit:
+
+```c
+const size_t old_length = sbufGetLength(buf);
+size_t allocation_capacity;
+if ((uint64_t) request > (uint64_t) UINT32_MAX - old_length ||
+    !sbufTryComputeCapacity((uint64_t) old_length + request,
+                           sbufGetInitialHeadroom(buf), &allocation_capacity))
+{
+    // Reject the requested geometry; buf remains owned and unchanged.
+}
+else
+{
+    buf = sbufReserveSpace(buf, old_length + request);
+    uint8_t *tail = sbufGetMutablePtr(buf) + old_length; // reacquire after growth
+    ssize_t produced = recv(fd, tail, request, 0);
+    if (produced > 0)
+    {
+        sbufSetLength(buf, old_length + (size_t) produced);
+    }
+    // Zero is EOF; negative is an error. Handle either with length unchanged.
+    // buf remains owned here, including when the allocation was replaced.
+}
+```
+
+Neither append family implicitly grows storage. A `Try` prefix describes a
+helper's refusal behavior, not a universal allocation guarantee:
+`bufferpoolTryGetBestFit()` and `sbufTryEnsureOrdinary()` can allocate after
+accepting geometry. Actual heap allocation failure remains fatal.
+
+### Operation Contracts
+
+The table separates expected refusal from programmer preconditions, storage
+replacement, and ownership. Valid representation and locally checkable
+preconditions use Debug assertions; they are not extra runtime failure modes.
+
+| Operation | Expected refusal | Allocation or replacement | Length and ownership effect |
+| --- | --- | --- | --- |
+| `sbufAppendSpaceInPlace` | None when tailroom precondition holds | Neither | Extends length; caller immediately initializes; ownership retained |
+| `sbufTryAppendSpaceInPlace` | `NULL` for insufficient tailroom | Neither | Same on success; fields and storage unchanged on refusal |
+| `sbufAppendBytesInPlace` | None when tailroom precondition holds | Neither | Copies, then extends length; source and destination remain owned |
+| `sbufTryAppendBytesInPlace` | `false` for insufficient tailroom | Neither | Same on success; fields and storage unchanged on refusal |
+| `sbufGetResidentView` | None for a valid buffer | Neither | Observes resident bytes; borrowed lifetime |
+| `sbufShiftLeft` | Caller establishes headroom | Neither | Extends front; caller immediately initializes exposed bytes |
+| `sbufDuplicateTo` | `false` if destination cannot represent the complete copy | Neither | Destination changes only on success; source retained |
+| `sbufReserveSpace` | Representable geometry is a caller obligation | May replace and free old buffer | Existing payload and length preserved; only returned buffer remains owned |
+| `sbufConcat` | Caller supplies distinct ordinary inputs and bounded total geometry | May replace destination | Appends source; source retained |
+| `sbufAppendMerge` | Valid distinct ordinary inputs and geometry required | May replace first input | Consumes both inputs; only returned buffer remains owned |
+
+`sbufConcatNoCheck()` retains its ordinary, distinct-buffer, sufficient-tailroom
+preconditions and copies through `sbufAppendBytesInPlace()` without growth.
+`sbufConcat()` keeps explicit growth and its `memoryCopyLarge` policy. Neither
+operation transfers the source's checksum intent. Always execute mutating helpers
+outside `assert()` so Release builds perform the operation.
+
 ### Packet checksum repair requests
 
 `kSbufFlagRecalculateChecksum` uses the existing `sbuf_t.flags` storage without
@@ -177,8 +347,9 @@ Each clone owns its own request; consuming one does not change another.
 `sbufReserveSpace()` preserves the request across replacement or no growth; use
 only its returned pointer after it may replace the allocation.
 
-Byte-copy helpers, including `sbufWriteBuf()`, do not transfer intent. New partial
-moves, slices and range extractions start unmarked and do not consume the source's
+Byte-copy helpers, including `sbufWriteBuf()` and the append-byte helpers, do not
+transfer intent. All in-place append helpers preserve the destination flags. New
+partial moves, slices and range extractions start unmarked and do not consume the source's
 request. Concatenation preserves the destination bit through growth without ORing
 source bits. Cursor/length changes preserve the bit mechanically; mutable access
 and byte writers do not infer checksum consequences. Packet-aware callers must
@@ -292,9 +463,14 @@ is permitted. Inspecting or overwriting the kernel-backed body or control storag
 through generic byte accessors is not permitted; those accessors do not add
 splice checks. Opaque synchronous forwarding and size accounting remain valid.
 
-`sbufGetResidentPrefixLength()` returns the addressable prefix of a splice
-buffer, or the full length of an ordinary buffer. After successful pipe I/O,
-`sbufSpliceConsumeBody(buf, bytes)` updates length and logical capacity together
+`sbufGetResidentView()` pairs the current data pointer with the addressable
+prefix of a splice buffer, or the full active payload of an ordinary buffer.
+`sbufGetResidentPrefixLength()` supplies that same resident bound when no pointer
+is needed. A body without a prefix has a zero-length view at the metadata
+boundary even when its logical length is positive; accessing the view does not
+read or consume the private pipe. Reacquire this borrowed snapshot after mutation.
+After successful pipe I/O, `sbufSpliceConsumeBody(buf, bytes)` updates length and
+logical capacity together
 without moving the cursor. This accounting helper does not read or discard pipe
 bytes itself; use it only for bytes already removed from the private pipe.
 
@@ -915,7 +1091,9 @@ sbufByteCopy(header, wire_header, header_len);
 
 The returned pointer replaces a subsequent `sbufGetMutablePtr(buf)` when the
 caller needs the new front. Byte copying requires no aligned cursor; aligned
-integer writers still require the alignment described above.
+integer writers still require the alignment described above. Fill the entire
+exposed header synchronously before any observer or ownership handoff; length has
+already been extended during this private initialization interval.
 
 `sbufShiftLeft` asserts that enough current headroom exists:
 
@@ -1199,8 +1377,11 @@ When sizing a destination buffer from an untrusted or variable payload length:
 - Compare the requested length with actual writable capacity
   (`sbufGetWritableCapacity()`) in ordinary Release control flow before any
   assert-only length mutator (such as `sbufSetLength()`) or write.
-- Publish the `sbuf_t` length only after the producer has successfully written or
-  validated that many bytes.
+- Publish actual produced length only after a partial or failing producer has
+  successfully written or validated that many bytes. Space append and prepend
+  may privately extend length for a guaranteed complete synchronous fill, but no
+  inspection, queue publication, callback, or ownership handoff may observe the
+  region before it is fully initialized.
 
 `sbufEnsureHeadroom(pool, buf, need)` consumes an exclusively owned buffer
 and returns the sole owned result. Sufficient headroom returns the original
@@ -1255,8 +1436,11 @@ this bookkeeping so later context destruction cannot recycle the payload again.
 CRLF searches, exact/at-least/full reads, and `bufferstreamTakeChunk()` only on ordinary
 input. Logical stream entries are storage boundaries, not protocol records.
 In Debug, Push asserts the ordinary-input precondition before copying or retaining input,
-including empty input. `bufferstreamInitEmpty()` initializes a destroyable stream
-without reserving deque storage; its pool and exact-read padding contract match
+including empty input. Per-entry byte inspection and delimiter scans also retain
+that ordinary-input precondition while using resident views. A short splice view
+does not permit skipping its pipe bytes to inspect a later entry; BufferStream
+requires ordinary storage throughout. `bufferstreamInitEmpty()` initializes a
+destroyable stream without reserving deque storage; its pool and exact-read padding contract match
 `bufferstreamCreate()`, which retains its eager reservation. Both initializers
 require that any previous contents have already been released.
 `bufferstreamGetEntryCount()` counts retained storage entries after coalescing,
