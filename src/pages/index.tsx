@@ -221,7 +221,7 @@ function HomepageHeader(): ReactElement {
         </div>
         <div className={styles.heroStats} aria-label="WaterWall highlights">
           <HeroStat
-            value="50+"
+            value="80+"
             label={translate({
               id: "homepage.hero.stat.nodes",
               message: "documented nodes",
