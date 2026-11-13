@@ -2266,6 +2266,76 @@ packets may be smaller. Both datagram and framed input are independently bounded
 at 1,472 bytes, regardless of local `max-packet-size`. Keep these internal bounds aligned with the production engine when
 changing its pinned library or admission mapping.
 
+### ConnectionStripe framing and receive windows
+
+ConnectionStripeClient and ConnectionStripeServer share
+`Internals/ConnectionStripeCommon`. Both operate on ordinary reliable streams
+and advertise `kNodeFlagBlocksSplice`. Their node metadata reserves 24 bytes of
+left padding. Each direction has an independent byte-offset space and DATA
+record-index space, both beginning at zero. Every frame begins with this fixed
+24-byte header; multibyte integers are big endian:
+
+| Byte range | Meaning |
+| --- | --- |
+| `0` | Type, from the table below. |
+| `1..3` | Reserved, all zero. |
+| `4..7` | Body length, unsigned 32-bit. |
+| `8..15` | Offset or first control value, unsigned 64-bit. |
+| `16..23` | Auxiliary control value or DATA index, unsigned 64-bit. |
+
+| Type | Name | Body and header values |
+| --- | --- | --- |
+| `1` | JOIN | Body is 24 bytes: session ID (16), member index (2), member count (2), and receive-window bytes (4). Offset and auxiliary fields are zero. |
+| `2` | READY | No body. Offset is the server's receive window; auxiliary value is the group count. Sent by the server on member zero. |
+| `3` | DATA | Body has 1–16,384 application bytes. Offset is the first byte's stream position; auxiliary value is the DATA record index. |
+| `4` | WINDOW | No body. Offset is the cumulative consumed-byte count; auxiliary value is the cumulative consumed-record count. |
+| `5` | CLOSE | No body. Offset is the final byte count; auxiliary value is the final DATA record count. |
+| `6` | CLOSE_ACK | No body. Echoes the accepted CLOSE counts. |
+
+The complete JOIN is 48 bytes. Every member sends one with the same fresh random
+128-bit session ID, consistent count and client window, and a unique index in
+`0..count-1`. Client counts are 1–32; the server also enforces its configured
+`max-connections`. Session IDs are grouping metadata, not peer authentication.
+Control framing and DATA remain parseable when headers or bodies are split
+across input buffers or several frames arrive in one buffer.
+All control frames after JOIN travel on member zero; DATA can use any member.
+READY and server DATA can consequently arrive in either order across members.
+The client admits pre-READY DATA into its bounded receive inventory but waits
+for valid READY before delivering it. The server still rejects DATA before its
+group is complete. Never infer cross-member ordering from the server having
+submitted READY first.
+
+The local receive window defaults to 1 MiB and permits 16 KiB–16 MiB. The peer
+may send only within the cumulative consumed-byte count plus that window, and
+may have at most 256 unconsumed DATA records outstanding. Check arithmetic before
+adding lengths or advancing counts. Receiver records use canonical ordinary
+storage and remain bounded by both the logical-byte window and 256-record
+inventory; the receive window alone is not an exact physical-memory bound.
+Record indices and byte offsets must agree when contiguous data is delivered.
+Overlapping, duplicate, inconsistent or out-of-window DATA is a protocol error.
+
+These limits reserve space for earlier missing data even when later records
+arrive first. Withholding new WINDOW credit after application Pause bounds
+reordering without stopping every transport's control or gap-filling traffic.
+Consume and release received storage in order, then advertise cumulative credit.
+CLOSE may overtake DATA on another member; verify and consume its complete
+announced prefix before acknowledging it. Data is delivered while the application
+remains attached and discarded after local Finish. Closure and owned-line teardown follow
+[Part 2](./part2-lines-and-callbacks.mdx#connectionstripe-ownership-flow-and-close).
+
+Unsent application input has a separate FIFO. `max-buffered-bytes` defaults to
+4 MiB, accepts 64 KiB–64 MiB, and caps logical bytes and canonical allocation
+charge independently. Each member's frame parser also has its own byte and
+allocation-charge bounds set to this value. The setting does not cap the
+receiver's separate reordering storage or the neighboring transports' buffers.
+Source payload admission must account
+for retained capacity even when logical input is small. Recycle only buffers
+still owned locally and use the exact line's pool. Fresh frames and reconstructed
+payload must retain onward padding. Session setup and close drain default to
+10,000 ms each, with accepted values 1–600,000 ms; deadlines do not extend on
+partial progress. The local idle table services expiration once per second, so
+millisecond settings do not imply exact or subsecond timer precision.
+
 ### HalfDuplex setup and direct forwarding
 
 HalfDuplexClient selects its transport entries at startup. With neither

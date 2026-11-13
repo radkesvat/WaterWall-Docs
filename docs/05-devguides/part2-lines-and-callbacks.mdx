@@ -864,6 +864,11 @@ Do not let both a cancellation callback and the `RejectedSettled` branch perform
 the same fallback. Notification has already run when that result is returned.
 
 The shared `pipe_tunnel` follows the same rule for ordered cross-worker streams.
+Before publishing the companion line's Init, copy the ingress source address
+context, including its IP, port and protocol flags, alongside the user markers.
+Worker migration must not erase source metadata used by downstream routing or
+admission. This snapshot is taken while the source is owned by the calling
+worker and the companion is still unpublished.
 One explicit pair owner holds the borrowed/owned roles and references; any lost
 Init, data, control, or Finish atomically makes the pair terminal. Each side
 detaches on its owner worker, only the created companion line is destroyed, and
@@ -2169,6 +2174,78 @@ After Init and all admitted replay settle, destroy and zero the server's entire
 aligned line state, then permanently bypass it. Neither Est nor Resume is a
 prerequisite. No callbacks remain for the server after retirement, including
 Finish; the client retains its distinct-line mapping.
+
+### ConnectionStripe ownership, flow and close
+
+ConnectionStripeClient borrows the application line and owns the configured
+number of normal transport lines. ConnectionStripeServer borrows its incoming
+transport lines and owns exactly one reconstructed normal application line per
+complete group. All members are full duplex. The server chooses one processing
+worker using a keyed hash of the complete random session ID and uses PipeTunnel
+for arrivals on other workers. Return traffic follows each member's actual
+transport line. Before application Init, copy member zero's preserved source
+address context to the reconstructed line, independently of worker placement.
+Session state has its own lifetime and can outlive a detached
+application line; a line reference never permits callbacks after logical death.
+
+The client initializes every member through its shared next path and sends JOIN
+without waiting for application payload. The server initializes its next once
+every distinct member is present. Readiness for framed application DATA is a
+protocol state separate from adapter Est; the mapped transport Est must remain
+prompt and safe under reentrant payload or Finish. Startup therefore also works
+when the destination speaks first. No permanently bypassed line can replace
+these distinct-line mappings.
+The client may receive server DATA on one member before READY arrives on member
+zero. Retain that DATA within the normal receive bounds and defer application
+delivery until READY; independent streams provide no cross-member order.
+
+The sender keeps per-member output pressure and selects available members for
+bounded DATA records. A paused member does not hold the entire application when
+other members and peer credit remain available. Aggregate byte credit and the
+fixed outstanding-record limit constrain transmission independently. The local
+pending-application FIFO combines its own high/low pressure with those reasons;
+one Resume must not clear another reason's hold. Its high and low watermarks are
+75% and 50% of the configured bound. The FIFO has independent logical-byte and
+canonical allocation-charge admission checks.
+
+The session pump records requests made while it is already draining and runs
+another pass before returning idle. In particular, a source Resume may
+synchronously submit Payload or Finish after the current pass has exhausted its
+outgoing work. That work must progress without waiting for another external
+event. Each pass still honors transport pressure, receive credit and closure;
+a nonempty blocked queue alone does not request another pass.
+
+Each receiver owns the ordered delivery backlog and honors application-side
+Pause. Receive credit advances after in-order consumption: delivery while the
+application remains attached, or discard after that application has finished.
+Do not pause all input members merely because the reordering window is occupied:
+the missing earlier DATA and protocol control must still be able to arrive.
+The advertised window and record count already reserve their bounded receive
+capacity. Admission, offset arithmetic and terminal counts must reject malformed
+peer input without silently discarding application bytes.
+
+Finish ends the exact application line as a whole; it is not a separate TCP
+half-close operation. Detach and zero that line's state before outward callbacks,
+and destroy an owned application line before its Finish handler returns. An
+independent session may drain previously admitted data and exchange CLOSE and
+CLOSE_ACK while its transports remain alive. It must never send another callback
+to the detached application; received reverse DATA is consumed and discarded.
+CLOSE carries the final byte and record counts; acknowledge it only after the
+preceding records have been consumed in order. Setup and close drain have finite,
+non-extending deadlines, serviced by the local idle table's one-second sweep.
+The first local Finish or received CLOSE starts the drain deadline once; neither
+later delivery nor entering the other close direction restarts it.
+An unexpected transport Finish,
+protocol violation or refused hard storage bound aborts the group; there is no
+cross-member retransmission or replacement connection.
+
+Keep active groups registered until their terminal cleanup so a late JOIN cannot
+create a second application line. Per-worker `max-sessions` bounds retained
+sessions, and the server's `max-pending-connections` separately bounds lines
+waiting for a complete JOIN. Shutdown closes admission, detaches worker timers
+during quiescence and drains owned normal lines and session inventories while
+their wrappers, chains and pools still exist. Received Finish is never reflected
+toward its sender; borrowed transports are closed through their owners.
 
 ### KCP node ownership, sessions and pressure
 

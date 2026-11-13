@@ -1,0 +1,497 @@
+---
+sidebar_position: 17
+title: "Connection striping over TLS"
+sidebar_label: "ConnectionStripe: parallel TLS"
+description: "Share eight TLS/TCP connections with Mux, or stripe each application separately, to use capacity under per-connection bandwidth limits."
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Connection striping over TLS
+
+This example carries traffic between two servers over **eight independent,
+full-duplex TLS/TCP connections per Stripe group**. With Mux, several application
+connections share a group. Without Mux, each application connection gets its own
+group. In both variants, the destination service receives a separate TCP
+connection for each application connection and needs no Mux, Stripe or TLS support.
+
+Use **With Mux** for client-first protocols such as HTTP that can share carriers.
+Choose **Without Mux** for separate groups or services that send a greeting before
+the client writes: Mux sends a child's Open only with its first application
+payload. Stripe alone starts setup immediately and supports server-first data.
+Select the same variant on both servers.
+
+The loopback defaults allow both processes to run on one machine. Server 1 is the
+client endpoint (Iran in other examples); server 2 is the remote endpoint (Kharej).
+Runnable files are included for
+[With Mux](https://github.com/radkesvat/WaterWall/tree/main/tunnels/ConnectionStripeClient/examples/tls-mux)
+and [Without Mux](https://github.com/radkesvat/WaterWall/tree/main/tunnels/ConnectionStripeClient/examples/tls).
+
+## When this helps
+
+If each TCP connection between the servers has an independent upload or download
+bandwidth limit, several connections can use more of the path's available
+aggregate capacity. For example, eight connections each capped at 10 Mbit/s have
+a theoretical combined capacity of 80 Mbit/s in that direction, before overhead.
+This is an illustration, not a measured result or a promised speedup. Striping
+cannot increase a shared link limit, a per-IP aggregate limit or service capacity.
+Latency, receive windows, CPU and protocol overhead also affect throughput.
+
+Mux combines application connections into shared streams; Stripe distributes
+each shared stream across multiple carriers. The basic TCP arrangement is:
+
+```text
+Server 1: TcpListener -> MuxClient -> ConnectionStripeClient -> TcpConnector
+Server 2: TcpListener -> ConnectionStripeServer -> MuxServer -> TcpConnector(service)
+```
+
+The runnable configurations below add TLS to each carrier. To use the plain TCP
+arrangement, remove both TLS nodes, set the client's `stripe-client.next` to
+`transport`, and set the server's `transport.next` to `stripe-server`.
+
+## Topology
+
+<Tabs groupId="connection-stripe-mux">
+<TabItem value="with-mux" label="With Mux" default>
+
+```mermaid
+flowchart LR
+    Apps[Applications] <--> Entry["Server 1 TcpListener :1080"]
+    Entry <--> MC[MuxClient]
+    MC <--> Client[ConnectionStripeClient]
+    Client <--> CT[TlsClient]
+    CT <--> Out[TcpConnector]
+    Out <-->|"8 TLS/TCP connections per Mux parent"| In["Server 2 TcpListener :8443"]
+    In <--> ST[TlsServer]
+    ST <--> Server[ConnectionStripeServer]
+    Server <--> MS[MuxServer]
+    MS <--> Dest[TcpConnector]
+    Dest <-->|"one connection per application"| Service["TCP service :9000"]
+```
+
+The example uses one client worker and MuxClient's `fixed-connections-count`
+mode with `per-worker-connections-count: 1`. Applications reuse one healthy
+selectable Mux parent, and Stripe opens eight carriers for that parent. A normal
+child close leaves other children and the shared group usable.
+
+In general, `K` active Mux parents with Stripe `connections: N` require `K × N`
+inter-server connections. Worker count, Mux mode and replacement of parents affect
+`K`; eight is not a process-wide hard limit. For example, two client workers each
+using one parent normally use two groups, or 16 carriers. Retired parents may
+coexist with replacements while their children finish.
+
+</TabItem>
+<TabItem value="without-mux" label="Without Mux">
+
+```mermaid
+flowchart LR
+    App[Application] <--> Entry["Server 1 TcpListener :1080"]
+    Entry <--> Client[ConnectionStripeClient]
+    Client <--> CT[TlsClient]
+    CT <--> Out[TcpConnector]
+    Out <-->|"8 TLS/TCP connections per application"| In["Server 2 TcpListener :8443"]
+    In <--> ST[TlsServer]
+    ST <--> Server[ConnectionStripeServer]
+    Server <--> Dest[TcpConnector]
+    Dest <--> Service["TCP service :9000"]
+```
+
+Each application connection creates eight carriers, each with its own TCP and
+TLS handshake. All members reach the same Stripe server instance, which creates
+one destination connection for that group. One hundred simultaneous application
+connections therefore require 800 carriers and 100 service connections.
+
+</TabItem>
+</Tabs>
+
+Both variants stripe upload and download independently and restore byte order.
+A slow member can delay data that arrived ahead of it on another member; with
+Mux that delay can affect all children on the parent. Losing any member aborts
+its group and ends the applications using it. More members consume more sockets,
+TLS sessions and buffers. Compare `connections: 1` with larger counts using the
+same workload before choosing a deployment value.
+
+## Files and ports
+
+Create separate `client` and `server` directories, each containing `config.json`
+and `core.json`, or copy both directories from the selected runnable variant.
+
+| Endpoint | Address | Purpose |
+| --- | --- | --- |
+| Client entry | `127.0.0.1:1080` TCP | Plain TCP connection from the application. |
+| Server transport | `127.0.0.1:8443` TCP | All eight TLS connections. |
+| Destination | `127.0.0.1:9000` TCP on the server | One service connection per application stream. |
+
+The local example generates a self-signed certificate and disables certificate
+verification explicitly for that demonstration. For deployment, install a
+trusted server certificate and enable verification. The Stripe session ID groups
+members; it does not authenticate or encrypt them. TLS provides the encryption
+in this example.
+
+## Client configuration
+
+Save the selected variant as `client/config.json`:
+
+<Tabs groupId="connection-stripe-mux">
+<TabItem value="with-mux" label="With Mux" default>
+
+```json title="client/config.json"
+{
+  "name": "connection-stripe-tls-mux-client",
+  "nodes": [
+    {
+      "name": "application",
+      "type": "TcpListener",
+      "next": "mux-client",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 1080,
+        "nodelay": true
+      }
+    },
+    {
+      "name": "mux-client",
+      "type": "MuxClient",
+      "next": "stripe-client",
+      "settings": {
+        "mode": "fixed-connections-count",
+        "per-worker-connections-count": 1
+      }
+    },
+    {
+      "name": "stripe-client",
+      "type": "ConnectionStripeClient",
+      "next": "tls-client",
+      "settings": {
+        "connections": 8
+      }
+    },
+    {
+      "name": "tls-client",
+      "type": "TlsClient",
+      "next": "transport",
+      "settings": {
+        "sni": "stripe.example.test",
+        "verify": false,
+        "alpns": [
+          "http/1.1"
+        ]
+      }
+    },
+    {
+      "name": "transport",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 8443,
+        "nodelay": true,
+        "fastopen": false
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+<TabItem value="without-mux" label="Without Mux">
+
+```json title="client/config.json"
+{
+  "name": "connection-stripe-tls-client",
+  "nodes": [
+    {
+      "name": "application",
+      "type": "TcpListener",
+      "next": "stripe-client",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 1080,
+        "nodelay": true
+      }
+    },
+    {
+      "name": "stripe-client",
+      "type": "ConnectionStripeClient",
+      "next": "tls-client",
+      "settings": {
+        "connections": 8
+      }
+    },
+    {
+      "name": "tls-client",
+      "type": "TlsClient",
+      "next": "transport",
+      "settings": {
+        "sni": "stripe.example.test",
+        "verify": false,
+        "alpns": [
+          "http/1.1"
+        ]
+      }
+    },
+    {
+      "name": "transport",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 8443,
+        "nodelay": true,
+        "fastopen": false
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+</Tabs>
+
+`connections: 8` applies to each input stream seen by Stripe: a Mux parent in
+With Mux, or an individual application connection in Without Mux.
+
+## Server configuration
+
+Save the selected variant as `server/config.json`:
+
+<Tabs groupId="connection-stripe-mux">
+<TabItem value="with-mux" label="With Mux" default>
+
+```json title="server/config.json"
+{
+  "name": "connection-stripe-tls-mux-server",
+  "nodes": [
+    {
+      "name": "transport",
+      "type": "TcpListener",
+      "next": "tls-server",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 8443,
+        "nodelay": true
+      }
+    },
+    {
+      "name": "tls-server",
+      "type": "TlsServer",
+      "next": "stripe-server",
+      "settings": {
+        "cert-file": "server.crt",
+        "key-file": "server.key",
+        "sni": "stripe.example.test"
+      }
+    },
+    {
+      "name": "stripe-server",
+      "type": "ConnectionStripeServer",
+      "next": "mux-server",
+      "settings": {
+        "max-connections": 32
+      }
+    },
+    {
+      "name": "mux-server",
+      "type": "MuxServer",
+      "next": "destination",
+      "settings": {}
+    },
+    {
+      "name": "destination",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 9000,
+        "nodelay": true,
+        "fastopen": false
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+<TabItem value="without-mux" label="Without Mux">
+
+```json title="server/config.json"
+{
+  "name": "connection-stripe-tls-server",
+  "nodes": [
+    {
+      "name": "transport",
+      "type": "TcpListener",
+      "next": "tls-server",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 8443,
+        "nodelay": true
+      }
+    },
+    {
+      "name": "tls-server",
+      "type": "TlsServer",
+      "next": "stripe-server",
+      "settings": {
+        "cert-file": "server.crt",
+        "key-file": "server.key",
+        "sni": "stripe.example.test"
+      }
+    },
+    {
+      "name": "stripe-server",
+      "type": "ConnectionStripeServer",
+      "next": "destination",
+      "settings": {
+        "max-connections": 32
+      }
+    },
+    {
+      "name": "destination",
+      "type": "TcpConnector",
+      "settings": {
+        "address": "127.0.0.1",
+        "port": 9000,
+        "nodelay": true,
+        "fastopen": false
+      }
+    }
+  ]
+}
+```
+
+</TabItem>
+</Tabs>
+
+`max-connections: 32` accepts this client's eight-member groups; it does not
+wait for 32 members. With Mux, Stripe reconstructs a parent and MuxServer opens
+service connections for its children. Without Mux, Stripe opens one service
+connection directly. The destination `127.0.0.1` means the server's own host.
+Mux does not carry distinct destination addresses in this fixed-service example.
+
+## Core configuration
+
+Save this as `core.json` in both directories:
+
+```json title="core.json"
+{
+  "log": {
+    "path": "log/",
+    "internal": {
+      "loglevel": "INFO",
+      "file": "internal.log",
+      "console": true
+    },
+    "core": {
+      "loglevel": "INFO",
+      "file": "core.log",
+      "console": true
+    },
+    "network": {
+      "loglevel": "INFO",
+      "file": "network.log",
+      "console": true
+    },
+    "dns": {
+      "loglevel": "INFO",
+      "file": "dns.log",
+      "console": true
+    }
+  },
+  "configs": [
+    "config.json"
+  ],
+  "misc": {
+    "workers": 1,
+    "ram-profile": "client",
+    "mtu": 1500,
+    "try-enabling-bbr": false,
+    "tcp-tune": false
+  }
+}
+```
+
+Both processes use one worker to make the example's connection counts simple.
+Increasing the client worker count also increases Mux's per-worker parent slots.
+The server always processes each Stripe group on one worker, even when it has
+several workers available. These files disable automatic TCP tuning for the demo.
+
+## Run locally
+
+Use a WaterWall build containing both ConnectionStripe nodes, TLS and the TCP
+adapters, plus MuxClient and MuxServer for With Mux. From the directory containing `client` and `server`, generate a local
+certificate with OpenSSL:
+
+```bash
+openssl req -x509 -newkey rsa:2048 -nodes -sha256 -days 30 \
+  -subj '/CN=stripe.example.test' \
+  -addext 'subjectAltName=DNS:stripe.example.test' \
+  -keyout server/server.key -out server/server.crt
+```
+
+Start a destination HTTP service in one terminal:
+
+```bash
+python3 -m http.server 9000 --bind 127.0.0.1
+```
+
+Start the server from its directory in a second terminal:
+
+```bash
+cd /path/to/selected-example/server
+/absolute/path/to/Waterwall --config:core.json
+```
+
+Start the client in a third terminal:
+
+```bash
+cd /path/to/selected-example/client
+/absolute/path/to/Waterwall --config:core.json
+```
+
+Send a plain HTTP request through the client entry:
+
+```bash
+curl --fail http://127.0.0.1:1080/
+```
+
+Repeat the request to open another application connection. With Mux, the healthy
+fixed parent and its eight carriers are reused; Without Mux, the new application
+creates another group. Each HTTP request connection reaches a separate service
+connection. Request and response bytes are reordered at each Stripe receiver.
+The client entry is an ordinary TCP forwarding port, not an HTTP or SOCKS proxy.
+Stop the processes with Ctrl+C when finished.
+
+## Use two hosts
+
+1. Change the client `transport.settings.address` to the server's reachable address.
+2. Bind the server transport listener to its interface or `0.0.0.0`, and allow
+   the selected TCP port, `8443` in this example.
+3. Install the server certificate and key. Set both TLS nodes' `sni` to the
+   certificate name, use a trusted certificate chain and set client `verify: true`.
+4. Set server `destination.settings.address` and `port` to the destination
+   service as reached from the server.
+5. Choose the client entry's address and port for the applications that should
+   reach this service.
+
+Every member of a group must reach the same server node instance. A load balancer
+that spreads the eight connections across separate processes cannot reconstruct
+that group.
+
+## Limits and closure
+
+The defaults advertise a 1 MiB receive window in each direction and cap
+outstanding DATA records at 256. Unsent application data has separate 4 MiB
+logical-byte and retained-allocation limits; each member's frame parser has
+separate limits of the same size. Setup and close drain each have a 10-second
+deadline, checked by a one-second expiry sweep. These settings are configurable; see the
+[client reference](../../02-noderefs/ConnectionStripeClient.mdx) and
+[server reference](../../02-noderefs/ConnectionStripeServer.mdx).
+
+An orderly close includes the final byte and record counts. Its acknowledgment
+waits for earlier data even when another member delivers the close first.
+Unexpected loss of any member aborts the group; with Mux this ends all children
+using that parent. A normal child close leaves siblings and their group usable.
+There is no member replacement or cross-member retransmission inside a group.
+Finish closes the application line as a whole, without a separate TCP half-close
+API. Both Stripe nodes use ordinary buffers
+and disable splice for their chains. Mux children share their parent's Stripe
+receive window; Mux also has its own child and buffering limits.
