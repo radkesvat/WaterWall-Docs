@@ -1650,8 +1650,8 @@ descriptors remain fatal invariants. Exact transfer primitives live in
 `splice_frame_reader_t` in `ww/bufio/splice_frame_reader.{h,c}` owns a
 `splice_stream_t`, the active-drain guard, incremental-frame progress, nested
 logical-byte and retained-charge limits, empty-input disposal and output-buffer
-selection. UdpOverTcpClient, UdpOverTcpServer, KeepAliveClient, KeepAliveServer, Bgp4Client and Bgp4Server use
-this reader. It runs on the borrowed pool's owner worker and makes no callbacks
+selection. UdpOverTcpClient, UdpOverTcpServer, KeepAliveClient, KeepAliveServer, Bgp4Client, Bgp4Server, ConnectionStripeClient
+and ConnectionStripeServer use this reader. It runs on the borrowed pool's owner worker and makes no callbacks
 or line-reference changes. Its `nested_byte_limit` and `retained_charge_limit`
 fields are immutable limits, not usage counters. Incoming buffer length uses
 `size_t` for admission accounting; declared frame progress remains bounded
@@ -1684,6 +1684,7 @@ before processing it.
 | UdpOverTcpClient and UdpOverTcpServer | 2 MiB | 4 MiB |
 | KeepAliveClient and KeepAliveServer | 8 MiB | 16 MiB |
 | Bgp4Client and Bgp4Server | 2,162,705 bytes | 4,325,410 bytes |
+| ConnectionStripeClient and ConnectionStripeServer (per member) | `max-buffered-bytes` | `max-buffered-bytes` |
 
 The node still decodes and validates headers, chooses whether to deliver or
 discard each body or chunk, emits callbacks and closes the line. A borrowed
@@ -2269,10 +2270,13 @@ changing its pinned library or admission mapping.
 ### ConnectionStripe framing and receive windows
 
 ConnectionStripeClient and ConnectionStripeServer share
-`Internals/ConnectionStripeCommon`. Both operate on ordinary reliable streams
-and advertise `kNodeFlagBlocksSplice`. Their node metadata reserves 24 bytes of
-left padding. Each direction has an independent byte-offset space and DATA
-record-index space, both beginning at zero. Every frame begins with this fixed
+`Internals/ConnectionStripeCommon`. Both accept ordinary, private-pipe splice,
+and mixed reliable-stream input and advertise `kNodeFlagSupportsSplice`. Their
+node metadata reserves 24 bytes of left padding. Splice output follows the final
+expanded chain capability and `misc.splice`; plain TCP and Mux/TCP can qualify.
+TLS and KCP remain whole-chain blockers. Support does not establish a measured
+throughput or CPU benefit. Each direction has an independent byte-offset space
+and DATA record-index space, both beginning at zero. Every frame begins with this fixed
 24-byte header; multibyte integers are big endian:
 
 | Byte range | Meaning |
@@ -2308,9 +2312,15 @@ submitted READY first.
 The local receive window defaults to 1 MiB and permits 16 KiB–16 MiB. The peer
 may send only within the cumulative consumed-byte count plus that window, and
 may have at most 256 unconsumed DATA records outstanding. Check arithmetic before
-adding lengths or advancing counts. Receiver records use canonical ordinary
-storage and remain bounded by both the logical-byte window and 256-record
-inventory; the receive window alone is not an exact physical-memory bound.
+adding lengths or advancing counts. Receiver records retain an extracted body
+only when its onward headroom is sufficient and its queue charge is no larger than the exact canonical ordinary
+allocation for that length and padding, using checked sbuf geometry helpers.
+Otherwise consume it into that exact ordinary allocation. This retains suitable
+private pipes without retaining oversized ordinary pool tiers. Records remain
+bounded by both the logical-byte window and 256-record inventory; queue charge
+is local accounting, not kernel pipe capacity or physical memory. Each retained
+splice body owns a private pipe from the finite global inventory; empty slots
+allocate no pipes.
 Record indices and byte offsets must agree when contiguous data is delivered.
 Overlapping, duplicate, inconsistent or out-of-window DATA is a protocol error.
 
@@ -2328,9 +2338,23 @@ Unsent application input has a separate FIFO. `max-buffered-bytes` defaults to
 charge independently. Each member's frame parser also has its own byte and
 allocation-charge bounds set to this value. The setting does not cap the
 receiver's separate reordering storage or the neighboring transports' buffers.
-Source payload admission must account
-for retained capacity even when logical input is small. Recycle only buffers
-still owned locally and use the exact line's pool. Fresh frames and reconstructed
+Source payload admission retains suitable splice input only within the canonical
+charge allowance and existing FIFO budget; ordinary input still uses exact
+canonical storage. Account for retained capacity even when logical input is
+small. Keep a partially consumed transmit source charged until ownership ends.
+Extract each selected DATA body through the range-move helper, prepend its
+resident 24-byte header within advertised padding, and dispatch header and body
+together after committing offsets, record credit and lane cursor. Pipe checkout
+or partial transfer refusal immediately selects complete ordinary fallback.
+JOIN and protocol controls remain small ordinary output. JOIN parsing consumes
+only missing intro bytes through range reads, preserving the unread suffix.
+Cross-worker JOIN handoff deliberately copies the saved 48-byte intro plus
+unread suffix into the existing bounded ordinary replay allocation, never into
+the node's 24-byte prepend budget. The fixed-header reader extracts whole DATA
+bodies, accepts mixed input, and retains its drain guard and independent parser
+bounds. DATA acceptance owns and settles its input on every result before
+abort callbacks can retire session context. Recycle only buffers still owned
+locally and use the exact line's pool. Fresh frames and reconstructed
 payload must retain onward padding. Session setup and close drain default to
 10,000 ms each, with accepted values 1–600,000 ms; deadlines do not extend on
 partial progress. The local idle table services expiration once per second, so
