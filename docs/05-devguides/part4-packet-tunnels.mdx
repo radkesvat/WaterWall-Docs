@@ -5,7 +5,7 @@ sidebar_label: "Part 4: Packet Tunnels"
 description: "Packet-line semantics, pure packet tunnels, packet/stream bridges, packet-line initialization, and paired-tunnel direction rules for layer-3 work."
 ---
 <!--
-Documentation version: 168
+Documentation version: 170
 -->
 
 # Part 4: Packet Lines & Packet Tunnels
@@ -587,8 +587,8 @@ must explicitly select spread.
 
 Each multiqueue source range has one flow rule per receive queue; spread adds
 one opaque rule per queue. Opaque rules have independent owned identities and
-rollback records. Only one NOTRACK rule is installed per range. Protocol exclusions
-apply equally to every receive family and NOTRACK. Fixed queue identities,
+rollback records. Protocol exclusions and the raw PREROUTING local-unicast
+scope apply equally to every receive family. Fixed queue identities,
 source matching, partial rollback, cleanup retry and cleanup-before-single-queue
 fallback remain unchanged; incomplete cleanup fails startup. Deterministic
 eligible packets cannot fall through into a random rule family. Spread can
@@ -911,17 +911,13 @@ packet-to-stack input.
 
 ## Linux capture conntrack policy
 
-`RawSocket` uses one `bypass-conntrack` setting for capture and raw output,
-defaulting to true. When enabled, Linux capture pairs each source-range NFQUEUE
-rule in `filter INPUT` with a `CT --notrack` rule in `raw PREROUTING`. NOTRACK
-additionally matches `addrtype --dst-type LOCAL`, so ordinary transit traffic, broadcast, and multicast
-are not exempted. The INPUT source-only capture match remains unchanged.
-Matching occurs before DNAT; selected local-unicast traffic must not depend on
-host conntrack-based NAT or connection-state filtering. Setting the option to
-false installs neither capture nor output NOTRACK rules; NFQUEUE capture and
-its drop-and-dispatch behavior remain active.
-Keep normal raw priority: NOTRACK must not move fragment reassembly or change the
-capture payload limit. PMTU/ICMP delivery remains a separate responsibility.
+Linux `RawSocket` capture always uses NFQUEUE in `raw PREROUTING` with source
+and protocol filters plus `addrtype --dst-type LOCAL`. Only local-unicast input
+is captured; ordinary transit traffic, broadcasts and multicast continue through
+the host stack. Active NF_DROP consumes the original before conntrack, DNAT and
+the normal routing decision. No incoming NOTRACK rule is installed. Preserve
+ordinary raw priority, fragment reassembly ordering and the capture payload limit.
+PMTU/ICMP delivery remains separate.
 
 `dont-capture-protocols` is a set of literal IPv4 Protocol bytes (integers
 0..255); omission and `[]` exclude nothing and duplicates are idempotent.
@@ -929,7 +925,7 @@ Alternatively, `capture-protocols` accepts the same values as an allowlist;
 omission selects all protocols and an explicit empty array selects none.
 The two keys are mutually exclusive, including empty arrays. Compile the
 allowlist into the same exclusion predicate once at creation. Apply the same
-predicate to NFQUEUE and incoming NOTRACK, so an unselected protocol from a
+predicate to every NFQUEUE rule, so an unselected protocol from a
 configured source reaches ordinary host conntrack and firewall processing.
 Filtering only after queue delivery is too late to preserve conntrack. These
 options never change the marked raw socket's OUTPUT exemption.
@@ -953,33 +949,35 @@ The constructor consumes the borrowed exclusion set synchronously; neither
 backend retains a pointer into the node's settings.
 
 Prepare the inactive queue readers before rule installation and service them
-with NF_ACCEPT from the lifecycle coordinator during commands. Install all INPUT
-rules before any enabled NOTRACK rules and activate worker capture only after
-all selected rules succeed.
-The lifecycle owner removes NOTRACK before NFQUEUE, including startup rollback,
-normal stop, and cleanup following reader failure. Attempt queue cleanup even if
-NOTRACK cleanup fails. Account for each rule kind independently, including
+with NF_ACCEPT from the lifecycle coordinator during commands. Activate worker
+capture only after every selected queue rule succeeds. The lifecycle owner
+removes owned queue rules during startup rollback, normal stop and cleanup after
+reader failure. Account for flow and opaque rules independently, including
 commands that may have committed before a timeout; reconcile those outcomes
-against the corresponding table and chain. Retain failed cleanup ownership for
-retry and report residual rules. Do not mutate the rule ledger from a normal worker receive callback or run
-blocking firewall commands in the nonblocking stop-request phase.
+against raw PREROUTING. Retain failed cleanup ownership for retry
+and report residual rules. Do not mutate the rule ledger from a normal worker
+receive callback or run blocking firewall commands in the stop-request phase.
 
-Rule removal affects future packets. Already-marked or queued packets remain
-untracked. `--queue-bypass` cannot undo NOTRACK; abrupt process death or final
-cleanup failure can leave `WWCAP_NOTRACK_...` rules in `raw PREROUTING` requiring
-administrator removal. This implementation does not reclaim another process's
-rules. `skip-sysctl` suppresses Capture's global sysctl tuning batch only, never
-either rule kind or the independent per-device `kernel-queue-tune` setting.
+Queue-number selection must inspect both filter INPUT and raw PREROUTING
+to avoid reactivating stale or foreign rules that reference the same queues. Closed queues use `--queue-bypass`; accepted packets resume at later
+tables, skipping remaining rules in the queued table. Early accepted packets
+can undergo normal conntrack processing. Residual NFQUEUE rules still require
+cleanup; this implementation never reclaims another process's rules.
+`skip-sysctl` suppresses Capture's global sysctl tuning batch only, never queue
+rules or the independent per-device `kernel-queue-tune` setting.
 
 ## Linux raw output conntrack policy
 
-`RawSocket` defaults `bypass-conntrack` to true. A configured `mark` field is
-rejected while it is enabled, including zero or null. Disabling the option
-preserves explicit output marks and installs neither capture nor output
-NOTRACK exemptions. The Windows backend accepts the setting without changing
-WinDivert behavior.
+Linux raw output always bypasses conntrack. An explicit `mark` must be an
+integer from `1` through `UINT32_MAX`, dedicated to WaterWall traffic. Validate
+before narrowing to `uint32_t`; reject zero, fractions and other types. The exact
+configured value serves both policy routing and the output NOTRACK rule. Shared
+marks also exempt unrelated traffic, so their dedication is an operator contract.
+Omitting `mark` requests automatic selection on each start. Keep the configured
+mark separate from the effective mark so restarts preserve explicit values and
+repeat automatic collision checks. Windows WinDivert behavior is unchanged.
 
-The Linux raw device selects a random mark from values at least `0x00010000`,
+When no mark is configured, the Linux raw device selects a random mark from values at least `0x00010000`,
 preferring the high half of the 32-bit space. Selection checks `iptables-save`
 mark comparisons/literal assignments and IPv4 `ip rule` fwmark selectors. It
 preserves their match results for an unmarked packet, including masked and
