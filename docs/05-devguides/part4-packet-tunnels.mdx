@@ -5,7 +5,7 @@ sidebar_label: "Part 4: Packet Tunnels"
 description: "Packet-line semantics, pure packet tunnels, packet/stream bridges, packet-line initialization, and paired-tunnel direction rules for layer-3 work."
 ---
 <!--
-Documentation version: 171
+Documentation version: 172
 -->
 
 # Part 4: Packet Lines & Packet Tunnels
@@ -1942,17 +1942,38 @@ PingServer/Ping6Server use `tunnelPrevDownStreamPayload()` for the clone and
 `tunnelNextUpStreamPayload()` for the clone and `tunnelPrevDownStreamPayload()`
 for native delivery. Reflecting the original request would violate the contract.
 
-The representation is exactly `[existing IPv4 H][Echo 8][native body B][P 1]`,
-where actual `H = 20..60` includes options and `P = 0..255` saves the original
-protocol in the **final declared IP byte**. There is no second IPv4 header.
-Visible protocol is 1 (Ping) or 58 (Ping6); request/reply types are 8/0 or
-128/129, always code zero. Total length is native length plus nine, and Echo
-payload length is `B + 1`. Visible checksums include the trailer with its actual
-odd/even byte parity. Ping6 also includes its configured IPv6 pseudo-header with
-message length `8 + B + 1`; both pseudo-addresses default independently to `::`.
-They are checksum inputs, not routed addresses or wire IPv6 headers. Explicit
-values normally mirror at the peers; their commutative sum proves no direction.
-Strict bare IPv6 parsing retains valid compressed IPv4 tails.
+Ordinary Ping and direct Ping6 use `[existing IPv4 H][Echo 8][native body B][P 1]`.
+Ping6 `ipv6-in-ipv4` uses `[existing IPv4 H][IPv6 40][Echo 8][native body B][P 1]`.
+Actual H = 20..60 includes options, and P = 0..255 is the original protocol in the
+**final declared IP byte**. There is no second IPv4 header. Visible protocols are
+1 (Ping), 58 (direct Ping6) and 41 (IPv6-in-IPv4 Ping6); request/reply types are
+8/0 or 128/129, code zero. Framing F is 9 or 49, total length is N+F and tracked
+Echo payload length is B+1. Both inputs and decoded outputs remain native IPv4.
+
+Ping6 mode omission selects `direct`; only exact `direct` and `ipv6-in-ipv4`
+strings are accepted. Direct forbids either IPv6 address key by presence and uses
+fixed zero/zero pseudo-addresses, including when unused codec fields are nonzero.
+The new mode requires `local-ipv6`/`peer-ipv6` as actual inner local/peer endpoints,
+mirrored at the peer. Bare IPv6 syntax accepts compressed IPv4 tails, ULA, global
+and link-local unicast; reject unspecified, loopback, multicast, IPv4-mapped,
+brackets, zones, prefixes, malformed encoding and embedded NULs. No public IPv6,
+OS assignment or common subnet is required; the pair is not authentication.
+No negotiation, automatic mode detection or runtime switching is supported.
+
+Generated inner IPv6 has version 6, native TOS as Traffic Class, Flow Label zero,
+Next Header 58, Hop Limit 64 and Payload Length 8+B+1. Admission proves the complete
+base header, exact inner/outer lengths, immediate Next Header 58 and explicit
+peer-to-local 16-byte endpoint pair before repair, reply or tracker admission.
+Extensions, Fragment headers and jumbograms are rejected. Accept other received
+Traffic Class, Flow Label and Hop Limit values, including zero; consume as an
+endpoint without forwarding decrements or outer/inner Traffic Class equality.
+
+ICMPv6 uses Next Header 58, full Echo length (8+B+1), and the actual validated
+inner addresses in the new mode, fixed zeros in direct. Exclude both IP headers
+from Echo bytes and include final P at its actual parity. Preserve arithmetic-zero
+checksums without UDP substitution. The IPv6 header has no checksum. This is a
+fixed WaterWall carrier convention, not a general IPv6 router, full RFC 4213
+implementation or automatic native recovery using ordinary ping tools.
 
 TCP requires a complete minimum header and valid data offset; UDP requires its
 minimum header and a declared length within B, retaining accepted IP padding;
@@ -1970,15 +1991,17 @@ Preserve source/destination, options, ID, DF, TTL and TOS/DSCP/ECN locally. Only
 protocol, length and IPv4 checksum change for framing. Transit changes survive;
 no original header copy exists. No `local-ipv4`, `peer-ipv4`, `ttl` or `tos`
 settings remain; unknown settings are rejected. Keep identifier, sequence-start
-and send-replies, plus Ping6's optional independent IPv6 checksum inputs. Empty
-or omitted settings work. Address rewriting/restoration belongs to the chain:
+and send-replies, plus Ping6's mode-dependent address settings above. Empty
+or omitted settings select direct mode. Address rewriting/restoration belongs
+to the chain:
 
 ```text
 TunDevice -> PingClient/Ping6Client -> IpOverrider -> RawSocket
 RawSocket -> IpOverrider -> PingServer/Ping6Server -> TunDevice
 ```
 
-Capture the peer's network address and protocol 1/58. An intervening IpOverrider
+Capture the peer's network address and protocol 1/58/41 according to the mode.
+An intervening IpOverrider
 breaks direct decoder discovery, so examples intending carrier locality use
 explicit `opaque-flow-mode: "peer"`. Do not change automatic-neighbour discovery.
 
@@ -1992,11 +2015,11 @@ Opaque protocols can protect addresses/header fields themselves; preserve or
 restore those fields or use a protocol-aware transform. ICMP quoted bytes are
 not translated. Native checksum lengths exclude framing/trailer and UDP padding.
 
-Advertise exactly nine bytes of left padding; never assume tailroom. Encode
-shifts left nine, overlap-safely moves the actual header left nine then body left
-one, and writes P into the final free byte. Decode saves P, moves body right one
-then header right nine and advances the cursor nine. Reacquire pointers after
-shifts. Packed header and byte/checksum operations must support unaligned input.
+Advertise per-instance F = 9 or 49 bytes of left padding during construction;
+never assume tailroom. Encode shifts left F, overlap-safely moves the actual
+header left F then body left one, and writes P into the final free byte. Decode
+saves P, moves body right one then header right F and advances the cursor F.
+Reacquire pointers after shifts. Packed header and byte/checksum operations must support unaligned input.
 Refuse malformed geometry, fragments, excess size and insufficient headroom
 before repair/mutation or sequence/tracker admission; call mutating helpers
 outside assertions so Release performs them too.
@@ -2005,13 +2028,22 @@ Both entry points reject MF or nonzero offset, for all native protocols and with
 either repair-flag value, before native parsing or mutation. DF alone is accepted
 and preserved. Reassemble native fragments before encoding and fragmented
 carriers before decoding; preserve-fragments does not make them admissible.
-The 1500-byte final ceiling permits at most 1491 bytes of **complete native IP**,
-not application payload. The user budgets all chain overhead and actual path
-MTU through TunDevice device-mtu, applicable CTP/PTC mtu and core misc.mtu in
+Inner IPv6 Fragment headers are rejected rather than reassembled here.
+The 1500-byte final ceiling permits at most 1491 bytes of **complete native IP**
+for ordinary Ping/direct Ping6 or 1451 for IPv6-in-IPv4 Ping6, not application
+payload. The user budgets all chain overhead and actual path MTU through TunDevice device-mtu, applicable CTP/PTC mtu and core misc.mtu in
 both directions. Larger core/device MTUs do not waive the ceiling. No PMTU,
 negotiation, MSS, segmentation, fragmentation or automatic MTU configuration is
 added. Drops retain the shared five-second ERROR limiter and report geometry,
 reassembly, size, checksum, headroom and bounded tracking failures with byte limits.
+
+A new-mode reply also reverses the received inner pair, preserves exact Echo
+length and payload, copies inner Traffic Class independently of outer TOS, and
+sets Flow Label zero, Next Header 58 and Hop Limit 64. Outer reply policy remains
+reverse received addresses, generated ID, TTL 64, copied outer TOS and cleared
+fragment flags. Clone before native restoration/stripping. Carrier repair only
+repairs admitted visible IPv4/ICMPv6; hidden native checksum restoration still
+uses the surviving outer IPv4 pair, never the inner IPv6 endpoints.
 
 Each node has synchronized 1024-entry outstanding/replay rings and a local random
 key. Correlation uses type/code, identifier, sequence, Echo payload length and
