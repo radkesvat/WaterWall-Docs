@@ -2,192 +2,162 @@
 sidebar_position: 349
 title: "PingClient"
 sidebar_label: "PingClient"
-description: "Reference documentation for the PingClient Echo v2 packet tunnel."
+description: "Reference for the PingClient IPv4 Echo packet transform."
 ---
 
 <!--
-Documentation version: 158
-Sync note: Keep this file aligned with tunnels/PingClient/description.md and the versioned translation notice.
+Documentation version: 159
+Sync note: Keep aligned with WaterWall-Docs/docs/02-noderefs/PingClient.mdx and its Persian translation.
 -->
 
-# PingClient
+# PingClient Node
 
-`PingClient` is the client-side endpoint of Ping wire v2. It carries a complete
-inner IPv4 packet in a real ICMP Echo Request, and consumes correlated Echo
-Replies as wire acknowledgements. Reply generation is optional and disabled by
-default. It is a pure packet tunnel with no connection line state.
+`PingClient` is a pure IPv4 packet transform paired with `PingServer`. It uses
+chain-owned worker packet lines, zero per-line state and bounded node-wide Echo
+correlation. Decoding, replay checks and optional replies stay on the arrival
+worker; a later stateful consumer establishes its own transport-flow affinity.
 
-After decoding an Echo Request, inner packets are forwarded downstream on
-the arrival worker. Correlation, replay checks and any generated Echo Reply also
-stay on that worker; the shared tracker does not require transport-flow affinity.
-Inner fragments are forwarded immediately with their bytes and boundaries intact,
-without waiting for the leading fragment. A later stateful consumer establishes
-its own flow ownership. Unrelated or unmatched ICMP retains its packet bytes.
+## Packet representation
 
-Use the paired edges in this order:
+For an actual IPv4 header length `H = 20..60`, original protocol `P = 0..255`
+and native body `B`, including any native transport header:
 
 ```text
-TunDevice -> PingClient -> RawSocket
-RawSocket -> PingServer -> TunDevice
+native: [existing IPv4, protocol=P ][native body B]
+carrier:[same IPv4, protocol=1][Echo Request 8][native body B][P 1]
 ```
 
-## Deployment Scenarios
+The saved protocol is the **last byte of the declared IP packet**, inside the
+Echo checksum coverage. There is exactly one IPv4 header. Encoding adds nine
+bytes; decoding removes the Echo header and final byte. IPv4 options are supported.
+The buffer length must equal IPv4 total length. TCP data offset, UDP datagram
+length and generic ICMP geometry are checked against the native span, excluding
+framing. UDP padding remains accepted; other protocols are opaque and may have
+an empty body. A present protocol byte of zero is valid.
 
-The TUN pair above carries inner IPv4 packets between hosts. Give the TUNs
-separate inner addresses, route the intended destinations through them, and
-keep the outer `local-ipv4` / `peer-ipv4` addresses outside the TUN routes.
-Use an inner MTU no greater than `1472` for a 1500-byte outer path; smaller
-outer paths need a smaller inner MTU because Ping adds 28 bytes.
+The transform preserves current source/destination, options, ID, DF, TTL and
+TOS/DSCP/ECN locally. Only protocol, total length and IPv4 checksum change as
+framing. Transit changes such as TTL decrement, option processing and deliberate
+address rewrites remain visible after decode; no saved original header exists.
 
-For a fixed TCP service without TUN interfaces, use the connection bridges:
+For TCP/UDP, encoding incrementally changes the native checksum's address
+contributions from actual addresses to zero/zero. Decode restores contributions
+from zero/zero to the current IPv4 addresses. Disabled UDP checksum zero and
+invalid native checksum residuals survive unless native repair was explicitly
+requested before encoding. Carrier repair affects only visible IPv4/Echo
+checksums and never repairs hidden native corruption. ICMP and opaque bodies
+receive no address normalization. Protocols that protect addresses or other IP
+fields need those fields preserved/restored or a protocol-aware transform.
 
-```text
-client: TcpListener -> ConnectionToPackets -> PingClient -> RawSocket
-server: RawSocket -> PingServer -> PacketsToConnection -> TcpConnector
-```
+## Directions, replies and tracking
 
-This is a complete chain shape, not a runnable config. For example:
-
-| Component | Configuration role |
+| Input to PingClient | Action |
 | --- | --- |
-| Client `TcpListener` | Accept application TCP on `127.0.0.1:5000`. |
-| Client `ConnectionToPackets` | Use `source-ipv4: "10.90.0.1"`, `target-address: "10.90.0.2"`, `port: 5300`, and `mtu: 1400`. |
-| Ping pair | Use the hosts' reachable outer addresses as `local-ipv4` / `peer-ipv4`, reversed on the server. These are distinct from `10.90.0.x`. |
-| Each `RawSocket` | Set `capture-filter-mode: "source-ip"`, `capture-ips` to the other host's outer address, and `capture-protocols: [1]` for ICMP. |
-| Server `PacketsToConnection` | Use `mtu: 1400` and point `next` to the TCP connector. |
-| Server `TcpConnector` | Forward to the real service, for example `127.0.0.1:5300`. |
+| upstream native packet | Emit a fresh type-8, code-0 request toward `next`. |
+| downstream request | Optionally send an independent reply toward `next`, then deliver the decoded original toward `prev` once. |
+| downstream matching reply | Consume the reply. |
+| downstream valid unmatched reply | Forward the complete carrier unchanged toward `prev`. |
 
-Here `10.90.0.2` is the inner flow destination; the server connector deliberately
-replaces it with the actual backend. Replies return through the same bridges.
-Raw packet I/O still needs its platform permissions, even though this variant
-uses no TUN. The network must carry Echo Requests in both directions, because
-reverse application data also uses requests. Ping itself supplies no encryption;
-use a separate protection layer when the application needs it.
+Both endpoints always encode local data as new requests. `send-replies` is
+independent at each endpoint and defaults to false. When enabled, the receiver
+clones the validated request before decapsulation. A generated type-0, code-0
+reply preserves identifier, sequence and exact normalized Echo payload including
+the trailer; it reverses received IPv4 addresses, copies TOS, uses TTL 64,
+generates an IPv4 ID and clears fragmentation flags. Data delivery never waits
+for a reply. The original and reply have independent buffer ownership.
 
-The [Ping-to-lwIP integration fixture](https://github.com/radkesvat/WaterWall/blob/main/tests/cases/ping_server_packets_to_connection_alignment_roundtrip/config.json)
-exercises the bridge composition in-process; it is a test fixture, not a
-replacement for the two hosts' RawSocket and routing configuration.
-
-## Two Independent Echo Sessions
-
-Ping v2 never puts new application data into an Echo Reply.
-
-```text
-client data: PingClient -- Echo Request(data) --> PingServer
-             PingClient <-- optional Echo Reply(same bytes) -- PingServer
-
-server data: PingClient <-- Echo Request(data) -- PingServer
-             PingClient -- optional Echo Reply(same bytes) --> PingServer
-```
-
-The peer delivers the received request's inner IPv4 packet once. With
-`send-replies: true`, it first sends an exact type-0 Echo Reply. False or omission
-skips reply allocation, copying, and transmission. The endpoints choose this
-setting independently; request tracking and replay suppression remain active,
-and incoming correlated replies are consumed regardless of the local setting.
-Data delivery does not wait for a reply.
-
-| PingClient callback | Behavior |
-| --- | --- |
-| upstream plain packet | Build a type-8 Echo Request; forward upstream. |
-| downstream peer request | If `send-replies` is true, build/send a type-0 reply upstream; strip and forward the original request downstream once. |
-| downstream matching reply | Consume as acknowledgement. |
+Each node has synchronized 1,024-entry outstanding and replay rings. Matching
+uses type/code, identifier, sequence, payload length and a locally keyed digest
+of the exact native body plus trailer; addresses and worker IDs are excluded.
+Matching replies clear the outstanding entry. Valid unmatched replies can have
+arbitrary or empty payloads and are never decoded as native packets. Requests
+are marked before outward callbacks, including reentrant callbacks. Remembered
+duplicates deliver data once and may receive another optional reply. Bounded
+replacement can allow an evicted old identity to be accepted again. These rings
+are bookkeeping, not authentication, retransmission or reliability.
 
 ## Settings
 
+Settings may be omitted or an empty object.
+
 ```json
 {
-  "name": "ping-client",
+  "name": "pingclient",
   "type": "PingClient",
-  "settings": {
-    "local-ipv4": "198.51.100.10",
-    "peer-ipv4": "203.0.113.20",
-    "send-replies": false,
-    "identifier": "random",
-    "sequence-start": 1,
-    "ttl": 64,
-    "tos": 0
-  },
-  "next": "raw-out"
+  "settings": {"identifier": "random", "sequence-start": 1, "send-replies": false},
+  "next": "next-node"
 }
 ```
 
-| Setting | Required | Default | Description |
-| --- | --- | --- | --- |
-| `local-ipv4` | yes | — | Local source of requests/replies. |
-| `peer-ipv4` | yes | — | Request destination and expected source of peer carrier traffic. |
-| `send-replies` | no | `false` | Boolean. Send exact Echo Replies for received peer requests when true; false or omission skips reply generation. |
-| `identifier` | no | `"random"` | Stable local request-session ID. Integer `0..65535` is a deterministic override; random defaults are nonzero. |
-| `sequence-start` | no | `1` | First local request sequence, `0..65535`; wrap is valid. |
-| `ttl` | no | `64` | Locally generated packet TTL. Integer `0..255`. |
-| `tos` | no | `0` | Local request TOS. Integer `0..255`; generated replies copy the peer request TOS. |
+| Setting | Default | Meaning |
+| --- | --- | --- |
+| `identifier` | `"random"` | Stable random nonzero local identifier, or integer `0..65535`. Replies mirror the request identifier. |
+| `sequence-start` | `1` | Integer `0..65535`; sequence wraps normally. |
+| `send-replies` | `false` | Boolean enabling exact replies to received requests. |
 
-Client and server identifiers are intentionally independent. A reply mirrors
-the request's identifier and sequence rather than the responder configuration.
+Only these settings are accepted. `local-ipv4`, `peer-ipv4`, `ttl` and `tos`
+are rejected as unknown settings. Data addresses and header policy belong to
+the surrounding chain.
 
-## Wire and Safety Rules
-
-The wire format is exactly:
+## Deployment scenarios
 
 ```text
-20-byte IPv4 header -> 8-byte ICMP Echo header -> complete inner IPv4 packet
+client: TunDevice -> PingClient -> IpOverrider -> RawSocket
+server: RawSocket -> IpOverrider -> PingServer -> TunDevice
 ```
 
-- Local requests: type `8`, code `0`, configured source/destination/TOS/TTL,
-  DF set, IPv4 ID `0`, local identifier, and ascending sequence.
-- Generated replies, when `send-replies` is true: type `0`, code `0`, reversed
-  addresses, copied request identifier/sequence/payload length/payload bytes,
-  copied request TOS, local TTL, and cleared fragmentation bits.
-- Reply IPv4 IDs come from a securely seeded tuple-scoped Linux-like
-  approximation. This is not host-global Linux kernel state.
+Users own address rewriting/restoration and routing. Capture the peer's network
+address and protocol `1` with RawSocket. With IpOverrider between capture and
+the decoder, choose `"opaque-flow-mode": "peer"` explicitly because `auto` only
+recognizes a directly adjacent decoder. These are packet chains; ordinary
+UdpListener/UdpConnector normal-line compositions are unsupported.
 
-Input must be an exact IPv4 packet no larger than `1472` bytes. Valid inner IPv4
-fragments are supported; outer carrier fragmentation, invalid checksums,
-malformed lengths, IPv6/non-IPv4 input, and oversized packets are dropped.
-Structurally valid traffic unrelated to the configured carrier tuple passes
-through unchanged in the same direction.
+The trailer is not a signature. Ordinary Echo payloads can satisfy this layout,
+especially for opaque native protocols. The chain/capture configuration must
+select a dedicated carrier stream, with one logical carrier peer per node.
+There is no encryption, peer authentication or automatic distinction from
+ordinary pings. Valid unrelated IPv4 protocols pass through unchanged, preserving
+pending checksum intent, subject to fragment rejection below.
 
-One synchronized node-wide tracker has a 1024-entry outstanding ring and a
-1024-entry replay ring. Device worker affinity is not correlation identity: a
-reply or duplicate request can arrive on another packet-line WID and still
-match. Duplicate peer requests deliver their inner data once and get another
-reply only when `send-replies` is true. The 28-byte carrier overhead gives a
-1500-byte maximum packet; Ping does not fragment, perform PMTU discovery, or
-adjust MSS.
+## MTU and reassembly
 
-Packet rejection diagnostics use the network logger at `ERROR` level and
-identify the specific validation, checksum, size, headroom, or tracking failure.
-Each drop message includes the packet length, maximum inner/carrier lengths,
-wrapper overhead, and available/required left headroom, all in bytes. The
-five-second log gate is shared by all failure reasons, directions, and workers
-of each node, so it does not emit one message per rejected packet.
+The user is responsible for configuring a native MTU that leaves room for all
+chain overhead and the actual network path. Ping/Ping6 add nine bytes and drop
+native packets exceeding the 1,500-byte carrier ceiling after encoding. They do
+not discover or negotiate MTU, adjust MSS, segment, or fragment packets. Both
+entry points reject IP fragments; configure packet adapters to reassemble
+fragments before these nodes. Setting `preserve-fragments` does not make fragments
+acceptable.
 
-## Breaking Migration From v1
+At this ceiling, 1,491 bytes is the maximum **complete native IPv4 packet**,
+including its IP and transport headers. A 1,492-byte native packet is dropped.
+Configure TunDevice `device-mtu`, applicable ConnectionToPackets and
+PacketsToConnection `mtu`, and core `misc.mtu` for all chain overhead in both
+directions. A larger core/device MTU never waives the carrier ceiling. A smaller
+network path requires a smaller native MTU. Keep the real peer reachable outside
+the TUN route. Set `"fragment-policy": "reassemble"` on packet adapters.
 
-Only the settings above are accepted. `strategy`, all `wrap-*`/`warp-*`
-modes, `source`, `dest`, protocol-swap settings, `check-identifier`,
-`ipv4-id-start`, `xor-byte`, `roundup-size`, and `roundup` are removed and
-produce a migration error.
+MF or nonzero fragment offset is refused at encode and decode before native
+parsing, checksum repair or mutation, including with repair intent. DF alone
+is accepted and preserved. Reassemble native fragments before encoding and
+transit-fragmented carriers before decoding.
 
-Replace `source`/`dest` with `local-ipv4`/`peer-ipv4`; reverse them on the
-server. Upgrade both peers together: v2 is not compatible with the removed
-wire formats.
+Drops use `ERROR` diagnostics naming geometry, fragmentation/reassembly,
+checksum, size, headroom or tracking failures. Messages include packet length,
+native/carrier limits, overhead and available/required headroom. One shared
+five-second rate limiter covers all reasons, directions and workers per node.
 
-Correct Echo semantics reduce protocol fingerprints but do not make arbitrary,
-high-rate tunnel traffic indistinguishable from interactive `ping` traffic.
-
-## Node Metadata
-
-Source-backed metadata:
+## Node metadata
 
 | Property | Value |
 | --- | --- |
 | `version` | `2` |
-| node flags | `kNodeFlagNone` |
-| `can_have_prev` | `true` |
-| `can_have_next` | `true` |
-| `layer_group` | `kNodeLayer3` |
-| `layer_group_prev_node` | `kNodeLayer3` |
-| `layer_group_next_node` | `kNodeLayer3` |
-| `required_padding_left` | `28` bytes |
+| flags | `kNodeFlagNone` |
+| `can_have_prev` / `can_have_next` | `true` / `true` |
+| node / previous / next layer | `kNodeLayer3` |
+| `required_padding_left` | `9` bytes |
 | line state | none |
+
+Lifecycle Init/Est/Finish/Pause/Resume callbacks retain same-direction forwarding.
+These nodes create or destroy no normal lines, never destroy packet lines, and
+start no private readers or timers.

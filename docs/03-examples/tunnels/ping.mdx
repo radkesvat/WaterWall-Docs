@@ -35,9 +35,9 @@ TLS when it needs those properties.
 
 Use the [common setup](./overview.mdx) for `core.json`, variable syntax, and
 startup. Leave `misc.mtu` at `1500` on both servers. These configurations
-explicitly set the inner MTU to `1400`: Ping adds a 28-byte IPv4/ICMP wrapper,
-so the outer path must carry at least `1428` bytes without fragmentation. The
-maximum supported inner packet is `1472` bytes on a 1500-byte outer path.
+explicitly set the inner MTU to `1400`: Ping adds a nine-byte Echo header/trailer,
+so the outer path must carry at least `1409` bytes without fragmentation. The
+maximum supported inner packet is `1491` bytes on a 1500-byte outer path.
 Lower `tunnel_mtu` on both hosts if your path needs a smaller value.
 
 These are Linux examples. Run WaterWall with permission to use raw sockets and
@@ -48,9 +48,11 @@ TunDevice variant also needs `/dev/net/tun` and TUN support. The connection
 bridges themselves need no TUN, but their RawSocket transport still needs these
 raw-packet and firewall permissions.
 
-Use actual IPv4 addresses assigned to the two servers. Each Ping node checks
-the received outer source and destination against `peer-ipv4` and `local-ipv4`.
-The examples assume direct IPv4 reachability and do not configure NAT traversal.
+Use actual reachable IPv4 addresses for the two servers. Ping retains the native
+IPv4 header; the independent IpOverrider rules select public addresses on send
+and restore native addresses before decode. These point-to-point teaching rules
+are not universal mappings for arbitrary native destinations. Choose your own
+address/routing policy; this example does not configure NAT traversal.
 Allow ICMP **Echo Requests in both directions** through the network and host
 firewalls, as well as user TCP connections to Iran's `user_port`. Return data
 also travels in fresh Echo Requests; allowing only Echo Replies back to Iran
@@ -66,6 +68,22 @@ including ordinary ping and ICMP errors from that peer. Ordinary outer-address
 ping is therefore unsuitable as a health check while the tunnel is active.
 The `[1]` protocol filter leaves TCP and UDP between the servers in the normal
 host stack. See [RawSocket](../../noderefs/RawSocket) for capture behavior.
+
+The final protocol trailer is real Echo payload, not a signature: ordinary pings
+can satisfy the layout. Select a dedicated carrier stream and one logical peer
+per node; public-address filtering supplies no authentication. Both RawSockets
+use explicit `"opaque-flow-mode": "peer"` because IpOverrider interrupts direct
+decoder adjacency.
+
+The user is responsible for configuring a native MTU that leaves room for all
+chain overhead and the actual network path. Ping/Ping6 add nine bytes and drop
+native packets exceeding the 1,500-byte carrier ceiling after encoding. They do
+not discover or negotiate MTU, adjust MSS, segment, or fragment packets. Both
+entry points reject IP fragments; configure packet adapters to reassemble
+fragments before these nodes. Setting `preserve-fragments` does not make fragments
+acceptable. The 1,491-byte limit is a complete IPv4 packet, not application data.
+Budget TunDevice `device-mtu`, both bridges' `mtu` and core `misc.mtu` in both
+directions; a larger core MTU never raises the carrier ceiling. DF alone survives.
 
 ## Set the addresses
 
@@ -102,8 +120,8 @@ for that server's complete configuration. Save one configuration per host.
 The bridges create and recover inner TCP packets in userspace:
 
 ```text
-Iran:   TcpListener -> ConnectionToPackets -> PingClient -> RawSocket
-Kharej: RawSocket -> PingServer -> PacketsToConnection -> TcpConnector
+Iran:   TcpListener -> ConnectionToPackets -> PingClient -> IpOverrider -> RawSocket
+Kharej: RawSocket -> IpOverrider -> PingServer -> PacketsToConnection -> TcpConnector
 ```
 
 `ConnectionToPackets` opens an inner TCP flow from `inner_ip_iran` to
@@ -155,9 +173,30 @@ Save as `config_iran.json` on the Iran server.
       "name": "ping_client",
       "type": "PingClient",
       "settings": {
-        "local-ipv4": $ip_server_iran$,
-        "peer-ipv4": $ip_server_kharej$,
         "send-replies": false
+      },
+      "next": "carrier_addresses"
+    },
+    {
+      "name": "carrier_addresses",
+      "type": "IpOverrider",
+      "settings": {
+        "up": {
+          "source-ip": {
+            "ipv4": $ip_server_iran$
+          },
+          "dest-ip": {
+            "ipv4": $ip_server_kharej$
+          }
+        },
+        "down": {
+          "source-ip": {
+            "ipv4": $inner_ip_kharej$
+          },
+          "dest-ip": {
+            "ipv4": $inner_ip_iran$
+          }
+        }
       },
       "next": "raw_transport"
     },
@@ -166,8 +205,14 @@ Save as `config_iran.json` on the Iran server.
       "type": "RawSocket",
       "settings": {
         "capture-filter-mode": "source-ip",
-        "capture-ips": [$ip_server_kharej$],
-        "capture-protocols": [1]
+        "capture-ips": [
+          $ip_server_kharej$
+        ],
+        "capture-protocols": [
+          1
+        ],
+        "fragment-policy": "reassemble",
+        "opaque-flow-mode": "peer"
       }
     }
   ]
@@ -187,7 +232,9 @@ Save as `config_kharej.json` on the Kharej server.
     "ip_server_kharej": "198.51.100.20",
     "tunnel_mtu": 1400,
     "final_ip": "127.0.0.1",
-    "final_port": 80
+    "final_port": 80,
+    "inner_ip_iran": "10.90.0.1",
+    "inner_ip_kharej": "10.90.0.2"
   },
   "nodes": [
     {
@@ -195,8 +242,37 @@ Save as `config_kharej.json` on the Kharej server.
       "type": "RawSocket",
       "settings": {
         "capture-filter-mode": "source-ip",
-        "capture-ips": [$ip_server_iran$],
-        "capture-protocols": [1]
+        "capture-ips": [
+          $ip_server_iran$
+        ],
+        "capture-protocols": [
+          1
+        ],
+        "fragment-policy": "reassemble",
+        "opaque-flow-mode": "peer"
+      },
+      "next": "carrier_addresses"
+    },
+    {
+      "name": "carrier_addresses",
+      "type": "IpOverrider",
+      "settings": {
+        "up": {
+          "source-ip": {
+            "ipv4": $inner_ip_iran$
+          },
+          "dest-ip": {
+            "ipv4": $inner_ip_kharej$
+          }
+        },
+        "down": {
+          "source-ip": {
+            "ipv4": $ip_server_kharej$
+          },
+          "dest-ip": {
+            "ipv4": $ip_server_iran$
+          }
+        }
       },
       "next": "ping_server"
     },
@@ -204,8 +280,6 @@ Save as `config_kharej.json` on the Kharej server.
       "name": "ping_server",
       "type": "PingServer",
       "settings": {
-        "local-ipv4": $ip_server_kharej$,
-        "peer-ipv4": $ip_server_iran$,
         "send-replies": false
       },
       "next": "packets_to_connection"
@@ -247,9 +321,9 @@ This variant uses the kernel TCP stack and one TUN interface per host:
 
 ```text
 Iran service:   TcpListener -> TcpConnector to 10.90.0.2:5300
-Iran packets:   TunDevice -> PingClient -> RawSocket
+Iran packets:   TunDevice -> PingClient -> IpOverrider -> RawSocket
 
-Kharej packets: RawSocket -> PingServer -> TunDevice
+Kharej packets: RawSocket -> IpOverrider -> PingServer -> TunDevice
 Kharej service: TcpListener on 10.90.0.2:5300 -> TcpConnector to backend
 ```
 
@@ -259,8 +333,9 @@ Kharej's private listener through the tunnel. `route-table: "off"` leaves
 additional system-route installation disabled; this fixed-service setup needs
 no manual routes, default-route changes, IP forwarding, or NAT.
 
-The Ping nodes create the outer public-address headers while preserving the
-inner packet, so no `IpOverrider` is needed. Kharej's TCP listener binds only
+IpOverrider rewrites the reused carrier header in each direction and restores
+the native TUN addresses before decoding. TCP/UDP checksum address contributions
+are normalized while wrapped and restored for the final addresses. Kharej's TCP listener binds only
 its inner TUN address. WaterWall creates the TUN before binding that listener.
 Allow inner TCP on `tunnel_port` through Kharej's TUN firewall, and allow inner
 ICMP on both TUNs if you want to use the ping check below.
@@ -281,7 +356,8 @@ Save as `config_iran.json` on the Iran server.
     "tun_cidr": "10.90.0.1/30",
     "user_port": 443,
     "tunnel_port": 5300,
-    "tunnel_mtu": 1400
+    "tunnel_mtu": 1400,
+    "inner_ip_iran": "10.90.0.1"
   },
   "nodes": [
     {
@@ -311,7 +387,8 @@ Save as `config_iran.json` on the Iran server.
         "device-ip": $tun_cidr$,
         "device-mtu": $tunnel_mtu$,
         "route-table": "off",
-        "gso": false
+        "gso": false,
+        "fragment-policy": "reassemble"
       },
       "next": "ping_client"
     },
@@ -319,9 +396,30 @@ Save as `config_iran.json` on the Iran server.
       "name": "ping_client",
       "type": "PingClient",
       "settings": {
-        "local-ipv4": $ip_server_iran$,
-        "peer-ipv4": $ip_server_kharej$,
         "send-replies": false
+      },
+      "next": "carrier_addresses"
+    },
+    {
+      "name": "carrier_addresses",
+      "type": "IpOverrider",
+      "settings": {
+        "up": {
+          "source-ip": {
+            "ipv4": $ip_server_iran$
+          },
+          "dest-ip": {
+            "ipv4": $ip_server_kharej$
+          }
+        },
+        "down": {
+          "source-ip": {
+            "ipv4": $inner_ip_kharej$
+          },
+          "dest-ip": {
+            "ipv4": $inner_ip_iran$
+          }
+        }
       },
       "next": "raw_transport"
     },
@@ -330,8 +428,14 @@ Save as `config_iran.json` on the Iran server.
       "type": "RawSocket",
       "settings": {
         "capture-filter-mode": "source-ip",
-        "capture-ips": [$ip_server_kharej$],
-        "capture-protocols": [1]
+        "capture-ips": [
+          $ip_server_kharej$
+        ],
+        "capture-protocols": [
+          1
+        ],
+        "fragment-policy": "reassemble",
+        "opaque-flow-mode": "peer"
       }
     }
   ]
@@ -355,7 +459,8 @@ Save as `config_kharej.json` on the Kharej server.
     "tunnel_port": 5300,
     "tunnel_mtu": 1400,
     "final_ip": "127.0.0.1",
-    "final_port": 80
+    "final_port": 80,
+    "inner_ip_iran": "10.90.0.1"
   },
   "nodes": [
     {
@@ -363,8 +468,37 @@ Save as `config_kharej.json` on the Kharej server.
       "type": "RawSocket",
       "settings": {
         "capture-filter-mode": "source-ip",
-        "capture-ips": [$ip_server_iran$],
-        "capture-protocols": [1]
+        "capture-ips": [
+          $ip_server_iran$
+        ],
+        "capture-protocols": [
+          1
+        ],
+        "fragment-policy": "reassemble",
+        "opaque-flow-mode": "peer"
+      },
+      "next": "carrier_addresses"
+    },
+    {
+      "name": "carrier_addresses",
+      "type": "IpOverrider",
+      "settings": {
+        "up": {
+          "source-ip": {
+            "ipv4": $inner_ip_iran$
+          },
+          "dest-ip": {
+            "ipv4": $inner_ip_kharej$
+          }
+        },
+        "down": {
+          "source-ip": {
+            "ipv4": $ip_server_kharej$
+          },
+          "dest-ip": {
+            "ipv4": $ip_server_iran$
+          }
+        }
       },
       "next": "ping_server"
     },
@@ -372,8 +506,6 @@ Save as `config_kharej.json` on the Kharej server.
       "name": "ping_server",
       "type": "PingServer",
       "settings": {
-        "local-ipv4": $ip_server_kharej$,
-        "peer-ipv4": $ip_server_iran$,
         "send-replies": false
       },
       "next": "inner_tun"
@@ -386,7 +518,8 @@ Save as `config_kharej.json` on the Kharej server.
         "device-ip": $tun_cidr$,
         "device-mtu": $tunnel_mtu$,
         "route-table": "off",
-        "gso": false
+        "gso": false,
+        "fragment-policy": "reassemble"
       }
     },
     {
@@ -458,7 +591,7 @@ If the application cannot connect, check these points:
   RawSocket capture of the opposite source address with `capture-protocols: [1]`.
 - Firewalls and the network carry Echo Requests in both directions. Check
   WaterWall's network logs for capture startup, permissions, or rejected packets.
-- Both inner MTUs fit the outer path after the 28-byte wrapper; Ping does not
+- Both inner MTUs fit the outer path after the nine-byte overhead; Ping does not
   perform PMTU discovery or fragment an oversized carrier.
 - Kharej can reach `final_ip:final_port`. In the TUN variant, also check the
   connected subnet route, matching inner TCP port, and TUN firewall rules.

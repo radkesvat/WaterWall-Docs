@@ -5,7 +5,7 @@ sidebar_label: "Part 4: Packet Tunnels"
 description: "Packet-line semantics, pure packet tunnels, packet/stream bridges, packet-line initialization, and paired-tunnel direction rules for layer-3 work."
 ---
 <!--
-Documentation version: 170
+Documentation version: 171
 -->
 
 # Part 4: Packet Lines & Packet Tunnels
@@ -144,9 +144,9 @@ its hold with received pressure for the same producer; a documented packet
 endpoint may absorb signals. Keep packet loss/admission policy explicit and never destroy the
 persistent packet line to implement per-flow pressure handling.
 
-`PingClient` and `PingServer` inherit these lifecycle pass-throughs from
+`PingClient`, `PingServer`, `Ping6Client` and `Ping6Server` inherit these lifecycle pass-throughs from
 `packettunnelCreate()`. Payload support
-is a separate contract: both Ping v2 endpoints require the chain's exact worker
+is a separate contract: all four Ping/Ping6 endpoints require the chain's exact worker
 packet line for buffer ownership and worker validation. Their supported edge
 orders are:
 
@@ -157,7 +157,7 @@ RawSocket -> PingServer -> TunDevice
 
 An ordinary normal-line topology such as
 `UdpListener <-> PingServer <-> UdpConnector` is therefore not a supported Ping
-v2 composition. `packettunnelCreate()` keeps standard lifecycle pass-throughs,
+composition. `packettunnelCreate()` keeps standard lifecycle pass-throughs,
 but an implemented payload handler may still enforce a stricter packet-line role.
 
 ### Category 3 — intentional terminal absorber: handle locally and document
@@ -284,9 +284,11 @@ refuse and pass unchanged must preflight and preserve bytes and intent on refusa
 TunDevice, RawSocket and packet/connection bridges consume the actual packet's
 request. Aligned copies retain intent locally until finalization; raw-byte
 ConnectionToPackets messages complete repair before queueing. Packet/stream
-bridges finish repair before serialization; no local flag is serialized. Ping
-repairs inner packets before encapsulation and requested outer packets before
-validation, then clears outer intent when stripping to the inner packet.
+bridges finish repair before serialization; no local flag is serialized. Ping/Ping6
+preflight native geometry, fragment/size/headroom refusal and requested native
+repair before sequence admission. Carrier repair affects only the visible
+IPv4/Echo checksums; decode restores native address contributions without
+repairing hidden corruption. Unrelated protocols retain bytes and pending intent.
 Generated replies, originals and duplicates own independent requests.
 
 Mark the surviving allocation after replacement and each generated packet
@@ -462,8 +464,8 @@ construction, including a malformed duplicate after a valid setting.
 Omission remains `prefix` beside a decoder. Requested and effective values are
 kept separately. Explicit values are unchanged. Auto checks only the device's
 physical publication neighbour after topology and packet binding are finalized:
-upstream toward `next` requires exact type `PingServer`; downstream toward `prev`
-requires exact type `PingClient`. Instance names, indirect Ping, wrappers,
+upstream toward `next` requires exact type `PingServer` or `Ping6Server`; downstream toward `prev`
+requires exact type `PingClient` or `Ping6Client`. Instance names, indirect Ping, wrappers,
 encoding directions and opposite RawSocket endpoints do not qualify. Auto never
 selects `spread`. Thus `TunDevice -> PingClient -> RawSocket` resolves to
 `prefix`/`peer`, and `RawSocket -> PingServer -> TunDevice` to `peer`/`prefix`.
@@ -1923,62 +1925,112 @@ to close admission and join the reader before reclaiming its reachable state.
 ## Paired Tunnel Direction (the PingClient / PingServer Rule)
 
 Transform role and callback forwarding direction are separate decisions. Ping
-wire v2 uses two independent Echo sessions:
+and Ping6 each use two independent Echo request sessions:
 
 ```text
-client data: PingClient -- Echo Request --> PingServer
-             PingClient <-- optional exact Echo Reply -- PingServer
-
-server data: PingClient <-- Echo Request -- PingServer
-             PingClient -- optional exact Echo Reply --> PingServer
+client data: Client -- Echo Request --> Server
+             Client <-- optional exact Echo Reply -- Server
+server data: Client <-- Echo Request -- Server
+             Client -- optional exact Echo Reply --> Server
 ```
 
-- PingClient upstream and PingServer downstream originate type-8 requests with
-  their local data. Their peer decodes the request in its corresponding
-  callback and forwards the inner packet in the same callback direction.
-- Inbound parsing validates exact IPv4 framing and the IPv4 header checksum
-  before classifying the configured peer/local/ICMP tuple. Carrier-only
-  restrictions, including a 20-byte outer header and no outer fragmentation,
-  apply only after that match. Unrelated valid IPv4 packets, including options
-  and fragments, pass through unchanged in the received direction.
-- Validation failures expose a concrete diagnostic reason without changing
-  classification or forwarding. Packet drops log at `ERROR` with packet length,
-  inner/carrier limits, wrapper overhead and available/required left headroom.
-  The existing five-second gate stays shared per node across reasons and workers.
-- `send-replies` is a boolean configured independently on each endpoint and
-  defaults to `false`. Only `true` allocates a reply clone and emits the received
-  request's exact type-0 reply back to its sender before delivering the original
-  request. False or omission skips reply allocation and output. A reply is an
-  acknowledgement only; the sender consumes a matching reply instead of
-  delivering its payload regardless of its own `send-replies` setting. Data
-  delivery does not wait for a reply.
-- Correlation and replay suppression belong to one bounded synchronized tracker
-  per Ping node. The arrival worker runs correlation and reply generation;
-  its WID is not request/reply correlation identity. Both remain
-  active when reply generation is disabled. Duplicate requests deliver inner
-  data once and receive another reply only when local reply generation is enabled.
-- With reply generation enabled, a request receiver publishes two distinct
-  buffers. The generated reply clone travels back toward the request sender,
-  while the decoded original continues in the received direction. With it
-  disabled, only the decoded original is published. Decoded originals and replies
-  remain on the arrival worker. Inner fragments are forwarded immediately with
-  their bytes and boundaries intact; Ping does not hold later fragments for a
-  leading fragment or select a transport-flow worker.
-- The shared codec keeps its checked input APIs. At the nodes' reply and strip
-  call sites, the validated envelope, exact independent clone and locally retained
-  original already establish success. Assert those caller guarantees rather than
-  adding packet-drop or acknowledgement fallback paths. Execute the codec calls
-  outside assertions so Release builds still perform them.
-- Consequently, PingServer's upstream request handler sends an enabled reply
-  clone with `tunnelPrevDownStreamPayload()` and the decoded original with
-  `tunnelNextUpStreamPayload()`. PingClient's downstream request handler sends
-  the clone with `tunnelNextUpStreamPayload()` and the decoded original with
-  `tunnelPrevDownStreamPayload()`.
+Client upstream and server downstream encode; client downstream and server
+upstream decode. Each accepted original continues in its received callback
+direction. The independent optional reply clone travels back toward the sender:
+PingServer/Ping6Server use `tunnelPrevDownStreamPayload()` for the clone and
+`tunnelNextUpStreamPayload()` for native delivery; PingClient/Ping6Client use
+`tunnelNextUpStreamPayload()` for the clone and `tunnelPrevDownStreamPayload()`
+for native delivery. Reflecting the original request would violate the contract.
 
-Sending the **original received request** back toward its sender would be an
-invalid reflection. An enabled, separately generated exact Echo Reply travels
-in that opposite direction. Likewise, encapsulating the original in PingServer's
-upstream callback would transform it twice.
+The representation is exactly `[existing IPv4 H][Echo 8][native body B][P 1]`,
+where actual `H = 20..60` includes options and `P = 0..255` saves the original
+protocol in the **final declared IP byte**. There is no second IPv4 header.
+Visible protocol is 1 (Ping) or 58 (Ping6); request/reply types are 8/0 or
+128/129, always code zero. Total length is native length plus nine, and Echo
+payload length is `B + 1`. Visible checksums include the trailer with its actual
+odd/even byte parity. Ping6 also includes its configured IPv6 pseudo-header with
+message length `8 + B + 1`; both pseudo-addresses default independently to `::`.
+They are checksum inputs, not routed addresses or wire IPv6 headers. Explicit
+values normally mirror at the peers; their commutative sum proves no direction.
+Strict bare IPv6 parsing retains valid compressed IPv4 tails.
+
+TCP requires a complete minimum header and valid data offset; UDP requires its
+minimum header and a declared length within B, retaining accepted IP padding;
+ICMP requires its generic header. Other protocols are opaque, including empty B.
+A zero trailer is valid; a missing trailer is not. Exact buffer/IP total length
+agreement is mandatory. Valid unmatched replies need no trailer/native framing:
+consume an exact outstanding match or forward the whole carrier unchanged.
+Candidates with unsupported type/code, invalid geometry/checksums or oversize
+are dropped. Valid unrelated protocols retain bytes and pending repair intent.
+The chain selects a dedicated carrier stream: the trailer is not a signature,
+ordinary pings can satisfy the format, and no peer authentication is provided.
+Each node's correlation scope is one logical carrier peer, selected by the chain.
+
+Preserve source/destination, options, ID, DF, TTL and TOS/DSCP/ECN locally. Only
+protocol, length and IPv4 checksum change for framing. Transit changes survive;
+no original header copy exists. No `local-ipv4`, `peer-ipv4`, `ttl` or `tos`
+settings remain; unknown settings are rejected. Keep identifier, sequence-start
+and send-replies, plus Ping6's optional independent IPv6 checksum inputs. Empty
+or omitted settings work. Address rewriting/restoration belongs to the chain:
+
+```text
+TunDevice -> PingClient/Ping6Client -> IpOverrider -> RawSocket
+RawSocket -> IpOverrider -> PingServer/Ping6Server -> TunDevice
+```
+
+Capture the peer's network address and protocol 1/58. An intervening IpOverrider
+breaks direct decoder discovery, so examples intending carrier locality use
+explicit `opaque-flow-mode: "peer"`. Do not change automatic-neighbour discovery.
+
+Before framing, complete an explicit native repair request under original
+protocol/addresses. Then use `updateIpv4TransportChecksumAddresses()` for TCP/UDP
+actual-address to zero/zero normalization. After stripping, restore zero/zero to
+current addresses and recalculate only the surviving IPv4 header checksum.
+Disabled UDP zero and invalid native residuals survive absent native repair.
+Carrier repair authorizes visible checksums only, never hidden native repair.
+Opaque protocols can protect addresses/header fields themselves; preserve or
+restore those fields or use a protocol-aware transform. ICMP quoted bytes are
+not translated. Native checksum lengths exclude framing/trailer and UDP padding.
+
+Advertise exactly nine bytes of left padding; never assume tailroom. Encode
+shifts left nine, overlap-safely moves the actual header left nine then body left
+one, and writes P into the final free byte. Decode saves P, moves body right one
+then header right nine and advances the cursor nine. Reacquire pointers after
+shifts. Packed header and byte/checksum operations must support unaligned input.
+Refuse malformed geometry, fragments, excess size and insufficient headroom
+before repair/mutation or sequence/tracker admission; call mutating helpers
+outside assertions so Release performs them too.
+
+Both entry points reject MF or nonzero offset, for all native protocols and with
+either repair-flag value, before native parsing or mutation. DF alone is accepted
+and preserved. Reassemble native fragments before encoding and fragmented
+carriers before decoding; preserve-fragments does not make them admissible.
+The 1500-byte final ceiling permits at most 1491 bytes of **complete native IP**,
+not application payload. The user budgets all chain overhead and actual path
+MTU through TunDevice device-mtu, applicable CTP/PTC mtu and core misc.mtu in
+both directions. Larger core/device MTUs do not waive the ceiling. No PMTU,
+negotiation, MSS, segmentation, fragmentation or automatic MTU configuration is
+added. Drops retain the shared five-second ERROR limiter and report geometry,
+reassembly, size, checksum, headroom and bounded tracking failures with byte limits.
+
+Each node has synchronized 1024-entry outstanding/replay rings and a local random
+key. Correlation uses type/code, identifier, sequence, Echo payload length and
+keyed digest of exact normalized body plus trailer, excluding network addresses
+and WID. Matching replies clear their entry; bounded replacement permits an old
+evicted identity to return. Mark requests before callbacks; duplicate requests
+deliver data once while remembered and can receive another optional reply.
+Tracking remains active with send-replies false and works across arrival workers.
+It is bookkeeping, not authentication or reliability.
+
+Send-replies defaults false independently at each endpoint. True clones before
+native restoration, preserving identifier, sequence and exact body/trailer;
+reverse the received addresses, copy TOS, use TTL 64, the existing reply-ID
+generator and cleared fragmentation flags. Recalculate checksums over actual IHL
+and full Echo length. Do not repair hidden native checksums in the clone. Hold a
+temporary line reference and check logical aliveness across the reply callback
+before continuing with the still-owned original. These zero-line-state middle
+transforms retain lifecycle forwarding and never create/destroy normal lines,
+destroy packet lines, start private readers or redistribute native packets.
 
 The procedure for any packet tunnel:
 
