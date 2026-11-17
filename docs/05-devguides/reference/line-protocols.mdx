@@ -1,0 +1,1774 @@
+---
+sidebar_position: 5
+title: "Line and protocol ownership"
+description: "Specialized line roles, protocol readiness, flow control, and teardown."
+---
+
+# Line and protocol ownership
+
+Apply the shared [Part 2 contracts](../part2-lines-and-callbacks.mdx) first. Consult the relevant sections below when changing these nodes or their callers; [Protocol buffering](./protocol-buffers.mdx) covers their framing and retained storage.
+
+## Specialized line and protocol cases {#specialized-line-and-protocol-cases}
+
+Apply the ownership, Finish and flow-control contracts in [Part 2](../part2-lines-and-callbacks.mdx) to each exact line role.
+
+### Authenticated identity publication {#authenticated-identity-publication}
+
+AuthenticationClient separates cached admission from control-session readiness. Every credential family and new
+connection admission checks `started && !stopping`, a valid installed table/clock basis, no terminal continuity error,
+and no sticky explicit Authenticate rejection under `control_mutex -> users_lock -> collection/user locks`.
+A public availability precheck is only a snapshot; the actual lookup/reservation must recheck it under those locks.
+After initial synchronization ordinary outages/re-authentication and malformed refreshes keep the last usable RAM cache
+without an age timeout. Only a correlated `authentication-failed` for the current Authenticate sets rejection; only a
+validated successful Session clears it. After a valid producer credential match, session capacity/token/epoch refusal
+returns `session-unavailable`, preserving the old session/checkpoint and usable client cache/pending batch while the
+existing generic RemoteError path reconnects with bounded backoff. `accounting-continuity-lost` remains distinct.
+Session expiry/timeout does not fabricate credential rejection. Existing
+connections retain accounting, cached enforcement and reservation release during rejection. Reused HTTP requests
+perform new admission; in-flight exchanges and CONNECT streams continue.
+
+A correlated stats permission refusal keeps this cached admission policy. Nonterminal push failures preserve the exact
+batch and first-use/debt state, reconnect and reauthenticate after a monotonic not-before deadline of at least 30 seconds
+(or a larger configured reconnect interval). Required retry scheduling remains active with optional intervals zero;
+explicit work, first use and Resume cannot bypass it. Only a matching batch ACK clears refusal recovery. No pull may
+replace the baseline while that batch is unresolved, so cached policy may remain stale. Terminal epoch continuity,
+sequence and replay inconsistency still block new admission. This recovery needs the same live server checkpoint;
+startup permission changes or process restart do not provide checkpoint recovery.
+
+A required/in-flight pull defers first-use reporting while preserving its request latch and per-user flags. After a
+non-accounting refresh failure, an installed usable cache may report against its unchanged baseline between traversal
+attempts. Pull and reporting retries retain separate deadlines; never send a new batch during an active traversal.
+Pull/ACK completion continues remembered reporting. Paused control writes do not rearm the short progress timer; Resume restarts
+eligible work explicitly. Worker quiescence cancels both progress and reconnect timer roots.
+
+Credential eligibility and handle liveness check cached enabled state, expiry and cumulative traffic quota. Persisted
+IP/connection/device/speed gauges must not reject credentials. Live capacity is the separate atomic local reservation
+operation. Local allowances can overshoot global quotas across disconnected clients; administrative changes arrive
+with a valid refresh, and already-produced usage remains acceptable after policy changes.
+
+Consumers that must try several UUID-derived credentials use AuthenticationClient's typed UUID source metadata and
+generation-checked copy pages. A page visits at most 256 source rows, including rows without UUID credentials, and
+returns only owned UUID/durable-ID values. Callers must bound their retained copies and crypto work, wipe copied
+credentials on release, and never retain private user pointers or perform crypto under database locks. Every page in
+one candidate snapshot uses the same installed `users_generation`; a changed generation invalidates unfinished
+construction. Include currently ineligible UUID accounts in the snapshot and recheck eligibility after protocol proof.
+`authenticationclientResolveUUIDCandidateWithProfile()` checks the current UUID owner, durable ID and continuous
+membership generation floor with availability, eligibility and profile copying under the normal lock order. Ordinary
+refresh preserves continuous identities; removal/recreation or UUID reassignment invalidates older candidates. The
+returned handle uses the current generation. Snapshot limits report configured sync bounds, not a process-wide RAM cap.
+
+Shared credential copying in `lineAddUser()`,
+`lineAddAuthenticatedCredentials()` (including `lineSetAuthenticatedCredentials()`),
+`lineCopyUsers()` and AuthenticationClient profile lookups intentionally fails
+fast under the project [heap-allocation policy](../part5-tunnel-anatomy.mdx#heap-allocation-failure).
+The memory manager terminates on OOM before a failed copy can return. These APIs
+must never return or continue with partially copied identity. Existing signatures
+and ordinary cleanup remain unchanged; this contract does not require secure wiping
+of these copies.
+
+Absent fields retain their existing semantics. A null profile output
+still requests only the handle and requires no profile-string copies. The global
+`stringDuplicate()` function returns `NULL` for a null source; copying a non-null
+source follows the fatal allocation policy, including node-local copies.
+
+Recoverable shared-copy results, transactional staging and caller rollback are
+an explicit policy redesign requiring a maintainer request. Do not introduce
+them as incidental hardening of these shared APIs.
+
+### Paged client table publication {#paged-client-table-publication}
+
+Producer synchronization uses shared request 9 (`GetUsersPage`) and `Users` response 3. A traversal owns a private
+incremental table and page clock ranges. It replays an unresolved usage batch before starting and keeps `pull_required`
+through every page, inter-page gap and terminal validation. A pending correlation represents one request; removing it
+must not release the traversal barrier. First-use/push work remains latched and local traffic continues accumulating.
+
+Under `control_mutex`, pending capacity gates request admission and short progress continuations. Full capacity
+retains desired pulls/pushes/catch-up work without batch reconstruction, warnings or a one-millisecond retry loop.
+Include ordinary `pull_requested` in runnable work. A recognized response completes semantic validation and
+enrollment/ACK/error processing before waking queued work; raw pending removal never sends while locked.
+Local send rollback defers continuation after actually releasing capacity; stale correlations release nothing.
+Optional jobs and request timeout may all be zero: waiting indefinitely for an unanswered request must not busy retry.
+Multiple Pings retain their own absolute deadlines and the timer tracks the earliest one.
+
+Periodic ticks join an active traversal. An explicit `authenticationclientRequestPull()` during traversal coalesces
+into one later traversal, and installation preserves that latch. Producer pages retain an immutable server snapshot,
+so configuration edits do not invalidate its continuation or final validation. A failed refresh releases staging and
+backs off that pull without preventing new reports from an already installed baseline. Due pull retries still get a
+turn under continuing traffic. Initial synchronization and unresolved-batch replay remain barriers.
+
+Every request binds the current epoch and last acknowledged sequence/digest. Only matching ACK/enrollment updates
+those local facts. Usage ACKs require strict bounded JSON validation before settling counters or releasing retry
+storage; reject trailing input, duplicate decoded keys, decoded NUL and malformed UTF-8 without changing accounting state.
+Check exact decimal-string metadata, instance/config revision, total, contiguous positions, bounded
+count, canonical advancing cursor, completion flags and checkpoint before admitting rows. Count exact received user
+object spans before construction. Positive host-representable `sync-max-users`/`sync-max-bytes` default to 100000 and
+268435456. They bound one traversal, including an early declared-total refusal, without whole-total reservation.
+Resource or protocol failure releases staging only and preserves active cache, debt, clocks and generation.
+
+Each producer session retains a reference to an immutable encoded snapshot. Sessions may share a snapshot acquired
+at the same configuration and statistics revision; a new acquisition cannot reuse pre-ACK counters. Snapshot offsets,
+rows and construction scratch share the server's finite `snapshot-max-bytes` allowance (256 MiB by default).
+Capture and page reads hold server state ownership and release it before transport callbacks. Terminal validation,
+replacement, session expiry/destruction and a renewable idle lease release references; the default lease is 60 seconds.
+Resource refusal never publishes a partial snapshot. Administrative `list-users` retains its separate live revision
+cursor contract. Each page carries current wall/accounting timestamps, while snapshot revisions and records remain
+fixed. Envelope revisions may be newer; installed revisions come from the validated snapshot, with latest observed
+remote revisions stored separately. The client requires terminal validation before publishing.
+
+Before runtime movement, finish structural/ID/index validation, baseline copying, page-clock coverage and current debt
+completeness. Under the table lock, merge current local deltas/observations, then migrate reservations, shaping and carry.
+Migration/publication is a nonfailing commit. Reapply each user's OWN page wall/accounting/receipt samples after migration,
+because runtime migration replaces clock state. Publish active and baseline together and increment generation once.
+Keep relative catch-up debt even if saturation hides it or an account is absent; never prune debt to finish a traversal.
+An absent account's owed traffic and first-use evidence move into retained orphan obligations before publication.
+They do not block installing other accounts and are not sent while the ID is absent. The same durable ID's later
+return reattaches its obligation exactly once. The retained ledger and replacement overlaps have a finite allowance
+derived from `sync-max-bytes`; capacity refusal preserves the old table and every obligation. Status includes
+`orphan_debt_count`, and detailed accounting includes these obligations. Authoritatively absent IDs cannot admit new
+connections; live-handle accounting/close and shaping-ticket settlement retain their existing ownership rules.
+Retain the original local first-use origin, report timestamp and strongest elapsed-age sample alongside orphan debt,
+including observations already acknowledged before later bytes became owed. Restore that evidence after runtime
+migration and before installing the new clock projection; absence must never restart duration expiry. Each newly
+appearing account receives a handle-generation floor. Continuous membership migrates that floor, while removal and
+reappearance establish a new one: an older handle must neither become active again nor release a new connection's
+reservation. Independently owned shaping tickets still settle by their own tokens.
+
+Only an explicit `usage-accounts-missing` response may resolve a rejected batch without an ACK. Validate its current
+epoch, exact attempted sequence and payload digest, unchanged prior checkpoint sequence/digest, and unique missing
+IDs belonging to that batch before releasing immutable attempt storage. Preserve debt, baseline and checkpoint;
+the uncommitted sequence remains reusable for the surviving accounts. A lost reply or unproved/malformed refusal
+never permits rewriting an uncertain batch. Exact accepted-batch replay remains acknowledgeable after account removal.
+
+### Account configuration and accounting ownership {#account-configuration-and-accounting-ownership}
+
+`usersPatchConfigByIdentifier()` pins an existing user with the collection write
+lock through validation and commit. Its typed `user_config_patch_t` has a presence
+bit per editable leaf and carries no credentials, counters, runtime state or
+creation/first-use timestamps. It reuses the existing string/CIDR preparation and
+index transaction. Finish every expected duplicate/overlap/capacity precondition
+before publishing fields, then apply only selected leaves under `user->lock`.
+Never merge a previously copied whole `timeinfo` or limits structure into a patch:
+that can overwrite concurrent first-use accounting or omitted policy fields.
+Collection-to-user lock order remains unchanged; first-use updates share that
+user lock. Configuration edits preserve live reservations and client refreshes
+migrate them by durable ID while rebuilding the expiry projection.
+
+Collection lookups return borrowed user/string pointers whose lifetime needs external collection ownership when removal
+or replacement can run concurrently. Successful non-self `usersCopy(dest, src)` replaces the destination and invalidates
+all of its old user/string pointers; failed copy preserves them, and self-copy is a no-op. Standalone indexed-field
+setters such as `userSetId` and `userSetWireGuardAllowedIps` must not mutate accounts already owned by a collection;
+use collection transactions so every lookup index changes together. Runtime self-move is also a no-op.
+
+Each owned name, password, email, notes and normalized Allowed-IP string carries
+its derived JSON-escaped content charge and encoding/representability result.
+Prepare replacements before shared locks and transfer their metadata with their
+text; imports, name-map hints, setters, snapshots, copies and moves preserve this
+ownership invariant. Generic object callers may hold unexportable text, recorded
+by that result. Never repair missing metadata by rescanning stored strings under
+API transaction locks. Direct fixture replacements must update the same metadata.
+
+A successful prepared configuration patch transfers its owned values, clears its aliases/presence masks and consumes
+the preparation; only destruction is valid afterward. Busy, timeout and other precommit refusals leave it reusable.
+Prepared account creation remains reusable, including a later duplicate-ID attempt after successful creation.
+
+Fresh JSON imports derive each credential once and use structural/index validation. Trusted baseline copies preserve
+those derived values without recomputation. Public `usersValidate` and `userPasswordDataValid` still perform the full
+credential consistency diagnostic in every build, and arbitrary caller-supplied checked-add objects retain that check.
+An incremental required-ID import rolls back only its own appended rows on failure; successful pages never copy or
+rederive the accumulated table. The collection keeps full diagnostic, standalone and legacy update APIs available.
+
+AuthenticationServer validates at most 64 request frames before executing an envelope. The session at entry governs
+all siblings, and successful Authenticate does not authorize adjacent requests. Without a valid token, frame payload
+is at most 16 KiB. Authenticate data is at most 16,375 bytes and uses strict quiet JSON parsing with depth two and eight
+lexical values; configured credentials must fit the exact escaped handshake including a resume epoch. Failed
+Authenticate closes further input admission before response handoff while preserving bounded paused response delivery.
+Only authenticated administrative refusals and commits enter the audit queue; anonymous refusals consume no slots.
+
+Producer module descriptors are the single source for operation names, permissions, store mutation, state-lock class
+and handlers. Parse each envelope once into at most 64 borrowed frame views before any operation; run mutation-first
+and read-second over those views under one state lock. Authenticate mutates session state without becoming a store
+mutation. Page requests take exclusive ownership for snapshot bookkeeping; point reads take shared ownership.
+An unauthenticated envelope without Authenticate returns bounded refusals under shared ownership. Session resolution
+must be repeated after reacquiring exclusive ownership. Unknown wire operations remain ordinary bounded refusals. Digest lookup
+uses canonical base64 with exact decoded lengths; password payloads stay length-bounded and are copied before C-string use.
+
+Request 9 is paged synchronization (`GetUsersPage`, with the retained `GetAllUsers` C alias). Each request independently
+checks token, pull permission and the producer's epoch/acknowledged sequence/digest. Instance/config/position
+cursors bind the session's retained snapshot, not authority. At most 128 users and a 256 KiB response target form ordinary pages; one
+exceptional first row may use the hard response cap after exact metadata overhead. Admit encoded row size before
+copying its strings. A terminal cursor requires one final validation under the same state lock before client publication.
+Configuration and traffic edits leave an acquired snapshot unchanged. Paging never acknowledges usage.
+See the [producer page schema](../../02-noderefs/AuthenticationServer.mdx#getuserspage-module).
+
+AuthenticationServer `UpdateUser` selects a nonzero exact durable ID and accepts
+only explicit configuration leaves. It rejects protected/unknown/duplicate keys,
+empty containers, null, invalid UTF-8/NUL, excessive nesting and trailing input.
+The checked lexical parser consumes the full authentication payload with depth
+limit four and at most 64 lexical values before JSON-tree allocation, without applying host-config file-size limits. Successful nonempty
+patches bump config_revision once, even for a same-value assignment, inside the
+server state write lock; stats_revision and producer checkpoint are unchanged.
+Competing patches serialize: omitted fields survive and the latest accepted edit
+to the same field wins. There is no expected-revision precondition or remote reset.
+For example, a name-only patch after a 100-byte account receives 10 more bytes
+leaves 110 bytes and its first-use timestamp intact.
+
+Password replacement is a separate prepared collection transaction, exposed by
+AuthenticationServer's explicitly permitted `change-user-password` API. It checks
+the server-wide edit token and changes the password plus all four credential
+indexes together. Configuration-only patch types and producer `UpdateUser` still
+cannot change credentials. Preserve the stable user address/ID, configuration,
+traffic, first-use evidence, creation/expiry, statistics revision, producer
+checkpoints and live reservations; a credentials-only commit takes no statistics
+lock. Exact password bytes matter. A UUID-form password adds or replaces its UUID
+identity; changing to plain text removes it. Case-equivalent UUID spellings keep
+that identity for the same account, while changed derived keys stop resolving.
+
+Clients receive the change on their ordinary refresh schedules. Before a valid
+refresh, an offline or connected cache may still accept its old credential.
+Refresh migrates reservations, accounting clocks, first-use/ACK evidence and expiry
+projection by durable ID, including pending exact-batch replay and traffic produced
+during a pull. Existing connections retain accounting and reservation release;
+rotation does not forcibly terminate them. Public reads omit credentials, so an
+unknown password-change outcome requires a fresh read and an explicit decision to
+resubmit the desired password with its current token, without automatic retries.
+
+AuthenticationClient's `traffic-multiplier` converts measured upload/download bytes at its two public traffic
+entry points, before counters and quota enforcement, using fixed-point integer arithmetic with scale 1000.
+The startup-fixed JSON number defaults to 1, accepts 0.001 through 1000 and at most three effective decimal places.
+Callers must supply raw measured bytes without pre-scaling. Store a separate fractional charge remainder per user
+and direction; rounding each payload independently changes the charge with fragmentation. Update remainders,
+charged counters and first-use evidence in the same user/stats transaction. Migrate the remainders by durable ID
+on refresh, including same-ID credential changes; reconnect/ACK must not clear them. Generic copies, database JSON
+and sync batches exclude these process-local remainders. Removal/destruction discards them, with no crash recovery.
+Apply checked saturation to charged counters without unsigned wraparound.
+
+Existing and pulled counters, batch deltas, baselines, immutable retries and catch-up debt already use charged quota
+bytes; never scale them again. AuthenticationServer and other producer/import paths accept charged bytes as supplied.
+Traffic limits and API usage/accounting totals use the same units. Bandwidth, speed, reservations and timestamps keep
+their existing meanings. Start first-use expiry from a positive raw measurement even when its charged increment is zero.
+
+Remote usage reporting uses only deduplicated `PushUserStats` batches with root
+`epoch`, `sequence`, `users` and entry `id`, `up`, `down`, `first-usage-at-ms`, all required and no other
+fields. The same strict lexical rules apply. Recognize an exact replay using its
+original payload bytes before consulting current account existence; a subsequent
+account edit/removal must not prevent that ACK. New batches validate all entries
+before any mutation. Server aggregate bytes and the earliest accepted first-use observation are
+accounting state; creation is import metadata, while limits/enabled/expiry are
+configuration. Connection/IP reservations remain local runtime state. Stored or
+imported IP/device/connection/speed gauges are not live global occupancy or an
+admission source. See the [statistics ownership table](../../02-noderefs/AuthenticationServer.mdx#statistics-ownership)
+for the current boundaries and requirements for future telemetry. No live gauge
+reporting, reset, or crash-recovery behavior is implied.
+Producer write JSON is bounded before tree allocation: `PushUserStats` allows
+depth three and at most `7 + 9 * 4096` lexical values (including keys),
+`UpdateUser` allows depth four and 64 values, and full `AddNewUser` allows depth
+four and 256 values. Keep these independent of the 16 MiB wire cap and preserve
+credential-string cleanup on post-parse refusal. Envelope response assembly
+reserves space for a correlated error for every remaining frame, so an oversized
+read response cannot discard the acknowledgement of an earlier committed write.
+
+First nonzero measured client traffic, including a discounted increment below one charged byte, captures a valid local monotonic origin (zero is allowed) and immutable positive
+accounting-clock estimate inside the user write lock, then updates counters/expiry under stats write lock. Generic
+server/import helpers without a client clock never invent observations. Both client traffic APIs use this transaction;
+zero-byte calls, login, reservation and refresh rebasing do not start use. Scheduling latches are separate from evidence.
+
+GetAllUsers requires exact canonical `server-time-ms` and positive `accounting-time-ms`, with no local-wall fallback.
+The server initializes one wall/monotonic accounting anchor per instance, then advances it only with fresh monotonic
+elapsed time and saturation. Clients sample receipt before parsing and retain maximum elapsed first-use age across
+local observations, prior age and canonical estimates. Checked differences never rewind an anchor. Future imported
+origins remain future until reached or superseded by real earlier use. Duration and absolute-date policy project
+separately; unchanged pulls keep the earlier absolute deadline and never extend relative lifetime. Explicit edits
+recompute only their component. Already expired at monotonic zero must remain expired, not become unlimited.
+
+Generic user/user-collection helpers accepting expiry `now_ms` use local
+monotonic milliseconds when a client expiry projection is valid. Without that
+projection they use the wall-time domain of persisted absolute/first-use expiry.
+Do not pass pacing time to an unclocked account's expiry check. Client traffic
+observation/accounting helpers with an installed accounting clock sample fresh
+monotonic time while locked instead of using the caller's fallback `now_ms`.
+
+`userSetClientViewExpiry()` changes only the local expiry projection: valid zero
+means no projected expiry, and clearing validity restores persisted wall-time
+expiry. It clears the projection's expired marker, while retaining accounting
+anchors, first-use/ACK evidence and age. A later clock installation or observed
+traffic can rebuild the projection from that retained state.
+
+Runtime clock/evidence/ACK state and fractional charge remainders migrate by durable ID with reservations, including same-ID credential changes, under
+ordered collection locks, both user locks, then both stats locks. Keep new authoritative policy/timeinfo and rebuild
+projections before table publication. Generic user/users copies and JSON exclude these process-local fields. Explicit
+accounting snapshots capture counters and observations together and retain only owned values across replacement.
+
+The runtime-migration destination must be an unpublished staging table without
+live reservations or waiters of its own: moving state retires the destination's
+previous runtime storage. Migration keeps its newly imported policy/timeinfo,
+transfers matching source accounting clocks and reservations, and requires fresh
+per-user clock projection before publication. It is not a merge of two active
+runtime tables.
+
+Every batch entry includes the producer's same immutable observation, even after its ACK. Zero-delta metadata-only
+entries report unacknowledged observations at saturation; matching ACK settles only included totals/observation markers
+and keeps origins/age. New batches validate all entries before mutation, sample accounting time once, clamp future
+estimates and merge the smallest nonzero canonical observation, then publish checkpoint and one stats revision.
+Configuration patches cannot write these fields; unrelated missing-only first-use APIs retain their contract.
+Cross-host estimates include network/serialization delay and rate drift; local monotonic suspend semantics remain
+unchanged. This introduces no crash recovery, remote reset, live telemetry or global reservation coordinator.
+
+### WIO Descriptor Ownership {#wio-descriptor-ownership}
+
+A `wio_t` stores its owned primary descriptor directly as `int fd`, defined in
+`ww/event/wevent.h`. `wioGetFD()` returns that descriptor, or `-1` after it has
+been closed or released. Descriptor zero is valid. The descriptor has no separate
+allocation, reference count, or pool; only the WIO allocation has deferred
+lifetime protection.
+
+WIO close removes watcher interest and settles its queued writes, invokes the
+close callback while the descriptor is still available, then invalidates and
+closes the descriptor exactly once. Deferred graceful close keeps it open until
+draining ends. Reentrant freeing in the close callback preserves the WIO
+allocation until that close frame returns. On Windows, the native close kind is
+captured at descriptor adoption, so sockets use `closesocket()` and CRT file
+descriptors use `_close()` even if the logical I/O type changes later.
+
+The separate `io_slot` field preserves descriptor-table bookkeeping after `fd`
+becomes `-1`. It is never used for I/O. Pending and native IOCP operation roots
+protect the WIO allocation after close; they do not keep its socket open.
+
+NIO splice reads move socket bytes into a wrapper's private pipe before invoking
+the callback. The wrapper contains neither a source pointer nor a source reference;
+its length reflects the actual transfer. After delivery the read path does not
+inspect the source or buffer, so callbacks may close/free the source immediately.
+No socket reservation or post-callback source guard is needed for this read path.
+
+Each splice allocation exclusively owns its private pipe. Buffers can be retained
+or partially consumed and deferred immediately, and source WIO reclamation
+cannot affect them. Queued writes preserve their private pairs until completion
+or discard. Graceful close drains them; cancellation drains or closes each private
+pair before recycling. See the
+[private-body rules and AAA/BBB example](./splice-buffers.mdx#independent-private-bodies).
+This source-independent lifetime does not make pipe bytes ordinary pointer data:
+parsers and retaining transforms follow the [BufferStream representation contract
+in Part 3](./buffer-containers.mdx#bufferstream-representation-inspection-and-extraction-contracts).
+
+Freeing a pending NIO detaches its descriptor-table slot immediately but defers
+recycling the WIO allocation until the pending dispatcher releases it. Shutdown
+also settles these detached pending allocations before destroying the WIO pool.
+
+`pending` also prevents reuse of the allocation for a new descriptor. If the OS
+reuses an fd whose closed NIO is still pending, `wioGet()` retires that old object
+on its original loop and creates a fresh WIO for the new connection. The old
+pending entry never follows an accepted socket to another worker. A closed NIO
+whose pending dispatch has finished can still be reused in place.
+
+`wioDetach()` runs on the original owner thread and `wioAttach()` on the
+destination owner thread. Both require stopped read/write interest and no
+pending dispatch; a pending WIO triggers `LOGF()` and `abortProgramNow(1)`.
+Stopping interest alone does not release pending-list ownership. Defer a
+handoff until the original loop has finished dispatch. SocketManager hands off
+newly accepted, non-pending WIOs, including when an fd number was reused.
+The dispatcher retains its `cur->loop == loop` ownership check as well.
+
+`wioReleaseNoClose()` preserves descriptors owned by another subsystem, such
+as c-ares. It removes watcher interest, detaches the WIO's array slot, and sets
+`fd` to `-1` without closing the external descriptor. The external owner remains
+responsible for closing it. Pending/native operations and callback frames still
+settle before the WIO allocation can return to its existing pool.
+
+### SocketManager endpoints and selection {#socketmanager-endpoints-and-selection}
+
+SocketManager owns one separately allocated endpoint per physical listening
+socket. Its persistent pointer collection is the sole listener/UDP side-data
+inventory. An endpoint owns its interface-scope string and authoritative WIO slot;
+its lifetime must not depend on the logical filter that first created it. WIO
+userdata points to the endpoint, including on newly accepted TCP sockets. Static
+UDP callbacks resolve the endpoint's existing `udpsock_t`; posted datagrams retain
+that public side-data pointer. Dynamic UdpListener endpoints use their separate
+provider-owned lifecycle.
+
+Physical sharing requires equal protocol, bind family/address/wildcard class,
+bound port and effective scope. Dispatch uses the receiving endpoint's scope as
+eligibility: a scoped arrival admits that interface's filters and unrestricted
+filters; unknown scope admits only unrestricted filters. On platforms without
+device binding, the resolved interface bind address supplies address eligibility.
+The shared TCP/UDP selector must apply the same protocol, logical port, scope,
+address-tier and ACL predicate to fresh candidates and cached targets.
+
+Address tiers remain outermost: exact, same-family wildcard, then dual-stack
+IPv6 wildcard for IPv4. Priorities scan high to low with registration ties kept.
+An eligible unbalanced filter returns immediately, including after balanced
+candidates accumulate. Balanced selection retains the first group's candidate
+set and cached-hit short circuit. Sticky keys include normalized client/local IPs,
+logical destination port, address tier, effective scope and protocol; client source
+port is not part of this key. Redirected arrivals retain their logical original
+port separately from the physical endpoint's bound port.
+
+Selection owns no WIO, buffer or line and performs no transport/tunnel callback.
+TCP applies the selected filter's socket options before committing a new sticky
+entry and detaching/posting the accepted WIO. Failed option setup closes once
+without trying another filter. UDP commits before posting its buffer/side-data.
+Cached hits refresh during selection; failed cache insertion still allows delivery.
+Balance-table pointers live privately in filters; `socket_filter_option_t`
+contains listener configuration only.
+TcpListener still creates/owns accepted normal lines; UdpListener still
+creates/owns the peer lines in each physical socket's worker-local idle tables.
+
+### Reverse activation and pairing {#reverse-activation-and-pairing}
+
+ReverseServer borrows both normal halves. The local/user half enters its owner
+worker's waiting list in downstream Init, before establishment can reenter;
+pairing must not require a first application Payload. Reverse handshake validation
+still precedes admission of the reverse half. Either arrival order initiates
+local or cross-worker matching; notifications resolve live peer lists on their
+owner worker and never carry a foreign line pointer. PipeTunnel owns any normal
+companion it creates for migration.
+
+After Est returns, hold an unpaired user source with Pause. After validating the
+complete reverse handshake and owning its accompanying application tail, hold
+that reverse source while matching. Never pause an incomplete handshake. Publish
+the combined source-notification latch before callbacks; waiting/startup FIFO
+holds and peer-consumer pressure are distinct reasons. Activation does not clear
+consumer pressure. Drain eligible older application buffers before releasing a
+source with Resume, and preserve both the waiting hold and consumer pressure
+through PipeTunnel migration. A source may pair, close or admit bounded input
+reentrantly from any notification.
+
+A pair emits exactly one length-bearing activation prefix before user bytes.
+ReverseClient owns both of its normal lines and opens its destination only after
+consuming the complete prefix, independently of application input. The unused
+pair's existing idle deadline covers partial activation. Publish pair state and
+retained FIFO ownership before Init/Payload/Est/Pause/Resume callbacks. Hold and
+recheck both exact halves when continuing initial replay; a close releases all
+pending buffers before propagating Finish away from its sender. The server hands
+off activation exactly once even when its consumer is paused, separately from
+application backlog. This bounded startup exception does not bypass receiver hard
+limits or Finish, and a paused transport may defer the physical write. Retained
+application output waits for its consumer's Resume. After activation and initial replay,
+application forwarding remains direct. See [the wire and storage contract in
+Part 3](./protocol-buffers.mdx#reverse-activation-prefix).
+
+Neither reverse node can permanently bypass itself: every paired delivery maps
+between two different normal lines, and Finish still needs that association.
+ReverseServer retains its combined waiting/FIFO/consumer holds as an exact-line
+endpoint. ReverseClient forwards every Pause/Resume once destination Init has
+started. Before that Init, it remembers only an outstanding transport Pause;
+Resume cancels it. Publish destination initialization before calling out, then
+replay any remaining Pause after Init returns, before handing off the initial
+application body. Clear the pending flag before notification so nested signals
+supersede it. Keep the existing activation FIFO guard and bounds through this
+callback; Pause does not gate the admitted body or nested replay.
+
+ReverseClient accepts activation after transport Init even if Est has not yet
+arrived. Completing activation moves the pair from its current connecting or
+unused count to active exactly once. A late or repeated Est marks transport
+readiness without returning an active pair to the spare pool or replenishing it
+again. Est during a partial activation may still move connecting to unused; it
+does not reset the prefix parser or clear pending Pause.
+
+### Shutdown-complete owners and adapters {#shutdown-complete-owners-and-adapters}
+
+Immediate `Finish` ownership is only half of the normal-line contract. Every
+autonomous creator must also be able to enumerate all of its live lines during
+worker shutdown. Publish each new line into exactly one owner-worker inventory
+before any re-entrant `Init` or other callback can expose it, and remove the
+entry exactly once on every close path. Clear the slot or idle-table entry
+*before* invoking `Finish`: the callback can re-enter, and a repeated stop must
+see an empty slot and do nothing.
+
+A connection-admitting/source owner stops admission, enumerates its remaining
+lines, destroys its state, sends `Finish` away from any sender as applicable,
+and returns with every owned line logically dead. A connection-holding tail
+adapter has a different obligation: enumerate every line whose `Init` reached
+it, detach and close its OS resource, destroy its adapter state, and send exactly
+one downstream `Finish` so the real creator closes the line. A tail owns no
+responsibility before its `Init`; the autonomous or internal creator must cover
+that interval itself.
+
+Source-owner draining runs on the owning event worker while the event loop,
+chain, tunnel states, tail adapters, and line pools are still alive. NodeManager
+visits tunnels in chain storage order, which is not guaranteed to be
+source-to-tail. A middle or tail worker hook therefore cannot require borrowed
+line sets to be empty based on neighbour ordering, and it must not build a
+duplicate inventory merely to compensate. Middle tunnels do inventory and drain
+normal lines they create internally. Final `onDestroy`, after all worker drains,
+may diagnose a residual borrowed registry. Persistent packet lines and
+documented terminal absorbers with no per-line resource are explicit exceptions
+rather than missing inventories.
+
+Every other tunnel must **propagate `Finish`** and let the owner destroy the
+line. Calling `lineDestroy()` on a line you did not create is a serious bug.
+
+There is also a debug invariant to respect: when a line is finally freed,
+`lineUnRefInternal()` asserts that every tunnel's line state is already zeroed
+(`debugAssertZeroBuf`). That is why each tunnel must destroy its own line state
+before the real line-closing `Finish` propagates — unless it is intentionally
+holding a positive reference across the close.
+
+### HttpClient HTTP/2 upload completion {#httpclient-http2-upload-completion}
+
+An HTTP/2-capable `HttpClient` creates a distinct owned normal carrier during
+application Init. Ordinary HTTP/1, split mode, forced HTTP/1 WebSocket and custom
+raw upgrade retain their existing shapes. Copy routing context and users to the
+carrier before next Init; register it in the owner-worker inventory before any
+callback. Protocol state and retained buffers live on the carrier, while the
+borrowed application state only holds the association.
+
+Application Finish detaches that association and destroys application-side state
+before final output. The application owner may destroy its exact line immediately.
+On the independent carrier, finish accepted input in FIFO order, including input
+awaiting h2c/WebSocket readiness, then emit WebSocket Close where applicable and
+HTTP/2 END_STREAM. Release any application-held carrier read Pause so control
+frames can arrive. Keep reading flow-control/control frames and discard response
+body events after detachment. A normal response END_STREAM does not cancel an
+unfinished upload; reset of the tunnel stream does.
+
+The first application Finish starts `close-drain-timeout-ms` (default 30000,
+integer 1..86400000). Deadline checks use fresh monotonic time and never refresh
+on traffic or progress. Completion, expiry, cancellation and shutdown cancel the
+timer, unlink the carrier and destroy its state before closing the live next
+side and destroying the owned line. Real carrier Finish must return with that
+exact line logically dead, even when it reenters an active output callback.
+Never notify a detached or already-finished application. A line reference keeps
+memory available for post-call checks, not the dead carrier's protocol state.
+
+Successful HTTP/2 upload completion requests bounded socket-only linger from
+TcpConnector. This later adapter phase owns no HTTP state or carrier reference
+and is separate from the HTTP/2 deadline and remote application acknowledgment.
+
+### HttpServer HTTP/2 response completion {#httpserver-http2-response-completion}
+
+In single-line HTTP/2 mode, `HttpServer` borrows the carrier owner's normal line.
+After service-side Finish, response DATA and END_STREAM can remain blocked by
+HTTP/2 flow control. Keep the HTTP session only while it still has protocol work
+to produce; continue receiving carrier control frames such as WINDOW_UPDATE.
+Never deliver more request-body payload or other callbacks toward the finished
+service. Discard both newly decoded body data and already queued body events;
+the service may finish synchronously during an earlier event delivery.
+
+Distinguish an active final-byte Finish call from deferred response completion.
+If carrier Finish reenters that active call, record carrier closure and let the
+active call destroy state once. If carrier Finish arrives after that call has
+returned to wait for credit, destroy the retained HTTP state immediately. Do
+not reflect Finish toward either already-finished side. The carrier's owner
+still destroys its line; HttpServer must never retain dirty state until a later
+callback on a logically dead line.
+
+After response DATA and END_STREAM reach the previous tunnel, destroy HTTP state
+and propagate Finish. The Linux TcpListener may retain only a detached socket
+context to finish accepted writes and read/discard residual peer input. That
+context owns no line reference or HTTP state. This is separate from HTTP/2's
+credit wait: a line reference preserves memory, not protocol delivery or logical
+life.
+
+The first service-side Finish starts a fixed `close-drain-timeout-ms` deadline
+(default 30000, integer range 1..86400000) on the line's owner worker. Incoming
+traffic, flow-control credit and response progress never refresh it. Expiry
+discards remaining HTTP output, destroys local state and finishes only the
+still-live carrier direction; the finished service receives no more callbacks.
+Response completion, carrier closure, peer stream cancellation and owner shutdown
+cancel this wait and detach its timer. Do not wait to emit END_STREAM on a
+canceled stream. The deadline applies to ordinary and WebSocket HTTP/2, including
+h2c upgrade; it is independent of carrier idle limits and the later socket-only
+linger. See the [node reference](../../02-noderefs/HttpServer.mdx#http2-mode)
+for the current pressure thresholds and adapter timeout limits.
+
+### TLS close and fallback completion {#tls-close-and-fallback-completion}
+
+`TlsServer` treats peer TLS `close_notify` as local graceful termination. It marks
+closure before sending upstream `Finish` once to the initialized cleartext branch,
+then queues its reciprocal alert after already accepted ciphertext. The existing
+record-delay drain continues through advisory Pause; after output drains, it
+destroys TLS state and sends downstream `Finish`. Retiring the cleartext branch
+must not leave the frontend waiting for client TCP EOF or idle expiry. New
+application bytes are discarded during closure, and no callback may reach the
+finished branch. After a callout, revalidate both line life and the TLS association
+before continuing, since a borrowed line can outlive its destroyed local state.
+Raw upstream `Finish` instead discards pending ciphertext and destroys TLS state
+without reflecting callbacks toward the finished wire side. Raw fallback keeps
+its separate directional replay and closure behavior.
+
+### TlsServer SNI fallback admission {#tlsserver-sni-fallback-admission}
+
+`TlsServer` borrows the normal line created by its upstream owner. With both `sni`
+and fallback configured, its OpenSSL early ClientHello callback compares the visible
+SNI before TLS output. A mismatch or absent SNI suspends OpenSSL; the payload driver
+must replay the retained original wire bytes to fallback before later payloads.
+Matching SNI continues to the protected branch. Without fallback, the SNI gate
+still rejects mismatches. Malformed ClientHello/SNI input rejected before routing
+stays on the TLS error path.
+
+The original transcript is bounded to 1 MiB, including record headers and coalesced
+trailing bytes, and the existing handshake deadline covers incomplete input.
+Retained snapshots use compact byte copies and coalescing; never retain a full
+receive allocation for each tiny fragment merely because the logical byte count
+is below the limit. Copies carry the line pool's left padding for later replay.
+ServerHello, including HelloRetryRequest, commits the protected TLS branch: never
+switch to fallback afterward. Starting fallback releases TLS state and disarms its
+deadline before branch Init. Queue the entire initial input before invoking Init,
+including the triggering plaintext buffer when applicable. While Init is on the
+stack, later re-entrant input may enqueue behind it, but neither inline payload
+nor scheduled drains may run, including through Resume. After Init survives,
+clear its initialization barrier before replaying pending Pause, retaining the
+startup FIFO barrier until that notification returns. A close during Init discards
+queued input; a close during the later Pause callback may deliver the initialized
+branch's final batch. Then release startup admission and drain ready input in FIFO
+order, including during advisory Pause. Preserve the borrowed line's reference/owner rules.
+
+Before branch selection, retain only a pending client-side Pause for the branch
+that has not received Init. Resume cancels that pending notification. Once the
+selected branch has received Init, relay every Pause/Resume, including duplicates;
+clear any pending notification before an outward callback so reentry cannot
+replay stale pressure. Keep the line referenced when work continues after the
+notification and stop if it closes the line. This startup mapping does not gate
+TLS record output or delayed fallback payloads on Resume.
+
+### Delayed Fallback Batches Before Closing {#delayed-fallback-batches-before-closing}
+
+A scheduled line task holds a physical line reference only. It does **not** keep
+the line logically alive, and its runner intentionally skips the callback after
+the owner destroys the line. A borrowed middle tunnel therefore must never park an
+upstream `Finish` behind a line timer merely because its fallback payload queue is
+delayed.
+
+For an initialized fallback branch, use this close order:
+
+1. Mark the previous side finished and publish a fallback-drain gate before any
+   final branch `Payload` callback. An empty queue can destroy local state and
+   synchronously finish the initialized branch immediately.
+2. For a non-empty bounded FIFO, capture the branch and line pool, and establish
+   that its total fits the destination buffer before coalescing it in FIFO order.
+   Detach every entry into the local batch before the neighboring callback;
+   an emptied embedded queue may remain bound to its budget. An admission limit that already
+   proves this bound needs only an assertion at the drain, provided no path can
+   bypass the limit. One callback bounds the final handoff and its reentrant
+   teardown window.
+3. Never flush while branch Init is unfinished. TrojanServer, VlessServer,
+   VmessServer and TlsServer may deliver this final batch through advisory Pause;
+   receiver limits still apply. Recycle any batch disallowed by the node's close gate before
+   finishing the branch.
+4. While the final callback runs, absorb supported `Init`, `Est`, `Pause`, and
+   `Resume` callbacks, and recycle any returned `Payload`. A callback explicitly
+   forbidden by the receiving node remains fatal; for example, `TlsServer`
+   rejects downstream `Init` even during this drain. A re-entrant downstream `Finish` records that
+   the branch already closed and is absorbed, so no reflected or duplicate branch
+   `Finish` follows.
+5. Re-check `lineIsAlive()` after the final payload while holding the temporary
+   reference. If it died, unref and return without touching line state. Otherwise
+   destroy local line state before the final branch `Finish`; after that finish,
+   only unref and return.
+
+The old timer has no cancellation handle. Emptying/detaching its queue logically
+cancels the work; once the real owner destroys the line, the scheduled runner
+becomes a harmless reference release. Preserving the exact remaining delay after
+`Finish` instead requires a detached session object that owns copied buffers,
+timer state, and branch resources without any `line_t` or line-state reference.
+That is a different design, not an excuse to keep a borrowed line alive.
+
+With delay zero, the safe referenced inline path requires completed branch Init
+and no older FIFO batch or scheduled drain. TrojanServer, VlessServer, VmessServer
+and TlsServer do not gate it on Pause. Retained bytes keep their ordered drain path, so later
+payload cannot overtake them.
+
+### Shared fallback replay {#shared-fallback-replay}
+
+TrojanServer, VlessServer, VmessServer and TlsServer use
+`Internals/FallbackReplay` for retained replay, batch assembly and delayed delivery
+on their borrowed normal client line. The node still selects the branch,
+reconstructs the exact transcript, sends Init and pending receiver Pause, and owns
+its close policy and line-state destruction. The component does not create or
+destroy a line or introduce a configurable node.
+
+Keep branch initialization separate from a wider input-dispatch barrier. Clear
+the component's Init barrier immediately after branch Init survives, before
+replaying pending Pause. Source Finish during Init discards retained input;
+source Finish during the later Pause callback can deliver the initialized branch's
+final batch. The initial zero-delay transcript is one inline batch. Each node
+selects its subsequent zero-delay dispatch policy explicitly:
+
+| Consumer | Zero-delay input during a replay callback |
+| --- | --- |
+| VlessServer, VmessServer | Retain input for one asynchronous drain on a later loop iteration. |
+| TrojanServer | Retain input for its existing synchronous pump, which sends each queued entry in FIFO order after the active callback returns. |
+| TlsServer | Deliver nested input inline when no older FIFO entry or scheduled drain exists. |
+
+Later input cannot overtake retained bytes. A positive configured delay uses one
+scheduled FIFO drain in every mode, including when jitter chooses zero milliseconds.
+Advisory Pause does not delay due or final batches.
+
+Before closing replay from the previous side, the node must publish its existing
+Closing phase or finished-side guard so downstream Payload, Est, Pause and Resume
+cannot reach the finished source. The component absorbs a branch Finish only during its final
+drain. Destroy node state before sending the remaining branch Finish, and stop
+accessing line/state when replay reports callback-driven retirement. Scheduled
+work retains allocation only; owner cleanup settles retained bytes before pools
+or tunnels are reclaimed, including when accepted work is later canceled.
+
+### Adapters Flush On Their Own {#adapters-flush-on-their-own}
+
+Adapters such as `TcpConnector` and `TcpListener` may flush queued bytes before
+they actually close the socket after receiving `Finish`. So a middle tunnel
+should: send its final protocol bytes, destroy local state, forward `Finish` —
+and then trust the adapter to flush. Do **not** keep protocol state alive just to
+"wait for the socket to drain."
+
+### TCP socket close lingering {#tcp-socket-close-lingering}
+
+`lineRequestCloseLinger(line, reason)` requests bounded socket cleanup on that
+exact line. The reason mask distinguishes `kLineCloseLingerProtocolDrain` from
+`kLineCloseLingerPeerWriteShutdown`; either makes `lineShouldLingerOnClose()` true.
+Requests are idempotent owner-worker operations on a live normal line. Use
+`lineClearCloseLinger(line, reason)` only when the condition represented by that
+reason no longer applies; clearing one reason must preserve the other. This
+metadata does not retain the line, change Finish ownership, or automatically
+propagate to associated lines.
+
+HttpClient and HttpServer request the protocol-drain reason after handing off
+their final HTTP/2 output.
+
+TcpListener and TcpConnector use the same socket executor in
+`Internals/TcpAdapterCommon`. `tcpAdapterBeginCloseLinger(io, table)` returns
+false without taking ownership, leaving ordinary close to the caller; true
+transfers the socket and may complete its cleanup inline. On Linux it flushes
+accepted writes for at most `WIO_DEFAULT_CLOSE_TIMEOUT` (60000 ms), then shuts
+down writes and reads/discards
+incoming data for at most 5000 ms of inactivity or 30000 ms total. Input can
+refresh only the idle limit, never the absolute limit. Peer close, errors and
+shutdown may finish cleanup sooner. Other platforms keep ordinary adapter close.
+The detached context owns the socket and its idle-table entry, with no line
+reference, protocol state or callbacks to finished tunnels. These socket limits
+are separate from HTTP/2 flow-control drain deadlines and do not acknowledge
+remote application receipt. This is software-managed cleanup, not `SO_LINGER`.
+
+### TCP adapter idle deadlines {#tcp-adapter-idle-deadlines}
+
+`TcpListener` starts each owned normal line with a `60000 ms` idle deadline.
+Listener-side payload activity extends it using the `600000 ms` active idle
+timeout; the idle-table refresh only extends an existing deadline. Explicit
+`initial-idle-timeout-ms` and `active-idle-timeout-ms` settings override these
+defaults. `TcpConnector` uses a `600000 ms` idle limit for its borrowed normal
+lines, refreshed on adapter activity. Keep both active defaults aligned so
+neither adapter introduces a shorter cleanup limit into a fallback path.
+Target closure still propagates Finish without waiting for these idle deadlines;
+socket output may drain under the existing adapter close contract.
+
+`TcpConnector` explicitly sets a separate `60000 ms` WIO connect timeout before
+starting each outbound TCP attempt, after address resolution. Both NIO and IOCP
+cancel that timer on successful connection. It bounds connection establishment,
+not first-payload silence, and immediate socket errors can still finish the line
+sooner. The node's deadline does not change the generic WIO connect default for
+other callers.
+
+The initial listener wait approximates NGINX's default, while ten minutes is a
+transport cleanup policy, not an NGINX maximum. Neither adapter tracks HTTP
+request stages. `TlsServer` owns its separate absolute handshake deadline and
+disarms it when entering fallback. Protocol-specific header/body/write deadlines
+and lingering-close behavior cannot be obtained by changing adapter idle limits
+alone. Fallback targets allowing longer inactivity require every applicable idle
+limit in the chain to accommodate it.
+
+### MuxClient fixed-parent selection {#muxclient-fixed-parent-selection}
+
+Fixed mode assigns a worker-local key to each new child and a stable identity to
+each owned parent. Selection first prefers non-suspect eligible parents, then
+uses rendezvous hashing, with the parent identity breaking equal scores.
+`max-children` remains a hard eligibility cap; existing associations are never
+remapped. The child is initialized as an unattached borrowed line before parent
+selection invokes any neighbour, and a physical reference protects that Init.
+Reentrant source Finish destroys the unattached state without reflection; a
+finished child must not be attached or established afterward.
+
+MuxClient's `keepalive` defaults true in all modes, with `ping-interval` 15000 ms
+and `tolerance-ms` 45000 ms (integers in `1..INT_MAX`). Each parent schedules its
+first probe one `ping-interval` after downstream transport Est, sending on the
+first eligible local-idle expiry at or after that deadline. Waiting for this
+probe does not make the parent suspect or block child attachment; reply timing starts only
+when a probe is sent. A parent-local transport notification latch sets this
+schedule even if a downstream junction already marked the shared line established;
+repeated Est does not reset it. MuxServer's boolean
+`keepalive` defaults true and controls replies only. Disabled endpoints consume
+controls without responding or acknowledging. Only a matching complete Pong on
+the same parent clears an outstanding probe; user traffic and partial frames do
+not. The first matching Pong confirms peer support. Unanswered discovery probes
+are retried without suspicion or retirement, so disabled responders are safe but
+parents that never confirm support have no health-based recovery.
+
+One quarter of elapsed tolerance (at least 1 ms) makes a confirmed parent lower
+priority in fixed selection. Full tolerance permits soft retirement in every
+mode on reply-deadline expiry or new-child selection, including during Pause. Late
+matching replies restore unretired parents.
+Retirement preserves attached children and the authoritative owner inventory,
+but never returns a parent to selection. Each worker retains at most one
+keepalive-retired parent per fixed slot, or one in timer/counter modes. Pending
+final output still counts; Unregister settles the count exactly once. At the
+bound, occupied unresponsive parents remain selectable and the deadline item
+retries retirement after 1000 ms without changing the original probe time.
+Empty unresponsive parents close through normal parent-loss cleanup without
+waiting for Resume.
+A watchdog-retired parent closes when its last child leaves, discarding blocked
+final output. Ordinary timer/counter rotation still preserves output until drain.
+No active child is forcibly terminated and no expiry callback creates replacement
+parents.
+
+Probe times use `wloopNowMonotonicMS()` on the owner worker. Parent transport
+Pause and child FlowPause do not suspend scheduled probes or outstanding reply
+deadlines.
+New probes wait for unpaused parent output, an idle output pump and an empty FIFO;
+only handoff starts the reply clock. Blocked probes retry after 1000 ms while
+retaining their original due timestamp; missed wakeups coalesce into one due probe.
+The local table's approximately one-second wakeup precision applies even to
+shorter configured intervals and tolerances. A separate item tracks the reply
+deadline, so matching Pong cancels that obligation without rescheduling the next
+probe. Discovery expiry clears the unanswered obligation and permits another due
+probe without penalizing a peer whose keepalive support remains unconfirmed.
+Pong replies share the ordinary parent FIFO, charge limit and Pause gate.
+Downstream buffering and transfer after handoff consume tolerance. Unconfirmed support still prevents
+health-based retirement. Quiet connections
+and one-way uploads need only the Mux peer's reply. Timer-mode parent age uses the
+same monotonic clock; wall-clock changes do not rotate transport connections.
+MuxServer's rejected-Open burst refill also uses its owner's monotonic clock.
+See Part 7 for table and parent ownership.
+
+### ConnectionFisher line mapping and retirement {#connectionfisher-line-mapping-and-retirement}
+
+ConnectionFisherClient terminates its borrowed main line and owns the candidate
+child lines. It must keep the winning-child mapping, combined backlog/transport
+pressure and Finish ownership for the association's lifetime. Its independent
+backlog drain obeys child Pause; its main-side reply Pause is held until a winner
+exists so it cannot block the probe exchange. Candidate Est notifications map to
+one main-line readiness notification. These are endpoint responsibilities, so the
+client cannot permanently bypass itself.
+
+ConnectionFisherServer borrows one normal line along its actual next/prev path.
+It validates FISH?, sends FISH!, and delays next Init until the first application
+body. The current body and nested input retain FIFO position and their existing
+2 MiB logical-byte / 8 MiB queue-charge bounds across reply, Init and pending-Pause callbacks. Keep only
+the latest upstream Pause before next Init; replay it after Init unless a newer
+Pause/Resume handled that state during reentry. Once Init starts, relay every
+Pause/Resume in both directions and every downstream Est, including repeats.
+
+After Init and all admitted replay settle, destroy and zero the server's entire
+aligned line state, then permanently bypass it. Neither Est nor Resume is a
+prerequisite. No callbacks remain for the server after retirement, including
+Finish; the client retains its distinct-line mapping.
+
+### ConnectionStripe ownership, flow and close {#connectionstripe-ownership-flow-and-close}
+
+ConnectionStripeClient borrows the application line and owns the configured
+number of normal transport lines. ConnectionStripeServer borrows its incoming
+transport lines and owns exactly one reconstructed normal application line per
+complete group. All members are full duplex. The server chooses one processing
+worker using a keyed hash of the complete random session ID and uses PipeTunnel
+for arrivals on other workers. Return traffic follows each member's actual
+transport line. Before application Init, copy member zero's preserved source
+address context to the reconstructed line, independently of worker placement.
+Session state has its own lifetime and can outlive a detached
+application line; a line reference never permits callbacks after logical death.
+
+The client initializes every member through its shared next path and sends JOIN
+without waiting for application payload. The server initializes its next once
+every distinct member is present. Readiness for framed application DATA is a
+protocol state separate from adapter Est; the mapped transport Est must remain
+prompt and safe under reentrant payload or Finish. Startup therefore also works
+when the destination speaks first. No permanently bypassed line can replace
+these distinct-line mappings.
+The client may receive server DATA on one member before READY arrives on member
+zero. Retain that DATA within the normal receive bounds and defer application
+delivery until READY; independent streams provide no cross-member order.
+
+The sender keeps per-member output pressure and selects available members for
+bounded DATA records. A paused member does not hold the entire application when
+other members and peer credit remain available. Aggregate byte credit and the
+fixed outstanding-record limit constrain transmission independently. The local
+pending-application FIFO combines its own high/low pressure with those reasons;
+one Resume must not clear another reason's hold. Its high and low watermarks are
+75% and 50% of the configured bound. The FIFO has independent logical-byte and
+canonical allocation-charge admission checks.
+
+The session pump records requests made while it is already draining and runs
+another pass before returning idle. In particular, a source Resume may
+synchronously submit Payload or Finish after the current pass has exhausted its
+outgoing work. That work must progress without waiting for another external
+event. Each pass still honors transport pressure, receive credit and closure;
+a nonempty blocked queue alone does not request another pass.
+
+Each receiver owns the ordered delivery backlog and honors application-side
+Pause. Receive credit advances after in-order consumption: delivery while the
+application remains attached, or discard after that application has finished.
+Do not pause all input members merely because the reordering window is occupied:
+the missing earlier DATA and protocol control must still be able to arrive.
+The advertised window and record count already reserve their bounded receive
+capacity. Admission, offset arithmetic and terminal counts must reject malformed
+peer input without silently discarding application bytes.
+
+Finish ends the exact application line as a whole; it is not a separate TCP
+half-close operation. Detach and zero that line's state before outward callbacks,
+and destroy an owned application line before its Finish handler returns. An
+independent session may drain previously admitted data and exchange CLOSE and
+CLOSE_ACK while its transports remain alive. It must never send another callback
+to the detached application; received reverse DATA is consumed and discarded.
+CLOSE carries the final byte and record counts; acknowledge it only after the
+preceding records have been consumed in order. Setup and close drain have finite,
+non-extending deadlines, serviced by the local idle table's one-second sweep.
+The first local Finish or received CLOSE starts the drain deadline once; neither
+later delivery nor entering the other close direction restarts it.
+An unexpected transport Finish,
+protocol violation or refused hard storage bound aborts the group; there is no
+cross-member retransmission or replacement connection.
+
+Keep active groups registered until their terminal cleanup so a late JOIN cannot
+create a second application line. Per-worker `max-sessions` bounds retained
+sessions, and the server's `max-pending-connections` separately bounds lines
+waiting for a complete JOIN. Shutdown closes admission, detaches worker timers
+during quiescence and drains owned normal lines and session inventories while
+their wrappers, chains and pools still exist. Received Finish is never reflected
+toward its sender; borrowed transports are closed through their owners.
+
+### KCP node ownership, sessions and pressure {#kcp-node-ownership-sessions-and-pressure}
+
+KcpClient borrows its application line and creates an owned UDP transport
+line during Init. KcpServer borrows the UDP-facing carrier and creates a
+distinct owned service line for each confirmed session. Their KCP/FEC and timer
+state lives outside either application line. Application Finish detaches both
+association links and zeros that line's node state before returning; the server
+also destroys its exact owned service line. No later callback targets that
+retired application. Transport Finish aborts its sessions immediately. Only the
+client destroys its owned transport; the server finishes toward the owner of
+its borrowed carrier after its last session and pending challenge are gone.
+
+HELLO/CHALLENGE/CONFIRM/READY negotiates fresh independent 128-bit nonces and
+matching FEC settings before server service Init. A 40-byte outer envelope checks
+the full nonce pair before KCP or FEC input. Unknown data cannot create a service;
+duplicate CONFIRM cannot initialize another one. Each carrier permits one pending
+challenge and at most 64 established/closing sessions, including ACK responders.
+Server startup gates KCP delivery until service Init safely begins/completes.
+Actual transport Est remains prompt and separate from handshake readiness.
+Application-side Pause/Resume maps onto the associated live carrier, including
+repeated notices. Toward the application, combine local KCP pressure with carrier
+pressure as described below. Advisory pressure never stops protocol updates,
+acknowledgements, retransmissions, due pings or ready wire output.
+
+Both nodes negotiate `D = min(close-drain-timeout-ms)` with default 30000 and
+integer range `1..INT_MAX`. The first local or peer closing event fixes the send
+deadline at that event plus D; later packets and handshake progress never restart
+it. An earlier application Finish keeps its original timestamp when negotiation
+shortens D. Previously accepted data drains before exactly one CLOSE is queued.
+Only KCP acknowledgment of that CLOSE confirms local sending; a flush, empty
+queue before CLOSE, deadline, transport failure or shutdown does not.
+
+A received CLOSE retires the application exactly once and starts any independent
+accepted-output drain before publishing its KCP ACK. Duplicate CLOSE is handled by
+KCP's ordinary ACK logic. A peer-only responder remains until receipt plus D;
+a confirmed local sender retains ACK-capable state until confirmation plus D.
+These fixed obligations bound retention by 2D from the first closing event.
+Expiration wins at deadline equality. Expired local PUSH output is suppressed,
+including within mixed ACK/PUSH datagrams, while required duplicate ACKs survive.
+ACK-only retention uses a deadline wakeup rather than continuous KCP ticks.
+
+KCP/FEC callbacks stage owned datagrams; neighboring callbacks occur only after
+library calls return. Per-session serialization preserves admitted FIFO work
+across nested callbacks. Hold exact line references and independent session
+lifetime protection around outward callbacks, then recheck logical life and
+association identity. A reference alone cannot keep a finished line usable.
+
+Each session's source-pressure latch counts locally queued/unacknowledged KCP
+segments. Admit the entire source payload before a pressure callback. Set the
+latch above its threshold and clear it below the threshold; equality retains
+the existing state. ACK-only input can clear the local hold. The automatic
+threshold saturates at `INT_MAX`; it is advisory and does not impose a hard
+buffer cap.
+
+The application producer stays paused while either the local KCP hold or carrier
+pressure is active. The client combines these reasons for its borrowed application;
+the server combines each session's local hold with the shared carrier state for
+that session's owned service. Publish each reason before an outward callback.
+During ordinary operation, relay carrier Pause/Resume, including repeats, only
+when that session's local hold is absent. Local hold transitions notify the
+application only while the carrier is not paused. Neither reason's Resume may
+release the other's hold.
+After a new server service's Init, deliver any pending carrier Pause even if Init
+also created local KCP pressure: that local notification may have been suppressed
+by the carrier hold, so startup must still establish the service's initial Pause.
+Notify only a live, attached application whose Init has begun; callback-driven
+Finish must prevent later signals to that retired association.
+
+Incomplete KCP messages wait. A complete message larger than the local receive
+buffer, a missing flag or an unknown flag is a session-local protocol failure.
+Flag-only DATA remains harmless. Closing receivers never deliver payload or
+repeat Finish to an already retired application. Shutdown aborts all outstanding
+obligations through the owned inventories described in Part 7.
+
+### Raw QUIC transforms {#raw-quic-transforms}
+
+`QuicClient` borrows its application's normal line and owns a separate carrier
+line. `QuicServer` borrows its carrier's normal line and owns a separate service
+line. Both use the supplied adapters for sockets. Client upstream plaintext
+becomes next-side carrier data; server upstream carrier data becomes next-side
+plaintext on its service line. Outputs preserve these directions even though the
+transforms have opposite roles. One QUIC v1 connection carries one
+client-initiated bidirectional application stream per association. The client sends encrypted opening
+byte `0x00`; the server validates and consumes it before releasing application
+data, including queued server-first output. It is never application data.
+
+Both nodes initialize and publish local state and companion-line linkage before
+forwarding next Init once on that owned line. Copy routing context before that
+handoff. An owned line receiving Finish must be logically dead before its handler
+returns; borrowed lines remain their creator's responsibility.
+Client handshake startup is independent of Est. Every supported downstream Est
+is relayed, including repeats; authenticated protocol readiness produces no
+extra Est. Application bytes wait under hard budgets until handshake/stream
+readiness, while input and library output are serialized against reentry.
+Neighbor callbacks run after the QUICHE driver call returns. After each callback,
+check exact line life and local attachment. Application Finish may detach one
+line while the independent session and carrier remain active.
+
+Incoming carrier pressure combines with local application pressure; neither
+reason's Resume releases the other. Notifications without a local hold relay,
+including duplicates. Due loss/ACK alarms and ready FIFO output continue through
+Pause. A separate local send-pressure
+latch asks only the application source to pause when any retained byte count,
+entry count or allocation charge exceeds three quarters of its hard limit.
+Resume requires all three below one half; equality preserves its state. The
+allocation limit is twice the configured byte budget. Accepted unacknowledged
+chunks remain charged, so ACK-only input must be able to release pressure. An external Pause reaching a UDP adapter can stop ACK ingress;
+finite pauses recover when deadlines permit, while prolonged pauses can close
+the association.
+
+A received Finish closes its sender's direction before cleanup and never emits
+back toward that side. Application-side Finish detaches the application
+immediately; neither payload nor pressure may reach it again. Destroy an owned
+service line before returning from its Finish callback. The independent carrier
+and engine continue delivering accepted output and stream FIN, including when
+application Finish preceded handshake readiness. Do not admit new application
+input while closing. Carrier Finish aborts the session and destroys an owned
+client carrier before returning.
+
+`close-drain-timeout-ms` defaults to 30,000 and accepts integer values
+1–86,400,000. The first local application Finish or peer FIN starts one fixed
+local delivery deadline, including before readiness. Progress, retries and
+duplicate FIN never extend it. Handshake/idle deadlines, carrier loss and process
+shutdown can close earlier. The setting is local, not negotiated.
+
+An ordered PEER_FIN event follows every decoded byte preceding the FIN. Deliver
+those bytes, detach/finish the application, and drain its already accepted
+outgoing bytes before CONNECTION_CLOSE. Application half-close is not exposed.
+After local FIN acknowledgement and peer FIN, retain protocol closing/draining
+state for a separate fixed interval of at most three probe timeouts, capped by
+the configured close-drain timeout. Do not equate acknowledged payload bytes
+with acknowledged FIN. This phase handles late protocol traffic without
+reopening the application; repeated input cannot extend its deadline. Expired
+unconfirmed delivery is logged and retired. Reset or other protocol failure
+aborts the association.
+
+### SpeedLimit independent drains {#speedlimit-independent-drains}
+
+SpeedLimit combines its directional queue hold with external consumer pressure.
+It publishes each reason before notification and sends Resume only when both have
+cleared, without a temporary Resume followed by Pause. Consumer Pause stops that
+direction's timer/backlog output; a due timer leaves the bounded queue intact and
+does not poll while blocked. Consumer Resume rearms queued work, including an
+empty-queue local-release tick, before any outward notification. Timer admission
+refusal, including a refused reset of an existing timer, settles local buffers/timers
+and closes through the normal line owner. Keep the reset result; an existing timer
+pointer does not guarantee rearm admission.
+Each notification path returns without touching line state after the callback,
+which may synchronously close or reenter the connection. Token availability never
+overrides consumer pressure, and empty queued input cannot stall a drain.
+
+### UserController shared user shaping {#usercontroller-shared-user-shaping}
+
+Bandwidth-enabled UserController is an explicit producer-control limiter on its borrowed normal lines. For streams,
+its local queue hold and external consumer Pause are independent reasons: neither releases the other. Datagram backlog
+does not create a producer hold or send Pause/Resume solely for local shaping: UDP producers may otherwise discard
+arrivals before the controller's bounded queue fills. Datagram queue overflow drops the newly refused input; explicit
+external consumer Pause/Resume still applies and is propagated. The direction carrying queued
+upstream bytes controls the producer toward prev; downstream bytes control the producer toward next. Mapping those
+bytes to upload/download depends separately on the saved Init origin. A consumer Pause suspends that direction's drain
+and removes its eligible fair turn. Resume establishes progress before notifying the producer, because notification may
+reenter Payload or Finish. Anonymous and unlimited immediate forwarding remain transparent; a retained FIFO still has
+priority after a finite-to-unlimited transition. UserController still borrows the line. For an internal close, save the
+Init origin before clearing local state, finish the noncreator side first, then the creator side; reverse-origin lines
+therefore finish prev before next. Receiving Finish still propagates only away from its sender.
+
+A user's independent directional bucket and fair-turn queue belong to one AuthenticationClient runtime and are shared
+across controllers and workers. Waiter identity is a non-reused runtime ticket, not a raw user pointer or numeric ID alone.
+No user, collection or budget lock covers a neighboring callback. Ready queues receive bounded FIFO turns; paused,
+canceled, empty or removed tickets do not block eligible work. Refill uses fresh monotonic samples across workers; burst
+capacity is `max(1, ceil(R / 10))` bytes at actual logical rate `R` bytes/s, with zero unlimited and no unsigned-64 rate
+clamp. The one-byte minimum permits integer-byte progress at very low rates. Whole datagrams can hold a turn while earning
+credit, so FIFO fairness does not promise equal latency.
+Bandwidth preview and delivery commit use separate samples for pacing and expiry. Buckets, grants and retries use
+fresh monotonic milliseconds. Installed client expiry projections retain their local monotonic interpretation,
+including an explicit projection without a client clock. A standalone user without that projection compares absolute
+and first-use-duration expiry against fresh wall time under the same locks; wall-clock corrections never refill buckets.
+Preview does not charge. Commit rechecks shared enabled/expiry/traffic eligibility and charges only delivered bytes
+through the same directional fractional-remainder primitive as ordinary scaled traffic accounting. Live reservation
+gauges remain separate from stored gauge predicates.
+
+An oversized head datagram must earn complete credit before release. Credit earned before its activation is limited to
+ordinary capacity; abandoning its turn cannot donate an oversized burst to another ticket.
+
+Managed positive arrival observes first use before retention, independently of charged traffic. Delivery first previews
+eligibility without consuming credit, prepares exact output and reserves all retained costs, then revalidates and commits
+bandwidth plus multiplied quota under shared locks. Successful commit is immediately followed by ownership handoff,
+without intervening fallible preparation or scheduling. Streams may split; datagrams stay whole. A quota-exhausting final
+chunk is handed off once before closure. Queued, canceled or discarded data consumes no quota or multiplier remainder.
+An already exhausted user cannot commit more. Public traffic-accounting APIs retain their ordinary accounting behavior.
+
+The creator binds a pure owner-worker payload-mode resolver before preparation, or a manual instance configures
+`payload-mode` as `stream`, `datagram` or `dest_context->protocol`; conflicting or missing sources reject startup.
+The destination option reads protocol metadata once during Init: exactly TCP selects stream and exactly UDP selects
+datagram; missing, ambiguous or unsupported protocol rejects the line, even when unmanaged. It is opt-in, not an implicit
+fallback. Use it only when destination metadata is ready before Init and describes payload framing at this point in the
+chain; transport conversion may leave routing metadata that no longer describes local payloads.
+Either Init direction evaluates and saves the mode before admission or forwarding. Late promotion uses that saved mode,
+independently of later routing metadata changes. SOCKS/Trojan/VLESS classify their initialized exact-line role, HTTP uses stream, and WireGuardServer's private UserController classifies PTC-owned inner TCP as stream and inner UDP as datagram. Carriers are outside account enforcement.
+
+### StreamFragmenter upstream scheduling {#streamfragmenter-upstream-scheduling}
+
+TlsClient's optional `fragment` object creates an owned private StreamFragmenter
+after the TLS core and before its configured next node. Both borrow the same
+source-owned normal line. The complete initial TLS flight reaches the helper as
+one Payload; subsequent TLS output uses the same ordinary callback path. The
+helper's default Est wait gates its own output without holding the transport Est
+notification. Record shaping precedes stream fragmentation; their queues and
+budgets remain independent. Raw ClientHello-generation calls do not enter this
+per-line helper.
+
+StreamFragmenter borrows ordinary upstream-created Layer 4 lines. In default
+stream mode, its immutable settings select the first `count` Payload arrivals or
+arrivals strictly before a `duration-ms` deadline established at the first
+downstream Est by default. Every arrival consumes counter scope, including empty,
+bypassed, and too-short input. Eligibility and selected absolute cut offsets are
+fixed before admission or any reentrant handoff.
+
+With `tls-hello-fragment: true`, the first non-empty arrival latches eligibility
+and bypass for one initial ClientHello; later callbacks can complete it after
+scope expiry. Earlier empty callbacks still count. Selected cuts are sampled
+once when the four-byte handshake header reveals the complete message length.
+Offsets count handshake bytes, including that header and excluding TLS record
+headers. The node keeps the exact original wire prefix in a single budgeted
+candidate FIFO job. It accepts supported handshake records up to a 64 KiB
+message ending at an original record boundary, preserves record versions and
+boundaries, and adds headers only for selected cuts inside an original record.
+Failure to recognize that initial candidate, bypass, no selected cuts, or
+assembly deadline expiry makes the original prefix ready unchanged and ends
+detection for the line. No later ClientHello is probed. A suffix from the
+completing input is admitted behind the candidate before any callback can
+deliver newer input.
+
+Optional `wait-for-est` defaults to true. When enabled, all pre-Est upstream
+input joins the same bounded FIFO, including bypassed, empty and exhausted-scope
+input. No upstream handoff or fragment-delay timer starts before the first
+downstream Est has finished forwarding. Counter scope still counts arrivals;
+timed scope admits pre-Est arrivals and starts its window on the first Est.
+Publish receipt and the timed deadline before forwarding Est promptly, retaining
+the startup gate across notification and checking exact-line life afterward.
+Nested Payload, Resume or Est cannot bypass that gate. Duplicate Est continues
+forwarding without restarting eligibility or scheduling. Pressure notifications
+remain transparent before Est and do not gate fragment scheduling.
+Disabled shaping does not disable the startup wait. Explicit false permits
+pre-Est scheduling and starts timed eligibility in Init. Finish settles the same
+FIFO without waiting for Est. This is a node-specific scheduling policy,
+not a general prerequisite for middle-node payload admission or a promise of
+transport packet boundaries.
+
+One per-line FIFO owns original payload jobs and the active remainder. Each job's
+first delay starts at the active head; subsequent delays start after the previous
+fragment is forwarded. Bypassed and no-longer-eligible arrivals retain their FIFO
+position. New arrivals during an active drain append behind its remainder,
+including from Pause, Resume, or Payload callbacks.
+
+Once shaping eligibility is exhausted, or TLS handling reaches its terminal opaque
+phase, retire the node only after the startup wait is open, its FIFO and candidate
+are empty, no timer or drain is active, and its own source pressure is released.
+Destroy and zero the full line-state region before permanent bypass. Subsequent
+callbacks skip the node, including Finish. A collecting TLS candidate remains
+active after scope expiry. Generic timed expiry is observed on input or drain;
+there is no extra timer solely to retire an idle line. Disabled shaping may
+retire during Init when `wait-for-est` is false, or after the first Est and queued
+work settle when it is true.
+
+The incomplete TLS candidate also occupies that FIFO, but its parser can
+advance through bounded admitted input while the startup Est wait closes the
+output gate. The separate assembly deadline starts with the first selected
+non-empty input, includes time waiting for Est, and may arm the line's one timer
+before Est. It is canceled on successful commitment. After completion, the first fragment
+delay starts only when the ready job reaches the head and the startup gate is
+open. Expiry makes original bytes ready without bypassing the startup Est wait
+or older FIFO work; Finish discards them. An empty callback during collection
+needs no extra parser job.
+
+Upstream Pause/Resume use transparent defaults. Downstream producer pressure
+combines the fragmentation backlog hold with the latest next-side notification.
+Due fragments, completed TLS candidates, and ready FIFO work do not
+wait for Resume. Monotonic deadline checks prevent the event loop's coarse timer
+rounding from sending early. Downstream bytes and Est retain ordinary immediate
+forwarding.
+
+Retained jobs, including the active head, share fixed inclusive limits of 8 MiB
+logical bytes, 8 MiB canonical buffer-capacity charge, and 1,024 jobs. Local source
+pressure starts at 6 MiB charge or 768 jobs and clears only at/below both 3 MiB and
+384 jobs. Clear this local hold automatically at those low watermarks; send Resume
+only when next-side pressure is also clear. An external Resume cannot release the
+backlog hold, and backlog drain cannot release next-side Pause. Publish ownership
+and updated accounting before callbacks. Ordinary allocation charge
+remains held until its remainder transfers; splice charge can shrink with body
+consumption. One transient output fragment is additional extraction workspace,
+not another retained FIFO. Neither charge nor the job limit promises physical
+kernel pipe memory usage.
+
+The splice-capable node extracts generic selected ranges through `sbufMoveRangeTo`,
+with ordinary fallback, and transfers the final remainder directly. TLS
+inspection uses range helpers to materialize only the candidate prefix; later
+opaque splice buffers can still pass intact. Rewriting temporarily reserves both
+original and replacement buffers in the same byte/charge budget before replacing
+the job. The explicit job count includes the queued active head; buffer replacement
+keeps the same job and does not acquire a second job slot.
+Received Finish
+cancels its timer and discards all queued bytes before forwarding away from the
+sender. Local admission/setup refusal closes the borrowed line upstream then
+downstream; it never destroys that line itself. Generic event-loop quiescence
+detaches timer callbacks before the creator's owner-worker line drain reclaims
+the retained timer handle and jobs. See the [node reference](../../02-noderefs/StreamFragmenter.mdx)
+for configuration and concrete cut examples.
+
+### Client destination preparation before DNS {#client-destination-preparation-before-dns}
+
+TcpConnector selects its destination once before DNS and retains that
+destination's socket options and outbound IP range in the resolver's prepare-hook
+storage. Its own Init initializes the ordinary connector line state and consumes
+the prepared settings directly during socket creation, before connect can trigger
+callbacks. Keep destination selection and its settings together across DNS.
+
+TcpConnector and UdpConnector check constant domains against the address context's
+1–255-byte length before narrowing, for both single and weighted destinations.
+TcpConnector's constant CIDRs use the strict shared parser at construction:
+IPv4 accepts prefixes 0–32 and IPv6 accepts 64–128. Randomization replaces only
+host bits, including the complete IPv4 `/0` and IPv6 `/64` ranges.
+
+TrojanClient, VlessClient, VmessClient and Socks5Client apply their configured
+address, port and TCP/UDP selection to the line's destination context before local DNS
+resolution. Their internal DomainResolver invokes a client-owned prepare hook;
+the resolver itself does not choose the client's protocol. These hooks need no
+custom resolver line-state storage.
+
+TrojanClient, VlessClient, VmessClient and Socks5Client share address, port and protocol
+selection through `ProxyClientCommon/destination.h`. The helper snapshots the
+incoming context before replacing fields, preserving mixed constant/inherited
+settings and the selected address context's ownership and metadata. It performs
+no DNS, line-state or callback work. `ProxyClientCommon` depends only on `ww`;
+each client remains independently selectable at build time. Socks5Client keeps
+its UDP ordinary-read preference in its wrapper, applied before local DNS can
+retain input.
+
+When local DNS is enabled, each client wrapper applies its
+configured DNS strategy after selection.
+VmessClient first validates the selected command's security/framing combination,
+address and port, and rejects embedded-NUL or reserved packetaddr domains before
+DNS. Its packetaddr IP-only check remains in Init after DNS can resolve an
+ordinary domain.
+
+DNS resolution replaces the destination address while preserving the selected
+protocol flags. When Init reaches the client, read those flags from the prepared
+destination context. Without local DNS, the client applies the target directly
+in Init and then reads the same flags. Target preparation leaves exactly one of
+TCP or UDP selected; this is a debug invariant at the client entry, not another
+runtime configuration check.
+
+Do not apply the target settings a second time after DNS: a configured domain
+could overwrite the resolved destination. Protocol-selection warnings and the
+existing TCP fallback for an invalid incoming `dest_context->protocol` belong
+to target preparation and occur there once.
+
+HttpProxyClient also prepares its configured/dynamic origin in a client-owned
+DomainResolver hook when local resolution is enabled for CONNECT. It is TCP-only:
+validate and reject explicit UDP/ICMP/packet inputs before replacing context;
+an unspecified protocol becomes TCP. Copy dynamic address and port before any
+setter resets their storage. Do not apply the other clients' protocol fallback
+rules here. After DNS, format the numeric origin without reapplying settings,
+before the following connector replaces context with the proxy endpoint.
+
+ConnectionToPackets also prepares its destination in its internal DomainResolver
+hook before DNS. Its optional `target-address` and `port` independently replace
+the corresponding incoming fields; omission or their exact `dest_context->...`
+selectors preserve those fields. Preserve the destination protocol during address
+replacement: an exact destination TCP/UDP protocol wins, otherwise infer it from
+the source context. The resolver stores the selected protocol for the bridge's
+Init and uses `only-ipv4`. A configured literal IPv6 address fails configuration;
+an unusable dynamic destination fails only its line. Consume the resolved address
+in Init without applying the configured target again. `source-ipv4` selects the
+virtual packet source, independently of this destination preparation.
+
+Disabling resolution does not disable destination preparation. Socket connectors
+and ConnectionToPackets retain their preparation helper and reserved user storage;
+they reject unresolved input through the ordinary borrowed-line failure path.
+Supported proxies may retain a hostname according to their protocol restrictions.
+An already-resolved destination keeps its selected IP, port and protocol.
+TcpConnector weighted strategy-only overrides inherit the node transport and are
+rejected when resolution is disabled. Never select a weighted target again after
+DNS; its retained socket options and effective strategy belong to that selection.
+
+### UDP line role names {#udp-line-role-names}
+
+TrojanClient, VlessClient and Socks5Client name the borrowed UDP-facing line
+`UdpApplication` and refer to it through `application_line`. Application is relative
+to this protocol layer: the preceding chain may contain another protocol node.
+TrojanClient and VlessClient name their internally owned TCP line `UdpCarrier`
+and link to it through `carrier_line`; UDP describes the traffic carried, not the
+carrier's transport protocol. Socks5Client instead distinguishes its internally
+owned `UdpControl` TCP line and `UdpRelay` UDP line.
+
+These names describe protocol roles. Server-side client, control and UDP remote
+roles retain their own names; `prev` and `next` describe callback direction and
+neighboring tunnels. Determine ownership from the exact line's creation site.
+
+### SOCKS transport readiness and protocol ordering {#socks-transport-readiness-and-protocol-ordering}
+
+Socks5Client forwards every direct TCP transport Est before or after negotiation,
+including repeats, while starting its greeting only once. A UDP control carrier
+maps transport establishment to its application once. Authentication, command
+success and relay readiness retain their distinct application-data gates. Its pending application
+FIFO uses the default 2 MiB logical-byte / 8 MiB queue-charge backlog budget described in
+[Part 3](./protocol-buffers.mdx#protocol-storage-and-admitted-batches).
+Direct TCP releases this FIFO when protocol-ready, without waiting for Resume,
+and keeps nested input behind older bytes. Its source pressure combines received
+next-side Pause with negotiation/drain backlog, including during startup. The
+first retained application input originates source Pause; draining that local
+backlog clears only its own reason, sending Resume only if transport pressure is
+also clear. The opposite direction remains transparent. UDP retains combined
+control/relay output pressure and its protocol backlog hold at the association boundary. Its control
+handshake remains separate from application receive pressure.
+Proxy reply parsing has one synchronous owner. Nested downstream Payload cannot
+advance the parser recursively or overtake the accepted reply tail. A retained
+TCP response backlog drains in FIFO order without a consumer-Pause gate. Ready
+direct TCP forwarding keeps its synchronous path. UDP application receive pressure
+maps to the owned relay, including replay when that relay is created; control tails
+are discarded after association acceptance.
+
+Direct TCP permanently bypasses Socks5Client after the successful command reply
+has been consumed, all parser/reentrant input and application FIFOs have drained,
+and its local source hold has been released. Destroy and zero its complete line
+state before clearing the active bit. A source-pressure or Est callback may finish
+setup reentrantly; suspended continuations check the active bit before using that
+state again. UDP application, control and relay lines remain active for protocol
+framing, signal mapping and owned-line cleanup.
+
+Socks5Server forwards every CONNECT transport Est, including repeats, and generates
+its success reply only once. That reply still precedes backend response bodies,
+including under Init/Est reentry and Pause. CONNECT success and ready ordering
+queues do not wait for Resume. Repeated TCP Pause/Resume forwards transparently;
+before outgoing Init, retain the latest receiver Pause for replay to the initialized
+branch, with an early Resume canceling that pending request. UDP control, client
+and remote line roles retain their explicit mapping and endpoint behavior.
+Its control-input scope serializes parser progression: nested Payload joins the
+upstream FIFO behind the active input. Method, authentication and UDP-association
+transitions and identity are committed before reply callbacks. Failure replies
+close input admission before calling prev; reentrant Finish still completes local
+cleanup before the borrowed-line owner destroys its line.
+
+CONNECT TCP permanently bypasses Socks5Server after its success-reply handoff,
+outgoing Init and startup pressure replay, and both directional ordering queues
+have settled. Drain work added by a response callback in the opposite direction
+before retiring. Input and control-dispatch guards keep state alive for older
+parser/Init callbacks; a suspended Est continuation recognizes nested retirement.
+Destroy and zero local state first; credentials already published on the line
+remain available. UDP control/client/remote lines stay active for their endpoint
+and association responsibilities.
+
+DomainResolver accepts upstream Init and delays next Init until destination DNS
+completes. Its prepare hook runs before resolution and has no direction argument.
+Downstream Init and upstream Est retain the normal constructor's rejection policy;
+this is a node-specific contract, not a rule for reverse/Bridge or companion lines.
+Payload, Pause/Resume and Finish still operate in both ordinary directions.
+
+Standalone and embedded DomainResolver providers choose native, direct or chain DNS. Native uses the
+existing worker channel; direct and chain reuse one custom-socket c-ares channel
+per instance and owner worker. The application line is borrowed. The transport
+owns separately created **normal DNS lines**, including in a packet-containing
+chain. Publish their exact-line transport association and owner inventory before
+outward Init, and dispatch every DNS Est, Payload, Pause, Resume and Finish to
+that owner. Never forward a DNS callback to an application's prev. Receiving
+Finish destroys the exact owned DNS line before returning, without reflecting
+Finish to the sender. DNS lines stay active while the channel owns them;
+application bypass must not retire their transport state.
+
+For a supported shared owner entry, generated DNS lines call the owner's narrow
+preparation hook directly before owner Init. Never call ordinary resolver Init on
+them: it would overwrite the exact-line transport association with application
+state. Preserve the numeric server, port, exact UDP/TCP protocol, resolver marker
+and one-shot destination pin. Preparation initializes all owner-required storage
+and options; the first logical destination selector consumes the pin so a later
+outer connector can select its independent VPN endpoint. HttpProxyClient honors
+the pinned CONNECT authority and consumes the pin before initializing its outer
+transport, whether local resolution is enabled or disabled. ConnectionToPackets
+preserves pinned server addresses and ports despite configured target overrides,
+while still initializing its selected protocol. User preparation storage
+is cleaned once when that owned DNS line closes, including synchronous refusal
+or Finish. The application line remains borrowed; owning a DNS socket does not
+grant ownership of its caller's line or any packet line.
+
+Init and subsequent per-datagram consumers submit to the same selected provider.
+UdpConnector packet-balanced lookups and UdpStatelessSocket outbound lookups
+snapshot domain, port and effective strategy before mutable routing contexts can
+change. Disabled unresolved datagrams fail without DNS or borrowed/packet-line
+destruction. `domainresolverTunnelResolveRaw()` leaves completion settlement to
+the caller's existing reference/lifetime guard, including dead-line and channel
+cleanup outcomes; the line-wrapped submission API retains its normal guards.
+
+A query and a c-ares connection have different lifetimes: queries may multiplex
+or reuse one DNS transport. Abandoning an application invalidates only its
+line-bound completion; the shared wrapper settles that retained reference once
+without canceling unrelated queries. Custom-channel submission uses the same
+line lifetime/shutdown guards as the native line helper. Cache and hosts-file
+completion may be synchronous. The virtual backend applies `ARES_AI_NOSORT` so
+address sorting cannot create connections to resolved application destinations;
+WaterWall applies the configured address-selection strategy afterward. An
+effective `only-ipv4` or `only-ipv6` strategy also constrains the query family to
+IPv4 or IPv6, respectively, across native, direct and chain providers. Returned
+order and preference strategies query both families. The core `asyncdnsResolve()`,
+`workerResolveDomainServiceAsync()` and `lineResolveDomainServiceAsync()` entry
+points request both families.
+
+The resolver keeps one authoritative upstream backlog through next Init. The
+Open phase permits downstream Est and replies immediately; an Init guard serializes
+new upstream input behind older DNS input. DNS completion releases that FIFO
+independently and observes next-side Pause. Admission checks logical bytes and
+retained allocation charge separately against 2 MiB per line, including empty
+buffers. The local DNS/backlog hold combines with next-side pressure before
+notifying prev. Upstream receive pressure is remembered during DNS and forwarded
+to next once Init starts. Failures before next Init finish only prev; internal
+failures after it starts finish both initialized sides. Received Finish destroys
+local state first and propagates only away from its sender.
+
+On an application normal line, the resolver permanently bypasses itself once next Init has
+returned, its pending FIFO is empty, and its local hold and neighbour pressure
+notifications have settled. Neither direction needs to be unpaused when the
+permissions already match. Destroy the entire resolver state, including embedded
+prepare-hook storage, before clearing the active bit. Prepare-state consumers
+must finish using that storage during next Init and copy anything needed later;
+the destroy hook runs at bypass or earlier Finish, never again after bypass.
+Source-pressure callbacks can complete this transition reentrantly, so suspended
+continuations check the active bit before touching state. Actual worker packet
+lines remain active; normal lines in a packet-containing chain remain eligible.
+
+### TrojanClient establishment and association ownership {#trojanclient-establishment-and-association-ownership}
+
+TrojanClient borrows direct TCP and UDP application normal lines. UDP creates one
+owned normal TCP carrier on the application's worker; only that carrier receives
+next Init. The application keeps its UDP routing context. Signal forwarding maps
+the application and carrier explicitly, retaining both exact lines across callbacks
+and checking logical life and association afterwards.
+
+A valid first application payload can submit the request after next Init, without
+waiting for transport Est. The request and complete first payload share one ordinary
+buffer; later TCP forwarding is opaque. Direct TCP transport Est is forwarded
+promptly, including repeats; UDP carrier Est maps once to its application. The
+first transport Est starts an idle first-payload deadline only if the request has
+not already been sent; repeated Est does not restart that deadline. TrojanClient,
+VlessClient and VmessClient share the [first-payload window timer
+contract](../part7-shutdown-and-signals.mdx#9-timers-watchers-and-deferred-timer-reclamation).
+The header-only timer sends when due on direct TCP, including during advisory Pause.
+TCP Pause/Resume notifications are forwarded transparently, including duplicates.
+The owned UDP carrier retains its output-pressure gate: its due header waits for
+carrier Resume. An admitted application Payload can still complete its combined
+handoff under the batch contract.
+
+Ordinary TCP forwarding and one-datagram upstream wrapping do not gain separate
+Pause queues. Downstream UDP retains framing input and completes the current
+accepted input batch. Keep only the guard/storage needed for parser reentry,
+initialization ordering or a genuine protocol wait. A node-wide pump is not a
+contract; use explicit directional handlers and focused helpers for actual work.
+
+For direct TCP, assembling the complete first request ends this node's setup work.
+Destroy and zero its line state, including cancellation of the first-payload timer,
+then permanently bypass the node before handing off that buffer. Reentrant
+callbacks use the transparent path; suspended Est callbacks must check
+the active bit before accessing their retired state. No transport Est or protocol
+reply is required for this transition. UDP application and owned carrier lines
+remain active for framing, association mapping and cleanup.
+
+Close cancels the deadline, detaches both association links and destroys locally
+owned buffers/state before outward Finish. Only the carrier is destroyed here.
+Source-owner shutdown drains the dependent carrier while loops, chains and pools
+remain alive. No duplicate borrowed-line inventory is needed.
+
+### VlessClient establishment and association ownership {#vlessclient-establishment-and-association-ownership}
+
+VlessClient borrows direct TCP and UDP application lines and owns only each UDP
+application's dependent TCP carrier on the same worker. Both links are attached
+before next Init. The line role determines the VLESS command: direct lines use
+TCP, while UDP application lines route requests through their UDP carrier role.
+Keep the configured protocol selection in tunnel state; per-line state need not
+store a second copy of the role's protocol. Its first-payload batching, idle
+deadline, signal mapping and
+opaque TCP paths follow the same ownership/admission rules as TrojanClient.
+Every direct TCP Est is forwarded, including repeats; UDP carrier Est maps once
+to its application. Repeated Est does not restart the first-payload deadline.
+
+VLESS protocol readiness remains separate. The request must precede upstream body,
+but neither transport Est nor a response is required before submitting a valid
+request/body batch after Init. Downstream body waits for complete validated
+response metadata. Consuming that metadata cannot lose or reorder a coalesced TCP
+body or the first UDP frame. UDP input retains incomplete framing bytes, completes
+all ready datagrams in its active accepted batch and preserves an incomplete suffix.
+
+Record request admission before the first outward callback so nested data cannot
+send a second request or overtake it. Protocol/reentry storage is bounded; an
+otherwise-ready TCP buffer is not retained merely for Pause or Est. Direct TCP
+Pause/Resume is transparent, including duplicates, and its first-payload timer
+sends when due without waiting for Resume. The owned UDP carrier retains its
+output-pressure gate and exact-line signal mapping as described for TrojanClient.
+Close clears timer/parser/ordering state and both links before outward Finish,
+never reflects toward its sender, and leaves an owned carrier logically dead.
+
+Direct TCP permanently bypasses VlessClient only after request admission and
+complete response metadata consumption, once the outer receive batch has drained
+all retained and reentrant body input. Either protocol direction may complete
+first; neither alone permits bypass. Destroy and zero local state before clearing
+the active bit, including canceling the first-payload timer. Suspended Est
+callbacks must recognize state retired by nested callbacks. UDP application
+and carrier lines remain active for framing, signal mapping and owned-line cleanup.
+
+### TrojanServer associations and fallback replay {#trojanserver-associations-and-fallback-replay}
+
+TrojanServer borrows the client normal line and owns each UDP backend on that
+client's worker. Target, credentials, map membership and callback-ready state must
+be published before backend Init. AuthenticationClient is a lookup dependency;
+UserController runs only on the protected branch. Authentication, initial parsing
+and exact fallback replay remain required independently of transport Est.
+
+TrojanServer and VlessServer acquire their locally owned credential snapshots
+before protected or fallback Init. Authentication rejection/unavailability retain
+their existing fallback policy. Heap allocation for local snapshots and configured
+local users follows the same fatal policy as shared line-identity and
+AuthenticationClient profile copies; see the
+[fail-fast publication contract](#authenticated-identity-publication).
+
+After selecting and initializing the TCP/fallback branch, ordinary synchronous
+body/reply forwarding needs no queue solely for Pause or Est. Preserve older body
+or replay bytes across reentrant branch Init; this is a protocol-ordering barrier,
+not permission to maintain permanent TCP transport queues. A local fallback may
+send Payload and Finish within Init without ever sending Est.
+
+Authenticated TCP on the normal next branch permanently bypasses TrojanServer at
+the pump's quiescent exit: onward Init has returned and retained body and reentrant
+input have drained. TCP Pause/Resume is forwarded transparently, including
+duplicates. A receiver Pause before branch selection is remembered and replayed
+onto the initialized branch; it does not gate TCP output.
+Destroy and zero the server's state before clearing its active bit. Credentials
+already published on the line remain available to later nodes. This transition
+does not wait for Est or require either direction to be unpaused. UDP stays active
+for framing and owned-backend cleanup. Fallback also stays active, because its
+selected branch and possible delayed replay cannot be replaced by following next.
+
+Trojan UDP backend identity is the original address kind, exact address/domain
+bytes and length, and port. Hashes select buckets; full equality selects a backend.
+The remote owns an immutable key borrowed by the client map, and detaches it before
+freeing it. Routing/DNS rewrites cannot change lookup/removal identity; wildcard
+IPv4 and IPv6 remain distinct, and domain spelling and case are preserved.
+
+UDP is an association junction. Upstream callbacks operate on the borrowed client;
+backend upstream events use each owned backend, and replies/notifications return
+through downstream callbacks. Aggregate backend pressure by exact membership: one
+backend's Resume cannot release a carrier still paused by another backend. Client
+reply pressure applies to every initialized backend, including new backends.
+Publish each contribution before callbacks, clear it on removal, and restart
+traversal after callbacks rather than retaining raw sibling pointers or iterators.
+
+Pause stops future carrier admission, not completion of the carrier input already
+being decoded. Each complete datagram in that active input is submitted to its
+selected backend even if an earlier datagram caused Pause; the backend's receiver
+owns bounded in-flight tolerance. Preserve framing/destination checks, initial
+input ordering and the incomplete suffix. Stop immediately if the affected line
+or association closes. Do not drain unrelated pending input as part of this batch.
+
+Replies received on initialized live backends do not wait for backend Est. They may
+forward synchronously with the required datagram framing. If independent backend
+producers or reentry require an association FIFO, keep one bounded encoded FIFO,
+account entries before callbacks, and stop its independent drain at consumer Pause.
+Already-admitted immutable replies belong to the client FIFO and do not need a
+borrowed backend pointer kept alive merely as an Est waiter.
+
+Intentional fallback delay owns a bounded FIFO and scheduled drain. Due replay
+does not wait for Resume; both directions relay advisory Pause/Resume, including
+duplicates, along the selected branch. Source Finish permits at most one
+synchronous final batch outside branch Init, including during advisory Pause,
+with the finished side closed before any callback. Returned callbacks cannot
+revive parsing or reopen the finished direction. Init, delay and reentry still
+preserve the same FIFO order.
+
+Retain the client across association callbacks and each exact backend across its
+own Init/Payload/permission calls. Close detaches membership and selected-input
+links before callbacks, releases only locally owned bytes and returns with owned
+backends logically dead. Source shutdown settles dependent lines and delayed work
+before reclaiming their reachable resources.
+
+### VlessServer association and replay ordering {#vlessserver-association-and-replay-ordering}
+
+VlessServer borrows its client normal line and owns one dependent UDP backend for the initial request's fixed destination.
+Publish destination, credentials and association links before backend Init; serialize nested input behind older parser
+bytes. Hold the client across backend callbacks and each exact backend across its own callbacks. Backend death can leave
+the client alive and permit recreation; client Est is still sent only once. Settle any extracted, undelivered body if Init
+fails. Replay client receiver pressure onto new/recreated backends before delivery.
+Backend source pressure is separate from client receiver pressure. Publish the
+current backend's contribution and the emitted source hold before callbacks;
+duplicate signals do not add holds or releases. Detach clears the contribution
+before callbacks. After the old backend is logically dead, release a previously
+sent hold on a surviving client, retaining that client independently through
+notification. Resume may close the client or install a paused replacement; never
+write stale association state afterward. Client teardown and shutdown suppress
+source restart.
+
+TCP and fallback forward every Pause/Resume transparently. Before branch selection,
+remember the latest receiver signal for replay onto the initialized branch; update
+that startup state during Init reentry so a newer Resume cancels stale Pause.
+UDP retains receiver pressure for backend recreation and response draining.
+
+Every same-line TCP and fallback Est is forwarded promptly, including repeats; an owned UDP backend still maps
+readiness to its application once. Est does not emit a standalone VLESS response header. The header accompanies the first
+nonempty TCP reply or first framed UDP reply in one ordinary buffer, including replies arriving before Est. Empty UDP
+datagrams are valid; an empty first UDP reply emits the response header and zero-length prefix together as `00 00 00 00`.
+Empty TCP input, Resume and Finish do not
+trigger a header-only send, and there is no header-only timer. TCP reply draining proceeds through advisory Pause;
+UDP retains its response-pressure gate. Publish header ownership before callbacks so Est and reply
+reentry cannot duplicate the header or reorder replies.
+
+TCP Init and unauthenticated fallback selection secure all older body/replay ownership before outward callbacks.
+Fallback restores inspected metadata before its untouched tail and gates every drain during branch Init. Delayed replay
+does not wait for Resume; the narrow source-Finish batch runs only outside Init, with the previous side already
+closed. Source-owner shutdown settles parser storage, delayed work and the owned backend while pools remain alive;
+VlessServer adds no inventory of borrowed lines. See Part 3 for representation and retention limits.
+
+Authenticated TCP on the normal next branch permanently bypasses VlessServer after
+the first response header/body handoff, once branch initialization, retained input
+and response queues have settled. Destroy
+and zero local state before clearing the active bit. Est alone or an empty reply
+does not complete this transition. Transparent TCP Resume forwarding does not
+start a reply drain or require a later permission-reconciliation step.
+Credentials already published on the line remain available to later nodes. UDP
+and fallback remain active for framing, owned-backend cleanup, branch selection
+and delayed replay.
+
+### VmessClient bootstrap and association ownership {#vmessclient-bootstrap-and-association-ownership}
+
+VmessClient borrows direct TCP and UDP application normal lines. For each UDP application,
+VmessClient creates one dependent TCP carrier on the same
+worker and is that carrier's exact-line head and owner. Initialize both states and
+publish both association links before next Init. Snapshot the final target before
+transport nodes replace destination context with the VMess server endpoint. Optional
+DomainResolver is an owned helper before the client and applies that target before
+local DNS. The outbound UUID is not an authenticated local-peer identity and must not
+create duplicate managed accounting on the carrier.
+
+Init emits no request. The first eligible payload may precede transport Est, reenter
+Est or arrive after advisory Pause; it sends immediately without awaiting a response.
+Publish request ownership, expected response marker and both codec contexts before
+the first outward Payload. Direct TCP forwards every Est promptly, including repeats;
+UDP maps the carrier's first Est once. The first Est sets one idle deadline. Repeated
+Est never resets it. Direct TCP due output proceeds through advisory Pause; an owned
+UDP carrier defers only its idle header while that exact carrier is paused. Empty TCP
+and empty native/oversized local UDP do not trigger a request. Packetaddr preserves empty
+application datagrams through a nonempty address envelope. There is no separate response
+deadline because a backend can legitimately remain silent.
+
+Independent TX/RX guards preserve each admitted FIFO across nested payloads and
+synchronous responses. Drain complete records incrementally through advisory Pause,
+stopping on closure. Keep the client active for the whole connection, including NONE
+and zero; no successful-TCP permanent bypass applies. UDP records preserve datagram
+boundaries, and authenticated empty records terminate only after tag verification.
+
+Finish publishes the sender's closed side before any outward callback, detaches
+associations, cancels timers, settles buffers and wipes session material. Protocol
+termination may go only toward an open wire side after request submission when
+`send-termination` is true (the default). False omits that record and uses the same
+full-close path, including strict counter exhaustion. Incoming valid EOF remains
+accepted independently. Finish never starts a request. Never reflect Finish or pressure toward its closed sender.
+An owned carrier receiving Finish must be logically dead before returning, including
+when Finish reenters final-record handoff. Temporary references preserve allocation;
+recheck logical life and association membership after callbacks. Borrowed application
+lines remain their source owner's responsibility during normal close and shutdown.
+
+### VmessServer authentication and association ownership {#vmessserver-authentication-and-association-ownership}
+
+VmessServer borrows its carrier and owns its dependent UDP backend normal lines.
+Publish verified destination and identity before protected Init; managed mode inserts
+UserController on decoded traffic, while fallback bypasses that helper. TLS and WebSocket remain
+separate preceding nodes and require no VMess chain-introspection setting.
+
+Native UDP keeps one fixed-destination backend. Authenticated packetaddr UDP uses a
+bounded per-carrier associative table of immutable IP/family/port destinations:
+`packetaddr-max-destinations` defaults to 64 and accepts 1..1024. Each live entry owns
+one same-worker normal backend, with copied source/listener context and authenticated
+identity published before protected Init. Managed UserController sees each decoded
+application datagram once; envelope/carrier bytes are not separate application traffic.
+At capacity, drop only a datagram requiring a new destination. An exact backend Finish
+removes its entry, permitting later recreation while admission remains open. Replies
+carry that backend's immutable target and queued reply bytes remain independently owned.
+
+Publish table removal, inventory removal and association detachment before callbacks.
+Recheck logical life and exact membership after reentry; references preserve allocation
+only. Carrier closure closes backend admission and drains every owned entry; worker
+stop also drains the separate owner inventory before pools and chains are reclaimed.
+Pressure relays retain the existing exact-line head/tail roles and finite response
+FIFO; packetaddr does not grant ordinary transforms a new producer gate. All these
+lines are normal lines, and only their creators destroy them.
+
+The server authenticates/parses the request before applying `allowed-security`, UDP
+and packetaddr permissions, and must enforce them before protected Init or backend
+creation. Denied authenticated requests close without fallback. The body allow-list
+classifies chunked NONE as `none` and unframed NONE as `zero`; it introduces no new
+wire mode or header-authentication mechanism. Mux.Cool/XUDP remain unsupported;
+WaterWall's custom Mux is not an interoperable substitute.
+
+A node shares one immutable, reference-counted vector of copied UUID identities and derived
+keys across workers. Build it from generation-checked AuthenticationClient pages outside broad
+credential locks. Pending searches pin the vector, use one worker-owned trial cipher context,
+and yield through a coalesced worker pump after 256 trials or one millisecond. Ordinary ready
+continuations have no deliberate timer delay or throughput rate limit. A stale-vector miss
+must reconsider an installed replacement before selecting fallback; successful header verification
+must revalidate UUID ownership, durable ID, identity incarnation and current eligibility before
+publishing the handle. Account refresh must not reset replay protection.
+
+AuthID and session replay tables are shared by all workers of one VmessServer instance, with
+full-key equality and atomic admission. Keep AuthID marks through the entire inclusive 120-second
+past/future window, including the future edge. A nondecreasing wall-clock cutoff prevents a
+backward correction from reviving purged timestamps. Session marks retain UUID/key/IV identity
+for three monotonic minutes. Capacity refusal must never evict live protection. Separate node
+instances have independent replay domains.
+
+Authentication admission counts pending carriers, retained input and all live credential-vector
+allocations, including construction and pinned old generations. The absolute handshake deadline
+starts at Init and input never extends it. Quiescence closes admission and detaches worker timers;
+queued work settles under normal worker-message ownership. Worker stop closes pending carriers
+through their owners and releases construction state. Ordinary source-owner drain settles established
+carriers and dependent UDP lines before pools, helpers or shared state are reclaimed.
+
+### HttpProxyServer fallback association {#httpproxyserver-fallback-association}
+
+HttpProxyServer borrows the client normal line and owns a separate child. Every
+child callback uses that child's selected branch entry, including pressure and
+Finish; helper insertion must not be bypassed. Detach the child, branch entry and
+worker inventory before closing it, and destroy that exact owned line before
+returning from its Finish handler. Retain the session and exact lines across
+reentrant calls; physical references do not keep associations logically alive.
+
+Publish original replay, working input and deferred tails in FIFO order before
+fallback Init. An active Payload suffix must be admitted before Init or outward
+pressure can reenter. No drain or pressure notification enters unfinished Init.
+Record receiver Pause/Resume before forwarding, even before branch selection;
+reconcile the latest state after Init, without waiting for Est. Nested Resume
+cancels earlier Pause, and independent backlog pressure still applies. Child Est
+maps promptly and once to the borrowed client, independently of replay or Pause.
+Only the first Est for each child clears its connect deadline and records initial
+progress. Repeated notifications are not data progress and must not extend the
+session's idle deadline.
+A child may send raw Payload and Finish inside Init without Est: retain its reply,
+discard upstream work, destroy the child, and drain accepted client output before
+Finish. Never reflect callbacks into that finished child.
+
+In both directions, publish the active Payload remainder before a streaming slice
+can call out. Nested input appends after that remainder and shares the existing
+delivery allowance; it must not enter a FIFO that drains before the older suffix.
+Close and early final-response handling settle active input as well as queued
+input. Raw fallback and CONNECT relay drain each direction's retained buffers
+directly, without needing spare working capacity from the opposite direction.
+Child Finish preserves accepted response bytes, including an active remainder,
+until the client can receive them; client Finish discards them immediately.

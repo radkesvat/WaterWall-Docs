@@ -1,0 +1,495 @@
+---
+sidebar_position: 1
+title: "Buffer containers and readers"
+description: "Choose and use queues, streams, staged readers, frame readers, and retained-buffer budgets."
+---
+
+# Buffer containers and readers
+
+Read [Part 3](../part3-buffers-and-padding.mdx) for geometry, padding and buffer ownership first. The contracts here apply when selecting or changing these helpers; protocol-specific policies live in [Protocol buffering](./protocol-buffers.mdx).
+
+## BufferQueue ownership and budgets {#bufferqueue-splice-ownership}
+
+BufferQueue accepts ordinary and splice buffers through its existing push, pop,
+peek, reserve, and destroy API. It preserves entries, including empty entries,
+and FIFO order. Logical byte accounting includes each splice buffer's real prefix
+and remaining private-pipe body; it does not count control-storage capacity.
+
+`bufferqueueGetLength()` reports logical bytes. `bufferqueueGetCharge()` reports
+the sum of `sbufGetQueueCharge()` for entries still owned by the queue. Both are
+cached O(1) totals, maintained by successful front/back insertion and pop. Empty
+entries contribute charge even though they add no logical bytes. Callers choose
+limits, their accounting scope, Pause/Resume decisions and overflow handling.
+An optional attached `buffer_budget_t` enforces admission across one or more
+queues and active reservations. Unbound queues retain their existing accounting
+without a finite admission policy; parser and Mux policies remain with their owners.
+
+`bufferqueueGetEntryCount()` counts stored buffers, including empty entries.
+Length, entry count and charge queries accept const queues and return `size_t`;
+these quantities remain distinct even when all three are used for admission.
+
+Splice insertion retains the original wrapper and private pipe in every build.
+It neither copies metadata as payload nor converts or consumes the body.
+Splice entries must already own any claimed body bytes in their private pipes;
+empty and prefix-only wrappers need no initialized pipe.
+Ordinary Debug insertion
+continues to replace allocations to detect stale aliases.
+
+Successful insertion transfers ownership to the queue. Failed try-insertion
+leaves the pointer, buffer, private-pipe contents, queue entries, and byte/charge
+totals unchanged. Unrepresentable totals are refused before ownership transfers,
+including before ordinary Debug replacement. Heap exhaustion while reserving
+deque storage is fatal; it does not produce a try-insertion refusal. Pop transfers
+ownership back to the caller. Peek is borrowed: do not consume or modify a queued
+buffer through an alias. Pop first, consume through
+the splice helpers, and reinsert any remainder so queue accounting stays correct.
+
+Use `bufferqueuePushBack()` or `bufferqueuePushFront()` when the caller already
+proves that bytes, queue charge, entry storage and any attached budget admit the
+buffer. A payload-length limit alone does not prove this: retained capacity can
+be much larger. Keep the try form wherever those checks can still refuse.
+
+Destroying a nonempty queue discards remaining private bodies and recycles the
+wrappers on the owning event worker, preserving healthy empty pipes. Drain errors
+close the affected pair before recycling; teardown never creates a replacement.
+Destroy releases only this queue's contribution to its attached budget and leaves
+a valid empty, unbound queue with both totals zero. Empty queue destruction
+requires no worker context. TCP adapter pause queues use these same ownership
+rules; final stream delivery order remains the caller's
+responsibility.
+
+A budget tracks logical bytes and canonical queue-capacity charge in O(1).
+Initialize both limits explicitly: `SIZE_MAX` is unrestricted and zero is a
+real zero allowance. Admission checks representability even in unrestricted
+dimensions. Empty buffers still consume charge. Finite charge therefore bounds
+retained buffer count indirectly; generic budgets impose no separate count cap.
+Queue length remains available for FIFO operations. Job, packet, engine-descriptor
+and fixed-resource limits belong to their owners, independently of this budget.
+Budgets own no buffers,
+pools, callbacks or flow-control state; each lives at a stable address on its
+owning worker until all attached queues and active reservations have settled.
+Limits remain fixed while in use.
+
+`bufferqueueTryAttachBudget()` requires an unbound queue and atomically admits its
+existing totals before publishing the binding. It can attach populated parser
+storage when that queue becomes output storage. Refusal preserves the queue and
+budget unchanged. Initialize the final line-state object before attaching queues
+to embedded budgets; copying a temporary with self-references is invalid.
+
+`bufferqueueAttachBudget()` is the strict form for callers that have already
+established admission. An empty queue always qualifies, including when other
+owners have filled the budget. It returns with the binding installed; unexpected
+refusal logs a fatal error and terminates in every build. Use it for required
+initialization attachments, and keep the try form wherever populated queues can
+legitimately exceed the available budget.
+
+`bufferqueueTryRebindBudget()` transfers a bound queue's current bytes and charge
+to another live worker-owned budget. Destination refusal changes
+neither budget nor the queue; rebinding to the same budget succeeds without
+re-admission. Success changes no buffers, FIFO positions or representations and
+performs no allocation or callbacks. Previously popped reservations keep their
+original budget. Empty queues change their binding too: even empty destruction
+accesses the bound budget, so its owner must remain alive until rebinding or
+queue destruction.
+
+Ordinary `bufferqueuePopFront()` releases the entry's budget cost before returning
+ownership. When the same scope continues retaining a popped buffer, use
+`bufferqueuePopFrontReserved()` with an empty reservation. It moves accounting to
+the active owner without reducing aggregate usage or attempting new admission.
+Reduce reservation bytes as plaintext or WIO progress is consumed, before reentrant
+callbacks can admit more input. Retained capacity remains charged
+until responsibility ends. Release clears the reservation; empty release is safe.
+Never copy one live reservation into two independently released owners.
+
+Same-budget `bufferqueueTryPushFrontReserved()` and `bufferqueueTryPushBackReserved()`
+reserve destination storage before transferring accounting, without charging twice.
+Their reservation must match the actual buffer cost; reconcile any consumption
+first. Failure preserves the buffer and reservation; success clears the reservation.
+`bufferqueueReserveExtra()` reserves deque slots only, never budget allowance.
+
+Whole-queue moves carry the binding and both cached totals by assignment, then
+initialize the relinquished source empty and unbound. Destroy an empty destination's
+storage before overwriting it. Never reset a populated queue to erase accounting.
+Destroy all queues and release all active reservations before asserting an embedded
+budget empty and clearing its owner. Recreated queues must attach explicitly again.
+
+BufferStream accepts ordinary entries only. The fixed-header splice stream owns
+mixed representations for Mux; NIO's internal WIO FIFO stores owned wrappers directly.
+
+## Staged buffer reader {#staged-buffer-reader}
+
+`buffer_reader_t` in `ww/bufio/buffer_reader.{h,c}` owns an active buffer and an
+unbound input queue for ordinary or splice bytes. It borrows the line's pool and
+caller-owned header storage; both remain valid through destruction. Initialize
+it in its final line-state location and keep it there. The reader makes no
+callbacks and owns no line reference or reentry guard. Nodes validate protocol
+fields, choose admission limits, serialize callbacks and recheck line and
+association lifetime before continuing. Budget-reserved VMess records use the
+[shared VMess record reader](./protocol-buffers.mdx#vmesscommon-and-vmessclient-ordinary-records) in
+`Internals/VmessCommon` rather than this reader.
+
+`bufferreaderTryPush()` accepts an inclusive logical-byte limit counting cached
+header bytes as well as unread sources. Success transfers input ownership;
+refusal changes neither input ownership nor reader state. Empty input is a valid
+queue entry, so the node retains its own empty-delivery policy.
+
+`bufferreaderGather()` consumes only the requested metadata extent, including
+private-pipe bytes, and recycles exhausted sources through the reader's pool.
+Partial progress stays cached and charged. The requested extent must fit the
+caller-provided header capacity. An already-satisfied extent, including zero,
+is a successful no-op; following body bytes remain untouched. Gathering itself
+allocates no storage. The node chooses the next field and validates its contents.
+
+`bufferreaderTakeBody()` requires complete body availability and representable
+ordinary output geometry, including full pool large-buffer padding. It returns
+one exact body with that padding available, removing both the cached header and
+body from the logical count before returning. A suitable whole head transfers
+directly. Otherwise, any contributing splice wrapper selects splice assembly,
+even when the requested bytes lie only in its resident prefix. Pipe refusal
+falls back to complete ordinary output, preserving any partial transfer progress.
+Unrequested suffix bytes stay owned by the reader. Zero bytes returns a real empty
+ordinary buffer and consumes cached metadata without consuming source body bytes.
+
+`bufferreaderConsumeHeader()` removes only validated metadata. VlessClient uses
+it for its initial response, and the servers use it for accepted requests before
+body/output accounting. `bufferreaderTakeChunk()` requires no cached header and
+transfers the next opaque storage chunk, including an admitted empty chunk, or
+returns NULL when none remains. Storage boundaries need not match admissions.
+
+`bufferreaderSettle()` checks the combined active and queued storage charge.
+Within the inclusive charge bound it leaves storage unchanged. Otherwise
+it combines unread bytes in FIFO order, reusing append room and growing assembly
+geometrically within the charge allowance. It preserves splice assembly where
+possible, with complete ordinary fallback on pipe refusal and full onward padding.
+If even ordinary fallback cannot fit, it returns false before consuming input;
+the caller closes and releases retained storage.
+Cached metadata and logical-byte accounting stay intact. The fixed header cache
+is separate from queue-capacity charge; this charge does not measure RSS or kernel
+pipe memory.
+
+TrojanClient, TrojanServer, VlessClient and VlessServer settle incomplete UDP
+input and nested UDP input above 8 MiB of queue-capacity charge, including the
+active head. This threshold does not limit the number of
+fragments in a valid datagram. Drain complete accepted datagrams before settling
+an incomplete remainder; nested input settles before returning to the outer
+parser dispatch. Client settlement applies only to the owned UDP carrier,
+including its response metadata in VlessClient. Direct TCP keeps its own admission
+rules. Existing logical-byte limits still apply before input is queued.
+
+`bufferreaderMoveToQueue()` transfers input into an initialized, empty, unbound
+destination. With `restore_header=true`, the inspected prefix is restored before
+the unread suffix for exact fallback replay. Otherwise metadata must already be
+consumed. Success empties the reader. Refusal leaves the destination unchanged
+and all bytes owned by the reader, although its active head may have moved into
+its queue; the caller closes and cleans up. Attach an output budget or transfer
+the transcript to FallbackReplay only after this ownership handoff. Server TCP
+ordering queues remain separate from the reader's unbound parser queue.
+
+Clear releases all input while preserving the pool/cache binding. Destroy also
+zeroes the reader. The node owns wiping its header storage. All operations run
+on the pool's owner worker, and the node retains responsibility for callback
+lifetime checks and for recycling extracted buffers it has not transferred onward.
+
+TrojanClient/Server share staged address gathering and UDP-header validation in
+`Internals/TrojanCommon`; VlessClient/Server share UDP length decoding in
+`Internals/VlessCommon`. Authentication, response/request transitions, routing and
+callbacks remain node-local. Each internal library is enabled when either node
+of its own pair is selected; no Trojan node depends on a VLESS node or vice versa.
+
+## BufferStream representation, inspection, and extraction contracts {#bufferstream-representation-inspection-and-extraction-contracts}
+
+`buffer_stream_t` accepts **ordinary resident buffers only**. Use its inspection,
+CRLF searches, exact/at-least/full reads, and `bufferstreamTakeChunk()` only on ordinary
+input. Logical stream entries are storage boundaries, not protocol records.
+In Debug, Push asserts the ordinary-input precondition before copying or retaining input,
+including empty input. Per-entry byte inspection and delimiter scans also retain
+that ordinary-input precondition while using resident views. A short splice view
+does not permit skipping its pipe bytes to inspect a later entry; BufferStream
+requires ordinary storage throughout. `bufferstreamInitEmpty()` initializes a
+destroyable stream without reserving deque storage; its pool and exact-read padding contract match
+`bufferstreamCreate()`, which retains its eager reservation. Both initializers
+require that any previous contents have already been released.
+`bufferstreamGetEntryCount()` counts retained storage entries after coalescing,
+including empty entries. `bufferstreamGetHeadLength()` reports only the first
+entry's logical length as `size_t`, or zero if absent/empty; it exposes no payload
+pointer. `bufferstreamGetLength()` reports total logical bytes as `size_t`.
+`bufferstreamGetCharge()` scans retained allocation charges in O(n), saturating
+at `SIZE_MAX` on overflow. Partial consumption keeps a source's charge until its
+storage is released. Charge excludes deque/pool storage and is not logical byte
+length or RSS. These accessors allocate nothing and make no callbacks; callers
+choose admission limits and when to settle retained storage.
+
+`bufferstreamSettleRetained(stream, max_charge)` runs on the pool's
+owning worker without callbacks. An empty logical stream releases every retained
+buffer, including empty entries. Otherwise it queries the best-fit ordinary
+allocation for the unread bytes with full pool large-buffer padding. The charge
+threshold is `max(max_charge, best_fit_allocation_charge)`. When charge fits,
+storage is unchanged, including at equality. Above that threshold, it copies
+the unread bytes in FIFO order into
+one best-fit buffer and releases all old entries. Compaction preserves full
+onward padding without consuming the stream's `split_headroom_budget` allowance.
+Unrepresentable allocation geometry returns false before changing input or
+ownership. Heap allocation failure remains fatal.
+
+These are compaction thresholds, not hard logical-byte or storage admission
+limits: a best-fit allocation may exceed `max_charge`. HttpCommon checks its
+caller-supplied byte limit before settlement. Ipv4StreamCodec settles only an
+incomplete packet remainder, whose length must be below the maximum packet size.
+Both retain their existing nested-input budgets and settlement points.
+
+Push owns its input and preserves bounded ordinary coalescing: a positive input
+of at most 4 KiB may append to a tail with sufficient spare space. Exact reads
+preserve checked lengths and the explicit `split_headroom_budget` budget. Deque
+insertion failure terminates during push or exact-read remainder retention.
+Both stream implementations operate exclusively on bytes and owned buffers.
+Fragment assembly belongs to the device reader session; no claim, callback, sidecar token,
+or hidden padding metadata follows a packet through buffer transforms.
+
+`bufferstreamMoveExactBytesTo()` validates the source range and destination append
+space before consumption. It appends into sufficient caller-owned ordinary
+storage without growing/replacing it or spending additional headroom.
+
+`bufferstreamTakeChunk()` transfers the next stored buffer without combining
+entries. It requires positive buffered logical length; a retained empty entry
+can still yield an empty result. The chunk is neither an original Push boundary
+nor a protocol frame. `split_headroom_budget` is an exact byte allowance that
+split exact-read allocations may consume, not a boolean or current headroom.
+
+`bufferstreamCopyBytesAt()` copies ordered bytes into caller-owned storage
+without consuming input or returning a borrowed view. It and the other
+non-mutating queries accept const streams. Byte inspection, copying and searches
+consume no bytes. The delimiter searches inspect all buffered
+ordinary bytes, including delimiters split across entries. `bufferstreamFindCRLF()`
+returns the CR offset; `bufferstreamFindDoubleCRLF()` returns the offset after the
+delimiter. No match leaves the output offset unchanged.
+HTTP parsers remain ordinary-only. HttpClient and HttpServer do not advertise
+splice support. HttpProxyServer establishes an ordinary-memory boundary at
+payload admission: only a complete, immediately forwardable splice wrapper in
+ready CONNECT/fallback relay bypasses materialization. Every input, output,
+deferred and active incoming session slot is ordinary. Parsing, transitions,
+Pause and reentry materialize the complete delivery through the shared splice
+read helper, preserving onward padding. The temporary ordinary input is at most
+`P + D` logical bytes and meets the existing remainder allocation bound based on
+`max(small_capacity, 2 * D)`, plus padding, alignment and sbuf header. Existing
+admission limits what survives return; conversion adds no persistent allowance
+and makes no RSS or copy-cost guarantee.
+
+## Fixed-header splice stream {#fixed-header-splice-stream}
+
+`splice_stream_t` in `ww/bufio/splice_stream.{h,c}` owns a FIFO, an explicit active
+head, an immutable header size and a trailing resident header cache. It borrows
+its owner-worker pool. Construction checks object
+allocation arithmetic. Mux parents use an eight-byte header cache; Mux children
+have no receive stream. Bgp4Client and Bgp4Server use a 19-byte cache for marker,
+length and type. BGP OPEN inspection gathers only ten fixed bytes, validates the
+version and declared room for application data, then consumes up to 255 optional
+bytes before releasing application bytes. Application bodies remain eligible for
+private-pipe extraction and incremental delivery. Their shared fixed-header frame
+reader drains available top-level body bytes before settling incomplete storage.
+Nested input shares a 2,162,705-byte logical budget
+with older retained wire bytes, including the cached header. Admission checks
+those bytes before Push, then settles retained buffer charge to at most 4,325,410
+bytes before returning to the outer drain. The same charge limit applies to the
+incomplete remainder at drain end; coalescing or beneficial compaction precedes
+refusal. A validated incomplete frame is smaller than 65,553 logical bytes;
+assert this derived bound instead of refusing complete top-level batches.
+Incoming fragment count is unrestricted. BGP validates a complete FIFO-head
+header immediately after admission, including nested input; OPEN validation and
+the 65,553-byte maximum wire frame remain protocol responsibilities.
+
+BGP encoded output has an independent 2,162,705-byte limit, including generated
+headers, and an 8 MiB retained-buffer charge limit. Each encoded batch passes these checks and is
+prepared before its first handoff. Both nodes borrow normal lines: default
+Pause/Resume callbacks forward every notification, including repeats, and
+available application bytes drain without waiting for Resume. A decoded frame may
+produce several Payload callbacks; closing during an incomplete frame cannot
+retract its already delivered prefix. Per-direction pump guards preserve FIFO
+across reentrant callbacks. The frame reader retains
+incomplete input, and the output FIFO retains queued frames during reentry.
+Ongoing framing prevents permanent bypass.
+
+`splicestreamDiscardFrame()` consumes the cached header and exactly the requested
+body bytes without producing a payload buffer. Its complete-header/body preconditions
+match frame extraction. Resident bytes are skipped; Linux private-pipe bodies drain
+to a lazily opened, close-on-exec `/dev/null` descriptor owned by the stream. Short
+transfers and EINTR preserve progress. Unavailable sink/unsupported splice falls back
+to bounded 4 KiB scratch reads; missing claimed pipe contents remain fatal. The next
+header refills only after the selected body is consumed. Destruction closes the sink
+and releases every retained input through the owner-worker pool.
+
+SpeedTestClient and SpeedTestServer use a 48-byte splice header cache and advertise
+splice support. Client `verify-payload` defaults to false and HELLO flag bit 8 selects
+the same policy at both endpoints. Unverified DATA consumes its body through frame
+discard; verified DATA and control bodies materialize only after enough bytes arrive.
+Partial frames return to the event loop. Each line bounds incomplete-frame charge to
+`2 * (16 MiB + 48)`, attempting beneficial compaction before refusal. Headers, lengths,
+stream IDs, sequence statistics and completion reports are always processed. Unverified
+senders initialize ordinary bodies to zero; verified senders generate the deterministic
+pattern. JSON summaries expose `verification_enabled`, and unverified payloads do not
+increment `valid_packets`. UDP keeps its per-datagram path.
+
+Their private frame encoders receive DATA sizes already bounded to 16 MiB by
+client settings or the accepted HELLO; control bodies are fixed and at most 72
+bytes. The 48-byte prefix and validated pool padding therefore have representable
+allocation geometry. Assert these caller bounds instead of adding nullable frame
+allocation or duplicate UDP-size checks. The shared header readers still validate
+external input, and report/HELLO dispatch establishes their exact body sizes before
+private readers run. Sender pacing preserves wide byte counts when converting
+them to elapsed microseconds and caps unrepresentable delays before narrowing.
+
+`splicestreamPush()` takes ownership on every result. It checks accounting and
+reserves FIFO metadata before consuming any new header bytes; representability
+refusal recycles the submitted input while preserving existing bytes and costs.
+Heap exhaustion is fatal. Empty inputs recycle immediately.
+Ordinary bytes, real resident splice prefixes and private pipe bodies maintain
+FIFO order. Push physically removes only missing header bytes from sources and
+recycles exhausted sources. The header cache owns only bytes.
+
+`splicestreamCanAdmit()` conservatively checks current logical bytes (including
+the cached header) plus incoming length and source queue charge against explicit
+limits. Equality is accepted; zero is a literal bound. Empty input adds no charge.
+It borrows both inputs, performs no mutation or reservation, and does not guarantee
+that a later Push succeeds. `splicestreamSettleCharge()` attempts beneficial
+compaction at most once when over its charge limit, then reports whether the
+result fits. It may allocate, materialize pipe bytes and recycle sources even when
+returning false, but preserves header/payload order and makes no callbacks.
+Both helpers require the stream's owner worker. UDP-over-TCP, KeepAlive and BGP
+use the shared fixed-header reader described below, which checks nested logical
+bytes before Push and settles charge afterward. SpeedTest settles incomplete
+retention after processing complete frames.
+Do not turn these helpers into unconditional prechecks on complete top-level batches.
+
+`splicestreamPeekHeader()` returns a borrowed cache pointer only when complete;
+the pointer expires on mutation. Repeated peeks perform no I/O or allocation.
+`splicestreamLength()` includes cached header bytes; `splicestreamBodyBytes()`
+returns zero until the header is complete, then counts all following bytes.
+Neither peeking nor waiting for a body refills a second header.
+
+`splicestreamMoveFrame(stream, destination, N)` consumes the current cached header
+**and exactly N body bytes**. Header readiness and complete body availability are
+caller preconditions, together with an empty destination; Debug asserts these
+without repeating the decoder's availability checks in Release. The supplied
+destination transfers ownership; always use the
+returned pointer because fallback may recycle/replace the supplied allocation.
+A NULL destination selects ordinary output, including after failed pipe checkout.
+The result preserves full onward pool padding. Resident-only ranges remain
+ordinary, including real prefixes of splice wrappers. Representation selection
+examines only the requested body bytes, in the active head and queued buffers;
+later pipe bytes do not make an earlier resident-only body use a pipe.
+`splicestreamMoveFrameToOrdinary()` has the same caller preconditions
+and retains fatal checks for ordinary destination type and sufficient storage
+before consuming; it never grows or replaces the destination.
+After the body completes, the stream clears its cache and gathers only the next
+header. N=0 consumes one zero-body frame. With header size zero, extraction is an
+exact body move with no header discard or look-ahead.
+
+`splicestreamMoveFrameChunk(stream, destination, N, finish_frame)` moves exactly
+N available body bytes using the same ownership, representation and padding
+rules. The caller tracks the declared remaining body length. With `finish_frame`
+false, the complete header stays cached and no next header is gathered; only the
+final body chunk may set it true. `splicestreamDiscardFrameChunk()` follows the
+same header-completion rule without producing a buffer. A zero-byte final discard
+consumes an empty frame without allocating a payload. Stream length continues to
+include the cached header until completion; body bytes already consumed do not
+remain in its logical length. Source capacity and charge follow the ordinary and
+splice [queue-charge rules](./protocol-buffers.mdx#queue-capacity-budgets). Mux uses these APIs for incremental delivery and
+discard; complete-frame users retain their existing extraction APIs.
+
+Pipe-backed extraction can split one source pipe or combine several independently
+owned sources into a new private pipe. Whole suitable wrappers transfer directly.
+Ordinary ranges and real prefixes copy/write in order; pipe bodies use nonblocking
+pipe-to-pipe `splice()`. Positive short progress accumulates and EINTR retries.
+Only successful transfers advance lengths; body consumption never moves the cursor
+into metadata at `head + initial_headroom`. No descriptors have two owning wrappers.
+
+Pipe destination capacity is fallible: nominal `F_GETPIPE_SZ` does not prove slot
+availability. Creation/growth failure, unsupported destinations and destination
+pressure select complete ordinary fallback, not process termination. Allocate the
+final best-fit result first, drain only the actual assembled destination bytes,
+then append the still-unmoved source range. Return exactly N ordered bytes once,
+leaving unrequested suffixes intact. Missing claimed source bytes or invalid owned
+descriptors remain fatal invariants. Exact transfer primitives live in
+`splice_buffer`, independently of Mux and the event loop.
+
+## Fixed-header frame reader {#fixed-header-frame-reader}
+
+`splice_frame_reader_t` in `ww/bufio/splice_frame_reader.{h,c}` owns a
+`splice_stream_t`, the active-drain guard, incremental-frame progress, nested
+logical-byte and retained-charge limits, empty-input disposal and output-buffer
+selection. UdpOverTcpClient, UdpOverTcpServer, KeepAliveClient, KeepAliveServer, Bgp4Client, Bgp4Server, ConnectionStripeClient
+and ConnectionStripeServer use this reader. It runs on the borrowed pool's owner worker and makes no callbacks
+or line-reference changes. Its `nested_byte_limit` and `retained_charge_limit`
+fields are immutable limits, not usage counters. Incoming buffer length uses
+`size_t` for admission accounting; declared frame progress remains bounded
+`uint32_t`, independently of aggregate byte and charge totals.
+Initialize it in the node's Init with a nonzero fixed header size, limits and
+finalized chain splice-output capability. The pool must outlive reader destruction.
+
+`spliceframereaderAdmit()` takes ownership of input on every result. Empty input is recycled
+without starting another drain. While a drain is active, admission first checks
+the stream's existing logical bytes, including cached header bytes, plus incoming
+length against the nested-byte limit. Equality is allowed. A byte-limit refusal
+recycles only the new input, preserving the existing stream. Otherwise Push
+appends input behind older bytes, then charge settlement attempts at most one
+beneficial compaction if retained charge exceeds its limit. This permits a small
+frame in an oversized backing buffer to fit after coalescing or compaction.
+Nested admission returns to the outer drain without delivering frames recursively.
+
+Charge refusal is not transactional: the reader may already own the input and
+may have compacted the complete retained body, including pipe-backed bytes. The
+node must close and destroy its reader after an admission or charge refusal;
+it must not recycle or retry the submitted buffer. These bounds govern retained
+buffer charge, not transient allocation peaks or process memory. Heap exhaustion
+remains fatal. A top-level input batch may exceed the nested-byte or retained-charge
+limits while ready frames or body chunks drain; charge is settled on the retained
+remainder before the drain ends. Do not reject that batch by applying the nested checks
+before processing it.
+
+| Reader users | Nested logical bytes | Retained buffer charge |
+| --- | --- | --- |
+| UdpOverTcpClient and UdpOverTcpServer | 2 MiB | 4 MiB |
+| KeepAliveClient and KeepAliveServer | 8 MiB | 16 MiB |
+| Bgp4Client and Bgp4Server | 2,162,705 bytes | 4,325,410 bytes |
+| ConnectionStripeClient and ConnectionStripeServer (per member) | `max-buffered-bytes` | `max-buffered-bytes` |
+
+The node still decodes and validates headers, chooses whether to deliver or
+discard each body or chunk, emits callbacks and closes the line. A borrowed
+header pointer expires on any reader mutation; decode required fields before
+taking or discarding the frame. Frame extraction returns the sole owned body
+buffer with full onward padding. It requests splice output only for a nonempty
+body when enabled; the underlying stream still returns resident-only ranges as
+ordinary buffers and falls back to ordinary output on pipe pressure. Discard
+consumes the complete header and body without producing a payload buffer.
+
+Complete-frame operations require no active incremental frame. UDP-over-TCP uses
+them so one decoded body remains one complete datagram. For byte-stream framing,
+call `spliceframereaderBeginFrame()` after validating a complete header and its
+declared body length. It records that length without consuming the header or
+requiring the whole body to be present. `spliceframereaderFrameActive()`,
+`spliceframereaderFrameRemaining()` and `spliceframereaderFrameAvailable()` expose
+progress; available bytes are capped at this frame's remainder, excluding any
+following frame. `spliceframereaderTakeChunk()` and
+`spliceframereaderDiscardChunk()` consume a caller-selected available range and
+publish the new remainder before returning. The header remains cached until the
+last chunk; consuming that chunk completes the frame and permits the next header
+to be gathered. Complete a zero-length frame explicitly with a zero-byte chunk.
+An active frame may span multiple drains. Do not start another frame or use
+complete-frame extraction while it remains active.
+
+KeepAlive and BGP deliver application bytes incrementally through these chunk
+operations. Callbacks carry ordered stream ranges, not preserved frame boundaries.
+If a connection closes midway through a frame, an already delivered prefix stays
+delivered. Protocol metadata must be validated before releasing application bytes,
+and control actions must wait until their declared body has been consumed. An
+incomplete header or unavailable body suffix simply ends the current drain; it
+does not block the event worker. Mux continues to use `splice_stream_t` directly:
+its source and child queues share pressure recovery, and its nested input and
+Resume handling do not use this reader's admission/drain policy.
+
+Hold a line reference across callbacks whenever decoding continues afterward,
+then check logical line life and `spliceframereaderIsAttached()` before resuming
+reader operations. A live borrowed line can have retired node state. Call
+`spliceframereaderEndDrain()` only on the normal path while that state remains
+valid; it settles charge and clears the guard on success. Never resume draining
+after Finish destroyed the reader.
+Reader destruction releases retained input and clears its attached-state marker.
