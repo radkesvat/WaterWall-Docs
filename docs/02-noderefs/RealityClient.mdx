@@ -6,17 +6,19 @@ description: "Reference documentation for the RealityClient node."
 ---
 
 <!--
-Documentation version: 153
+Documentation version: 154
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/RealityClient/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/RealityClient.mdx, and all files must keep the same documentation version.
 -->
 
 # RealityClient
 
+## Overview
+
 `RealityClient` is the client-side Reality v2 tunnel. It starts each line with a real client TLS handshake through an internal `TlsClient`, derives fresh directional session material from that handshake, and takes over the established raw connection. TLS 1.3 first completes an authenticated request/ack/confirm handoff; TLS 1.2 retains its immediate profile-aware takeover.
 
 Use it when the first bytes on the wire must look like a normal TLS client session to a visitor domain, while accepted WaterWall payload is protected by a shared Reality password.
 
-## Typical Placement
+## Typical placement
 
 A local SOCKS5 TCP proxy can use VLESS to carry the requested destination and
 Reality to protect the transport to the server:
@@ -46,7 +48,22 @@ RealityClient already creates its internal TLS client. The server's visitor
 branch reaches the real TLS site directly; RealityServer does not need a
 TlsServer in front of it for this scenario.
 
-## Basic Example
+
+Both peers must share `password`, `algorithm`, `salt`, and `kdf-iterations`,
+including their defaults, and use compatible handoff behavior. The visitor site
+must match the client SNI and certificate verification. Camouflage assumes a
+non-terminating on-path observer without the password or TLS traffic secrets
+and without control of the cover destination. It does not survive TLS termination
+or promise every browser timing or application behavior; read the
+[full security limits](#security-model-and-limitations) before deployment.
+
+## Minimal practical example
+
+The JSON below is a **node fragment**, not a complete config file.
+Replace the sample secret and transport/visitor node names, then complete
+the surrounding listener, peer, and application branches described above.
+
+### Basic Example
 
 The JSON below contains node fragments for this scenario, not a complete configuration. Add the listener and VLESS nodes described above; every named `next` must exist.
 
@@ -77,7 +94,10 @@ Paired with a normal TCP transport:
 }
 ```
 
-## Required Fields
+
+## Configuration
+
+### Required Fields
 
 | Field | Type | Description |
 |---|---|---|
@@ -87,7 +107,7 @@ Paired with a normal TCP transport:
 | `settings.sni` | string | Required by the internal `TlsClient`; this is the visitor TLS server name. |
 | `settings.password` | string | Shared Reality secret containing 1 through 32 UTF-8 bytes. Must match the server. |
 
-## Settings
+### Settings
 
 `RealityClient` passes the same settings object to its internal `TlsClient`, so TLS-facing options such as `sni`, `verify`, `ech-sni-trick`, `x25519mlkem768`, and `verbose` follow `TlsClient` behavior.
 
@@ -108,7 +128,30 @@ Paired with a normal TCP transport:
 
 Credential limits are measured in UTF-8 bytes, not characters, using the same byte length supplied to BLAKE2s. Optional defaults apply only when a key is absent; a present key with the wrong JSON type is a startup error. When both `algorithm` and `method` are present, `algorithm` wins, and a malformed primary value is not rescued by a valid alias. Unknown keys remain tolerated because this settings object is shared with the internal `TlsClient`.
 
-## Runtime Flow
+## Usage and troubleshooting
+
+### Operational Notes
+
+- `RealityClient` depends on `TlsClient`; the build requires `INCLUDE_TLS_CLIENT=ON`.
+- The first phase is a real TLS client handshake, so the `sni`, certificate verification behavior, and TLS fingerprinting options matter.
+- `password`, `salt`, `kdf-iterations`, and `algorithm` must match `RealityServer`.
+- The authenticated TLS 1.3 handoff is incompatible with earlier unpublished v2 builds that switched at main-handshake completion. Upgrade both peers together; TLS 1.2 layouts remain unchanged and there is no old-layout or v1 fallback. The obsolete `max-frame-size` setting is rejected rather than ignored.
+- The password-derived value is a root key, not a record key. Every real TLS connection derives fresh directional material, and password rotation invalidates future sessions without requiring a replay database.
+- This node is a stream tunnel, not a packet tunnel.
+
+## Advanced behavior
+
+### Security Model And Limitations
+
+The reviewed camouflage threat model is a non-terminating on-path observer. It may capture and reassemble the full bidirectional stream; inspect TLS record types, versions, lengths, directions, ordering, timing, visible nonces/IVs, and close behavior; manipulate bytes; and initiate probes while knowing the implementation. It is assumed not to know the Reality password or genuine TLS traffic secrets, not to terminate TLS, and not to control or collude with the configured cover destination. It also cannot alter a completed TLS handshake without failing TLS Finished verification.
+
+Per-session Reality material depends on the fresh client and server randoms from the genuine TLS handshake. There is no independent Reality server challenge dedicated to session freshness. Cross-connection replay protection therefore assumes that the observer cannot predict or control both handshake randoms. A malicious or colluding cover destination that deliberately helps reproduce a previously observed handshake binding is outside this model; defending that stronger model would require an independently authenticated server challenge.
+
+Reality camouflage reproduces selected public TLS record properties, including suite-specific record shapes, lengths, explicit nonces/IVs, controls, alerts, and close behavior. After takeover, however, the records contain Reality-AEAD ciphertext rather than genuine ciphertext under the cover connection's TLS traffic keys. Reality does not claim to survive TLS termination or to reproduce every Chrome timing distribution, write size, burst pattern, or higher-level application semantic. A TLS-terminating observer can test the real traffic keys against later records and is outside the reviewed camouflage boundary.
+
+## Implementation details
+
+### Runtime Flow
 
 Transport `Est` is recorded and forwarded immediately, once, independently of TLS or Reality readiness. The internal
 TlsClient registers a separate completion callback; only that callback captures the validated handshake binding and
@@ -146,7 +189,7 @@ Before the authenticated TLS 1.3 ACK, cover TLS close/error, local finish, or ma
 
 Shutdown is role-specific. A local upstream `Finish` destroys Reality state and finishes only `next`; it never fabricates `close_notify`. A received authenticated server `close_notify` is consumed without a response, then RealityClient immediately destroys its state and closes both still-open sides. It never waits for a later TCP `Finish`, so an authenticated peer cannot pin the connection open by withholding FIN. A locally detected authenticated-record failure is the client's only alert-producing path and sends at most one fatal `bad_record_mac` before both sides close. A received fatal alert likewise closes both sides immediately without a response. A raw transport `Finish` closes only the remaining local side. No additional setting controls this behavior.
 
-## Record Format
+### Record Format
 
 Reality records are shaped according to the negotiated cover suite:
 
@@ -184,7 +227,7 @@ The visible prefix is authenticated camouflage but is not the AEAD nonce. Each d
 
 The associated data binds the profile ID, v2 record domain, direction, Reality sequence number, session ID, TLS header, visible-prefix length, and visible prefix. The receive side authenticates only the exact next Reality sequence. Therefore duplicate, deleted, reordered, reflected, cross-profile, and cross-connection records fail authentication. Counters close before wrap.
 
-## Buffer And Lifecycle Notes
+### Buffer And Lifecycle Notes
 
 - `RealityClient` has per-line state for the downstream record parser, queued pre-handshake upstream payload, session ID, directional keys/IVs, and send/receive counters.
 - It does not create or destroy the normal line. It only destroys its own line state when the line finishes or when it closes both directions after a Reality error.
@@ -193,24 +236,7 @@ The associated data binds the profile ID, v2 record domain, direction, Reality s
 - Empty payload buffers are recycled without sending a Reality record.
 - Application plaintext fragments are automatically capped at the native TLS limit of `16384` bytes. Larger WaterWall payload callbacks are split immediately; `32768` bytes becomes exactly two full records, with no cross-callback buffering.
 
-## Security Model And Limitations
-
-The reviewed camouflage threat model is a non-terminating on-path observer. It may capture and reassemble the full bidirectional stream; inspect TLS record types, versions, lengths, directions, ordering, timing, visible nonces/IVs, and close behavior; manipulate bytes; and initiate probes while knowing the implementation. It is assumed not to know the Reality password or genuine TLS traffic secrets, not to terminate TLS, and not to control or collude with the configured cover destination. It also cannot alter a completed TLS handshake without failing TLS Finished verification.
-
-Per-session Reality material depends on the fresh client and server randoms from the genuine TLS handshake. There is no independent Reality server challenge dedicated to session freshness. Cross-connection replay protection therefore assumes that the observer cannot predict or control both handshake randoms. A malicious or colluding cover destination that deliberately helps reproduce a previously observed handshake binding is outside this model; defending that stronger model would require an independently authenticated server challenge.
-
-Reality camouflage reproduces selected public TLS record properties, including suite-specific record shapes, lengths, explicit nonces/IVs, controls, alerts, and close behavior. After takeover, however, the records contain Reality-AEAD ciphertext rather than genuine ciphertext under the cover connection's TLS traffic keys. Reality does not claim to survive TLS termination or to reproduce every Chrome timing distribution, write size, burst pattern, or higher-level application semantic. A TLS-terminating observer can test the real traffic keys against later records and is outside the reviewed camouflage boundary.
-
-## Operational Notes
-
-- `RealityClient` depends on `TlsClient`; the build requires `INCLUDE_TLS_CLIENT=ON`.
-- The first phase is a real TLS client handshake, so the `sni`, certificate verification behavior, and TLS fingerprinting options matter.
-- `password`, `salt`, `kdf-iterations`, and `algorithm` must match `RealityServer`.
-- The authenticated TLS 1.3 handoff is incompatible with earlier unpublished v2 builds that switched at main-handshake completion. Upgrade both peers together; TLS 1.2 layouts remain unchanged and there is no old-layout or v1 fallback. The obsolete `max-frame-size` setting is rejected rather than ignored.
-- The password-derived value is a root key, not a record key. Every real TLS connection derives fresh directional material, and password rotation invalidates future sessions without requiring a replay database.
-- This node is a stream tunnel, not a packet tunnel.
-
-## Node Metadata
+### Node Metadata
 
 Source-backed metadata:
 

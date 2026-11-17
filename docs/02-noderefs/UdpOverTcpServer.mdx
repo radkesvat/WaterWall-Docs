@@ -6,18 +6,22 @@ description: "Reference documentation for the UdpOverTcpServer node."
 ---
 
 <!--
-Documentation version: 152
+Documentation version: 153
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/UdpOverTcpServer/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/UdpOverTcpServer.mdx, and all files must keep the same documentation version.
 -->
 
 # UdpOverTcpServer
+
+## Overview
 
 `UdpOverTcpServer` is the remote peer for `UdpOverTcpClient`. It receives a length-prefixed byte stream from the previous
 stream-facing node, reconstructs UDP datagram boundaries, and forwards recovered packet payloads to the next node.
 
 Replies from the next node are framed with the same 2-byte length prefix and sent back downstream through the stream.
 
-## Typical Placement
+## Typical placement
+
+### Typical Placement
 
 Server side:
 
@@ -37,7 +41,7 @@ TcpUdpListener -> Router (UDP branch) -> UdpOverTcpClient -> TcpConnector
 
 The previous side of `UdpOverTcpServer` must be a stream path. The next side receives reconstructed packet payloads.
 
-## Flow Example
+### Flow Example
 
 ```mermaid
 flowchart LR
@@ -54,7 +58,11 @@ flowchart LR
     TC == "TCP stream" ==> TL
 ```
 
-## Basic Example
+## Minimal practical example
+
+These are node fragments; define the referenced neighboring nodes in the surrounding configuration.
+
+### Basic Example
 
 This complete node config matches the [client example](UdpOverTcpClient.mdx).
 TCP `7443` receives the framed WaterWall transport; UDP `127.0.0.1:51820` is
@@ -93,8 +101,9 @@ above places `TlsClient` and `TlsServer` around this stream transport.
 }
 ```
 
+## Configuration
 
-## Required Fields
+### Required Fields
 
 Top-level fields:
 
@@ -106,14 +115,50 @@ Top-level fields:
 
 `settings` can be `{}`. The current implementation does not read any tunnel-specific settings.
 
-## Optional Settings
+### Optional Settings
 
 There are no tunnel-specific optional settings in the current implementation.
 
 Transport, destination, socket, TLS, encryption, or routing behavior belongs to the neighboring nodes, such as
 `TcpListener`, `TlsServer`, `EncryptionServer`, `UdpConnector`, or `TcpUdpConnector`.
 
-## Framing Model
+## Usage and troubleshooting
+
+### Packet Size Limit
+
+The maximum outbound UDP datagram size is:
+
+```text
+65535 - 20 - 8 - 2 = 65505 bytes
+```
+
+Datagrams larger than this limit are dropped intact. Empty outbound payloads violate the existing Debug
+invariant; Release drops them. An incoming zero-length frame is invalid and closes the carrier.
+
+### Buffering And Overflow
+
+Incoming stream bytes are buffered until complete frames can be extracted.
+
+After complete frames drain, the 16-bit wire length leaves at most 65,536 bytes
+of incomplete input, including the two-byte header. The decoder accepts nonzero wire lengths
+through 65,535 bytes; the outbound datagram limit remains 65,505 bytes.
+
+Retained buffer charge is capped at 4 MiB, with beneficial compaction attempted after complete frames drain.
+Malformed frames, unrepresentable storage or exhausted budgets close
+the carrier through its owner. Decoder reentry shares a 2 MiB byte limit and 4 MiB charge limit with its
+retained stream. The parser never discards arbitrary stream bytes to continue.
+
+### Common Mistakes
+
+- Do not use `UdpOverTcpServer` without `UdpOverTcpClient` on the other side.
+- Do not place it directly after a packet-only node; the previous side must provide framed stream bytes.
+- Do not expect it to listen for TCP by itself; use `TcpListener` or another stream-facing server adapter before it.
+- The next side must preserve UDP datagram boundaries and use a UDP destination.
+- Do not send UDP datagrams larger than `65505` bytes.
+
+## Advanced behavior
+
+### Framing Model
 
 The server expects normal packet frames in this format:
 
@@ -131,31 +176,9 @@ Each payload callback on the datagram-facing side represents one UDP datagram. T
 UDP payloads; the source protocol metadata does not change their framing. Mixed listeners must route TCP
 traffic through a separate path before the client.
 
-## Packet Size Limit
+## Implementation details
 
-The maximum outbound UDP datagram size is:
-
-```text
-65535 - 20 - 8 - 2 = 65505 bytes
-```
-
-Datagrams larger than this limit are dropped intact. Empty outbound payloads violate the existing Debug
-invariant; Release drops them. An incoming zero-length frame is invalid and closes the carrier.
-
-## Buffering And Overflow
-
-Incoming stream bytes are buffered until complete frames can be extracted.
-
-After complete frames drain, the 16-bit wire length leaves at most 65,536 bytes
-of incomplete input, including the two-byte header. The decoder accepts nonzero wire lengths
-through 65,535 bytes; the outbound datagram limit remains 65,505 bytes.
-
-Retained buffer charge is capped at 4 MiB, with beneficial compaction attempted after complete frames drain.
-Malformed frames, unrepresentable storage or exhausted budgets close
-the carrier through its owner. Decoder reentry shares a 2 MiB byte limit and 4 MiB charge limit with its
-retained stream. The parser never discards arbitrary stream bytes to continue.
-
-## Lifecycle Behavior
+### Lifecycle Behavior
 
 On upstream `Init`, the server initializes its per-line framing state, sets the destination protocol to
 UDP, and immediately initializes the next node. Transport Est, Pause and Resume are forwarded promptly.
@@ -169,7 +192,7 @@ sender in the matching WaterWall direction. It does not call `lineDestroy()`.
 
 `UpStreamEst` and `DownStreamInit` are disabled in the current implementation.
 
-## Splice Support
+### Splice Support
 
 Both nodes accept ordinary buffers and private-pipe bodies. Each outbound UDP datagram keeps its body,
 gains a resident two-byte length prefix, and is forwarded in one callback. Oversized datagrams are dropped
@@ -180,7 +203,7 @@ UDP datagram boundaries remain intact, and the TCP carrier remains eligible for 
 materialization fallback belongs to the UDP sender. Complete frames in an admitted stream input continue
 after Pause; Finish or admission refusal stops processing.
 
-## Padding
+### Padding
 
 The node prepends the 2-byte frame header on the reply path using `sbufShiftLeft()`, so it advertises:
 
@@ -188,15 +211,7 @@ The node prepends the 2-byte frame header on the reply path using `sbufShiftLeft
 required_padding_left = 2
 ```
 
-## Common Mistakes
-
-- Do not use `UdpOverTcpServer` without `UdpOverTcpClient` on the other side.
-- Do not place it directly after a packet-only node; the previous side must provide framed stream bytes.
-- Do not expect it to listen for TCP by itself; use `TcpListener` or another stream-facing server adapter before it.
-- The next side must preserve UDP datagram boundaries and use a UDP destination.
-- Do not send UDP datagrams larger than `65505` bytes.
-
-## Node Metadata
+### Node Metadata
 
 Source-backed metadata:
 

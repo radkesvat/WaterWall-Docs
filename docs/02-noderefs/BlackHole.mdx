@@ -6,11 +6,13 @@ description: "Reference documentation for the BlackHole node."
 ---
 
 <!--
-Documentation version: 153
+Documentation version: 154
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/BlackHole/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/BlackHole.mdx, and all files must keep the same documentation version.
 -->
 
 # BlackHole
+
+## Overview
 
 `BlackHole` is a terminal sink adapter. It is placed at the end of a chain and
 consumes upstream traffic from the previous node without creating a socket,
@@ -26,18 +28,7 @@ It supports two behaviors:
 Because `BlackHole` is an adapter, downstream callbacks are not part of its
 valid runtime surface. Do not place another node after it.
 
-## What It Does
-
-- Can be used as the last node in a chain.
-- Rejects configuration with a `next` node.
-- Drops every upstream payload buffer it receives.
-- Recycles dropped payload buffers with `lineReuseBuffer()`.
-- Does not prepend, frame, encrypt, decode, or rewrite payload.
-- Does not allocate per-line tunnel state.
-- Does not require extra left padding.
-- Does not create or destroy packet lines.
-
-## Typical Placement
+## Typical placement
 
 Terminal passive drop point:
 
@@ -58,24 +49,11 @@ consumed or rejected at the chain end.
 `TcpListener -> BlackHole -> TcpConnector`, use another policy or routing tunnel
 instead.
 
-### Reject a selected proxy destination
+## Minimal practical example
 
-Use `BlackHole` as a Router branch when a policy should reject a connection
-without opening an outbound socket:
+These are node fragments. Add a listener or another upstream node that names this sink as its `next`; do not configure a `next` on `BlackHole`.
 
-```text
-TcpListener -> Socks5Server -> Router
-                                 |-- blocked destination -> BlackHole(active)
-                                 `-- default -> TcpConnector
-```
-Set the blocked branch to `mode: "active"`, and keep the direct connector's
-address and port set to the requested destination context. The
-[complete Router configuration](./Router.mdx#complete-example) shows all nodes
-and a working port-based rejection rule. `passive` mode instead leaves the line
-open and consumes data, which is useful for a sink test but does not return a
-normal application response.
-
-## Configuration Example
+### Configuration Example
 
 Passive mode:
 
@@ -101,7 +79,9 @@ Active mode:
 }
 ```
 
-## Required Fields
+## Configuration
+
+### Required Fields
 
 Top-level fields:
 
@@ -119,15 +99,15 @@ Required `settings` fields:
 
 `mode` is required. The current implementation does not provide a default.
 
-## Optional Fields
+### Optional Fields
 
 There are no optional `settings` fields.
 
 Do not configure a node-level `next` field. `BlackHole` is a chain-end adapter.
 
-## Mode Reference
+### Mode Reference
 
-### Passive Mode
+#### Passive Mode
 
 Accepted values:
 
@@ -149,7 +129,7 @@ In passive mode:
 Passive mode does not close the line by itself. It consumes payload until the
 previous side closes the line.
 
-### Active Mode
+#### Active Mode
 
 Accepted values:
 
@@ -170,14 +150,58 @@ In active mode:
 
 This behaves like an immediate connection reject at the end of the chain.
 
-## Payload Handling
+## Usage and troubleshooting
+
+### Reject a selected proxy destination
+
+Use `BlackHole` as a Router branch when a policy should reject a connection
+without opening an outbound socket:
+
+```text
+TcpListener -> Socks5Server -> Router
+                                 |-- blocked destination -> BlackHole(active)
+                                 `-- default -> TcpConnector
+```
+Set the blocked branch to `mode: "active"`, and keep the direct connector's
+address and port set to the requested destination context. The
+[complete Router configuration](./Router.mdx#complete-example) shows all nodes
+and a working port-based rejection rule. `passive` mode instead leaves the line
+open and consumes data, which is useful for a sink test but does not return a
+normal application response.
+
+### Notes and Caveats
+
+- `BlackHole` is layer-agnostic in node metadata, but it does not transform
+  between stream and packet semantics.
+- It is not useful for chains that need an application response, because payload
+  never passes through it.
+- Passive mode can leave the previous side open indefinitely if that side keeps
+  the line open.
+- Active mode is best used as a deliberate reject or kill endpoint.
+- The node has no protocol settings, credentials, remote address, port, or
+  framing options.
+
+## Implementation details
+
+### What It Does
+
+- Can be used as the last node in a chain.
+- Rejects configuration with a `next` node.
+- Drops every upstream payload buffer it receives.
+- Recycles dropped payload buffers with `lineReuseBuffer()`.
+- Does not prepend, frame, encrypt, decode, or rewrite payload.
+- Does not allocate per-line tunnel state.
+- Does not require extra left padding.
+- Does not create or destroy packet lines.
+
+### Payload Handling
 
 Upstream payload calls `lineReuseBuffer()` on the received buffer and returns.
 
 No payload bytes cross the node. Since no header is prepended and no frame is
 allocated, `BlackHole` has `required_padding_left = 0`.
 
-## Lifecycle Behavior
+### Lifecycle Behavior
 
 `BlackHole` follows downstream-end adapter direction rules:
 
@@ -191,19 +215,15 @@ allocated, `BlackHole` has `required_padding_left = 0`.
 
 It never calls `tunnelNextUpStream*()` because there is no next node.
 
-## Notes and Caveats
+### Splice support
 
-- `BlackHole` is layer-agnostic in node metadata, but it does not transform
-  between stream and packet semantics.
-- It is not useful for chains that need an application response, because payload
-  never passes through it.
-- Passive mode can leave the previous side open indefinitely if that side keeps
-  the line open.
-- Active mode is best used as a deliberate reject or kill endpoint.
-- The node has no protocol settings, credentials, remote address, port, or
-  framing options.
+The upstream sink recycles input, discarding any remaining private-pipe body. Healthy empty pipes may remain cached for reuse. Passive mode still consumes data; active mode closes during Init and does not accept later payload on that closed normal line. There is no downstream payload handler.
 
-## Node Metadata
+Ordinary fallback buffers remain accepted. Splice requires a supported Linux build, `misc.splice` enabled, no packet nodes, and support from every node in the finalized expanded/merged chain. The capability flag does not bypass these checks. No performance improvement is promised without measurement.
+
+Packet configurations of this dual-layer node still do not enable splice.
+
+### Node Metadata
 
 Source-backed metadata:
 
@@ -216,11 +236,3 @@ Source-backed metadata:
 | `layer_group_prev_node` | `kNodeLayerAnything` |
 | `layer_group_next_node` | `kNodeLayerNone` |
 | `required_padding_left` | `0` bytes |
-
-## Splice support
-
-The upstream sink recycles input, discarding any remaining private-pipe body. Healthy empty pipes may remain cached for reuse. Passive mode still consumes data; active mode closes during Init and does not accept later payload on that closed normal line. There is no downstream payload handler.
-
-Ordinary fallback buffers remain accepted. Splice requires a supported Linux build, `misc.splice` enabled, no packet nodes, and support from every node in the finalized expanded/merged chain. The capability flag does not bypass these checks. No performance improvement is promised without measurement.
-
-Packet configurations of this dual-layer node still do not enable splice.

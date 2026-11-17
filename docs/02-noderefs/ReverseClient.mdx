@@ -6,11 +6,13 @@ description: "Reference documentation for the ReverseClient node."
 ---
 
 <!--
-Documentation version: 155
+Documentation version: 156
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/ReverseClient/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/ReverseClient.mdx, and all files must keep the same documentation version.
 -->
 
 # ReverseClient
+
+## Overview
 
 `ReverseClient` keeps a pool of pre-opened outbound reverse connections toward a
 remote `ReverseServer`. When the server side needs a real connection, one of
@@ -20,73 +22,7 @@ used as a tunnel back through the client-side machine.
 This is the client-side node for reverse tunnel layouts: it is usually placed on
 the machine that can dial out but cannot accept direct inbound connections.
 
-## Why This Layout Uses Bridge
-
-Most WaterWall chains read naturally from left to right:
-
-```mermaid
-flowchart LR
-    User[TcpListener] --> Tunnel[Middle nodes] --> Target[TcpConnector]
-```
-
-`ReverseClient` has a different shape. It must create outbound idle links to
-the remote `ReverseServer`, but once the remote side assigns one of those links,
-the client still needs to expose the connection to a local target such as
-xray-core, a local SOCKS service, or another local TCP endpoint.
-
-WaterWall keeps a single `next` field per node. Instead of giving
-`ReverseClient` special custom fields such as `next-peer` and `next-core`, the
-reverse layout uses a `Bridge` pair:
-
-```mermaid
-flowchart LR
-    B1[Bridge to local target] --> Local[TcpConnector local service]
-    B2[Bridge to ReverseClient] --> RC[ReverseClient]
-    RC --> Peer[TcpConnector / TLS / HTTP path to ReverseServer]
-    B1 -. pair .- B2
-```
-
-In this layout:
-
-- `ReverseClient.next` is the peer path that eventually reaches
-  `ReverseServer`
-- the local target path is attached behind `ReverseClient` through the Bridge
-  pair
-- when a reverse link becomes active, `ReverseClient` initializes the local side
-  toward the previous node
-
-Read the `Bridge` page before designing a reverse topology. The Reverse nodes
-depend on that direction reversal and the required adjacency described below.
-
-## What It Does
-
-- Creates outbound reverse links through the next node.
-- Sends a private reverse-link handshake on every spare connection.
-- Keeps a minimum number of unused, established reverse links per worker.
-- Tracks connecting links separately from established-but-unused links.
-- Waits for the remote side to send real payload on a spare reverse link.
-- When a spare link is consumed, initializes the paired local-facing line toward
-  the previous node.
-- Forwards payload, finish, pause, and resume across the paired lines.
-- Replenishes the spare pool whenever a link is consumed or closed.
-- Closes and replaces idle spare links that remain unused for too long.
-
-`ReverseClient` is not a normal listener and not a normal connector. It creates
-internal lines itself and uses the ordinary next/previous WaterWall callbacks to
-join the reverse peer path to the local target path.
-
-## Required Chain Adjacency
-
-Place `Bridge` immediately before `ReverseClient`: `Bridge -> ReverseClient`.
-Do not put any node between them. On the server side, place `Bridge` immediately
-after `ReverseServer`: `ReverseServer -> Bridge`, also with no intervening nodes.
-
-These are chain-design rules that users must follow. The code does not
-automatically enforce either adjacency requirement. Transport or processing nodes
-must be placed outside these two gaps; the outbound path after `ReverseClient`
-may still contain the transport nodes described below.
-
-## Typical Placement
+## Typical placement
 
 Client-side shape:
 
@@ -108,7 +44,26 @@ The outbound peer path can be plain TCP, or it can include TLS, HTTP, Reality,
 Mux, or other transport nodes as long as it eventually reaches the matching
 `ReverseServer`.
 
-## Configuration Example
+
+### Required Chain Adjacency
+
+Place `Bridge` immediately before `ReverseClient`: `Bridge -> ReverseClient`.
+Do not put any node between them. On the server side, place `Bridge` immediately
+after `ReverseServer`: `ReverseServer -> Bridge`, also with no intervening nodes.
+
+These are chain-design rules that users must follow. The code does not
+automatically enforce either adjacency requirement. Transport or processing nodes
+must be placed outside these two gaps; the outbound path after `ReverseClient`
+may still contain the transport nodes shown in its placement diagram.
+
+
+## Minimal practical example
+
+The JSON below is a **node fragment**, not a complete config file.
+Configure the paired Bridges and matching remote reverse node as shown above;
+replace `shared-secret` and the named transport/service nodes for your deployment.
+
+### Configuration Example
 
 ```json
 {
@@ -122,6 +77,25 @@ Mux, or other transport nodes as long as it eventually reaches the matching
   "next": "outbound-to-reverse-server"
 }
 ```
+
+
+## Configuration
+
+### Required Fields
+
+Top-level fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | string | User-chosen node name. Must be unique inside the config file. |
+| `type` | string | Must be exactly `"ReverseClient"`. |
+| `next` | string | Required in practical configs. This is the outbound peer path toward `ReverseServer`. |
+
+`settings` may be omitted or empty. If present, it must be an object.
+
+## Usage and troubleshooting
+
+### Bridge-oriented example
 
 Minimal Bridge-oriented example:
 
@@ -188,34 +162,59 @@ the public gateway receives reverse links on `198.51.100.10:8443`, and the
 gateway's user entry is `127.0.0.1:18080`. Its whitelist uses the private
 machine's public egress address, not the gateway's own address.
 
-## Required Fields
+### Practical Notes
 
-Top-level fields:
+- `minimum-unused` is a latency/capacity tradeoff. Higher values keep more idle
+  outbound connections ready.
+- Idle pre-opened links are intentional. Do not treat them as leaked
+  connections.
+- Keep the reverse secret settings identical on both peers.
+- Use `Bridge` to attach the local target side cleanly without inventing custom
+  chain fields.
+- The outbound peer path may include other transport/security nodes, but it must
+  preserve byte-stream connectivity to the matching `ReverseServer`.
 
-| Field | Type | Description |
-| --- | --- | --- |
-| `name` | string | User-chosen node name. Must be unique inside the config file. |
-| `type` | string | Must be exactly `"ReverseClient"`. |
-| `next` | string | Required in practical configs. This is the outbound peer path toward `ReverseServer`. |
+## Advanced behavior
 
-`settings` may be omitted or empty. If present, it must be an object.
+### Why This Layout Uses Bridge
 
-## Optional Settings
+Most WaterWall chains read naturally from left to right:
 
-| Setting | Type | Default | Description |
-| --- | --- | --- | --- |
-| `minimum-unused` | integer | `workers * 4` | Minimum spare reverse links to keep ready per tunnel. Must be greater than `0`. |
-| `reverse-secret-length` | integer | `640` | Length of the reverse-link handshake. Must be in `1..1024`. |
-| `reverse-secret` | ASCII string | unset | XORs the default handshake bytes with this secret, repeated over the handshake length. Must be non-empty ASCII when set. |
+```mermaid
+flowchart LR
+    User[TcpListener] --> Tunnel[Middle nodes] --> Target[TcpConnector]
+```
 
-`ReverseClient`, `ReverseServer`, and any `SniffRouter` reverse detector in
-front of them must use the same `reverse-secret-length` and `reverse-secret`.
+`ReverseClient` has a different shape. It must create outbound idle links to
+the remote `ReverseServer`, but once the remote side assigns one of those links,
+the client still needs to expose the connection to a local target such as
+xray-core, a local SOCKS service, or another local TCP endpoint.
 
-Older documentation said changing the reverse handshake required editing the
-source. That is no longer accurate: the current implementation exposes
-`reverse-secret-length` and `reverse-secret` in node settings.
+WaterWall keeps a single `next` field per node. Instead of giving
+`ReverseClient` special custom fields such as `next-peer` and `next-core`, the
+reverse layout uses a `Bridge` pair:
 
-## Reverse-Link Handshake
+```mermaid
+flowchart LR
+    B1[Bridge to local target] --> Local[TcpConnector local service]
+    B2[Bridge to ReverseClient] --> RC[ReverseClient]
+    RC --> Peer[TcpConnector / TLS / HTTP path to ReverseServer]
+    B1 -. pair .- B2
+```
+
+In this layout:
+
+- `ReverseClient.next` is the peer path that eventually reaches
+  `ReverseServer`
+- the local target path is attached behind `ReverseClient` through the Bridge
+  pair
+- when a reverse link becomes active, `ReverseClient` initializes the local side
+  toward the previous node
+
+Read the `Bridge` page before designing a reverse topology. The Reverse nodes
+depend on that direction reversal and the [required adjacency](#required-chain-adjacency).
+
+### Reverse-Link Handshake
 
 Each spare reverse connection starts by sending an internal handshake.
 
@@ -232,7 +231,7 @@ bytes have been produced.
 This handshake is not user payload. `ReverseServer` uses it to distinguish
 pre-opened reverse links from the local/user side of the reverse topology.
 
-## Startup And Pool Behavior
+### Startup And Pool Behavior
 
 At startup, `ReverseClient` asks every worker to create outbound reverse links
 until the spare target is met.
@@ -251,7 +250,41 @@ also arrive after transport Init but before Est; completing it moves the link
 directly from connecting to active. Late or repeated Est marks transport readiness
 without changing an active pair's counters or creating another replacement spare.
 
-## Activation Flow
+## Implementation details
+
+### What It Does
+
+- Creates outbound reverse links through the next node.
+- Sends a private reverse-link handshake on every spare connection.
+- Keeps a minimum number of unused, established reverse links per worker.
+- Tracks connecting links separately from established-but-unused links.
+- Waits for the remote side to send real payload on a spare reverse link.
+- When a spare link is consumed, initializes the paired local-facing line toward
+  the previous node.
+- Forwards payload, finish, pause, and resume across the paired lines.
+- Replenishes the spare pool whenever a link is consumed or closed.
+- Closes and replaces idle spare links that remain unused for too long.
+
+`ReverseClient` is not a normal listener and not a normal connector. It creates
+internal lines itself and uses the ordinary next/previous WaterWall callbacks to
+join the reverse peer path to the local target path.
+
+### Optional Settings
+
+| Setting | Type | Default | Description |
+| --- | --- | --- | --- |
+| `minimum-unused` | integer | `workers * 4` | Minimum spare reverse links to keep ready per tunnel. Must be greater than `0`. |
+| `reverse-secret-length` | integer | `640` | Length of the reverse-link handshake. Must be in `1..1024`. |
+| `reverse-secret` | ASCII string | unset | XORs the default handshake bytes with this secret, repeated over the handshake length. Must be non-empty ASCII when set. |
+
+`ReverseClient`, `ReverseServer`, and any `SniffRouter` reverse detector in
+front of them must use the same `reverse-secret-length` and `reverse-secret`.
+
+Older documentation said changing the reverse handshake required editing the
+source. That is no longer accurate: the current implementation exposes
+`reverse-secret-length` and `reverse-secret` in node settings.
+
+### Activation Flow
 
 A spare reverse link remains unused until the complete one-time activation
 prefix from ReverseServer has arrived. Its four-byte big-endian total length
@@ -285,7 +318,7 @@ it. An outstanding Pause is relayed after Init returns, before the initial body.
 Already admitted application bytes still drain in FIFO order through Pause.
 The node remains active because every delivery maps between two different lines.
 
-## Finish And Replacement Behavior
+### Finish And Replacement Behavior
 
 If an active paired link closes from either side:
 
@@ -305,7 +338,7 @@ If an unused reverse link closes before pairing:
 If a spare link remains unused for about `30 seconds`, the idle timeout closes
 and replaces it.
 
-## Direction And Lifecycle Notes
+### Direction And Lifecycle Notes
 
 `ReverseClient` creates its own internal line pairs. Direct external upstream or
 downstream init into this node is not part of its normal contract.
@@ -321,19 +354,7 @@ Source-backed callback behavior:
 | upstream `Payload` from previous side | Forwards local payload to the paired outbound reverse link. |
 | `Finish` | Closes both internal lines for paired links; cleans counters and replaces capacity. |
 
-## Practical Notes
-
-- `minimum-unused` is a latency/capacity tradeoff. Higher values keep more idle
-  outbound connections ready.
-- Idle pre-opened links are intentional. Do not treat them as leaked
-  connections.
-- Keep the reverse secret settings identical on both peers.
-- Use `Bridge` to attach the local target side cleanly without inventing custom
-  chain fields.
-- The outbound peer path may include other transport/security nodes, but it must
-  preserve byte-stream connectivity to the matching `ReverseServer`.
-
-## Node Metadata
+### Node Metadata
 
 `ReverseClient` does not frame payload itself after the handshake, so it does not need left padding.
 
@@ -349,7 +370,7 @@ Source-backed metadata:
 | `layer_group_next_node` | `kNodeLayer4` |
 | `required_padding_left` | `0` bytes |
 
-## Splice support
+### Splice support
 
 The reverse handshake is generated in ordinary memory. Activation parsing consumes
 only the prefix bytes through representation-aware helpers; an accompanying

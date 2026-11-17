@@ -6,11 +6,13 @@ description: "Reference documentation for the EncryptionClient node."
 ---
 
 <!--
-Documentation version: 153
+Documentation version: 154
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/EncryptionClient/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/EncryptionClient.mdx, and all files must keep the same documentation version.
 -->
 
 # EncryptionClient
+
+## Overview
 
 The default is stream mode. Set `packet-mode: true` for complete IPv4 TCP/UDP
 packets; that profile encrypts only the transport payload and has no TLS-like header.
@@ -28,7 +30,7 @@ not verify certificates, and does not provide SNI or ALPN. In stream mode it use
 TLS-like record shape for encrypted payload framing.
 :::
 
-## Typical Placement
+## Typical placement
 
 Direct in-process pair:
 
@@ -46,25 +48,11 @@ server side: TcpListener -> EncryptionServer -> TcpConnector
 The client and server settings must match. Any stream tunnels between them must
 preserve the encrypted record bytes end to end.
 
-## What It Does
+## Minimal practical example
 
-The default is stream mode. `packet-mode: true` selects the separate packet
-profile below; this list describes the default stream behavior.
+These are node fragments; define the referenced neighboring nodes in the surrounding configuration.
 
-- Derives one 32-byte AEAD key from `password`, `salt`, and `kdf-iterations`.
-- Encrypts upstream payloads.
-- Splits upstream plaintext larger than `max-frame-size` into multiple records.
-- Wraps each encrypted chunk in a TLS-like application-data record.
-- Buffers downstream encrypted bytes until complete records are available.
-- Validates record headers and body lengths before decrypting.
-- Decrypts downstream records and forwards recovered plaintext to the previous
-  node.
-- Closes both directions on malformed records or AEAD authentication failure.
-
-In stream mode, `EncryptionClient` is a middle stream tunnel. It does not create sockets and it
-does not create packet lines.
-
-## Configuration Example
+### Configuration Example
 
 ```json
 {
@@ -98,7 +86,9 @@ Matching server-side settings:
 }
 ```
 
-## Required Fields
+## Configuration
+
+### Required Fields
 
 Top-level fields:
 
@@ -118,7 +108,7 @@ Required `settings` fields:
 `EncryptionClient` must also have a previous node in the chain. It is not a
 chain head or chain end.
 
-## Optional Settings
+### Optional Settings
 
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -141,7 +131,39 @@ WaterWall's dynamic-value enum, but string values are clearer and recommended.
 If AES-GCM is selected and the active crypto backend does not provide AES-GCM,
 startup fails.
 
-## Packet Mode
+## Usage and troubleshooting
+
+### Stream Limits and Padding
+
+| Value | Size |
+| --- | --- |
+| TLS-like header | `5` bytes |
+| nonce | `12` bytes |
+| AEAD tag | `16` bytes |
+| maximum TLS-like record body | `16384` bytes |
+| maximum plaintext per record | `16356` bytes |
+| required left padding | `17` bytes |
+
+`required_padding_left` is `17`, enough for the 5-byte header and 12-byte nonce
+that are prepended before encryption.
+
+If an upstream plaintext payload is larger than `max-frame-size`, the client
+splits it into multiple encrypted records. Zero-length payload buffers are
+recycled and not forwarded.
+
+### Notes and Caveats
+
+- Use it with a matching `EncryptionServer`.
+- This node protects payload bytes, but it does not hide that data is flowing
+  inside WaterWall's TLS-like record format.
+- `password` should be long, random, and kept out of public configs.
+- `max-frame-size` should normally match on both sides. A receiver rejects
+  records larger than its configured maximum.
+- Use `TlsClient`/`TlsServer` when you need real TLS semantics.
+
+## Advanced behavior
+
+### Packet Mode
 
 Set `"packet-mode": true` explicitly when the node receives complete IPv4
 packets. This selects Layer-3 metadata and a stateless packet transform instead
@@ -218,7 +240,7 @@ The following record framing, frame limits, buffering and stream lifecycle
 sections describe `packet-mode: false`. Packet mode uses chain-owned packet
 lines, no per-line reader state, and the normal packet-tunnel callback defaults.
 
-## Key Derivation
+### Key Derivation
 
 This describes the base key. Packet mode derives the two direction-specific keys
 from that base as described above.
@@ -236,7 +258,7 @@ tunnel instance is destroyed.
 For the encrypted path to work, both sides must use the same `password`, `salt`,
 `kdf-iterations`, and compatible `algorithm`.
 
-## Stream Wire Format
+### Stream Wire Format
 
 Each encrypted payload chunk is encoded as:
 
@@ -255,25 +277,27 @@ Header fields:
 The 5-byte header is used as AEAD associated data. The selected algorithm is not
 sent in the record header; it must be configured consistently on both peers.
 
-## Stream Limits and Padding
+## Implementation details
 
-| Value | Size |
-| --- | --- |
-| TLS-like header | `5` bytes |
-| nonce | `12` bytes |
-| AEAD tag | `16` bytes |
-| maximum TLS-like record body | `16384` bytes |
-| maximum plaintext per record | `16356` bytes |
-| required left padding | `17` bytes |
+### What It Does
 
-`required_padding_left` is `17`, enough for the 5-byte header and 12-byte nonce
-that are prepended before encryption.
+The default is stream mode. `packet-mode: true` selects the separate packet
+profile below; this list describes the default stream behavior.
 
-If an upstream plaintext payload is larger than `max-frame-size`, the client
-splits it into multiple encrypted records. Zero-length payload buffers are
-recycled and not forwarded.
+- Derives one 32-byte AEAD key from `password`, `salt`, and `kdf-iterations`.
+- Encrypts upstream payloads.
+- Splits upstream plaintext larger than `max-frame-size` into multiple records.
+- Wraps each encrypted chunk in a TLS-like application-data record.
+- Buffers downstream encrypted bytes until complete records are available.
+- Validates record headers and body lengths before decrypting.
+- Decrypts downstream records and forwards recovered plaintext to the previous
+  node.
+- Closes both directions on malformed records or AEAD authentication failure.
 
-## Stream Direction Behavior
+In stream mode, `EncryptionClient` is a middle stream tunnel. It does not create sockets and it
+does not create packet lines.
+
+### Stream Direction Behavior
 
 | Direction | Behavior |
 | --- | --- |
@@ -288,7 +312,7 @@ Complete records are drained as they become available; only an incomplete record
 remains buffered between callbacks. Once its header is complete, the record length
 is checked against `max-frame-size` before waiting for the rest of the body.
 
-## Stream Lifecycle Behavior
+### Stream Lifecycle Behavior
 
 On upstream `Init`, the client initializes its per-line read stream and forwards
 upstream `Init` to `next`.
@@ -306,17 +330,7 @@ Pause and resume are forwarded directionally:
 
 Upstream `Est` and downstream `Init` are disabled callbacks for this node.
 
-## Notes and Caveats
-
-- Use it with a matching `EncryptionServer`.
-- This node protects payload bytes, but it does not hide that data is flowing
-  inside WaterWall's TLS-like record format.
-- `password` should be long, random, and kept out of public configs.
-- `max-frame-size` should normally match on both sides. A receiver rejects
-  records larger than its configured maximum.
-- Use `TlsClient`/`TlsServer` when you need real TLS semantics.
-
-## Node Metadata
+### Node Metadata
 
 Source-backed metadata:
 

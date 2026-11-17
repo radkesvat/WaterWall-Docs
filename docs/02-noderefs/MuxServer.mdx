@@ -6,11 +6,13 @@ description: "Reference documentation for the MuxServer node."
 ---
 
 <!--
-Documentation version: 162
+Documentation version: 163
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/MuxServer/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/MuxServer.mdx, and all files must keep the same documentation version.
 -->
 
 # MuxServer
+
+## Overview
 
 `MuxServer` is the server-side peer for `MuxClient`. It receives framed MUX
 traffic on one parent transport line, creates child lines when `Open` frames
@@ -35,7 +37,22 @@ flowchart LR
 The previous side must provide the transport line that carries `MuxClient`
 frames. The next side receives the recreated logical child lines.
 
-## Typical Placement
+### What It Does
+
+- Initializes a parent line when upstream `Init` arrives from the transport.
+- Reads MUX frames from the parent line.
+- Creates one child line per valid `Open` frame.
+- Initializes each child line toward `next`.
+- Routes `Data`, `Close`, `FlowPause`, and `FlowResume` by `cid`.
+- Wraps downstream child payloads back into MUX `Data` frames.
+- Sends child finish events back to `MuxClient` as `Close` frames.
+- Queues parent-delivered data when a child's write side is paused.
+- Detaches accepted child queues when the parent transport finishes and drains them under child backpressure.
+
+`MuxServer` creates the child `line_t` objects behind the parent and is
+responsible for destroying them. It does not create the parent transport line.
+
+## Typical placement
 
 Simple TCP transport:
 
@@ -73,49 +90,26 @@ service target; for distinct destinations, put a destination-carrying protocol
 inside each child, such as `VlessClient -> MuxClient` on the client and
 `MuxServer -> VlessServer` on the server.
 
+## Minimal practical example
 
-## What It Does
+Node fragment; define the referenced neighbors and peers in the same deployment.
 
-- Initializes a parent line when upstream `Init` arrives from the transport.
-- Reads MUX frames from the parent line.
-- Creates one child line per valid `Open` frame.
-- Initializes each child line toward `next`.
-- Routes `Data`, `Close`, `FlowPause`, and `FlowResume` by `cid`.
-- Wraps downstream child payloads back into MUX `Data` frames.
-- Sends child finish events back to `MuxClient` as `Close` frames.
-- Queues parent-delivered data when a child's write side is paused.
-- Detaches accepted child queues when the parent transport finishes and drains them under child backpressure.
-
-`MuxServer` creates the child `line_t` objects behind the parent and is
-responsible for destroying them. It does not create the parent transport line.
-
-## Configuration Example
+Feed this fragment from the reliable byte stream coming from MuxClient and define `service-side-node` for each decoded child. Empty settings use the defaults; child limits and parent buffering can be selected below.
 
 ```json
 {
   "name": "mux-server",
   "type": "MuxServer",
-  "settings": {
-    "child-buffer-limit": 134217728,
-    "child-buffer-resume-threshold": 524288,
-    "parent-buffer-limit": 536870912,
-    "max-children": 10000,
-    "max-live-children": 0,
-    "initial-child-idle-timeout-ms": 10000,
-    "active-child-idle-timeout-ms": 300000,
-    "memory-high-watermark-percent": 85,
-    "memory-low-watermark-percent": 80,
-    "memory-reserve": 134217728,
-    "memory-fallback-max-live-children": 60000,
-    "detached-buffer-limit": 268435456,
-    "detached-child-limit": 12000,
-    "log-main-line-stats": false
-  },
+  "settings": {},
   "next": "service-side-node"
 }
 ```
 
-## Required Fields
+See [Configuration](#configuration) for defaults and conditional requirements and [Usage and troubleshooting](#usage-and-troubleshooting) for complete examples and operational limits.
+
+## Configuration
+
+### Required Fields
 
 Top-level fields:
 
@@ -129,7 +123,7 @@ Top-level fields:
 `MuxServer` should have a previous transport-facing node and should be reached
 by a matching `MuxClient`.
 
-### Parent keepalive replies
+#### Parent keepalive replies
 
 `keepalive` is an optional boolean setting, default `true`. MuxServer answers
 complete empty Pings with empty Pongs carrying the same 32-bit token in the CID
@@ -144,7 +138,7 @@ output Pause and share the ordinary FIFO and parent write charge limit. Resume
 preserves their token order and their order relative to application frames. A
 nonempty Ping closes its parent through normal protocol-error cleanup.
 
-### Parent write buffering
+#### Parent write buffering
 
 Each parent has a lazy FIFO of encoded outgoing buffers, shared by its children.
 The following optional settings measure **queue-capacity charge in bytes**:
@@ -207,7 +201,7 @@ and has no role in flow-control progress.
 These settings apply independently to every parent of this node. They are separate
 from `parent-buffer-limit`, which bounds incoming assembly plus attached child queues.
 
-## Optional Settings
+### Optional Settings
 
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -268,7 +262,48 @@ Mode settings such as `timer`, `counter`, and `fixed-connections-count` belong
 only to `MuxClient`. `MuxServer` follows the frames it receives and does not
 care which client-side mode created them.
 
-## Parent And Child Model
+## Usage and troubleshooting
+
+### Configuration Example
+
+```json
+{
+  "name": "mux-server",
+  "type": "MuxServer",
+  "settings": {
+    "child-buffer-limit": 134217728,
+    "child-buffer-resume-threshold": 524288,
+    "parent-buffer-limit": 536870912,
+    "max-children": 10000,
+    "max-live-children": 0,
+    "initial-child-idle-timeout-ms": 10000,
+    "active-child-idle-timeout-ms": 300000,
+    "memory-high-watermark-percent": 85,
+    "memory-low-watermark-percent": 80,
+    "memory-reserve": 134217728,
+    "memory-fallback-max-live-children": 60000,
+    "detached-buffer-limit": 268435456,
+    "detached-child-limit": 12000,
+    "log-main-line-stats": false
+  },
+  "next": "service-side-node"
+}
+```
+
+### Practical Notes
+
+- Pair this node with `MuxClient`; it is not useful by itself.
+- `MuxServer` has no client-side concurrency mode settings.
+- A `TcpConnector` after `MuxServer` creates one service connection per child.
+- `MuxServer` is a middle tunnel, not a generic endpoint.
+- A service-side Finish or orderly worker shutdown may discard residual
+  detached data. Worker shutdown forwards no queued Payload, even for a writable
+  child, before closing every remaining owned child.
+- No MUX wire change or peer capability is introduced.
+
+## Advanced behavior
+
+### Parent And Child Model
 
 `MuxServer` has two line roles:
 
@@ -312,7 +347,7 @@ Memory admission affects new Opens only. With fresh memory data,
 memory admission and `max-children` in force; it does not disable the fallback
 ceiling when fresh data is unavailable.
 
-## Frame Format
+### Frame Format
 
 `MuxServer` expects the same eight-byte wire header used by `MuxClient`:
 
@@ -354,7 +389,7 @@ order. The complete encoding, including all headers, must fit in `uint32_t`;
 an unrepresentable encoding recycles the input and closes only that child.
 The receiver does not restore the original callback boundary after this split.
 
-## Direction Behavior
+### Direction Behavior
 
 | Incoming callback | Behavior |
 | --- | --- |
@@ -370,7 +405,7 @@ The receiver does not restore the original callback boundary after this split.
 
 Frames for unknown cids and unknown frame kinds are dropped.
 
-## Child Idle Reclamation
+### Child Idle Reclamation
 
 Every admitted child starts with `initial-child-idle-timeout-ms`. The first
 nonempty incoming Data chunk or nonempty payload produced by `next` promotes
@@ -388,7 +423,7 @@ These limits and timers do not change MUX wire bytes. A parent stays reusable
 for its full transport lifetime, and destroying a child makes its count capacity
 available again on that same parent and MuxServer instance.
 
-## Backpressure And Queues
+### Backpressure And Queues
 
 Parent transport `Pause` stops parent-bound Payload, including Open, Close,
 flow controls and Ping/Pong. Admitted frames share one FIFO and charge limit;
@@ -465,7 +500,7 @@ memory are outside an individual queue's charge.
 This isolates a slow child and bounds retained queue capacity without creating parent-wide
 head-of-line blocking.
 
-## Finish And Close Handling
+### Finish And Close Handling
 
 If `MuxServer` receives a `Close` frame for a child, the Close remains ordered
 after every earlier queued `Data` byte. A paused child remains addressable by
@@ -485,47 +520,7 @@ later Resume without retaining or dereferencing the dead parent. New outbound
 child data is rejected. `detached-buffer-limit` bounds residual retained resource
 charge and `detached-child-limit` bounds residual child count per worker.
 
-## Buffer And Padding Notes
-
-`MuxServer` prepends MUX headers to downstream child payloads. Node metadata
-advertises:
-
-```text
-required_padding_left = 8
-layer_group = kNodeLayer4
-layer_group_next_node = kNodeLayer4
-layer_group_prev_node = kNodeLayer4
-```
-
-Incoming parent bytes wait only for a complete header or more body bytes.
-Available Data passes incrementally to the child or its bounded queue; other body
-bytes are consumed without delivery. After draining available input, if the
-retained incomplete stream grows above `1,048,584 bytes`, `MuxServer` discards
-the incomplete remainder, finishes the parent toward the previous node, and
-uses the same detached drain for already parsed child queues.
-
-## Practical Notes
-
-- Pair this node with `MuxClient`; it is not useful by itself.
-- `MuxServer` has no client-side concurrency mode settings.
-- A `TcpConnector` after `MuxServer` creates one service connection per child.
-- `MuxServer` is a middle tunnel, not a generic endpoint.
-- A service-side Finish or orderly worker shutdown may discard residual
-  detached data. Worker shutdown forwards no queued Payload, even for a writable
-  child, before closing every remaining owned child.
-- No MUX wire change or peer capability is introduced.
-
-## Worker shutdown
-
-During worker quiescence, `MuxServer` detaches its idle timer and switches terminal cleanup to discard retained
-MUX queues without sending payload, Close frames, or flow-control work. Its worker-local child idle table
-inventories every owned child, attached or detached. Worker stop drains the complete table, releases each child’s
-queue charge and live reservation exactly once, finishes toward the child destination, and destroys the child.
-A borrowed parent can remain alive with valid MUX state and outgoing backlog until its actual owner sends Finish later. The idle
-table is destroyed on its worker after drain; aggregate live-child checks run after all workers have stopped.
-Ordinary connection loss, idle expiry, and ordered peer Close keep their normal runtime behavior.
-
-## Byte streams and UDP
+### Byte streams and UDP
 
 Each child is an ordered byte stream. Neither the original Payload callback
 boundary nor the MUX Data frame boundary is part of the child contract. A frame
@@ -559,7 +554,7 @@ Direct UDP adapters next to MUX cannot rely on datagram boundaries. The
 UdpOverTcp pair currently requires nonempty datagrams; MUX stream delivery does
 not provide a representation for an empty datagram.
 
-### Splice retention and large batches
+#### Splice retention and large batches
 
 See the developer guide for the [limits table](../05-devguides/part3-buffers-and-padding.mdx#queue-capacity-budgets),
 [allocation and data-flow walkthrough](../05-devguides/part3-buffers-and-padding.mdx#mux-allocation-and-data-flow),
@@ -636,7 +631,38 @@ queues to detached accounting. Pop, transfer and discard settle scalar charges
 before callbacks; final owner cleanup settles every queue. HTTP and ordinary
 BufferStream remain ordinary-only.
 
-## Node Metadata
+## Implementation details
+
+### Buffer And Padding Notes
+
+`MuxServer` prepends MUX headers to downstream child payloads. Node metadata
+advertises:
+
+```text
+required_padding_left = 8
+layer_group = kNodeLayer4
+layer_group_next_node = kNodeLayer4
+layer_group_prev_node = kNodeLayer4
+```
+
+Incoming parent bytes wait only for a complete header or more body bytes.
+Available Data passes incrementally to the child or its bounded queue; other body
+bytes are consumed without delivery. After draining available input, if the
+retained incomplete stream grows above `1,048,584 bytes`, `MuxServer` discards
+the incomplete remainder, finishes the parent toward the previous node, and
+uses the same detached drain for already parsed child queues.
+
+### Worker shutdown
+
+During worker quiescence, `MuxServer` detaches its idle timer and switches terminal cleanup to discard retained
+MUX queues without sending payload, Close frames, or flow-control work. Its worker-local child idle table
+inventories every owned child, attached or detached. Worker stop drains the complete table, releases each child’s
+queue charge and live reservation exactly once, finishes toward the child destination, and destroys the child.
+A borrowed parent can remain alive with valid MUX state and outgoing backlog until its actual owner sends Finish later. The idle
+table is destroyed on its worker after drain; aggregate live-child checks run after all workers have stopped.
+Ordinary connection loss, idle expiry, and ordered peer Close keep their normal runtime behavior.
+
+### Node Metadata
 
 Source-backed metadata:
 

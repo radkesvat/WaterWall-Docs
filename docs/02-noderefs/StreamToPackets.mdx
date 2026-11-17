@@ -6,11 +6,13 @@ description: "Reference documentation for the StreamToPackets node."
 ---
 
 <!--
-Documentation version: 152
+Documentation version: 153
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/StreamToPackets/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/StreamToPackets.mdx, and all files must keep the same documentation version.
 -->
 
 # StreamToPackets
+
+## Overview
 
 `StreamToPackets` is the inverse adapter of `PacketsToStream`. It accepts a
 normal stream line from the previous side, treats the stream as a raw
@@ -26,32 +28,7 @@ IPv4 packet bytes + IPv4 packet bytes + IPv4 packet bytes + ...
 There is no 2-byte length prefix. Old documentation may call this node
 `DataAsPacket`, but the current node type is `StreamToPackets`.
 
-## What It Does
-
-- Accepts a stream-oriented WaterWall line from the previous side.
-- Tracks one active source IP for the whole node; several validated stream lines
-  from that IP carry traffic together.
-- Buffers upstream stream bytes until a full IPv4 packet is available.
-- Extracts packets using each IPv4 packet's total-length field.
-- Optionally validates decoded packets before forwarding them to the packet side.
-- Hands decoded packets to the packet chain on the receiving stream line's worker.
-- Sends decoded packets upstream to the next packet-oriented node.
-- Sends return packet payloads from the packet side back to one active stream
-  line chosen per inner flow, as raw IPv4 packets.
-- Drops IPv6, non-IPv4 payloads, malformed IPv4 packets, and packet-side output
-  when no active, unpaused stream line exists.
-
-This node rebuilds packet boundaries from a stream. It is not a TCP/UDP flow
-reconstruction node; use [PacketsToConnection](./PacketsToConnection.mdx) for that.
-
-The incoming stream must already contain complete IPv4 packets in the format
-described above. If a listener receives ordinary application bytes and you want
-to generate IPv4 TCP/UDP packets from those connections, use
-[ConnectionToPackets](./ConnectionToPackets.mdx). See the
-[packet bridge comparison](./PacketsToStream.mdx#choosing-a-packet-bridge) for the
-three different uses.
-
-## Typical Placement
+## Typical placement
 
 Stream input to packet output:
 
@@ -83,7 +60,11 @@ from that source; it is not a multi-client VPN concentrator with independent
 inner networks. The JSON below is a node fragment whose `next` names the
 server TUN node in this scenario.
 
-## Configuration Example
+## Minimal practical example
+
+These are node fragments; define the referenced neighboring nodes in the surrounding configuration.
+
+### Configuration Example
 
 ```json
 {
@@ -97,7 +78,9 @@ server TUN node in this scenario.
 }
 ```
 
-## Settings
+## Configuration
+
+### Settings
 
 Top-level fields:
 
@@ -118,7 +101,27 @@ Optional `settings` fields:
 There are no `interval-ms` or `tolerance-ms` settings on `StreamToPackets`.
 Those timers belong to `PacketsToStream`, which initiates the heartbeat.
 
-## Wire Format
+## Usage and troubleshooting
+
+### Practical Notes
+
+- Pair it with `PacketsToStream` on the opposite side.
+- Do not feed it an older 2-byte-prefix packet stream; current parsing uses the
+  IPv4 total-length field.
+- Use `packet-validation-level: "hard"` when you want stronger validation of
+  packets decoded from the stream.
+- Return packet output is lossy while every active line is paused, or while there
+  is no active source at all.
+- Return traffic may arrive on any line of the active source's pool, so the peer
+  must accept a decoded packet on any of its lines. `PacketsToStream` does.
+- Ownership is one source IP for the whole node. Put authentication or
+  allowlisting in front of it on untrusted listeners.
+- Use `PacketsToConnection` instead when the goal is TCP/UDP flow
+  reconstruction rather than packet boundary restoration.
+
+## Advanced behavior
+
+### Wire Format
 
 The stream contains complete IPv4 packets back-to-back:
 
@@ -135,7 +138,72 @@ packet, and waits until the full packet is buffered.
 Return packets from the packet side are written back to one of the active source's
 stream lines using the same raw IPv4 packet format.
 
-## Flow Model
+### Packet Validation
+
+`packet-validation-level` applies to packets decoded from upstream stream data
+before they are emitted to the packet side.
+
+| Level | Behavior |
+| --- | --- |
+| `"none"` | Default. No configurable validation after extraction. The extractor still performs light structural checks so it can find packet boundaries. |
+| `"loose"` | Drops non-IPv4 and malformed IPv4 packets. Checks minimum header, version, IPv4 header length, and total length matching packet length. |
+| `"hard"` | Applies `loose`, verifies IPv4 header checksum, and verifies TCP, UDP, and ICMP checksums for non-fragmented packets. IPv4 UDP checksum `0` is accepted. |
+
+For fragmented IPv4 packets in `"hard"` mode, only the IPv4 header checksum is
+verified. Transport checksums are skipped because they require reassembly.
+
+When validation drops a decoded packet, the tunnel writes a warning log with the
+validation level and reason.
+
+Packet-side return payloads are not processed by this configurable validation
+stage, but they still must be self-consistent IPv4 packets before being written
+to the stream line.
+
+### Sensitive Mode
+
+`StreamToPackets` is the responder side for sensitive-mode heartbeat.
+
+When enabled:
+
+- if a decoded upstream packet is a minimal IPv4 packet with protocol `0xFD`
+  and a 5-byte payload filled with `0xFF`, it is treated as a heartbeat ping
+- the ping is not forwarded to the packet side
+- `StreamToPackets` sends a matching heartbeat pong back on the same stream line
+- the pong is a minimal IPv4 packet with protocol `0xFD` and a 5-byte payload
+  filled with `0xDD`
+- the pong is not forwarded to the packet side
+
+`StreamToPackets` does not own heartbeat timers. Timeout and stream-line
+recreation are handled by `PacketsToStream`.
+
+## Implementation details
+
+### What It Does
+
+- Accepts a stream-oriented WaterWall line from the previous side.
+- Tracks one active source IP for the whole node; several validated stream lines
+  from that IP carry traffic together.
+- Buffers upstream stream bytes until a full IPv4 packet is available.
+- Extracts packets using each IPv4 packet's total-length field.
+- Optionally validates decoded packets before forwarding them to the packet side.
+- Hands decoded packets to the packet chain on the receiving stream line's worker.
+- Sends decoded packets upstream to the next packet-oriented node.
+- Sends return packet payloads from the packet side back to one active stream
+  line chosen per inner flow, as raw IPv4 packets.
+- Drops IPv6, non-IPv4 payloads, malformed IPv4 packets, and packet-side output
+  when no active, unpaused stream line exists.
+
+This node rebuilds packet boundaries from a stream. It is not a TCP/UDP flow
+reconstruction node; use [PacketsToConnection](./PacketsToConnection.mdx) for that.
+
+The incoming stream must already contain complete IPv4 packets in the format
+described above. If a listener receives ordinary application bytes and you want
+to generate IPv4 TCP/UDP packets from those connections, use
+[ConnectionToPackets](./ConnectionToPackets.mdx). See the
+[packet bridge comparison](./PacketsToStream.mdx#choosing-a-packet-bridge) for the
+three different uses.
+
+### Flow Model
 
 ```mermaid
 flowchart LR
@@ -152,7 +220,7 @@ Direction summary:
 | stream side to packet side | Buffers bytes, extracts IPv4 packets, optionally validates them, then sends packets to the next node. |
 | packet side back to stream side | Selects one active, unpaused stream line per inner flow and sends the valid IPv4 packet payload back on it as raw bytes. |
 
-## Active Source, Line Pool, And Packet-Line Bootstrap
+### Active Source, Line Pool, And Packet-Line Bootstrap
 
 `StreamToPackets` bridges between normal stream lines and persistent worker
 packet lines.
@@ -160,7 +228,7 @@ packet lines.
 At startup, it queues packet-line upstream `Init` on every worker so the next
 packet-side tunnel sees the worker packet line after node-manager startup.
 
-### Source identity
+#### Source identity
 
 Ownership is global to the node, not per worker: at most one concrete source IP
 is active at a time. The identity is the source IP alone. The port is excluded
@@ -170,7 +238,7 @@ directly composed in-process `PacketsToStream -> StreamToPackets` pair, for
 example - share one explicit anonymous identity, so those compositions keep
 working; two anonymous peers cannot be told apart.
 
-### Candidates and activation
+#### Candidates and activation
 
 When an upstream stream line is initialized:
 
@@ -183,7 +251,7 @@ decoded IPv4 packet, or by a valid sensitive-mode heartbeat. Malformed bytes,
 overflow, and failed validation are never protocol proof, so they can neither
 activate a candidate nor change the active source.
 
-### Ownership transitions
+#### Ownership transitions
 
 | Situation | Result |
 | --- | --- |
@@ -210,7 +278,7 @@ no way to close the line, so the node fails closed: it requests an orderly
 program shutdown, falling back to an immediate abort if worker 0 will not take
 the handoff. An old-source connection is never left running.
 
-## Inner-Flow Worker Affinity
+### Inner-Flow Worker Affinity
 
 Decoded packets are forwarded on the receiving stream line's worker packet
 line. A later stateful consumer establishes its own flow ownership. Source
@@ -218,7 +286,7 @@ admission still precedes publication, and the authorized source generation is
 rechecked immediately before forwarding; a superseded generation is dropped.
 Return traffic still uses per-flow rendezvous selection of an eligible carrier.
 
-## Packet Extraction
+### Packet Extraction
 
 Incoming upstream stream data is appended to a per-stream read buffer. The
 decoder:
@@ -247,28 +315,7 @@ FIFO limited to 128 KiB of logical bytes and 2 MiB of accounted storage,
 including the active nested delivery. Empty input retains nothing.
 Exceeding nested admission closes the affected borrowed stream through its owner.
 
-## Packet Validation
-
-`packet-validation-level` applies to packets decoded from upstream stream data
-before they are emitted to the packet side.
-
-| Level | Behavior |
-| --- | --- |
-| `"none"` | Default. No configurable validation after extraction. The extractor still performs light structural checks so it can find packet boundaries. |
-| `"loose"` | Drops non-IPv4 and malformed IPv4 packets. Checks minimum header, version, IPv4 header length, and total length matching packet length. |
-| `"hard"` | Applies `loose`, verifies IPv4 header checksum, and verifies TCP, UDP, and ICMP checksums for non-fragmented packets. IPv4 UDP checksum `0` is accepted. |
-
-For fragmented IPv4 packets in `"hard"` mode, only the IPv4 header checksum is
-verified. Transport checksums are skipped because they require reassembly.
-
-When validation drops a decoded packet, the tunnel writes a warning log with the
-validation level and reason.
-
-Packet-side return payloads are not processed by this configurable validation
-stage, but they still must be self-consistent IPv4 packets before being written
-to the stream line.
-
-## Return Path To Stream
+### Return Path To Stream
 
 When packet payload arrives from the next side:
 
@@ -298,24 +345,7 @@ while stream lines are joining or leaving. Per-packet round-robin is never used.
 
 This preserves the same headerless stream format used by `PacketsToStream`.
 
-## Sensitive Mode
-
-`StreamToPackets` is the responder side for sensitive-mode heartbeat.
-
-When enabled:
-
-- if a decoded upstream packet is a minimal IPv4 packet with protocol `0xFD`
-  and a 5-byte payload filled with `0xFF`, it is treated as a heartbeat ping
-- the ping is not forwarded to the packet side
-- `StreamToPackets` sends a matching heartbeat pong back on the same stream line
-- the pong is a minimal IPv4 packet with protocol `0xFD` and a 5-byte payload
-  filled with `0xDD`
-- the pong is not forwarded to the packet side
-
-`StreamToPackets` does not own heartbeat timers. Timeout and stream-line
-recreation are handled by `PacketsToStream`.
-
-## Pause, Resume, And Finish
+### Pause, Resume, And Finish
 
 This node is an endpoint for each borrowed stream line and maps it to a separate
 worker packet line. It retains per-carrier flow control and cannot permanently
@@ -349,7 +379,7 @@ never finishes or destroys a worker packet line. A takeover closes an old-source
 line by running a task on that line's own worker and finishing it toward the
 previous side, which is the owner that performs the destruction.
 
-## Checksum Recalculation
+### Checksum Recalculation
 
 The packet callback takes and clears the buffer request with
 `packettunnelTakeChecksumRequest(buf)` before any
@@ -362,23 +392,7 @@ at least 20 bytes fitting within the declared total length, and a total length
 matching the buffer within `kMaxAllowedPacketLength`. IPv6 and malformed
 framing are dropped independently of `packet-validation-level`.
 
-## Practical Notes
-
-- Pair it with `PacketsToStream` on the opposite side.
-- Do not feed it an older 2-byte-prefix packet stream; current parsing uses the
-  IPv4 total-length field.
-- Use `packet-validation-level: "hard"` when you want stronger validation of
-  packets decoded from the stream.
-- Return packet output is lossy while every active line is paused, or while there
-  is no active source at all.
-- Return traffic may arrive on any line of the active source's pool, so the peer
-  must accept a decoded packet on any of its lines. `PacketsToStream` does.
-- Ownership is one source IP for the whole node. Put authentication or
-  allowlisting in front of it on untrusted listeners.
-- Use `PacketsToConnection` instead when the goal is TCP/UDP flow
-  reconstruction rather than packet boundary restoration.
-
-## Node Metadata
+### Node Metadata
 
 The tunnel does not prepend bytes, so it has no extra left-padding requirement.
 

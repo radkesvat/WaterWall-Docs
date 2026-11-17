@@ -6,11 +6,13 @@ description: "Reference documentation for the KeepAliveServer node."
 ---
 
 <!--
-Documentation version: 154
+Documentation version: 155
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/KeepAliveServer/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/KeepAliveServer.mdx, and all files must keep the same documentation version.
 -->
 
 # KeepAliveServer
+
+## Overview
 
 `KeepAliveServer` is the server-side peer for `KeepAliveClient`. It decodes
 upstream keepalive frames from the client side, forwards normal payloads to
@@ -24,7 +26,7 @@ framed upstream input and will not understand ordinary unframed payload bytes.
 does not create or destroy `line_t` objects, and does not own any periodic
 timer.
 
-## Typical Placement
+## Typical placement
 
 Direct in-process test:
 
@@ -42,24 +44,11 @@ server side: TcpListener -> KeepAliveServer -> TcpConnector
 Any tunnels between the client and server must preserve the keepalive frame
 bytes exactly.
 
-## What It Does
+## Minimal practical example
 
-- Initializes local line state on upstream `Init`.
-- Validates upstream frame headers and forwards available normal payload bytes incrementally.
-- Decodes upstream normal frames and forwards their payload to `next`.
-- Answers upstream ping frames by sending downstream pong frames.
-- Ignores upstream pong frames.
-- Drops empty normal frames and unknown frame kinds.
-- Encodes downstream payloads as normal keepalive frames and sends them to the
-  previous node.
-- Splits downstream payloads larger than `1 MiB` into multiple normal
-  frames.
-- Destroys local line state and forwards the received directional `Finish`.
+These are node fragments; define the referenced neighboring nodes in the surrounding configuration.
 
-The server does not have its own keepalive timer. Periodic ping generation is
-owned by `KeepAliveClient`.
-
-## Configuration Example
+### Configuration Example
 
 ```json
 {
@@ -83,7 +72,9 @@ Matching client side:
 }
 ```
 
-## Required Fields
+## Configuration
+
+### Required Fields
 
 Top-level fields:
 
@@ -97,12 +88,42 @@ Top-level fields:
 `KeepAliveServer` must have a previous node and must be reached by a matching
 `KeepAliveClient`.
 
-## Settings
+### Settings
 
 `KeepAliveServer` currently has no meaningful settings. Keepalive timing is
 configured on `KeepAliveClient` with `settings.ping-interval`.
 
-## Frame Format
+## Usage and troubleshooting
+
+### Buffer And Padding Notes
+
+`KeepAliveServer` prepends the 5-byte frame prefix while encoding downstream
+payloads, so its node metadata advertises:
+
+```text
+required_padding_left = 5
+layer_group = kNodeLayer4
+layer_group_next_node = kNodeLayer4
+layer_group_prev_node = kNodeLayer4
+```
+
+The caller must provide enough left padding for the prefix; Debug asserts this
+precondition. WaterWall's chain padding calculation reserves the advertised space.
+
+### Practical Notes
+
+- Pair this node with `KeepAliveClient`; it is not useful by itself.
+- Ping and pong frames are internal to the KeepAlive pair and are not delivered
+  as payload to surrounding nodes.
+- The server answers pings, but it does not measure client health or enforce a
+  pong timeout.
+- This node does not encrypt, authenticate, compress, or rewrite payload bytes.
+- It is safest around transports that preserve the framed bytes between the
+  client and server.
+
+## Advanced behavior
+
+### Frame Format
 
 The server uses the same 5-byte prefix as the client:
 
@@ -124,7 +145,26 @@ The body length includes the kind byte. Each normal frame carries at most
 Larger downstream payloads are split into multiple frames. Both peers use the
 same five-byte prefix.
 
-## Direction Behavior
+## Implementation details
+
+### What It Does
+
+- Initializes local line state on upstream `Init`.
+- Validates upstream frame headers and forwards available normal payload bytes incrementally.
+- Decodes upstream normal frames and forwards their payload to `next`.
+- Answers upstream ping frames by sending downstream pong frames.
+- Ignores upstream pong frames.
+- Drops empty normal frames and unknown frame kinds.
+- Encodes downstream payloads as normal keepalive frames and sends them to the
+  previous node.
+- Splits downstream payloads larger than `1 MiB` into multiple normal
+  frames.
+- Destroys local line state and forwards the received directional `Finish`.
+
+The server does not have its own keepalive timer. Periodic ping generation is
+owned by `KeepAliveClient`.
+
+### Direction Behavior
 
 | Incoming callback | Behavior |
 | --- | --- |
@@ -137,7 +177,7 @@ same five-byte prefix.
 | downstream `Finish` | Destroys local state, then forwards `Finish` to the previous node. |
 | downstream `Init` | Disabled; reaching this callback is treated as a fatal invalid chain flow. |
 
-## Framed Input Handling
+### Framed Input Handling
 
 Upstream bytes are accumulated in a `splice_stream_t`. This means a frame can
 arrive split across multiple payload callbacks, or multiple frames can arrive in
@@ -151,47 +191,7 @@ The decoder:
 - drops unknown frame kinds
 - drains available body bytes first, then closes if retained allocation charge still exceeds its limit after compaction
 
-## Buffer And Padding Notes
-
-`KeepAliveServer` prepends the 5-byte frame prefix while encoding downstream
-payloads, so its node metadata advertises:
-
-```text
-required_padding_left = 5
-layer_group = kNodeLayer4
-layer_group_next_node = kNodeLayer4
-layer_group_prev_node = kNodeLayer4
-```
-
-The caller must provide enough left padding for the prefix; Debug asserts this
-precondition. WaterWall's chain padding calculation reserves the advertised space.
-
-## Practical Notes
-
-- Pair this node with `KeepAliveClient`; it is not useful by itself.
-- Ping and pong frames are internal to the KeepAlive pair and are not delivered
-  as payload to surrounding nodes.
-- The server answers pings, but it does not measure client health or enforce a
-  pong timeout.
-- This node does not encrypt, authenticate, compress, or rewrite payload bytes.
-- It is safest around transports that preserve the framed bytes between the
-  client and server.
-
-## Node Metadata
-
-Source-backed metadata:
-
-| Property | Value |
-| --- | --- |
-| node flags | `kNodeFlagSupportsSplice` |
-| `can_have_prev` | `true` |
-| `can_have_next` | `true` |
-| `layer_group` | `kNodeLayer4` |
-| `layer_group_prev_node` | `kNodeLayer4` |
-| `layer_group_next_node` | `kNodeLayer4` |
-| `required_padding_left` | `5` bytes |
-
-## Splice Support
+### Splice Support
 
 `KeepAliveServer` advertises `kNodeFlagSupportsSplice`. Its upstream decoder uses
 a five-byte `splice_stream_t` header cache; its downstream encoder prepends the
@@ -224,3 +224,17 @@ Zero or oversized frame body lengths, admission failure and retained-storage ove
 close the borrowed line through its owner. Finish releases incomplete frames,
 active encoder suffixes and queued reentrant input; this node never destroys
 `line_t` itself.
+
+### Node Metadata
+
+Source-backed metadata:
+
+| Property | Value |
+| --- | --- |
+| node flags | `kNodeFlagSupportsSplice` |
+| `can_have_prev` | `true` |
+| `can_have_next` | `true` |
+| `layer_group` | `kNodeLayer4` |
+| `layer_group_prev_node` | `kNodeLayer4` |
+| `layer_group_next_node` | `kNodeLayer4` |
+| `required_padding_left` | `5` bytes |

@@ -5,7 +5,7 @@ sidebar_label: "Part 1: Overview & Mental Model"
 description: "The runtime model, core objects, callback directions, and tunnel lifecycle you must understand before changing any WaterWall tunnel."
 ---
 <!--
-Documentation version: 167
+Documentation version: 168
 -->
 
 # WaterWall Developer Guide
@@ -32,6 +32,13 @@ neighbors, because a repeated pattern can contain a repeated bug. An explicitly
 requested lifecycle redesign is cross-cutting work, not forbidden work; account
 for every affected implementation, test, and contract document.
 :::
+
+## Reading path
+
+- [Foundations: runtime, objects and callback directions](#the-runtime-model)
+- [Mandatory correctness and worker contracts](#what-correct-means-here)
+- [A minimal tunnel skeleton](#a-minimal-tunnel-skeleton)
+- [Reusable helpers and configuration reference](#reuse-existing-containers-and-helpers)
 
 ## How This Guide Is Organized
 
@@ -67,66 +74,6 @@ the existing code.
 | Splice representation helpers | `ww/bufio/splice_buffer.h`, `ww/bufio/splice_buffer.c` |
 | Buffer pools | `ww/bufio/buffer_pool.h`, `ww/bufio/buffer_pool.c` |
 | Node metadata | `ww/objects/node.h` |
-
-## Reuse Existing Containers and Helpers
-
-Before implementing a private data structure, buffer utility, or timeout
-scheduler, check the facilities already available in `ww`. Prefer an existing
-helper when its ownership, worker affinity, and timing contracts fit the node.
-
-WaterWall includes the **STC** library for typed C data structures. It provides
-hash maps (`stc/hmap.h`), sets (`stc/hset.h`), deques (`stc/deque.h`), and priority
-queues (`stc/pqueue.h`), among other containers. `ww/CMakeLists.txt` configures
-the dependency and exports its include path to nodes. Follow existing container
-definitions for the `i_type`, `i_key`, and, where needed, `i_val` configuration.
-Mutable containers still require owner-worker confinement or synchronization.
-The pinned STC headers are copied to the build-owned `patched-deps/stc` tree.
-Its compact hash metadata saturates long probe distances; lookup, displacement
-and erase reconstruct the exact distance for saturated buckets. Never edit the
-dependency cache or allow distance truncation to turn an occupied bucket empty.
-User credential, name, identifier and active-IP indexes use one immutable secret
-process seed from the runtime CSPRNG. Direct object fixtures must establish the
-same secure-random, fast-random and crypto prerequisites as normal startup.
-
-`ww/bufio/` provides reusable helpers beyond raw buffers:
-
-| Need | Helpers |
-| --- | --- |
-| Inspect and extract bytes across queued ordinary buffers | `buffer_stream.h` |
-| Queue buffers in FIFO order while preserving entry boundaries | `buffer_queue.h` |
-| Own staged ordinary/splice input, cached-prefix accounting and parser-to-output transfer | `buffer_reader.h` |
-| Account for queued bytes and retained storage | `buffer_budget.h` |
-| Parse fixed headers with ordinary or splice input | `splice_stream.h`, `splice_buffer.h` |
-| Serialize complete-frame or incremental-body decoding and settle retained storage | `splice_frame_reader.h` |
-| Queue context events | `context_queue.h` |
-| Reuse buffers and other objects | `buffer_pool.h`, `generic_pool.h`, `threadsafe_generic_pool.h` |
-
-Read each helper's API contract and [Part 3](./part3-buffers-and-padding.mdx)
-before choosing it; the helpers differ in buffer ownership, representation, and
-worker requirements.
-
-For coarse idle expiry or keepalive scheduling, consider the tables in
-`ww/base/local_widle_table.h` and `ww/base/widle_table.h` instead of maintaining
-a custom linked list and timer. They already provide lookup, deadline refresh,
-expiration callbacks, removal, and drain operations. See
-[Choosing an Idle Table](#choosing-an-idle-table) for worker ownership, timing,
-and item lifetime, and [Part 7](./part7-shutdown-and-signals.mdx) for shutdown.
-
-## Good Reference Tunnels
-
-Use the closest existing patterns as comparisons, not as templates to copy
-blindly. These tunnels exercise useful contract shapes, but their behavior still
-has to be checked against the exact role being changed:
-
-| Reference | Read it for |
-| --- | --- |
-| `TcpListener`, `UdpListener` | Chain-head adapters that own an OS resource and create/destroy their normal lines |
-| `TcpConnector`, `UdpConnector` | Chain-tail adapters that own an OS resource but borrow the line created upstream |
-| `TlsClient`, `EncryptionClient` | Stateful protocol wrapping, per-line state, clean finish with final bytes |
-| `MuxClient` | Internal line ownership, parent/child lines, re-entrant safety |
-| `PacketsToStream`, `StreamToPackets`, `PacketsToConnection` | Packet-to-stream boundaries and packet-line anchored bridges |
-| `PingClient`, `PingServer` | Direct paired ICMP Echo transforms, same-direction decoded data, and optional opposite-direction exact replies |
-| `template` | An explicit callback skeleton for reference; production nodes retain applicable defaults |
 
 ## The Runtime Model
 
@@ -209,108 +156,6 @@ the Down-end; the chain tail (last adapter) faces the Up-end. Pressure signals
 travel symmetrically: a blocked Down-end writer requests Pause toward the Up-end,
 and vice versa. They do not guarantee that all in-flight or scheduled payload
 stops; receivers enforce their own hard limits.
-
-## Core configuration ownership
-
-The ordinary application owns the sole settings object and its normal WaterWall
-allocations. `getCoreSettings()` returns borrowed settings. Runtime construction
-borrows DNS and logging strings; consumers must not free them or destroy settings
-after construction. `destroyCoreSettings()` remains the application finalizer
-after workers and external activity have stopped. Parse failures use a synchronous
-startup error scope and local cleanup before a shutdown controller exists.
-
-Core startup runs the optional `misc.tcp-tune` phase after runtime logging is
-ready and before node configurations are loaded. It defaults on for native Linux
-and off elsewhere. When both `misc.tcp-tune` and `misc.splice` are enabled,
-this phase reads `net.ipv4.tcp_mem` and targets
-`3:4:6` pages at approximately 7.5%, 10%, and 15% of total host physical RAM.
-Compute one integral unit from host pages divided by 40, rounding down;
-never assume 4 KiB pages or use container quotas for this global setting.
-Preserve the current triple if any target threshold would decrease, and verify
-changed values by reading them back. Tuning failures warn and never fail startup.
-The application copies the configured flag into
-`ww_construction_data_t.tcp_tune_enabled`; runtime construction publishes
-`GSTATE.tcp_tune_enabled` before node startup. Automatic Mux socket sizing depends
-on chain presence independently of this flag or sysctl success. Explicit node
-buffer settings retain precedence. BBR has an independent admission flag; splice
-also gates the RAM-based `tcp_mem` step. RawSocket's separate `skip-sysctl` batch
-tunes backlogs and other TCP parameters; `tcp_mem` tuning belongs to core
-`tcp-tune`.
-See the
-[core setting and memory targets](../01-getting-started/tutorial-part1.mdx#tcp-tune).
-
-On Linux, omitted or non-positive `misc.workers` values use `get_nprocs()` to
-count online logical CPUs. Offline configured CPUs do not contribute to this
-default; the existing maximum of 254 workers still applies.
-
-The optional Linux packed launcher reads the selected core input once and checks
-JSON syntax and an object root, including restricted lexical checks when selected.
-It does not construct settings. It releases its CRT input buffer and temporary
-JSON after creating a sealed snapshot, restores the ordinary executable into a
-separate sealed memfd, and replaces itself with `execveat`. No heap objects or
-settings pointers cross execution. The ordinary application's startup adapter
-consumes the inherited snapshot, closes it before runtime initialization, and
-passes the exact byte length to the authoritative parser. Restricted mode is
-selected again from the original arguments and independently validates all bytes.
-Normal-mode historical NUL-terminated parser acceptance remains unchanged.
-
-The plain-C input reader always returns CRT storage, released only with
-`waterwallStartupOptionsFreeCoreJson()`. JSON allocator selection is private to
-the JSON component: CRT in the launcher and the normal allocator in WaterWall.
-Temporary input and JSON are released after full settings parsing. Node
-configuration parsing remains ordinary runtime work.
-
-The core `misc.mtu` setting is exposed as `CORE_DEFAULT_MTU`, accessing
-`global_ww_state.mtu_size`, solely as a construction-time default seed. The core
-parser retains its `68..65535` range and `DEFAULT_MTU_PROFILE` fallback of 1500.
-IpManipulator, PacketsToConnection and ConnectionToPackets resolve `mtu`;
-KcpClient and KcpServer resolve `send-mtu`; TunDevice resolves
-`device-mtu`. Each instance
-strictly parses its optional override, validates the final value against its own
-constraints, and stores an immutable MTU. An unsupported inherited value fails
-construction; a supported explicit override can replace it. Runtime consumers,
-including lazy netifs, later KCP handles and delayed trick work, read instance
-state, never core MTU storage. Overrides do not write back to core state. This is
-neither path-MTU measurement nor chain-wide MTU propagation.
-
-## Restricted Configuration Input
-
-`--restricted-config` selects a process-lifetime policy before reading core JSON.
-Only the startup owner selects it; JSON and environment settings cannot disable
-it. This is a configuration boundary, not a sandbox or a claim that Windows VPN
-policy, drivers, or host-controlled shutdown are ready for deployment.
-
-In this mode, core input is limited to 2 MiB; node input and resolved node JSON
-are each limited to 8 MiB. Limits exclude the terminating NUL. Reads, comment
-stripping, substitution output, and temporary replacement serialization stay
-bounded. Node files still support `//` comments and outside-string `$name$`
-substitutions; core JSON retains its ordinary JSON syntax. Variables and resolved
-JSON must consume their complete document, have valid UTF-8, unique decoded
-object keys, no embedded or decoded NUL, and at most 128 nested containers.
-The existing 512-node ceiling still applies.
-
-Built-in node lookup remains available. An unknown type must fail before the
-external loader or its search paths are consulted. TunDevice rejects either
-script field, including null or variable-resolved fields, before storing a
-command or starting a device. Parser diagnostics report categories and byte
-positions rather than source tails; restricted parser and NodeManager diagnostics
-omit caller-controlled identifiers. A resolved-JSON position refers to the
-resolved document, and a variables position is relative to that object.
-
-The client still owns protected inputs and artifacts, writable log paths, and
-its network-policy enforcement. The Windows packed public executable owns its
-internal process containment and lifecycle deadlines (see Part 7). In particular, the parser switch does not repair
-Windows driver extraction or DNS/route cleanup. Keep stdin finite and close its writers: the read is synchronous. The Windows
-launcher observer independently bounds stalled configuration transfer; the runtime
-shutdown coordinator itself cannot interrupt a pre-controller read.
-
-API-facing configuration strings retain lexical evidence before the ordinary
-configuration parser discards source bytes or serializes variable substitutions.
-An embedded-NUL suffix must never turn into a valid C-string token or selector.
-These checks cover operator settings and public selector names; unrelated node
-settings retain their existing parsing rules. Runtime JSON error state is local
-to each parsing thread, since envelopes and operation bodies can be parsed on
-different event workers. Global JSON allocator hooks remain startup-only.
 
 ## The Four Core Objects
 
@@ -536,49 +381,6 @@ final only after a complete callback pass reports no changes. Use `onIndex` when
 the tunnel only needs to read the final solution; that solution remains stable
 for `onIndex` and all later lifecycle callbacks. Static internal topology whose
 presence and placement are known before solving still belongs in `onChain`.
-
-## A Minimal Tunnel Skeleton
-
-The `template` tunnel explicitly lists the available callbacks below. Production
-nodes assign only callbacks whose functional behavior differs from the chosen
-constructor defaults; inherited callbacks need no node-specific implementation
-file, declaration, or registration. This is the template's `create.c`, lightly
-trimmed:
-
-```c
-tunnel_t *templateTunnelCreate(node_t *node)
-{
-    tunnel_t *t = tunnelCreate(node, sizeof(template_tstate_t), sizeof(template_lstate_t));
-    if (! t)
-    {
-        return NULL;
-    }
-
-    t->fnInitU    = &templateTunnelUpStreamInit;
-    t->fnEstU     = &templateTunnelUpStreamEst;
-    t->fnFinU     = &templateTunnelUpStreamFinish;
-    t->fnPayloadU = &templateTunnelUpStreamPayload;
-    t->fnPauseU   = &templateTunnelUpStreamPause;
-    t->fnResumeU  = &templateTunnelUpStreamResume;
-
-    t->fnInitD    = &templateTunnelDownStreamInit;
-    t->fnEstD     = &templateTunnelDownStreamEst;
-    t->fnFinD     = &templateTunnelDownStreamFinish;
-    t->fnPayloadD = &templateTunnelDownStreamPayload;
-    t->fnPauseD   = &templateTunnelDownStreamPause;
-    t->fnResumeD  = &templateTunnelDownStreamResume;
-
-    t->onPrepare = &templateTunnelOnPrepair;
-    t->onStart   = &templateTunnelOnStart;
-    t->onStop    = &templateTunnelOnStop;
-    t->onDestroy = &templateTunnelDestroy;
-
-    return t;
-}
-```
-
-Part 5 walks the full directory layout behind this skeleton, including `node.c`
-metadata, `line_state.c`, and where each callback lives.
 
 ## What "Correct" Means Here
 
@@ -879,6 +681,211 @@ address-family, local/remote address, and local/remote port tuple. Shutdown
 erases the secret only after all engines and their TCP PCBs are gone and workers
 have joined; startup rollback follows the same ordering.
 
+## A Minimal Tunnel Skeleton
+
+The `template` tunnel explicitly lists the available callbacks below. Production
+nodes assign only callbacks whose functional behavior differs from the chosen
+constructor defaults; inherited callbacks need no node-specific implementation
+file, declaration, or registration. This is the template's `create.c`, lightly
+trimmed:
+
+```c
+tunnel_t *templateTunnelCreate(node_t *node)
+{
+    tunnel_t *t = tunnelCreate(node, sizeof(template_tstate_t), sizeof(template_lstate_t));
+    if (! t)
+    {
+        return NULL;
+    }
+
+    t->fnInitU    = &templateTunnelUpStreamInit;
+    t->fnEstU     = &templateTunnelUpStreamEst;
+    t->fnFinU     = &templateTunnelUpStreamFinish;
+    t->fnPayloadU = &templateTunnelUpStreamPayload;
+    t->fnPauseU   = &templateTunnelUpStreamPause;
+    t->fnResumeU  = &templateTunnelUpStreamResume;
+
+    t->fnInitD    = &templateTunnelDownStreamInit;
+    t->fnEstD     = &templateTunnelDownStreamEst;
+    t->fnFinD     = &templateTunnelDownStreamFinish;
+    t->fnPayloadD = &templateTunnelDownStreamPayload;
+    t->fnPauseD   = &templateTunnelDownStreamPause;
+    t->fnResumeD  = &templateTunnelDownStreamResume;
+
+    t->onPrepare = &templateTunnelOnPrepair;
+    t->onStart   = &templateTunnelOnStart;
+    t->onStop    = &templateTunnelOnStop;
+    t->onDestroy = &templateTunnelDestroy;
+
+    return t;
+}
+```
+
+Part 5 walks the full directory layout behind this skeleton, including `node.c`
+metadata, `line_state.c`, and where each callback lives.
+
+## Good Reference Tunnels
+
+Use the closest existing patterns as comparisons, not as templates to copy
+blindly. These tunnels exercise useful contract shapes, but their behavior still
+has to be checked against the exact role being changed:
+
+| Reference | Read it for |
+| --- | --- |
+| `TcpListener`, `UdpListener` | Chain-head adapters that own an OS resource and create/destroy their normal lines |
+| `TcpConnector`, `UdpConnector` | Chain-tail adapters that own an OS resource but borrow the line created upstream |
+| `TlsClient`, `EncryptionClient` | Stateful protocol wrapping, per-line state, clean finish with final bytes |
+| `MuxClient` | Internal line ownership, parent/child lines, re-entrant safety |
+| `PacketsToStream`, `StreamToPackets`, `PacketsToConnection` | Packet-to-stream boundaries and packet-line anchored bridges |
+| `PingClient`, `PingServer` | Direct paired ICMP Echo transforms, same-direction decoded data, and optional opposite-direction exact replies |
+| `template` | An explicit callback skeleton for reference; production nodes retain applicable defaults |
+
+## Reuse Existing Containers and Helpers
+
+Before implementing a private data structure, buffer utility, or timeout
+scheduler, check the facilities already available in `ww`. Prefer an existing
+helper when its ownership, worker affinity, and timing contracts fit the node.
+
+WaterWall includes the **STC** library for typed C data structures. It provides
+hash maps (`stc/hmap.h`), sets (`stc/hset.h`), deques (`stc/deque.h`), and priority
+queues (`stc/pqueue.h`), among other containers. `ww/CMakeLists.txt` configures
+the dependency and exports its include path to nodes. Follow existing container
+definitions for the `i_type`, `i_key`, and, where needed, `i_val` configuration.
+Mutable containers still require owner-worker confinement or synchronization.
+The pinned STC headers are copied to the build-owned `patched-deps/stc` tree.
+Its compact hash metadata saturates long probe distances; lookup, displacement
+and erase reconstruct the exact distance for saturated buckets. Never edit the
+dependency cache or allow distance truncation to turn an occupied bucket empty.
+User credential, name, identifier and active-IP indexes use one immutable secret
+process seed from the runtime CSPRNG. Direct object fixtures must establish the
+same secure-random, fast-random and crypto prerequisites as normal startup.
+
+`ww/bufio/` provides reusable helpers beyond raw buffers:
+
+| Need | Helpers |
+| --- | --- |
+| Inspect and extract bytes across queued ordinary buffers | `buffer_stream.h` |
+| Queue buffers in FIFO order while preserving entry boundaries | `buffer_queue.h` |
+| Own staged ordinary/splice input, cached-prefix accounting and parser-to-output transfer | `buffer_reader.h` |
+| Account for queued bytes and retained storage | `buffer_budget.h` |
+| Parse fixed headers with ordinary or splice input | `splice_stream.h`, `splice_buffer.h` |
+| Serialize complete-frame or incremental-body decoding and settle retained storage | `splice_frame_reader.h` |
+| Queue context events | `context_queue.h` |
+| Reuse buffers and other objects | `buffer_pool.h`, `generic_pool.h`, `threadsafe_generic_pool.h` |
+
+Read each helper's API contract and [Part 3](./part3-buffers-and-padding.mdx)
+before choosing it; the helpers differ in buffer ownership, representation, and
+worker requirements.
+
+For coarse idle expiry or keepalive scheduling, consider the tables in
+`ww/base/local_widle_table.h` and `ww/base/widle_table.h` instead of maintaining
+a custom linked list and timer. They already provide lookup, deadline refresh,
+expiration callbacks, removal, and drain operations. See
+[Choosing an Idle Table](#choosing-an-idle-table) for worker ownership, timing,
+and item lifetime, and [Part 7](./part7-shutdown-and-signals.mdx) for shutdown.
+
+## Core configuration ownership
+
+The ordinary application owns the sole settings object and its normal WaterWall
+allocations. `getCoreSettings()` returns borrowed settings. Runtime construction
+borrows DNS and logging strings; consumers must not free them or destroy settings
+after construction. `destroyCoreSettings()` remains the application finalizer
+after workers and external activity have stopped. Parse failures use a synchronous
+startup error scope and local cleanup before a shutdown controller exists.
+
+Core startup runs the optional `misc.tcp-tune` phase after runtime logging is
+ready and before node configurations are loaded. It defaults on for native Linux
+and off elsewhere. When both `misc.tcp-tune` and `misc.splice` are enabled,
+this phase reads `net.ipv4.tcp_mem` and targets
+`3:4:6` pages at approximately 7.5%, 10%, and 15% of total host physical RAM.
+Compute one integral unit from host pages divided by 40, rounding down;
+never assume 4 KiB pages or use container quotas for this global setting.
+Preserve the current triple if any target threshold would decrease, and verify
+changed values by reading them back. Tuning failures warn and never fail startup.
+The application copies the configured flag into
+`ww_construction_data_t.tcp_tune_enabled`; runtime construction publishes
+`GSTATE.tcp_tune_enabled` before node startup. Automatic Mux socket sizing depends
+on chain presence independently of this flag or sysctl success. Explicit node
+buffer settings retain precedence. BBR has an independent admission flag; splice
+also gates the RAM-based `tcp_mem` step. RawSocket's separate `skip-sysctl` batch
+tunes backlogs and other TCP parameters; `tcp_mem` tuning belongs to core
+`tcp-tune`.
+See the
+[core setting and memory targets](../01-getting-started/tutorial-part1.mdx#tcp-tune).
+
+On Linux, omitted or non-positive `misc.workers` values use `get_nprocs()` to
+count online logical CPUs. Offline configured CPUs do not contribute to this
+default; the existing maximum of 254 workers still applies.
+
+The optional Linux packed launcher reads the selected core input once and checks
+JSON syntax and an object root, including restricted lexical checks when selected.
+It does not construct settings. It releases its CRT input buffer and temporary
+JSON after creating a sealed snapshot, restores the ordinary executable into a
+separate sealed memfd, and replaces itself with `execveat`. No heap objects or
+settings pointers cross execution. The ordinary application's startup adapter
+consumes the inherited snapshot, closes it before runtime initialization, and
+passes the exact byte length to the authoritative parser. Restricted mode is
+selected again from the original arguments and independently validates all bytes.
+Normal-mode historical NUL-terminated parser acceptance remains unchanged.
+
+The plain-C input reader always returns CRT storage, released only with
+`waterwallStartupOptionsFreeCoreJson()`. JSON allocator selection is private to
+the JSON component: CRT in the launcher and the normal allocator in WaterWall.
+Temporary input and JSON are released after full settings parsing. Node
+configuration parsing remains ordinary runtime work.
+
+The core `misc.mtu` setting is exposed as `CORE_DEFAULT_MTU`, accessing
+`global_ww_state.mtu_size`, solely as a construction-time default seed. The core
+parser retains its `68..65535` range and `DEFAULT_MTU_PROFILE` fallback of 1500.
+IpManipulator, PacketsToConnection and ConnectionToPackets resolve `mtu`;
+KcpClient and KcpServer resolve `send-mtu`; TunDevice resolves
+`device-mtu`. Each instance
+strictly parses its optional override, validates the final value against its own
+constraints, and stores an immutable MTU. An unsupported inherited value fails
+construction; a supported explicit override can replace it. Runtime consumers,
+including lazy netifs, later KCP handles and delayed trick work, read instance
+state, never core MTU storage. Overrides do not write back to core state. This is
+neither path-MTU measurement nor chain-wide MTU propagation.
+
+## Restricted Configuration Input
+
+`--restricted-config` selects a process-lifetime policy before reading core JSON.
+Only the startup owner selects it; JSON and environment settings cannot disable
+it. This is a configuration boundary, not a sandbox or a claim that Windows VPN
+policy, drivers, or host-controlled shutdown are ready for deployment.
+
+In this mode, core input is limited to 2 MiB; node input and resolved node JSON
+are each limited to 8 MiB. Limits exclude the terminating NUL. Reads, comment
+stripping, substitution output, and temporary replacement serialization stay
+bounded. Node files still support `//` comments and outside-string `$name$`
+substitutions; core JSON retains its ordinary JSON syntax. Variables and resolved
+JSON must consume their complete document, have valid UTF-8, unique decoded
+object keys, no embedded or decoded NUL, and at most 128 nested containers.
+The existing 512-node ceiling still applies.
+
+Built-in node lookup remains available. An unknown type must fail before the
+external loader or its search paths are consulted. TunDevice rejects either
+script field, including null or variable-resolved fields, before storing a
+command or starting a device. Parser diagnostics report categories and byte
+positions rather than source tails; restricted parser and NodeManager diagnostics
+omit caller-controlled identifiers. A resolved-JSON position refers to the
+resolved document, and a variables position is relative to that object.
+
+The client still owns protected inputs and artifacts, writable log paths, and
+its network-policy enforcement. The Windows packed public executable owns its
+internal process containment and lifecycle deadlines (see Part 7). In particular, the parser switch does not repair
+Windows driver extraction or DNS/route cleanup. Keep stdin finite and close its writers: the read is synchronous. The Windows
+launcher observer independently bounds stalled configuration transfer; the runtime
+shutdown coordinator itself cannot interrupt a pre-controller read.
+
+API-facing configuration strings retain lexical evidence before the ordinary
+configuration parser discards source bytes or serializes variable substitutions.
+An embedded-NUL suffix must never turn into a valid C-string token or selector.
+These checks cover operator settings and public selector names; unrelated node
+settings retain their existing parsing rules. Runtime JSON error state is local
+to each parsing thread, since envelopes and operation bodies can be parsed on
+different event workers. Global JSON allocator hooks remain startup-only.
+
 ## Glossary
 
 | Term | Meaning |
@@ -895,6 +902,7 @@ have joined; startup rollback follows the same ordering.
 | **kInvalidWID** | Sentinel value (`UINT8_MAX`) representing an unregistered or auxiliary thread. |
 | **Re-entrancy** | An inter-tunnel callback synchronously calling back into your tunnel, possibly closing the line before control returns. |
 | **Reflection** | Incorrectly forwarding a callback back toward a direction that has already finished. A common crash source. |
+
 
 ---
 

@@ -6,11 +6,13 @@ description: "VMess AEAD client with a static UUID, TCP/UDP destinations and com
 ---
 
 <!--
-Documentation version: 6
+Documentation version: 7
 Sync note: Keep this file, WaterWall-Docs/docs/02-noderefs/VmessClient.mdx and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/VmessClient.mdx synchronized.
 -->
 
 # VmessClient
+
+## Overview
 
 `VmessClient` sends modern VMess AEAD requests using one configured UUID or short string ID. It carries
 TCP streams or fixed-destination UDP datagrams over a byte-stream transport. The
@@ -20,7 +22,9 @@ The node's address and port select the **final proxied target**. The following
 `TcpConnector` selects the **VMess server endpoint**. TLS and WebSocket belong to
 their existing transport nodes; VmessClient does not discover or configure them.
 
-## Placement and examples
+## Typical placement
+
+### Placement and examples
 
 ```text
 TcpListener    -> VmessClient -> TcpConnector
@@ -32,6 +36,18 @@ TcpListener    -> VmessClient -> HttpClient (WebSocket) -> TlsClient -> TcpConne
 
 For HTTP/1.1 WebSocket over TLS, configure matching HTTP/1.1 ALPN in TlsClient.
 Certificate validation and SNI remain TlsClient settings.
+
+
+VMess body protection is a separate choice from TLS. `none` and `zero` leave
+application bodies unencrypted and unauthenticated. The default
+`encrypted-counter-policy: "wrap"` eventually repeats AEAD nonces under the same
+session key; it is not rekeying. `strict` closes before nonce reuse. Read the
+security and counter settings before choosing a policy.
+
+## Minimal practical example
+
+This is a **node fragment**. Complete the surrounding chain and replace the
+sample UUID with the matching peer credential.
 
 ```json
 {
@@ -54,6 +70,120 @@ Certificate validation and SNI remain TlsClient settings.
 Here `example.com:443` is the destination requested from the VMess server, even
 when the following connector dials a different host and port.
 
+
+`tls-client` names your configured TLS transport; its next connector dials the
+VMess server. The node target `example.com:443` is the service requested from it.
+
+## Configuration
+
+### Settings
+
+| Setting | Default | Accepted values |
+| --- | --- | --- |
+| `uuid` / `id` / `user-id` | Required | Dashed/compact hexadecimal UUID, or an exact UTF-8 string of 1..30 bytes mapped to UUIDv5 with the nil namespace. |
+| `target-address` / `address` / `target` | Required | Literal host/IP, `dest_context->address`, or `line->dest_ctx->address`. Domains contain 1..255 non-NUL bytes. |
+| `port` | Required | Integer 1..65535, `dest_context->port`, or `line->dest_ctx->port`. |
+| `protocol` / `proto` | `tcp` | `tcp`/`connect`, `udp`/`udp-associate`, `dest_context->protocol`, or `line->dest_ctx->protocol`. |
+| `dns-behaviour` | Local resolution disabled | Local lookup, address selection and DNS transport; see DNS behaviour below. |
+| `first-payload-timeout-ms` | `400` | Integer 0..4294967295; zero sends an idle request without deliberate waiting after transport Est. |
+| `security` | `aes-128-gcm` | `aes-128-gcm`, `chacha20-poly1305`, `auto`, `none`, or `zero`. |
+| `chunk-masking` | Mode-dependent | Boolean; true except for `zero`. |
+| `global-padding` | Mode-dependent | Boolean; true for encrypted modes, false for `none` and `zero`. |
+| `authenticated-length` | `false` | Boolean; encrypted modes only. |
+| `encrypted-counter-policy` | `wrap` | `wrap` or `strict`; local policy for each encrypted direction. |
+| `send-termination` | `true` | Boolean; send the optional final empty framed record on local close. |
+| `packet-encoding` | `none` | `none` or `packetaddr`; packetaddr applies only to UDP. |
+| `verbose` | `false` | Reason-coded diagnostics, sampled at most once per second per node, without credentials, keys or plaintext. |
+
+Use exactly one name from each credential/address alias group and at most one
+protocol selector. Duplicate JSON keys, conflicting aliases, unsupported settings,
+incorrect JSON types and invalid framing combinations fail construction. Setting names
+and string values must be valid UTF-8 without embedded NULs. Server-only
+user lists, fallback settings, AlterID and legacy authentication settings are not accepted.
+
+Dynamic protocol selection uses exact TCP or UDP. A missing, ambiguous or unsupported
+protocol logs a warning and falls back to TCP. A missing dynamic address, invalid or
+zero port, or a dynamically selected UDP/`zero` combination closes that association
+before transport Init. A fixed UDP/`zero` configuration fails construction.
+
+Short IDs use exact UTF-8 bytes, without trimming, case folding or Unicode normalization.
+For example, `waterwall` maps to `106b9dde-356b-5769-b2f6-7ea4193ec5f7`.
+Malformed UUID-sized strings and non-UUID IDs longer than 30 bytes are rejected.
+A managed VmessServer requires the canonical mapped UUID in AuthenticationClient's
+password database; short-name normalization applies to this client and local server
+credentials only.
+
+The UUID can be issued by the same management system used by a managed VmessServer.
+VmessClient does not depend on AuthenticationClient or UserController, publish that
+outbound credential as an authenticated local-peer identity, or duplicate accounting
+on its UDP carrier. Admission, quotas, account rotation and user shaping remain on
+the server/application side.
+
+### DNS behaviour
+
+Resolving a hostname means looking up its IP address. `VmessClient` can send
+the final target's hostname in the VMess request, or resolve it locally and
+send the selected IP instead. Local resolution runs only for an unresolved
+hostname when enabled. Literal IPs and already-resolved targets need no lookup.
+
+This setting concerns the final target reached through the proxy. The following
+connector selects the proxy server's address and has its own DNS settings.
+Without `dns-behaviour`, local resolution is disabled.
+
+Packetaddr requires an IP target. An unresolved hostname must be resolved locally
+first; disabling lookup does not make packetaddr accept hostnames.
+
+Configure this lookup with `settings.dns-behaviour`:
+
+```json
+{
+  "dns-behaviour": {
+    "resolve": true,
+    "mode": "direct",
+    "strategy": "prefer-ipv4",
+    "servers": ["203.0.113.53:53"]
+  }
+}
+```
+
+The address is a documentation placeholder; replace it with your resolver.
+
+| Field | Meaning |
+| --- | --- |
+| `resolve` | Required boolean: `true` allows lookup of unresolved hostnames; `false` disables local lookup. |
+| `mode` | `native` (default when enabled), `direct`, or `chain`. |
+| `strategy` | `core-settings`, `accept-dns-returned-order`, `prefer-ipv4`, `prefer-ipv6`, `only-ipv4`, or `only-ipv6`; omission uses this consumer's default address preference. |
+| `servers` | 1–32 numeric IP, IP:port or [IPv6]:port endpoints; required for direct/chain and rejected for native. |
+| `dns-next` | Nonempty DNS-entry name for chain only. |
+
+`native` uses core DNS settings and the worker's shared resolver. It is the default
+DNS transport when local resolution is enabled.
+
+`direct` sends DNS queries through a private WaterWall TCP/UDP connector to the
+servers you specify.
+
+`chain` sends DNS queries through a selected chain. Use a path with encryption,
+such as your VPN, to protect those queries; the mode alone does not encrypt them.
+The DNS path must carry both UDP queries and TCP fallback. A route or lookup
+failure does not switch to native DNS or another mode.
+
+In `chain` mode, omitting `dns-next` sends DNS requests through this proxy client
+and its following transport. To use another path, set `dns-next` to a separate
+DNS branch that does not already belong to another node. Leave the field omitted
+to use this node; do not set it to this node's own name.
+
+The disabled form is exactly `"dns-behaviour": {"resolve": false}`. It rejects `mode`, `strategy`, `servers` and `dns-next`. Empty/null/non-object policies, unknown fields and numeric strategies are rejected. Strategy names use the canonical lowercase strings above. `core-settings` chooses address preference only and never changes DNS transport.
+
+`resolve: false` keeps the hostname in requests that support it. The following connector still selects the independent proxy/VPN endpoint and has its own DNS policy. Use a numeric outer endpoint or an independent bootstrap path.
+
+Packetaddr still requires an IP target after preparation/resolution. A shared DNS entry must support both TCP and UDP with the configured VMess framing.
+
+See [DomainResolver](./DomainResolver.mdx) for native, direct and protected-chain configuration examples and core option limits. This policy controls lookups owned by this node; it does not configure PTC fake DNS, TunDevice system DNS or every DNS source in the program.
+
+## Usage and troubleshooting
+
+### Destination-context example
+
 To preserve an incoming proxy/router destination:
 
 ```json
@@ -71,7 +201,46 @@ To preserve an incoming proxy/router destination:
 }
 ```
 
-## Local SOCKS5 proxy over WebSocket and TLS {#socks5-websocket-tls-client}
+### Read-only stats
+
+The registered node API operation `stats` accepts an empty JSON object `{}` of at
+most 64 bytes including whitespace. It has no reset or mutation operation. Access
+requires the ordinary APIServer node/operation permission; see the shared
+[API protocol](../05-devguides/api/protocol.mdx) in the node reference.
+
+The fixed JSON response includes effective security/options/protocol, counter,
+termination and packet encoding settings, approximate active application/carrier
+counts, successful TX/RX body records, application bytes, wire bytes, wrap counts,
+fixed close/drop reasons and suppressed verbose messages. Every uint64 counter is
+a decimal JSON string, preserving full precision. Application bytes exclude
+packetaddr envelopes and count successfully encoded TX data and delivered RX data;
+wire bytes count submitted TX/received RX bytes including handshake and framing.
+Framed EOF contributes a record but no application bytes. Snapshots load atomic
+counters independently and are approximate while traffic continues; they never
+traverse live lines. The client owns no destination backend, auth cache or replay
+table. Invalid/nonempty bodies, expired deadlines and insufficient result/working
+budgets return an API error. Working memory includes 4,608 bytes of fixed render/
+metadata scratch plus the actual result-pool allocation charge.
+
+### Build and limitations
+
+`INCLUDE_VMESS_CLIENT` enables the node in standard builds. VmessClient and VmessServer
+share the internal VmessCommon codec and its direct OpenSSL provider requirement
+(3.3 or newer for streaming SHAKE), independently of the generic crypto backend.
+Client-only builds need neither VmessServer nor AuthenticationClient/UserController.
+
+The complete expanded chain uses ordinary buffers; new output retains full onward
+pool padding.
+
+Unsupported features include legacy headers, AlterID, AES-CFB, AES-CTR, Mux.Cool, XUDP,
+reverse commands, automatic account/security switching, reconnect/replay and new
+transport implementations.
+
+WaterWall Mux framing is custom and does not provide external VMess Mux.Cool interoperability.
+
+## Advanced behavior
+
+### Local SOCKS5 proxy over WebSocket and TLS {#socks5-websocket-tls-client}
 
 This paired scenario lets local SOCKS5 applications choose their destinations,
 then carries each TCP request to a remote VMess server over WebSocket and TLS:
@@ -143,111 +312,7 @@ the requested origin. Both HTTP nodes use `http-version: 1`, `websocket: true`
 and the same path, while both TLS nodes select `http/1.1`. No CDN is required.
 TLS and WebSocket wrap VMess once per connection; no Mux node is needed here.
 
-## Settings
-
-| Setting | Default | Accepted values |
-| --- | --- | --- |
-| `uuid` / `id` / `user-id` | Required | Dashed/compact hexadecimal UUID, or an exact UTF-8 string of 1..30 bytes mapped to UUIDv5 with the nil namespace. |
-| `target-address` / `address` / `target` | Required | Literal host/IP, `dest_context->address`, or `line->dest_ctx->address`. Domains contain 1..255 non-NUL bytes. |
-| `port` | Required | Integer 1..65535, `dest_context->port`, or `line->dest_ctx->port`. |
-| `protocol` / `proto` | `tcp` | `tcp`/`connect`, `udp`/`udp-associate`, `dest_context->protocol`, or `line->dest_ctx->protocol`. |
-| `dns-behaviour` | Local resolution disabled | Local lookup, address selection and DNS transport; see DNS behaviour below. |
-| `first-payload-timeout-ms` | `400` | Integer 0..4294967295; zero sends an idle request without deliberate waiting after transport Est. |
-| `security` | `aes-128-gcm` | `aes-128-gcm`, `chacha20-poly1305`, `auto`, `none`, or `zero`. |
-| `chunk-masking` | Mode-dependent | Boolean; true except for `zero`. |
-| `global-padding` | Mode-dependent | Boolean; true for encrypted modes, false for `none` and `zero`. |
-| `authenticated-length` | `false` | Boolean; encrypted modes only. |
-| `encrypted-counter-policy` | `wrap` | `wrap` or `strict`; local policy for each encrypted direction. |
-| `send-termination` | `true` | Boolean; send the optional final empty framed record on local close. |
-| `packet-encoding` | `none` | `none` or `packetaddr`; packetaddr applies only to UDP. |
-| `verbose` | `false` | Reason-coded diagnostics, sampled at most once per second per node, without credentials, keys or plaintext. |
-
-Use exactly one name from each credential/address alias group and at most one
-protocol selector. Duplicate JSON keys, conflicting aliases, unsupported settings,
-incorrect JSON types and invalid framing combinations fail construction. Setting names
-and string values must be valid UTF-8 without embedded NULs. Server-only
-user lists, fallback settings, AlterID and legacy authentication settings are not accepted.
-
-Dynamic protocol selection uses exact TCP or UDP. A missing, ambiguous or unsupported
-protocol logs a warning and falls back to TCP. A missing dynamic address, invalid or
-zero port, or a dynamically selected UDP/`zero` combination closes that association
-before transport Init. A fixed UDP/`zero` configuration fails construction.
-
-Short IDs use exact UTF-8 bytes, without trimming, case folding or Unicode normalization.
-For example, `waterwall` maps to `106b9dde-356b-5769-b2f6-7ea4193ec5f7`.
-Malformed UUID-sized strings and non-UUID IDs longer than 30 bytes are rejected.
-A managed VmessServer requires the canonical mapped UUID in AuthenticationClient's
-password database; short-name normalization applies to this client and local server
-credentials only.
-
-The UUID can be issued by the same management system used by a managed VmessServer.
-VmessClient does not depend on AuthenticationClient or UserController, publish that
-outbound credential as an authenticated local-peer identity, or duplicate accounting
-on its UDP carrier. Admission, quotas, account rotation and user shaping remain on
-the server/application side.
-
-## DNS behaviour
-
-Resolving a hostname means looking up its IP address. `VmessClient` can send
-the final target's hostname in the VMess request, or resolve it locally and
-send the selected IP instead. Local resolution runs only for an unresolved
-hostname when enabled. Literal IPs and already-resolved targets need no lookup.
-
-This setting concerns the final target reached through the proxy. The following
-connector selects the proxy server's address and has its own DNS settings.
-Without `dns-behaviour`, local resolution is disabled.
-
-Packetaddr requires an IP target. An unresolved hostname must be resolved locally
-first; disabling lookup does not make packetaddr accept hostnames.
-
-Configure this lookup with `settings.dns-behaviour`:
-
-```json
-{
-  "dns-behaviour": {
-    "resolve": true,
-    "mode": "direct",
-    "strategy": "prefer-ipv4",
-    "servers": ["203.0.113.53:53"]
-  }
-}
-```
-
-The address is a documentation placeholder; replace it with your resolver.
-
-| Field | Meaning |
-| --- | --- |
-| `resolve` | Required boolean: `true` allows lookup of unresolved hostnames; `false` disables local lookup. |
-| `mode` | `native` (default when enabled), `direct`, or `chain`. |
-| `strategy` | `core-settings`, `accept-dns-returned-order`, `prefer-ipv4`, `prefer-ipv6`, `only-ipv4`, or `only-ipv6`; omission uses this consumer's default address preference. |
-| `servers` | 1–32 numeric IP, IP:port or [IPv6]:port endpoints; required for direct/chain and rejected for native. |
-| `dns-next` | Nonempty DNS-entry name for chain only. |
-
-`native` uses core DNS settings and the worker's shared resolver. It is the default
-DNS transport when local resolution is enabled.
-
-`direct` sends DNS queries through a private WaterWall TCP/UDP connector to the
-servers you specify.
-
-`chain` sends DNS queries through a selected chain. Use a path with encryption,
-such as your VPN, to protect those queries; the mode alone does not encrypt them.
-The DNS path must carry both UDP queries and TCP fallback. A route or lookup
-failure does not switch to native DNS or another mode.
-
-In `chain` mode, omitting `dns-next` sends DNS requests through this proxy client
-and its following transport. To use another path, set `dns-next` to a separate
-DNS branch that does not already belong to another node. Leave the field omitted
-to use this node; do not set it to this node's own name.
-
-The disabled form is exactly `"dns-behaviour": {"resolve": false}`. It rejects `mode`, `strategy`, `servers` and `dns-next`. Empty/null/non-object policies, unknown fields and numeric strategies are rejected. Strategy names use the canonical lowercase strings above. `core-settings` chooses address preference only and never changes DNS transport.
-
-`resolve: false` keeps the hostname in requests that support it. The following connector still selects the independent proxy/VPN endpoint and has its own DNS policy. Use a numeric outer endpoint or an independent bootstrap path.
-
-Packetaddr still requires an IP target after preparation/resolution. A shared DNS entry must support both TCP and UDP with the configured VMess framing.
-
-See [DomainResolver](./DomainResolver.mdx) for native, direct and protected-chain configuration examples and core option limits. This policy controls lookups owned by this node; it does not configure PTC fake DNS, TunDevice system DNS or every DNS source in the program.
-
-## Security and framing
+### Security and framing
 
 All modes use authenticated AEAD request and response headers. `none` and `zero`
 leave application bodies unencrypted and unauthenticated. TLS remains separately
@@ -276,7 +341,9 @@ For the internal bits CHUNK=1, MASK=4, PADDING=8 and AUTH_LENGTH=16, the support
 combinations are `1,5,13,17,21,29` for encrypted modes, `1,5` for TCP NONE,
 `1,5,13` for UDP NONE, and `0` for zero. These are not a JSON bitmask setting.
 
-## Request timing and response handling
+## Implementation details
+
+### Request timing and response handling
 
 Init prepares the destination and starts the transport without emitting a VMess
 request. The first eligible payload sends immediately, including before Est,
@@ -302,7 +369,7 @@ applying SwitchAccount, endpoint or credential changes. Coalesced body bytes rem
 in order. Bad tags, malformed lengths and incorrect authenticated markers close
 the affected connection.
 
-## UDP, bounds and lifecycle
+### UDP, bounds and lifecycle
 
 The application UDP line is borrowed. VmessClient creates and owns one same-worker
 TCP carrier per association and preserves one fixed final target. Each accepted
@@ -370,44 +437,7 @@ and their dependent carriers before chain/pool teardown; quiescence prevents new
 timer output or associations. The node remains active for the whole connection,
 including `none`/`zero`.
 
-## Read-only stats
-
-The registered node API operation `stats` accepts an empty JSON object `{}` of at
-most 64 bytes including whitespace. It has no reset or mutation operation. Access
-requires the ordinary APIServer node/operation permission; see the shared
-[API protocol](../05-devguides/api/protocol.mdx) in the node reference.
-
-The fixed JSON response includes effective security/options/protocol, counter,
-termination and packet encoding settings, approximate active application/carrier
-counts, successful TX/RX body records, application bytes, wire bytes, wrap counts,
-fixed close/drop reasons and suppressed verbose messages. Every uint64 counter is
-a decimal JSON string, preserving full precision. Application bytes exclude
-packetaddr envelopes and count successfully encoded TX data and delivered RX data;
-wire bytes count submitted TX/received RX bytes including handshake and framing.
-Framed EOF contributes a record but no application bytes. Snapshots load atomic
-counters independently and are approximate while traffic continues; they never
-traverse live lines. The client owns no destination backend, auth cache or replay
-table. Invalid/nonempty bodies, expired deadlines and insufficient result/working
-budgets return an API error. Working memory includes 4,608 bytes of fixed render/
-metadata scratch plus the actual result-pool allocation charge.
-
-## Build and limitations
-
-`INCLUDE_VMESS_CLIENT` enables the node in standard builds. VmessClient and VmessServer
-share the internal VmessCommon codec and its direct OpenSSL provider requirement
-(3.3 or newer for streaming SHAKE), independently of the generic crypto backend.
-Client-only builds need neither VmessServer nor AuthenticationClient/UserController.
-
-The complete expanded chain uses ordinary buffers; new output retains full onward
-pool padding.
-
-Unsupported features include legacy headers, AlterID, AES-CFB, AES-CTR, Mux.Cool, XUDP,
-reverse commands, automatic account/security switching, reconnect/replay and new
-transport implementations.
-
-WaterWall Mux framing is custom and does not provide external VMess Mux.Cool interoperability.
-
-## Node Metadata
+### Node Metadata
 
 Source-backed metadata from `instance/node.c`:
 

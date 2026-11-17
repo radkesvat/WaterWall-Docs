@@ -2,76 +2,328 @@
 sidebar_position: 444
 title: "HttpProxyClient"
 sidebar_label: "HttpProxyClient"
-description: "راهنمای HttpProxyClient در WaterWall."
+description: "تونل‌های HTTP/1.1 CONNECT و درخواست‌های تکی HTTP از طریق پراکسی بالادستی، با احراز هویت اختیاری Basic و پشتیبانی از splice."
 ---
 
+import Link from '@docusaurus/Link';
+
 <!--
-Documentation version: 3
+Documentation version: 4
 -->
 
-# HttpProxyClient
+<Link id="httpproxyclient" />
 
-این node درخواست HTTP/1.1 یا تونل CONNECT را از proxy بالادست عبور می‌دهد. node بعدی باید به endpoint خود proxy وصل شود؛ `target-address` و `port` مقصد داخل proxy را انتخاب می‌کنند.
+<Link id="httpproxyclient-node" />
 
-## تنظیمات HTTP
+# گره HttpProxyClient
 
-`mode` یکی از `connect` (پیش‌فرض) یا `http` است. `target-address` و `port` اجباری‌اند و می‌توانند از `dest_context->address` و `dest_context->port` خوانده شوند. حالت HTTP یک درخواست می‌سازد و بایت‌های node قبلی را body آن می‌گیرد. `method`، `path` و `body-mode` آن را مشخص می‌کنند. `username` و `password` احراز هویت Basic اختیاری را فعال می‌کنند. برای TLS به proxy، `TlsClient` را پیش از connector قرار دهید.
+## نمای کلی {#overview}
+
+<bdi dir="ltr">`HttpProxyClient`</bdi> از طریق یک پراکسی HTTP/1.1 بالادستی متصل می‌شود. این گره میانی لایهٔ 4 دو حالت دارد:
+
+- **<bdi dir="ltr">`connect`</bdi> (پیش‌فرض):** یک تونل CONNECT به مقصد باز می‌کند و سپس جریان TCP را در هر دو جهت بدون تفسیر محتوا حمل می‌کند.
+- **<bdi dir="ltr">`http`</bdi>:** یک درخواست HTTP مطابق پیکربندی می‌سازد، بایت‌های برنامه در جهت upstream را به‌عنوان بدنهٔ درخواست به کار می‌برد و فقط بدنهٔ پاسخ موفق را برمی‌گرداند.
+
+گره انتقال بعدی به **نقطهٔ اتصال پراکسی** وصل می‌شود. <bdi dir="ltr">`target-address`</bdi> و <bdi dir="ltr">`port`</bdi> در HttpProxyClient، **مقصد اصلی قابل دسترسی از طریق آن پراکسی** را انتخاب می‌کنند. این دو آدرس مستقل‌اند.
+
+حالت HTTP درخواست‌های کامل HTTP ارائه‌شده از سوی فراخواننده را بازنویسی نمی‌کند: گره قبلی فقط بایت‌های بدنه را می‌دهد. اگر برنامه از قبل HTTP، TLS یا پروتکل TCP دیگری را به کار می‌برد و باید قاب‌بندی خودش را حفظ کند، از CONNECT استفاده کنید. <bdi dir="ltr">`HttpProxyServer`</bdi> رابط ورودی پراکسی فوروارد را فراهم می‌کند؛ <bdi dir="ltr">`HttpClient`</bdi> انتقال HTTP جداگانه‌ای با حالت‌های قاب‌بندی بیشتر ارائه می‌دهد.
+
+## جایگاه معمول در زنجیره {#typical-placement}
 
 ```text
 TcpListener -> HttpProxyClient -> TcpConnector
+TcpListener -> HttpProxyClient -> TlsClient -> TcpConnector
 ```
 
-برای HTTP کامل و تنظیمات timeout و header، [مرجع انگلیسی](https://radkesvat.github.io/WaterWall/docs/noderefs/HttpProxyClient) را ببینید.
+زنجیرهٔ دوم از اتصال به پراکسی دارای TLS محافظت می‌کند. <bdi dir="ltr">`TlsClient`</bdi> را برای نام گواهی همان پراکسی و HTTP/1.1 تنظیم کنید؛ برای مثال با <bdi dir="ltr">`alpns: ["http/1.1"]`</bdi>. TLS به‌صورت خودکار اضافه نمی‌شود.
 
-## رفتار DNS
+حالت HTTP همیشه یک URL مطلق <bdi dir="ltr">`http://`</bdi> درخواست می‌کند. افزودن TLS پس از HttpProxyClient اتصال به پراکسی را محافظت می‌کند؛ درخواست مقصد اصلی را به HTTPS تبدیل نمی‌کند. برای HTTPS تا مقصد اصلی، از CONNECT استفاده کنید و برقراری نشست TLS مقصد درون تونل را به برنامه یا گره TLS قبلی بسپارید.
 
-resolve کردن نام دامنه یعنی پیدا کردن آدرس IP آن. `HttpProxyClient` می‌تواند نام دامنهٔ
-مقصد نهایی را در درخواست HTTP CONNECT بفرستد، یا آن را محلی resolve کند و IP انتخاب‌شده
-را بفرستد. resolve محلی فقط برای نام دامنهٔ resolve‌نشده و در صورت فعال بودن انجام
-می‌شود. IP عددی یا مقصدی که از قبل resolve شده باشد به lookup نیاز ندارد.
+## نمونهٔ کاربردی ساده {#minimal-practical-example}
 
-این تنظیم مربوط به مقصد نهایی است که از طریق proxy به آن می‌رسید. connector بعدی
-آدرس سرور proxy را انتخاب می‌کند و تنظیمات DNS مستقل خودش را دارد. با حذف
-`dns-behaviour`، resolve محلی غیرفعال است.
+این یک **پیکربندی کامل گره‌ها** است؛ فایل آن را در <bdi dir="ltr">`core.json.configs`</bdi> فهرست کنید. <bdi dir="ltr">`origin.example`</bdi> و نقطهٔ اتصال پراکسی را با مقادیر خودتان جایگزین کنید.
 
-resolve محلی فقط در حالت CONNECT پشتیبانی می‌شود. در حالت HTTP عادی، نام دامنهٔ
-تنظیم‌شده به‌عنوان authority درخواست برای proxy بالادست باقی می‌ماند.
+### نمونهٔ CONNECT {#connect-example}
 
-این lookup را با `settings.dns-behaviour` تنظیم کنید:
+این پیکربندی گره‌ها، اتصال‌های پورت محلی 8443 را از طریق پراکسی <bdi dir="ltr">`127.0.0.1:8080`</bdi> به <bdi dir="ltr">`origin.example:443`</bdi> می‌فرستد:
 
 ```json
-{"dns-behaviour": {"resolve": true, "mode": "direct", "strategy": "prefer-ipv4", "servers": ["203.0.113.53:53"]}}
+{
+  "name": "http-proxy-connect",
+  "nodes": [
+    {
+      "name": "listen",
+      "type": "TcpListener",
+      "next": "proxy",
+      "settings": { "address": "127.0.0.1", "port": 8443 }
+    },
+    {
+      "name": "proxy",
+      "type": "HttpProxyClient",
+      "next": "proxy-transport",
+      "settings": {
+        "mode": "connect",
+        "target-address": "origin.example",
+        "port": 443
+      }
+    },
+    {
+      "name": "proxy-transport",
+      "type": "TcpConnector",
+      "settings": { "address": "127.0.0.1", "port": 8080 }
+    }
+  ]
+}
 ```
 
-این IP نمونهٔ مستندات است؛ آن را با سرور خود جایگزین کنید.
+HttpProxyClient درخواست <bdi dir="ltr">`CONNECT origin.example:443 HTTP/1.1`</bdi> را می‌فرستد، سرآیند پاسخ پراکسی را مصرف می‌کند و پس از پاسخ نهایی 2xx اجازهٔ عبور بایت‌های برنامه را می‌دهد. اگر مقصد اصلی روی پورت 443 انتظار TLS دارد، خود برنامه باید TLS را فراهم کند.
+
+## پیکربندی {#configuration}
+
+<Link id="تنظیمات-http" />
+
+### تنظیمات {#settings}
+
+گره به <bdi dir="ltr">`name`</bdi>، مقدار <bdi dir="ltr">`type: "HttpProxyClient"`</bdi>، فیلد <bdi dir="ltr">`next`</bdi> و شیء <bdi dir="ltr">`settings`</bdi> نیاز دارد. جای آن میان گره‌های لایهٔ 4 است. نام تنظیمات و مقادیر شمارشی به بزرگی و کوچکی حروف حساس‌اند. تنظیمات ناشناخته یا تکراری، نوع‌های نادرست و گزینه‌های متعارض حالت باعث شکست راه‌اندازی می‌شوند.
+
+#### مقصد و احراز هویت پراکسی {#target-and-proxy-authentication}
+
+| تنظیم | پیش‌فرض | معنی |
+| --- | --- | --- |
+| <bdi dir="ltr">`mode`</bdi> | <bdi dir="ltr">`"connect"`</bdi> | <bdi dir="ltr">`"connect"`</bdi> یا <bdi dir="ltr">`"http"`</bdi>. |
+| <bdi dir="ltr">`target-address`</bdi> | اجباری | IPv4، IPv6، دامنهٔ مقصد اصلی یا دقیقاً <bdi dir="ltr">`"dest_context->address"`</bdi>؛ <bdi dir="ltr">1–255</bdi> بایت. |
+| <bdi dir="ltr">`dns-behaviour`</bdi> | resolve محلی غیرفعال | جست‌وجوی مقصد اصلی، انتخاب آدرس و انتقال DNS؛ فعال‌کردن resolve به CONNECT نیاز دارد. |
+| <bdi dir="ltr">`port`</bdi> | اجباری | پورت صحیح مقصد اصلی در بازهٔ <bdi dir="ltr">1–65535</bdi>، یا دقیقاً <bdi dir="ltr">`"dest_context->port"`</bdi>. |
+| <bdi dir="ltr">`username`</bdi>, <bdi dir="ltr">`password`</bdi> | بدون مقدار | زوج اختیاری برای احراز هویت پیش‌دستانهٔ Basic پراکسی. هر دو باید با هم ارائه شوند. |
+| <bdi dir="ltr">`headers`</bdi> | <bdi dir="ltr">`{}`</bdi> | سرآیندهای اضافی درخواست با مقدار رشته‌ای، در هر دو حالت. |
+| <bdi dir="ltr">`verbose`</bdi> | <bdi dir="ltr">`false`</bdi> | مقدار بولی؛ اطلاعات تشخیصی بیشتر بدون اطلاعات ورود یا سرآیندهای کامل. |
+
+<bdi dir="ltr">`target-address`</bdi> شامل میزبان یا IP است، نه URL؛ پورت جداگانه مشخص می‌شود. بخش آدرس و پورت یا authority برای IPv6 روی شبکه کروشه دارد و هر authority شامل پورت است. مقصدهای دامنه‌ای به‌طور پیش‌فرض از DNS سمت پراکسی استفاده می‌کنند. برای resolve محلی مقصد اصلی در حالت CONNECT، مقدار <bdi dir="ltr">`dns-behaviour.resolve`</bdi> را <bdi dir="ltr">`true`</bdi> بگذارید. حالت HTTP عادی نام میزبان پیکربندی‌شده را در authority درخواست نگه می‌دارد و resolve محلی را مجاز نمی‌داند. بخش رفتار DNS در ادامه، فیلدهای سیاست و راهبردهای آدرس را فهرست می‌کند.
+
+آدرس‌های صریح IPv4/IPv6 و IPهای پویایی که از قبل resolve شده‌اند، DNS را دور می‌زنند؛ حتی آدرس صریحی که از خانوادهٔ مقابل باشد. این سیاست‌ها پاسخ‌های DNS را انتخاب می‌کنند، نه IPهای صریح را. بازگشت به گزینهٔ بعدی در راهبرد ترجیح آدرس، درخواست پراکسی را دوباره اجرا نمی‌کند.
+
+DNS محلی پیش از Init هستهٔ کلاینت و Init گره انتقال بعدی اجرا می‌شود. آدرس عددی و پورت انتخاب‌شدهٔ مقصد اصلی هم در authority مربوط به CONNECT و هم در Host قرار می‌گیرند؛ IPv6 داخل کروشه است. مقادیر ثابت و پویای آدرس/پورت را می‌توان با هم ترکیب کرد. connector بعدی، **پراکسی** را مستقل و با سیاست خودش انتخاب و resolve می‌کند. نبود مقادیر پویای مقصد یا تعیین صریح پروتکل مقصد به‌صورت UDP، ICMP یا بسته‌ای، line مربوط را می‌بندد؛ پروتکل مشخص‌نشده TCP می‌شود.
+
+برای مثال، تنظیمات زیر مقصد اصلی را به‌صورت محلی resolve می‌کنند:
+
+```json
+{
+  "mode": "connect",
+  "target-address": "origin.example",
+  "port": 443,
+  "dns-behaviour": {"resolve": true, "strategy": "prefer-ipv4"}
+}
+```
+
+اگر DNS آدرس <bdi dir="ltr">`192.0.2.20`</bdi> را انتخاب کند، درخواست <bdi dir="ltr">`CONNECT 192.0.2.20:443 HTTP/1.1`</bdi> با <bdi dir="ltr">`Host: 192.0.2.20:443`</bdi> ارسال می‌شود. نام میزبان اصلی جای Host را نمی‌گیرد. TLS درون CONNECT بر عهدهٔ برنامه/گره قبلی است: نام میزبان مقصد اصلی را برای SNI و اعتبارسنجی گواهی نگه دارید. TLS پس از HttpProxyClient هویت پراکسی را اعتبارسنجی می‌کند.
+
+هر یک از اطلاعات ورود باید <bdi dir="ltr">1–255</bdi> بایت و فاقد بایت‌های کنترلی یا DEL باشد؛ نام کاربری همچنین نمی‌تواند <bdi dir="ltr">`:`</bdi> داشته باشد. کلاینت در اولین درخواست خود <bdi dir="ltr">`Proxy-Authorization: Basic ...`</bdi> را می‌فرستد و پس از چالش احراز هویت تلاش مجدد نمی‌کند. این اطلاعات ورود به <bdi dir="ltr">`Authorization`</bdi> مقصد اصلی یا هویت کاربر line در WaterWall تبدیل نمی‌شوند. کدگذاری Basic اطلاعات ورود را رمزنگاری نمی‌کند؛ TLS تا پراکسی می‌تواند در مسیر انتقال از آن‌ها محافظت کند.
+
+نام سرآیندهای اضافی باید توکن معتبر HTTP باشد و با نادیده‌گرفتن بزرگی و کوچکی حروف ASCII یکتا بماند. مقدارها نمی‌توانند CR/LF یا نویسه‌های کنترلی دیگری جز تب افقی داشته باشند. گره، <bdi dir="ltr">`Host`</bdi>، <bdi dir="ltr">`Proxy-Authorization`</bdi>، <bdi dir="ltr">`Content-Length`</bdi>، <bdi dir="ltr">`Transfer-Encoding`</bdi> و <bdi dir="ltr">`Connection`</bdi> را کنترل می‌کند. سرآیندهای سفارشی همچنین نمی‌توانند <bdi dir="ltr">`Proxy-Connection`</bdi>، <bdi dir="ltr">`Keep-Alive`</bdi>، <bdi dir="ltr">`TE`</bdi>، <bdi dir="ltr">`Trailer`</bdi>، <bdi dir="ltr">`Upgrade`</bdi> یا <bdi dir="ltr">`Expect`</bdi> را تنظیم کنند. <bdi dir="ltr">`Authorization`</bdi> مقصد اصلی و <bdi dir="ltr">`Content-Type`</bdi> مجازند.
+
+#### گزینه‌های درخواست HTTP {#http-request-options}
+
+این تنظیمات فقط با <bdi dir="ltr">`mode: "http"`</bdi> پذیرفته می‌شوند:
+
+| تنظیم | پیش‌فرض | معنی |
+| --- | --- | --- |
+| <bdi dir="ltr">`method`</bdi> | <bdi dir="ltr">`"POST"`</bdi> | <bdi dir="ltr">`GET`</bdi>، <bdi dir="ltr">`HEAD`</bdi>، <bdi dir="ltr">`POST`</bdi>، <bdi dir="ltr">`PUT`</bdi>، <bdi dir="ltr">`PATCH`</bdi>، <bdi dir="ltr">`DELETE`</bdi> یا <bdi dir="ltr">`OPTIONS`</bdi>. |
+| <bdi dir="ltr">`path`</bdi> | <bdi dir="ltr">`"/"`</bdi> | مسیر escape‌شدهٔ مقصد اصلی و query اختیاری، با شروع <bdi dir="ltr">`/`</bdi>. |
+| <bdi dir="ltr">`body-mode`</bdi> | <bdi dir="ltr">`"chunked"`</bdi> | <bdi dir="ltr">`"none"`</bdi>، <bdi dir="ltr">`"fixed"`</bdi> یا <bdi dir="ltr">`"chunked"`</bdi>؛ HEAD به <bdi dir="ltr">`"none"`</bdi> نیاز دارد. |
+| <bdi dir="ltr">`content-length`</bdi> | بدون مقدار | فقط برای <bdi dir="ltr">`"fixed"`</bdi> اجباری است؛ عدد صحیح <bdi dir="ltr">0–9007199254740991</bdi>. |
+
+مسیر نمی‌تواند فاصلهٔ سفید خام، بایت غیر ASCII، fragment (<bdi dir="ltr">`#`</bdi>)، بک‌اسلش یا escape درصدی نامعتبر داشته باشد. خط درخواست تولیدشده، شامل متد، URI مطلق و نسخهٔ HTTP، به 8192 بایت محدود است. هر درخواست HTTP دارای <bdi dir="ltr">`Connection: close`</bdi> است. ارائهٔ <bdi dir="ltr">`content-length`</bdi> با هر حالت بدنه‌ای جز <bdi dir="ltr">`fixed`</bdi> نامعتبر است.
+
+#### محدودیت‌ها و مهلت‌ها {#limits-and-timeouts}
+
+| تنظیم | پیش‌فرض | معنی |
+| --- | --- | --- |
+| <bdi dir="ltr">`max-header-bytes`</bdi> | <bdi dir="ltr">`32768`</bdi> | عدد صحیح <bdi dir="ltr">1024–65536</bdi>؛ هر بلوک سرآیند پاسخ و کل سرآیند درخواست تولیدشده را محدود می‌کند. |
+| <bdi dir="ltr">`header-timeout-ms`</bdi> | <bdi dir="ltr">`15000`</bdi> | مهلت از اولین بایت هر بلوک سرآیند پاسخ ناقص. |
+| <bdi dir="ltr">`connect-response-timeout-ms`</bdi> | <bdi dir="ltr">`30000`</bdi> | فقط CONNECT: مهلت از تحویل سرآیند درخواست تا موفقیت نهایی. |
+| <bdi dir="ltr">`idle-timeout-ms`</bdi> | <bdi dir="ltr">`300000`</bdi> | مهلت نبود پیشرفت بایتی که از Init شروع و با پیشرفت payload تازه می‌شود. |
+
+DNS مقصد اصلی از سیاست مهلت/تلاش مجدد سرویس DNS ناهمگام استفاده می‌کند. محاسبهٔ زمان بیکاری کلاینت در Init هسته، پس از DNS مقصد اصلی آغاز می‌شود؛ بنابراین <bdi dir="ltr">`idle-timeout-ms`</bdi> این انتظار را حساب نمی‌کند، اما انتظارهای بعدی برای DNS پراکسی، اتصال و handshake را در بر می‌گیرد.
+
+مهلت‌ها عدد صحیح <bdi dir="ltr">1–2147483647</bdi> میلی‌ثانیه می‌پذیرند؛ صفر آن‌ها را غیرفعال نمی‌کند. زمان Pause نیز حساب می‌شود و انقضای مهلت line را می‌بندد. در حالت HTTP نمی‌توان <bdi dir="ltr">`connect-response-timeout-ms`</bdi> را مشخص کرد؛ انتظار پاسخ آن با مهلت‌های سرآیند و بیکاری پوشش داده می‌شود.
+
+<Link id="رفتار-dns" />
+
+### رفتار DNS {#dns-behaviour}
+
+resolve کردن نام میزبان یعنی جست‌وجوی آدرس IP آن. <bdi dir="ltr">`HttpProxyClient`</bdi> می‌تواند نام میزبان مقصد نهایی را در درخواست HTTP CONNECT بفرستد، یا آن را به‌صورت محلی resolve کند و IP انتخاب‌شده را بفرستد. resolve محلی فقط برای نام میزبان resolve‌نشده و در صورت فعال‌بودن انجام می‌شود. IPهای صریح و مقصدهایی که از قبل resolve شده‌اند به جست‌وجو نیاز ندارند.
+
+این تنظیم مربوط به مقصد نهایی قابل دسترسی از طریق پراکسی است. connector بعدی آدرس سرور پراکسی را انتخاب می‌کند و تنظیمات DNS خودش را دارد. بدون <bdi dir="ltr">`dns-behaviour`</bdi>، resolve محلی غیرفعال است.
+
+resolve محلی فقط در حالت CONNECT پشتیبانی می‌شود. در حالت HTTP عادی، نام میزبان پیکربندی‌شده به‌عنوان authority درخواست برای پراکسی بالادستی باقی می‌ماند.
+
+این جست‌وجو را با <bdi dir="ltr">`settings.dns-behaviour`</bdi> پیکربندی کنید:
+
+```json
+{
+  "dns-behaviour": {
+    "resolve": true,
+    "mode": "direct",
+    "strategy": "prefer-ipv4",
+    "servers": ["203.0.113.53:53"]
+  }
+}
+```
+
+این آدرس صرفاً نمونهٔ مستندات است؛ آن را با resolver خودتان جایگزین کنید.
 
 | فیلد | معنی |
 | --- | --- |
-| `resolve` | boolean اجباری: `true` اجازهٔ lookup نام دامنهٔ resolve‌نشده را می‌دهد و `false`، lookup محلی را غیرفعال می‌کند. |
-| `mode` | `native` (پیش‌فرض هنگام فعال بودن)، `direct` یا `chain`. |
-| `strategy` | یکی از `core-settings`، `accept-dns-returned-order`، `prefer-ipv4`، `prefer-ipv6`، `only-ipv4` یا `only-ipv6`؛ حذف آن اولویت پیش‌فرض آدرس مصرف‌کننده را به کار می‌برد. |
-| `servers` | ۱ تا ۳۲ endpoint عددی IP، IP:port یا [IPv6]:port؛ در direct/chain اجباری و در native ممنوع. |
-| `dns-next` | نام غیرخالی ورودی DNS، فقط در chain. |
+| <bdi dir="ltr">`resolve`</bdi> | مقدار بولی اجباری: <bdi dir="ltr">`true`</bdi> جست‌وجوی نام‌های میزبان resolve‌نشده را مجاز می‌کند؛ <bdi dir="ltr">`false`</bdi> جست‌وجوی محلی را غیرفعال می‌کند. |
+| <bdi dir="ltr">`mode`</bdi> | <bdi dir="ltr">`native`</bdi> (پیش‌فرض هنگام فعال‌بودن)، <bdi dir="ltr">`direct`</bdi> یا <bdi dir="ltr">`chain`</bdi>. |
+| <bdi dir="ltr">`strategy`</bdi> | <bdi dir="ltr">`core-settings`</bdi>، <bdi dir="ltr">`accept-dns-returned-order`</bdi>، <bdi dir="ltr">`prefer-ipv4`</bdi>، <bdi dir="ltr">`prefer-ipv6`</bdi>، <bdi dir="ltr">`only-ipv4`</bdi> یا <bdi dir="ltr">`only-ipv6`</bdi>؛ حذف آن ترجیح پیش‌فرض آدرس همین مصرف‌کننده را به کار می‌برد. |
+| <bdi dir="ltr">`servers`</bdi> | <bdi dir="ltr">1–32</bdi> نقطهٔ اتصال عددی با قالب IP، IP:port یا [IPv6]:port؛ در direct/chain اجباری و در native رد می‌شود. |
+| <bdi dir="ltr">`dns-next`</bdi> | نام غیرخالی ورودی DNS، فقط برای chain. |
 
-`native` از تنظیمات DNS در core و resolver مشترک worker استفاده می‌کند. هنگام
-فعال بودن resolve محلی، این حالت پیش‌فرض انتقال DNS است.
+<bdi dir="ltr">`native`</bdi> از تنظیمات DNS هسته و resolver مشترک worker استفاده می‌کند. این حالت، انتقال پیش‌فرض DNS هنگام فعال‌بودن resolve محلی است.
 
-`direct` درخواست‌های DNS را از طریق یک connector خصوصی TCP/UDP در WaterWall به
-سرورهایی که مشخص کرده‌اید می‌فرستد.
+<bdi dir="ltr">`direct`</bdi> درخواست‌های DNS را از طریق یک connector خصوصی TCP/UDP در WaterWall به سرورهای مشخص‌شده می‌فرستد.
 
-`chain` درخواست‌های DNS را از chain انتخابی می‌فرستد. برای محافظت از آن‌ها، مسیری
-رمزنگاری‌شده مانند VPN خود را انتخاب کنید؛ این حالت به‌تنهایی درخواست‌ها را
-رمزنگاری نمی‌کند. مسیر DNS باید هم درخواست‌های UDP و هم fallback روی TCP را حمل
-کند. خطای route یا lookup باعث تغییر به DNS بومی یا حالت دیگر نمی‌شود.
+<bdi dir="ltr">`chain`</bdi> درخواست‌های DNS را از زنجیرهٔ انتخاب‌شده می‌فرستد. برای محافظت از این درخواست‌ها مسیری رمزنگاری‌شده مانند VPN خودتان به کار ببرید؛ این حالت به‌تنهایی آن‌ها را رمزنگاری نمی‌کند. مسیر DNS باید هم درخواست‌های UDP و هم مسیر جایگزین TCP را حمل کند. شکست مسیریابی یا جست‌وجو باعث تغییر به DNS بومی یا حالت دیگری نمی‌شود.
 
-در حالت `chain`، مقدار `dns-next` را نام یک شاخهٔ DNS جدا بگذارید که هم UDP و هم
-TCP را پشتیبانی کند. این شاخه نباید از قبل به node دیگری تعلق داشته باشد. این node
-شاخهٔ DNS پیش‌فرض ندارد و نام‌بردن از خود آن مجاز نیست.
+برای <bdi dir="ltr">`chain`</bdi>، مقدار <bdi dir="ltr">`dns-next`</bdi> را نام شاخهٔ DNS جداگانه‌ای قرار دهید که هم UDP و هم TCP را پشتیبانی کند. شاخه نباید از قبل متعلق به گره دیگری باشد. این گره شاخهٔ DNS پیش‌فرض ندارد؛ نام‌بردن از خود همین گره مجاز نیست.
 
-شکل غیرفعال دقیقاً `"dns-behaviour": {"resolve": false}` است و فیلدهای `mode`، `strategy`، `servers` و `dns-next` را رد می‌کند. object تهی، null، نوع غیرobject، فیلد ناشناخته و strategy عددی رد می‌شوند. نام strategy باید یکی از رشته‌های canonical بالا با حروف کوچک باشد. `core-settings` فقط اولویت آدرس را انتخاب می‌کند و انتقال DNS را تغییر نمی‌دهد.
+شکل غیرفعال دقیقاً <bdi dir="ltr">`"dns-behaviour": {"resolve": false}`</bdi> است. این شکل <bdi dir="ltr">`mode`</bdi>، <bdi dir="ltr">`strategy`</bdi>، <bdi dir="ltr">`servers`</bdi> و <bdi dir="ltr">`dns-next`</bdi> را رد می‌کند. سیاست‌های تهی، null یا غیرشیء، فیلدهای ناشناخته و راهبردهای عددی رد می‌شوند. نام راهبردها همان رشته‌های استاندارد بالا با حروف کوچک است. <bdi dir="ltr">`core-settings`</bdi> فقط ترجیح آدرس را انتخاب می‌کند و هرگز انتقال DNS را تغییر نمی‌دهد.
 
-با `resolve: false`، درخواست proxy در صورت پشتیبانی پروتکل نام دامنه را نگه می‌دارد. connector بعدی مقصد مستقل proxy یا VPN و سیاست DNS خودش را دارد؛ برای bootstrap از IP عددی یا مسیر مستقل استفاده کنید.
+<bdi dir="ltr">`resolve: false`</bdi> نام میزبان را در درخواست‌هایی که از آن پشتیبانی می‌کنند نگه می‌دارد. connector بعدی همچنان نقطهٔ اتصال مستقل پراکسی/VPN را انتخاب می‌کند و سیاست DNS خودش را دارد. از نقطهٔ اتصال بیرونی عددی یا مسیر مستقل برای bootstrap استفاده کنید.
 
-resolve محلی فقط با `mode: "connect"` مجاز است. حالت HTTP عادی معنای authority را نگه می‌دارد. `settings.mode` برای HTTP و `settings.dns-behaviour.mode` برای انتقال DNS است.
+resolve محلیِ فعال فقط با حالت HTTP برابر <bdi dir="ltr">`mode: "connect"`</bdi> پشتیبانی می‌شود. HTTP عادی معنای authority خود را حفظ می‌کند. <bdi dir="ltr">`settings.mode`</bdi> مربوط به HTTP و <bdi dir="ltr">`settings.dns-behaviour.mode`</bdi> مربوط به DNS، عملیات متفاوتی را انتخاب می‌کنند.
 
-مثال‌های native، direct و chain محافظت‌شده و محدودیت گزینه‌های core را در [DomainResolver](./DomainResolver.mdx) ببینید. این سیاست فقط lookupهای متعلق به همین node را کنترل می‌کند؛ fake DNS در PTC، DNS سیستم در TunDevice و همهٔ منابع DNS برنامه را تغییر نمی‌دهد.
+برای نمونه‌های پیکربندی native، direct و زنجیرهٔ محافظت‌شده و محدودیت گزینه‌های هسته، [DomainResolver](./DomainResolver.mdx) را ببینید. این سیاست جست‌وجوهای متعلق به همین گره را کنترل می‌کند؛ fake DNS در PTC، DNS سیستمی TunDevice یا همهٔ منابع DNS برنامه را پیکربندی نمی‌کند.
+
+## کاربرد و رفع اشکال {#usage-and-troubleshooting}
+
+### مقصد پویا و احراز هویت پراکسی {#dynamic-target-and-proxy-authentication}
+
+اگر گره قبلی زمینهٔ مقصد را تنظیم می‌کند، با این تنظیمات کلاینت از همان مقصد استفاده کنید. این نمونه احراز هویت پراکسی را نیز فعال می‌کند:
+
+```json
+{
+  "name": "proxy",
+  "type": "HttpProxyClient",
+  "next": "proxy-transport",
+  "settings": {
+    "target-address": "dest_context->address",
+    "port": "dest_context->port",
+    "username": "alice",
+    "password": "replace-me"
+  }
+}
+```
+
+connector بعدی همچنان باید به پراکسی آدرس‌دهی کند. مقادیر پویای مقصد پیش از آن ثبت می‌شوند که connector بتواند زمینهٔ مقصد line را جایگزین کند.
+
+### نمونه‌های HTTP با یک درخواست {#one-request-http-examples}
+
+برای دانلود یک بدنه، گره <bdi dir="ltr">`proxy`</bdi> در نمونهٔ CONNECT را با این گره جایگزین کنید:
+
+```json
+{
+  "name": "proxy",
+  "type": "HttpProxyClient",
+  "next": "proxy-transport",
+  "settings": {
+    "mode": "http",
+    "target-address": "origin.example",
+    "port": 80,
+    "method": "GET",
+    "path": "/download",
+    "body-mode": "none"
+  }
+}
+```
+
+هر اتصال محلی درخواست <bdi dir="ltr">`GET http://origin.example:80/download HTTP/1.1`</bdi> را آغاز می‌کند. برنامهٔ محلی بدون ارسال درخواست خودش، بدنهٔ پاسخ را می‌خواند. ارسال دادهٔ غیرخالی در جهت upstream در این نمونه line را می‌بندد.
+
+برای آپلودی با اندازهٔ معلوم، از این تنظیمات استفاده کنید:
+
+```json
+{
+  "name": "proxy",
+  "type": "HttpProxyClient",
+  "next": "proxy-transport",
+  "settings": {
+    "mode": "http",
+    "target-address": "origin.example",
+    "port": 80,
+    "method": "POST",
+    "path": "/upload?source=waterwall",
+    "body-mode": "fixed",
+    "content-length": 4096,
+    "headers": { "Content-Type": "application/octet-stream" }
+  }
+}
+```
+
+برنامهٔ محلی دقیقاً 4096 بایت بدنه می‌فرستد که ممکن است میان چندین نوشتن تقسیم شود، سپس اتصال را برای خواندن پاسخ باز نگه می‌دارد. نباید برای اعلام پایان آپلود، اتصال TCP خود را ببندد یا half-close کند: EOF در مبدأ TCP در WaterWall، line را می‌بندد. شمار بایت پیکربندی‌شده از قبل پایان درخواست را مشخص می‌کند.
+
+## رفتار پیشرفته {#advanced-behavior}
+
+### بدنهٔ درخواست و تکمیل آپلود {#request-bodies-and-upload-completion}
+
+| حالت بدنه | قاب‌بندی روی شبکه | تکمیل |
+| --- | --- | --- |
+| <bdi dir="ltr">`none`</bdi> | بدون بدنهٔ درخواست | سرآیند درخواست را کامل می‌کند؛ ورودی غیرخالی برنامه line را می‌بندد. |
+| <bdi dir="ltr">`fixed`</bdi> | <bdi dir="ltr">`Content-Length`</bdi> | دقیقاً شمار پیکربندی‌شده آپلود را کامل می‌کند و جهت پاسخ باز می‌ماند. |
+| <bdi dir="ltr">`chunked`</bdi> | <bdi dir="ltr">`Transfer-Encoding: chunked`</bdi> | هر بافر غیرخالی برنامه یک قطعه می‌شود؛ محدودیت تکمیل را در ادامه ببینید. |
+
+شمارش طول ثابت در طول callbackهای payload ادامه دارد. بافری که از شمار باقی‌مانده فراتر برود، پیش از ارسال هر بخش از همان بافر رد می‌شود. طول محتوای صفر درخواست را در مرحلهٔ سرآیند کامل می‌کند. callback با payload خالی در هیچ حالتی نشانهٔ پایان بدنه نیست.
+
+کدگذاری chunked پیش از هر قطعهٔ دادهٔ بدنه اندازهٔ آن را در مبنای شانزده و پس از آن CRLF می‌گذارد. این روش اجازه می‌دهد سرآیند پیش از معلوم‌شدن اندازهٔ کل آپلود ارسال شود. برنامه بایت‌های خام را می‌دهد؛ HttpProxyClient قاب‌بندی قطعه‌ها را اضافه می‌کند و آن را از پاسخ‌های chunked حذف می‌کند. مرز قطعه‌ها لازم نیست با بسته‌های TCP یا نوشتن‌های برنامه یکسان باشد.
+
+#### محدودیت تکمیل آپلود chunked {#chunked-upload-completion-limitation}
+
+**یک آپلود chunked با طول محدود نمی‌تواند ارسال را تمام کند و سپس منتظر پاسخ بعدی بماند.** callback به نام <bdi dir="ltr">`Finish`</bdi> در WaterWall، line را از بین می‌برد؛ این callback علامت پایانِ صرفاً ارسال یا half-close در TCP نیست.
+
+هنگامی که مبدأ <bdi dir="ltr">`Finish`</bdi> می‌فرستد، HttpProxyClient ممکن است <bdi dir="ltr">`0\r\n\r\n`</bdi> را برای پایان‌دادن به درخواست chunked ارسال کند. این کار فقط وقتی رخ می‌دهد که سرآیند درخواست قبلاً فرستاده شده باشد، هیچ بافر آپلود قدیمی‌تر یا قطعهٔ فعالی باقی نمانده باشد، dispatch عادی همچنان مجاز باشد و پاسخ از قبل کامل نشده باشد. Pause مشورتی جلوی این قطعهٔ پایانی را نمی‌گیرد. سپس گره وضعیت خودش را از بین می‌برد و <bdi dir="ltr">`Finish`</bdi> را عبور می‌دهد؛ line را برای دریافت پاسخ نگه نمی‌دارد. آپلود ناقصی که کار قدیمی‌تر در انتظار دارد، بدون قطعهٔ پایانی بسته می‌شود و تحویل بایت‌های آخر تضمین نمی‌شود.
+
+یک قطعهٔ پایانی HTTP می‌تواند پایان درخواست را بدون بستن TCP مشخص کند. محدودیت اینجا نبود سیگنال جداگانهٔ WaterWall برای «آپلود تمام شد، دریافت را ادامه بده» است، نه الزام half-close کردن اتصال پراکسی.
+
+وقتی طول معلوم است و همتا پس از دریافت تمام آپلود پاسخ می‌دهد، از <bdi dir="ltr">`body-mode: "fixed"`</bdi> استفاده کنید. <bdi dir="ltr">`chunked`</bdi> را فقط با همتایی به کار ببرید که بتواند در حالی که آپلود هنوز باز است پاسخ دهد. پراکسی نیز باید این تبادل جریانی را مجاز کند و کل درخواست را پیش از عبور بافر نکند. در HttpProxyServer، پاسخ نهایی آپلود ناقص را لغو می‌کند؛ مقصد اصلی باید پیش از پاسخ‌دادن بایت‌های موردنیازش را مصرف کند.
+
+### رفتار پاسخ و اتصال {#response-and-connection-behavior}
+
+سرآیند درخواست به‌محض بازگشت Init گره بعدی و در صورت مجازماندن dispatch عادی ارسال می‌شود؛ از جمله هنگام Pause مشورتی. تأخیری تا اولین payload وجود ندارد و منتظر <bdi dir="ltr">`Est`</bdi> انتقال نمی‌ماند. هر <bdi dir="ltr">`Est`</bdi> انتقال مستقل، حتی در صورت تکرار، عبور داده می‌شود و به معنای پذیرش درخواست توسط پراکسی نیست.
+
+CONNECT دادهٔ برنامه را تا پاسخ نهایی موفق نگه می‌دارد و سپس بایت‌ها را بدون تفسیر محتوا عبور می‌دهد. حالت HTTP می‌تواند بدنه را بلافاصله پس از سرآیند درخواست ارسال کند و هنگام آپلود پاسخ بگیرد. فشار مبدأ، آخرین Pause/Resume سمت next را با توقف‌های ناشی از راه‌اندازی، پذیرش CONNECT و آپلود فعال/درانتظار ترکیب می‌کند. مبدأ فقط وقتی Resume می‌گیرد که هم توقف محلی و هم توقف انتقال رفع شده باشند؛ هیچ‌یک نمی‌تواند دیگری را آزاد کند. اعلان‌های تکراری انتقال وقتی توقف محلی باقی نمانده باشد عبور می‌کنند. سرآیندهای آماده، تخلیهٔ FIFO و پسوند قطعه‌ها منتظر Resume نمی‌مانند؛ موانع پروتکلی و حدود ذخیره‌سازی همچنان برقرارند. اعلان‌های فشار دریافت به‌سمت next همچنان عبور می‌کنند.
+
+هر دو حالت در تمام طول عمر line فعال می‌مانند: CONNECT پس از مذاکره نیز مهلت بیکاری پیکربندی‌شده را حفظ می‌کند و حالت HTTP وظایف قاب‌بندی بدنه و تکمیل را نیز نگه می‌دارد. bypass دائمی این تعهدها را از بین می‌برد.
+
+هر دو حالت به پاسخ نهایی 2xx از HTTP/1.1 نیاز دارند و تا 32 پاسخ اطلاعاتی را به‌صورت داخلی مصرف می‌کنند. HTTP/1.0، <bdi dir="ltr">`101`</bdi>/Upgrade، پاسخ‌های نهایی غیر 2xx (شامل <bdi dir="ltr">`407`</bdi> و تغییرمسیرها)، قاب‌بندی نامعتبر، قطع ناقص داده و عبور از محدودیت‌ها line را می‌بندند. سرآیندهای پاسخ پراکسی و بدنهٔ خطاها به برنامه تحویل داده نمی‌شوند.
+
+پس از CONNECT موفق، فیلدهای قاب‌بندی بدنه نادیده گرفته می‌شوند و بایت‌های بعدی متعلق به تونل‌اند. حالت HTTP بدنه‌های پاسخ با طول ثابت، chunked و پایان‌یافته با بستن اتصال را پردازش می‌کند. trailerها را اعتبارسنجی و حذف می‌کند و <bdi dir="ltr">`Content-Encoding`</bdi> را از حالت فشرده خارج نمی‌کند؛ محتوای فشرده به‌صورت دادهٔ بدنهٔ فشرده باقی می‌ماند. HEAD و پاسخ‌های بدون محتوا بدنه‌ای برای برنامه تولید نمی‌کنند.
+
+پاسخ کامل HTTP با قاب‌بندی مشخص، بلافاصله تبادل تکی را می‌بندد، بایت‌های دنباله را دور می‌ریزد و هر آپلود باقی‌مانده را لغو می‌کند. پاسخ close-delimited هنگامی پایان می‌یابد که پراکسی سمت خودش را ببندد. اگر بعداً قاب‌بندی یا قطع ناقص داده نامعتبر باشد، بایت‌های بدنه‌ای که قبلاً تحویل شده‌اند قابل پس‌گرفتن نیستند.
+
+مخزن اتصال یا استفادهٔ مجدد از اتصال، pipeline درخواست‌ها، تلاش مجدد، دنبال‌کردن تغییرمسیر، روند چالش احراز هویت، مذاکرهٔ Upgrade/WebSocket، HTTP/2، HTTP/3، پشتیبانی UDP یا TLS داخلی وجود ندارد. این محدودیت‌ها رابط پراکسی را توصیف می‌کنند؛ تونل CONNECT برقرارشده پروتکل درون خود را بررسی نمی‌کند.
+
+## جزئیات پیاده‌سازی {#implementation-details}
+
+### splice و محدودیت بافرها {#splice-and-buffer-limits}
+
+Splice به پلتفرم/ساخت پشتیبانی‌شده، <bdi dir="ltr">`misc.splice`</bdi> و پشتیبانی تمام گره‌های زنجیرهٔ گسترش‌یافته نیاز دارد. HttpProxyClient بافرهای splice واجد شرایط را برای relay برقرارشدهٔ CONNECT، آپلودهای fixed/chunked و بافرهای پاسخی که کاملاً در محدودهٔ شناخته‌شدهٔ دادهٔ بدنه قرار دارند حفظ می‌کند. آپلود chunked اندازهٔ قطعه را به ابتدای بافر بدنه اضافه می‌کند و یک پسوند CRLF جداگانه را به ترتیب FIFO می‌فرستد.
+
+ورودی سرآیند/قاب‌بندی و بافرهایی که از مرز بدنه عبور می‌کنند ممکن است به‌طور کامل به فضای ذخیره‌سازی معمولی با اندازهٔ متناسب تبدیل شوند. HttpProxyClient به‌طور پیش‌فرض خواندن معمولی درخواست نمی‌کند و در همهٔ مراحل ورودی معمولی و splice را پردازش می‌کند. افزودن TlsClient، splice را برای زنجیره غیرفعال می‌کند. پشتیبانی splice تضمین نمی‌کند که هر تحویل بدون کپی باشد.
+
+با DNS محلی مقصد اصلی، DomainResolver داخلی ورودی زودهنگام را در FIFO جداگانهٔ خود نگه می‌دارد: <bdi dir="ltr">2 MiB</bdi> بایت منطقی و <bdi dir="ltr">2 MiB</bdi> هزینهٔ تخصیص، بدون سقف جداگانهٔ 1,024 ورودی. بافرهای معمولی و متکی به pipe، از جمله پیشوندهای مقیم حافظه، را حفظ می‌کند. محدودیت‌های resolver و کلاینت به مراحل جداگانه مربوط‌اند، نه یک بودجهٔ تجمیعی حافظهٔ اتصال.
+
+هر ورودی تحویل‌شده به **<bdi dir="ltr">2 MiB</bdi>** محدود است. ورودی لازم برای نگه‌داری در هر جهت، مشمول حدود مشترک **<bdi dir="ltr">2 MiB</bdi> بایت منطقی** و **<bdi dir="ltr">2 MiB</bdi> هزینهٔ ظرفیت صف** است. هزینهٔ تخصیص شامل padding و سربار بافر است؛ بنابراین ممکن است نگه‌داری پیش از رسیدن به حد بایت منطقی رد شود. سرریز line را می‌بندد. این حدود، هر تحویل و فضای درانتظار را محدود می‌کنند، نه اندازهٔ کل بدنهٔ جریانی را.
+
+حدود parser همچنین شامل خط آغاز 8192 بایتی، 128 فیلد سرآیند، خط اندازه/افزونهٔ قطعهٔ 1024 بایتی و بخش trailer با 16384 بایت/64 فیلد است. فضای موقت سرآیند و قاب‌بندی، ذخیره‌سازی محدود و جداگانه دارد. تبدیل به حافظهٔ معمولی ممکن است موقتاً یک بافر ورودی معمولی با حداکثر <bdi dir="ltr">2 MiB</bdi> دادهٔ payload اضافه کند. این حدود مستقل از رده‌های buffer pool و ظرفیت pipe هستهٔ سیستم‌عامل‌اند و تضمین‌کنندهٔ کل حافظهٔ فرایند نیستند.
+
+### فرادادهٔ گره {#node-metadata}
+
+| ویژگی | مقدار |
+| --- | --- |
+| پرچم‌های گره | <bdi dir="ltr">`kNodeFlagSupportsSplice`</bdi> |
+| `can_have_prev` | `true` |
+| `can_have_next` | `true` |
+| `layer_group` | `kNodeLayer4` |
+| `layer_group_prev_node` | `kNodeLayer4` |
+| `layer_group_next_node` | `kNodeLayer4` |
+| <bdi dir="ltr">`required_padding_left`</bdi> | <bdi dir="ltr">`10`</bdi> بایت برای پیشوند قطعه |

@@ -6,11 +6,13 @@ description: "Reference documentation for the PacketGenerator node."
 ---
 
 <!--
-Documentation version: 154
+Documentation version: 155
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/PacketGenerator/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/PacketGenerator.mdx, and all files must keep the same documentation version.
 -->
 
 # PacketGenerator
+
+## Overview
 
 `PacketGenerator` is a layer-3 IPv4 packet generator. It pre-builds raw IPv4
 packets at startup and sends them across WaterWall worker packet lines over a
@@ -29,7 +31,7 @@ kernel path, raw socket backend, or upstream network blocks non-local source
 addresses, the generated packets may never leave the sender.
 :::
 
-## Typical Placement
+## Typical placement
 
 Raw IPv4 output:
 
@@ -63,7 +65,11 @@ RawSocket -> PacketCounter
 `PacketGenerator` is a chain-head singleton adapter. It must be at the start of a
 layer-3 chain and must have a `next` node.
 
-## Local Packet-Path Check
+## Minimal practical example
+
+Start with the complete in-process check below before trying a network carrier.
+
+### Local Packet-Path Check
 
 Before testing a network carrier, a direct in-process chain checks generation
 and counting without sockets, TUN devices, routes, or peer keys:
@@ -119,24 +125,46 @@ receiver is `UdpStatelessSocket -> WireGuardDevice -> PacketCounter`. In the
 WireGuard pair, the sender peer's `allowedips` must select `dest-ipv4`, and the
 receiver peer's `allowedips` must authorize every tested inner source range.
 
-## What It Does
+## Configuration
 
-- Accepts one IPv4 source CIDR range or an array of source CIDR ranges.
-- Accepts one destination IPv4 address.
-- Builds raw IPv4 packets for `TCP`, `UDP`, `ICMP`, or `ALL`.
-- Repeats each source IP `packets-per-ip` times.
-- Materializes the whole packet store before sending starts.
-- Distributes packet indexes across workers.
-- Sends packets over `duration-ms`, using packet index deadlines to spread them
-  across the configured duration.
-- Updates the packet line routing context before each send.
-- Does not close or finish worker packet lines after sending.
-- Stops a worker's timer and send loop if the downstream side finishes that
-  worker packet line.
+### Required Fields
 
-Source ranges are processed in config order. They are not interleaved.
+Top-level fields:
 
-## Source-IP Allowlist Testing
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | string | User-chosen node name. Must be unique inside the config file. |
+| `type` | string | Must be exactly `"PacketGenerator"`. |
+| `settings` | object | Required and must not be empty. |
+| `next` | string | Required. The next layer-3 node receives generated packets. |
+
+Required `settings` fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `source-ipv4-range` | string or array of strings | One IPv4 CIDR range, or an array of IPv4 CIDR ranges. |
+| `dest-ipv4` | string | Destination IPv4 address. Must be a single IPv4 address, not CIDR. |
+| `protocol-number` | string | `TCP`, `UDP`, `ICMP`, or `ALL`. Case-insensitive. |
+| `duration-ms` | integer | Positive send duration in milliseconds. |
+| `dest-port` | integer | Required for `TCP`, `UDP`, and `ALL`. Must be non-zero and in `0..65535`. |
+| `src-port` | integer or `"random"` | Required for `TCP`, `UDP`, and `ALL`. Must be non-zero, or `"random"`. |
+
+`dest-port` and `src-port` are not required for `ICMP`.
+
+### Optional Settings
+
+| Setting | Type | Default | Description |
+| --- | --- | --- | --- |
+| `packets-per-ip` | integer | `1` | Positive repeat count for each source IP. In `ALL` mode, each repeat sends 255 protocol variants. |
+
+When `src-port` is `"random"`, the current implementation selects a stable
+ephemeral-range port from `49152..65535` based on source IP, destination IP, and
+protocol. It is deterministic for the generated packet shape rather than random
+per packet.
+
+## Usage and troubleshooting
+
+### Source-IP Allowlist Testing
 
 `PacketGenerator` and `PacketCounter` are built for scenarios where the path or
 service is restricted by source IP. A common workflow is:
@@ -153,7 +181,7 @@ in `ALL` mode. PacketCounter calculates the per-IP total itself and reports
 each protocol separately. It also accepts arrays such as `[6, 17]` or
 `["TCP", "UDP"]` when receiving several protocols.
 
-## Configuration Example
+### Configuration Example
 
 ICMP probing:
 
@@ -194,42 +222,31 @@ TCP-shaped probing:
 }
 ```
 
-## Required Fields
+### Limits
 
-Top-level fields:
+- Total source IP count must fit in `uint32_t`.
+- Total packet count must fit in `uint64_t`.
+- Total materialized packet bytes must fit in `size_t`.
+- The materialized packet store is capped at `8 GiB`.
+- `required_padding_left = 0`.
 
-| Field | Type | Description |
-| --- | --- | --- |
-| `name` | string | User-chosen node name. Must be unique inside the config file. |
-| `type` | string | Must be exactly `"PacketGenerator"`. |
-| `settings` | object | Required and must not be empty. |
-| `next` | string | Required. The next layer-3 node receives generated packets. |
+Large ranges, `ALL` mode, and high `packets-per-ip` values grow memory usage
+quickly. Split large tests into smaller ranges or several runs if needed.
 
-Required `settings` fields:
+### Practical Notes
 
-| Field | Type | Description |
-| --- | --- | --- |
-| `source-ipv4-range` | string or array of strings | One IPv4 CIDR range, or an array of IPv4 CIDR ranges. |
-| `dest-ipv4` | string | Destination IPv4 address. Must be a single IPv4 address, not CIDR. |
-| `protocol-number` | string | `TCP`, `UDP`, `ICMP`, or `ALL`. Case-insensitive. |
-| `duration-ms` | integer | Positive send duration in milliseconds. |
-| `dest-port` | integer | Required for `TCP`, `UDP`, and `ALL`. Must be non-zero and in `0..65535`. |
-| `src-port` | integer or `"random"` | Required for `TCP`, `UDP`, and `ALL`. Must be non-zero, or `"random"`. |
+- Use `PacketCounter` on the target side to get per-source delivery counts.
+- Choose `report-after-ms` on `PacketCounter` longer than sender
+  `duration-ms` plus expected network delay and reordering time.
+- Use `ICMP` for simple path probing when allowed.
+- Use `TCP`, `UDP`, or `ALL` when the restricted environment behaves
+  differently by protocol or port.
+- If the sender-side network enforces source address validation, spoofed or
+  non-local source ranges may be filtered before reaching WaterWall's peer.
 
-`dest-port` and `src-port` are not required for `ICMP`.
+## Advanced behavior
 
-## Optional Settings
-
-| Setting | Type | Default | Description |
-| --- | --- | --- | --- |
-| `packets-per-ip` | integer | `1` | Positive repeat count for each source IP. In `ALL` mode, each repeat sends 255 protocol variants. |
-
-When `src-port` is `"random"`, the current implementation selects a stable
-ephemeral-range port from `49152..65535` based on source IP, destination IP, and
-protocol. It is deterministic for the generated packet shape rather than random
-per packet.
-
-## Generated Packet Shapes
+### Generated Packet Shapes
 
 All generated packets are IPv4 with:
 
@@ -252,7 +269,26 @@ Protocol-specific shapes:
 
 `ALL` mode emits `255` protocol variants per repeat, not `256`.
 
-## Scheduling And Workers
+## Implementation details
+
+### What It Does
+
+- Accepts one IPv4 source CIDR range or an array of source CIDR ranges.
+- Accepts one destination IPv4 address.
+- Builds raw IPv4 packets for `TCP`, `UDP`, `ICMP`, or `ALL`.
+- Repeats each source IP `packets-per-ip` times.
+- Materializes the whole packet store before sending starts.
+- Distributes packet indexes across workers.
+- Sends packets over `duration-ms`, using packet index deadlines to spread them
+  across the configured duration.
+- Updates the packet line routing context before each send.
+- Does not close or finish worker packet lines after sending.
+- Stops a worker's timer and send loop if the downstream side finishes that
+  worker packet line.
+
+Source ranges are processed in config order. They are not interleaved.
+
+### Scheduling And Workers
 
 Before runtime starts, `PacketGenerator` materializes every packet into a contiguous
 packet store. During startup:
@@ -267,18 +303,7 @@ This spreads packets across the configured duration instead of sending the whole
 store as one immediate burst. If several packets are due at the same moment, a
 worker may send them back-to-back.
 
-## Limits
-
-- Total source IP count must fit in `uint32_t`.
-- Total packet count must fit in `uint64_t`.
-- Total materialized packet bytes must fit in `size_t`.
-- The materialized packet store is capped at `8 GiB`.
-- `required_padding_left = 0`.
-
-Large ranges, `ALL` mode, and high `packets-per-ip` values grow memory usage
-quickly. Split large tests into smaller ranges or several runs if needed.
-
-## Packet-Line Semantics
+### Packet-Line Semantics
 
 `PacketGenerator` uses worker packet lines created by the chain. These packet lines
 are persistent worker helper lines, not per-connection lines.
@@ -288,18 +313,7 @@ successful completion. A downstream `Finish` permanently stops that worker's
 timer and send loop, while normal completion only logs after all assigned
 packets were sent.
 
-## Practical Notes
-
-- Use `PacketCounter` on the target side to get per-source delivery counts.
-- Choose `report-after-ms` on `PacketCounter` longer than sender
-  `duration-ms` plus expected network delay and reordering time.
-- Use `ICMP` for simple path probing when allowed.
-- Use `TCP`, `UDP`, or `ALL` when the restricted environment behaves
-  differently by protocol or port.
-- If the sender-side network enforces source address validation, spoofed or
-  non-local source ranges may be filtered before reaching WaterWall's peer.
-
-## Node Metadata
+### Node Metadata
 
 Source-backed metadata:
 

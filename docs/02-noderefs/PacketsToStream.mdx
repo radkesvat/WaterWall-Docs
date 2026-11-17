@@ -6,11 +6,13 @@ description: "Reference documentation for the PacketsToStream node."
 ---
 
 <!--
-Documentation version: 152
+Documentation version: 153
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/PacketsToStream/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/PacketsToStream.mdx, and all files must keep the same documentation version.
 -->
 
 # PacketsToStream
+
+## Overview
 
 `PacketsToStream` adapts a packet-oriented side of a chain to a
 stream-oriented side. It receives packet payloads from the previous side,
@@ -27,26 +29,9 @@ There is no 2-byte length prefix. Packet boundaries are recovered from each
 packet's IPv4 total-length field. Old documentation may call this node
 `PacketAsData`, but the current node type is `PacketsToStream`.
 
-## What It Does
+## Typical placement
 
-- Accepts packet payload from the previous side.
-- Creates one stream-facing WaterWall line per worker when needed.
-- Reuses that stream-facing line for later packets on the same worker.
-- Recalculates IPv4 checksums before forwarding if the packet buffer requests it.
-- Drops packets that are not self-consistent IPv4 packets.
-- Writes valid IPv4 packets to the stream side without adding a framing header.
-- Buffers return stream bytes and reconstructs IPv4 packets from the total
-  length field.
-- Sends reconstructed return packets back to the previous packet side on the
-  receiving stream line's worker.
-- Accepts return traffic for any inner flow on any of its stream lines.
-- Recreates the stream-facing line if it finishes or sensitive-mode heartbeat
-  fails.
-
-This is a packet-to-stream adapter based on IPv4 parsing, not a generic byte
-framing protocol.
-
-## Choosing a Packet Bridge
+### Choosing a Packet Bridge
 
 Choose the bridge according to the data that enters the node:
 
@@ -60,7 +45,7 @@ The stream pair transports IP packets, including their headers. The connection
 bridges use a userspace TCP/UDP stack and expose application payloads on their
 connection side.
 
-## Typical Placement
+### Typical Placement
 
 Packet input to a stream transport:
 
@@ -78,7 +63,7 @@ server2: TcpListener -> StreamToPackets -> TunDevice
 This works because `PacketsToStream` and `StreamToPackets` use the same raw
 IPv4 concatenation format.
 
-### Packet over TLS
+#### Packet over TLS
 
 For an encrypted IPv4 path, add TLS around the existing packet stream:
 
@@ -107,7 +92,11 @@ traffic between the two inner interface addresses before adding remote subnets
 or a default route. The JSON below is only the `PacketsToStream` node fragment;
 its `next` would name `TlsClient` in this topology.
 
-## Configuration Example
+## Minimal practical example
+
+These are node fragments; define the referenced neighboring nodes in the surrounding configuration.
+
+### Configuration Example
 
 ```json
 {
@@ -123,7 +112,9 @@ its `next` would name `TlsClient` in this topology.
 }
 ```
 
-## Settings
+## Configuration
+
+### Settings
 
 Top-level fields:
 
@@ -145,7 +136,23 @@ Optional `settings` fields:
 
 There are no required tunnel-specific settings.
 
-## Wire Format
+## Usage and troubleshooting
+
+### Practical Notes
+
+- Pair it with `StreamToPackets` on the other side.
+- Do not pair it with older 2-byte-prefix packet framing unless that peer has
+  been updated to the current IPv4-total-length format.
+- Use `PacketsToConnection` instead when you want lwIP to reconstruct TCP/UDP
+  flows as normal WaterWall connection lines.
+- Use `packet-validation-level: "hard"` when you want stronger corruption
+  detection on the return stream, at the cost of checksum work.
+- The stream parser can recover from garbage, but a hostile stream may still
+  produce garbage packets that look structurally valid until realignment occurs.
+
+## Advanced behavior
+
+### Wire Format
 
 The stream-side wire format is a raw concatenation of complete IPv4 packets:
 
@@ -169,7 +176,72 @@ IPv6, non-IPv4 payloads, malformed IPv4 packets, and IPv4 packets with trailing
 bytes beyond the total-length field are dropped because they would desynchronize
 the stream parser on the peer.
 
-## Flow Model
+### Packet Validation
+
+`packet-validation-level` applies to packets decoded from downstream stream data
+before those packets are emitted back to the packet side.
+
+It does not replace the unconditional forwardability checks used before writing
+packet-side input to the stream. Packet-side input still must be self-consistent
+IPv4 so the peer can parse it.
+
+| Level | Behavior |
+| --- | --- |
+| `"none"` | Default. No configurable validation after extraction. The extractor still performs light structural checks so it can find packet boundaries. |
+| `"loose"` | Drops non-IPv4 and malformed IPv4 packets. Checks minimum header, version, IPv4 header length, and total length matching packet length. |
+| `"hard"` | Applies `loose`, verifies IPv4 header checksum, and verifies TCP, UDP, and ICMP checksums for non-fragmented packets. IPv4 UDP checksum `0` is accepted. |
+
+For fragmented IPv4 packets in `"hard"` mode, only the IPv4 header checksum is
+verified. Transport checksums are skipped because they require reassembly.
+
+When validation drops a decoded packet, the tunnel writes a warning log with the
+validation level and reason.
+
+### Sensitive Mode
+
+Sensitive mode is a stream-line health check. It is implemented using valid
+IPv4 heartbeat packets because the wire format has no separate control frame.
+
+When enabled:
+
+- each worker gets a heartbeat timer
+- every `interval-ms`, `PacketsToStream` sends one heartbeat ping on the active
+  stream-facing line
+- the ping is a minimal IPv4 packet with protocol `0xFD` and a 5-byte payload
+  filled with `0xFF`
+- the peer's `StreamToPackets` treats that packet as a ping and sends back a
+  matching heartbeat pong
+- the pong is a minimal IPv4 packet with protocol `0xFD` and a 5-byte payload
+  filled with `0xDD`
+- pings and pongs are not emitted to the packet side
+- if no pong arrives before `tolerance-ms`, the current stream-facing line is
+  finished locally and recreated
+
+Only one ping is in flight per worker. A late pong beyond the tolerance also
+causes the line to reset.
+
+## Implementation details
+
+### What It Does
+
+- Accepts packet payload from the previous side.
+- Creates one stream-facing WaterWall line per worker when needed.
+- Reuses that stream-facing line for later packets on the same worker.
+- Recalculates IPv4 checksums before forwarding if the packet buffer requests it.
+- Drops packets that are not self-consistent IPv4 packets.
+- Writes valid IPv4 packets to the stream side without adding a framing header.
+- Buffers return stream bytes and reconstructs IPv4 packets from the total
+  length field.
+- Sends reconstructed return packets back to the previous packet side on the
+  receiving stream line's worker.
+- Accepts return traffic for any inner flow on any of its stream lines.
+- Recreates the stream-facing line if it finishes or sensitive-mode heartbeat
+  fails.
+
+This is a packet-to-stream adapter based on IPv4 parsing, not a generic byte
+framing protocol.
+
+### Flow Model
 
 ```mermaid
 flowchart LR
@@ -186,7 +258,7 @@ Direction summary:
 | packet side to stream side | Valid IPv4 packet is sent raw on the worker-local stream line. |
 | stream side back to packet side | Stream bytes are buffered, decoded into IPv4 packets, optionally validated, then emitted downstream on the receiving stream line's worker packet line. |
 
-## Worker-Local Stream Line
+### Worker-Local Stream Line
 
 `PacketsToStream` anchors its state on the persistent worker packet line. For
 each worker, it creates a normal stream-facing line toward the next tunnel when
@@ -202,7 +274,7 @@ The stream-facing line is:
 The packet line itself is persistent worker state. It is not destroyed when the
 stream-facing line is recreated.
 
-## Packet Decoding On Return Path
+### Packet Decoding On Return Path
 
 Return traffic from the stream side is buffered in a read stream. The decoder:
 
@@ -236,51 +308,7 @@ FIFO limited to 128 KiB of logical bytes and 2 MiB of accounted storage,
 including the active nested delivery. Empty input retains nothing.
 Exceeding nested admission closes the stream carrier and schedules its recreation.
 
-## Packet Validation
-
-`packet-validation-level` applies to packets decoded from downstream stream data
-before those packets are emitted back to the packet side.
-
-It does not replace the unconditional forwardability checks used before writing
-packet-side input to the stream. Packet-side input still must be self-consistent
-IPv4 so the peer can parse it.
-
-| Level | Behavior |
-| --- | --- |
-| `"none"` | Default. No configurable validation after extraction. The extractor still performs light structural checks so it can find packet boundaries. |
-| `"loose"` | Drops non-IPv4 and malformed IPv4 packets. Checks minimum header, version, IPv4 header length, and total length matching packet length. |
-| `"hard"` | Applies `loose`, verifies IPv4 header checksum, and verifies TCP, UDP, and ICMP checksums for non-fragmented packets. IPv4 UDP checksum `0` is accepted. |
-
-For fragmented IPv4 packets in `"hard"` mode, only the IPv4 header checksum is
-verified. Transport checksums are skipped because they require reassembly.
-
-When validation drops a decoded packet, the tunnel writes a warning log with the
-validation level and reason.
-
-## Sensitive Mode
-
-Sensitive mode is a stream-line health check. It is implemented using valid
-IPv4 heartbeat packets because the wire format has no separate control frame.
-
-When enabled:
-
-- each worker gets a heartbeat timer
-- every `interval-ms`, `PacketsToStream` sends one heartbeat ping on the active
-  stream-facing line
-- the ping is a minimal IPv4 packet with protocol `0xFD` and a 5-byte payload
-  filled with `0xFF`
-- the peer's `StreamToPackets` treats that packet as a ping and sends back a
-  matching heartbeat pong
-- the pong is a minimal IPv4 packet with protocol `0xFD` and a 5-byte payload
-  filled with `0xDD`
-- pings and pongs are not emitted to the packet side
-- if no pong arrives before `tolerance-ms`, the current stream-facing line is
-  finished locally and recreated
-
-Only one ping is in flight per worker. A late pong beyond the tolerance also
-causes the line to reset.
-
-## Pause, Resume, And Finish
+### Pause, Resume, And Finish
 
 This node owns the stream-facing line and maps it to a separate worker packet
 line. It keeps endpoint flow control and cannot permanently bypass itself:
@@ -315,7 +343,7 @@ can release more input. Failed Init and shutdown do not send a recovery Resume.
 Sensitive-mode heartbeat Ping still sends while paused. Pause neither suspends
 the Pong deadline nor reopens ordinary packet forwarding.
 
-## Checksum Recalculation
+### Checksum Recalculation
 
 The packet callback takes and clears the buffer request with
 `packettunnelTakeChecksumRequest(buf)` before any
@@ -331,19 +359,7 @@ framing are dropped independently of `packet-validation-level`.
 This is important after packet-manipulation nodes that intentionally mark
 packets for checksum repair.
 
-## Practical Notes
-
-- Pair it with `StreamToPackets` on the other side.
-- Do not pair it with older 2-byte-prefix packet framing unless that peer has
-  been updated to the current IPv4-total-length format.
-- Use `PacketsToConnection` instead when you want lwIP to reconstruct TCP/UDP
-  flows as normal WaterWall connection lines.
-- Use `packet-validation-level: "hard"` when you want stronger corruption
-  detection on the return stream, at the cost of checksum work.
-- The stream parser can recover from garbage, but a hostile stream may still
-  produce garbage packets that look structurally valid until realignment occurs.
-
-## Node Metadata
+### Node Metadata
 
 The tunnel does not prepend bytes, so it has no extra left-padding requirement.
 

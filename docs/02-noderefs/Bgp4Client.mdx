@@ -6,14 +6,24 @@ description: "Reference documentation for the Bgp4Client node."
 ---
 
 <!--
-Documentation version: 153
+Documentation version: 154
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/Bgp4Client/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/Bgp4Client.mdx, and all files must keep the same documentation version.
 -->
 
 # Bgp4Client
 
+## Overview
+
 `Bgp4Client` is a layer-4 stream tunnel that wraps upstream payloads in
 BGP-like frames and unwraps downstream frames produced by `Bgp4Server`.
+
+:::warning
+`Bgp4Client` does not implement real BGP routing, BGP peering, route exchange,
+or BGP authentication. It only uses a BGP-like frame shape as stream
+camouflage/framing.
+:::
+
+## Typical placement
 
 It is intended to be paired with `Bgp4Server`:
 
@@ -27,29 +37,11 @@ server connector selects the actual HTTP service on `127.0.0.1:8080`. Point
 the local application at `127.0.0.1:18080`. The two BGP nodes frame and unframe
 the bytes; they neither rewrite HTTP nor choose a destination.
 
-:::warning
-`Bgp4Client` does not implement real BGP routing, BGP peering, route exchange,
-or BGP authentication. It only uses a BGP-like frame shape as stream
-camouflage/framing.
-:::
+## Minimal practical example
 
-## What It Does
+These are node fragments; define the referenced neighboring nodes in the surrounding configuration.
 
-- Initializes one per-line read stream and first-frame state during upstream
-  `init`.
-- On the first upstream payload, prepends a synthetic BGP OPEN body before the
-  application bytes.
-- Wraps upstream payloads as BGP-like frames.
-- Chooses a random non-OPEN BGP type for later upstream payload frames.
-- Parses downstream BGP-like frames from a stream buffer.
-- Strips downstream frame metadata and forwards the recovered payload to the
-  previous tunnel.
-- Closes both directions when it receives malformed framed data.
-
-`Bgp4Client` is a normal stream tunnel. It does not create network sockets and
-does not create or destroy packet lines.
-
-## Configuration Example
+### Configuration Example
 
 Client side:
 
@@ -77,7 +69,9 @@ The `password` field is accepted for compatibility with the old configuration
 shape, but it is not used for encryption or authentication in the current
 protocol logic.
 
-## Required Fields
+## Configuration
+
+### Required Fields
 
 Top-level fields:
 
@@ -87,7 +81,7 @@ Top-level fields:
 | `type` | string | Must be exactly `"Bgp4Client"`. |
 | `next` | string | The next stream node that receives wrapped frames. |
 
-## Optional Settings
+### Optional Settings
 
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -95,79 +89,9 @@ Top-level fields:
 
 No other settings are currently parsed.
 
-## Frame Format
+## Usage and troubleshooting
 
-All upstream payloads are wrapped as:
-
-```text
-16-byte marker | 2-byte body length | 1-byte BGP type | body
-```
-
-Field details:
-
-| Field | Value |
-| --- | --- |
-| marker | Sixteen bytes of `0xff`. |
-| body length | Big-endian `uint16_t`. Covers the type byte plus body bytes. |
-| BGP type | `1` for the first OPEN frame; random `2` through `5` for later payload frames. |
-| body | Tunneled payload, or synthetic OPEN body plus tunneled payload for the first upstream frame. |
-
-Supported type values used by the implementation:
-
-| Type | Name |
-| --- | --- |
-| `1` | OPEN |
-| `2` | UPDATE |
-| `3` | NOTIFICATION |
-| `4` | KEEPALIVE |
-| `5` | ROUTE-REFRESH |
-
-The frame length is not the standard BGP message length. In this tunnel it is
-the older WaterWall contract: type byte plus body bytes, excluding the 16-byte
-marker and 2-byte length field.
-
-## First Upstream Payload
-
-`Bgp4Client` does not send a standalone OPEN frame during `init`. Instead, the
-first upstream payload is framed as BGP type `1` and the client prepends a
-synthetic OPEN body before the application bytes.
-
-Synthetic OPEN fields:
-
-| Field | Behavior |
-| --- | --- |
-| version | Always `4`. |
-| AS number | Random `uint16_t` generated when the tunnel instance is created. |
-| hold time | `90` seconds. |
-| router id | Random value generated when the tunnel instance is created. |
-| optional parameter length | Random length from `3` through `10` bytes. |
-| optional parameter bytes | Random bytes in the range `0` through `199`. |
-
-After this first frame, `open_sent` is set for the line. Later upstream payloads
-are wrapped without the synthetic OPEN prefix and use a random non-OPEN type.
-
-Because `Bgp4Server` expects tunneled application data after the OPEN prefix,
-the first OPEN frame must carry payload bytes after the synthetic OPEN body.
-
-## Downstream Parsing
-
-Downstream bytes are accumulated by the shared `splice_frame_reader_t` over a
-`splice_stream_t`.
-
-For each downstream frame, `Bgp4Client`:
-
-1. Gathers the 19-byte header and checks the marker, length and non-OPEN type.
-2. Rejects a declared body length that leaves no application payload.
-3. Strips the framing metadata and forwards available payload bytes in order,
-   without waiting for the rest of the frame.
-4. Keeps the current frame's remaining length until its last byte is consumed,
-   then starts reading the next header.
-
-An incomplete header or unavailable body suffix returns control to the worker
-until more input arrives. Nested-byte or retained-charge refusal closes the line
-under the limits below.
-
-## Limits
+### Limits
 
 | Limit | Value | Notes |
 | --- | --- | --- |
@@ -231,7 +155,108 @@ the borrowed connection through its owner. Finish releases queued buffers and
 pipes before forwarding away from the sender. These behaviors do not guarantee
 zero-copy delivery or a throughput improvement.
 
-## Data Flow
+### Notes and Caveats
+
+- `Bgp4Client` requires a paired `Bgp4Server` for useful operation.
+- `password` is not a security feature in the current implementation.
+- The BGP-like length field excludes the marker and length bytes.
+- The first OPEN frame is sent only when the first upstream payload arrives.
+- Upstream `est` and downstream `init` are disabled callbacks.
+- This node is a layer-4 stream tunnel, not a packet tunnel.
+
+## Advanced behavior
+
+### Frame Format
+
+All upstream payloads are wrapped as:
+
+```text
+16-byte marker | 2-byte body length | 1-byte BGP type | body
+```
+
+Field details:
+
+| Field | Value |
+| --- | --- |
+| marker | Sixteen bytes of `0xff`. |
+| body length | Big-endian `uint16_t`. Covers the type byte plus body bytes. |
+| BGP type | `1` for the first OPEN frame; random `2` through `5` for later payload frames. |
+| body | Tunneled payload, or synthetic OPEN body plus tunneled payload for the first upstream frame. |
+
+Supported type values used by the implementation:
+
+| Type | Name |
+| --- | --- |
+| `1` | OPEN |
+| `2` | UPDATE |
+| `3` | NOTIFICATION |
+| `4` | KEEPALIVE |
+| `5` | ROUTE-REFRESH |
+
+The frame length is not the standard BGP message length. In this tunnel it is
+the older WaterWall contract: type byte plus body bytes, excluding the 16-byte
+marker and 2-byte length field.
+
+### First Upstream Payload
+
+`Bgp4Client` does not send a standalone OPEN frame during `init`. Instead, the
+first upstream payload is framed as BGP type `1` and the client prepends a
+synthetic OPEN body before the application bytes.
+
+Synthetic OPEN fields:
+
+| Field | Behavior |
+| --- | --- |
+| version | Always `4`. |
+| AS number | Random `uint16_t` generated when the tunnel instance is created. |
+| hold time | `90` seconds. |
+| router id | Random value generated when the tunnel instance is created. |
+| optional parameter length | Random length from `3` through `10` bytes. |
+| optional parameter bytes | Random bytes in the range `0` through `199`. |
+
+After this first frame, `open_sent` is set for the line. Later upstream payloads
+are wrapped without the synthetic OPEN prefix and use a random non-OPEN type.
+
+Because `Bgp4Server` expects tunneled application data after the OPEN prefix,
+the first OPEN frame must carry payload bytes after the synthetic OPEN body.
+
+### Downstream Parsing
+
+Downstream bytes are accumulated by the shared `splice_frame_reader_t` over a
+`splice_stream_t`.
+
+For each downstream frame, `Bgp4Client`:
+
+1. Gathers the 19-byte header and checks the marker, length and non-OPEN type.
+2. Rejects a declared body length that leaves no application payload.
+3. Strips the framing metadata and forwards available payload bytes in order,
+   without waiting for the rest of the frame.
+4. Keeps the current frame's remaining length until its last byte is consumed,
+   then starts reading the next header.
+
+An incomplete header or unavailable body suffix returns control to the worker
+until more input arrives. Nested-byte or retained-charge refusal closes the line
+under the limits below.
+
+## Implementation details
+
+### What It Does
+
+- Initializes one per-line read stream and first-frame state during upstream
+  `init`.
+- On the first upstream payload, prepends a synthetic BGP OPEN body before the
+  application bytes.
+- Wraps upstream payloads as BGP-like frames.
+- Chooses a random non-OPEN BGP type for later upstream payload frames.
+- Parses downstream BGP-like frames from a stream buffer.
+- Strips downstream frame metadata and forwards the recovered payload to the
+  previous tunnel.
+- Closes both directions when it receives malformed framed data.
+
+`Bgp4Client` is a normal stream tunnel. It does not create network sockets and
+does not create or destroy packet lines.
+
+### Data Flow
 
 Upstream direction:
 
@@ -248,7 +273,7 @@ next node -> Bgp4Client unwraps -> previous node
 `Bgp4Client` expects `Bgp4Server` on the opposite side. A non-matching peer that
 does not produce the expected frame shape will cause protocol errors.
 
-## Lifecycle Behavior
+### Lifecycle Behavior
 
 On upstream `init`, `Bgp4Client` initializes its line state and forwards
 upstream `init` to the next tunnel after creating its receive stream.
@@ -277,16 +302,7 @@ consumer pause state or gating payload output:
 | upstream pause/resume | next tunnel upstream |
 | downstream pause/resume | previous tunnel downstream |
 
-## Notes and Caveats
-
-- `Bgp4Client` requires a paired `Bgp4Server` for useful operation.
-- `password` is not a security feature in the current implementation.
-- The BGP-like length field excludes the marker and length bytes.
-- The first OPEN frame is sent only when the first upstream payload arrives.
-- Upstream `est` and downstream `init` are disabled callbacks.
-- This node is a layer-4 stream tunnel, not a packet tunnel.
-
-## Node Metadata
+### Node Metadata
 
 Source-backed metadata:
 

@@ -5,7 +5,7 @@ sidebar_label: "Part 6: Build, Test & Review"
 description: "CMake presets, focused builds, the integration test harness, build-environment gotchas, the full review checklist, and the report format expected from coding agents."
 ---
 <!--
-Documentation version: 176
+Documentation version: 177
 -->
 
 # Part 6: Building, Testing & Reviewing
@@ -13,6 +13,43 @@ Documentation version: 176
 A tunnel change is not done when it compiles. It is done when it builds through a
 known-good preset, passes the relevant integration tests, and survives the review
 checklist. This part covers how to validate work and how to present it.
+
+## Reading path
+
+- [Select proportionate validation and regression coverage](#choosing-validation-and-regression-coverage)
+- [Build, format and run the ordinary test lanes](#building)
+- [Review checklist and reporting](#code-review-rules-and-tunnel-checklist)
+- [Platform and dependency build reference](#platform-and-dependency-build-reference)
+- [Specialized validation reference](#specialized-validation-reference)
+- [Optional optimization evidence policy](#optional-optimization-and-evidence-review)
+
+## Choosing Validation And Regression Coverage
+
+Validation should answer the product question directly and remain proportional to
+risk:
+
+- Start with the smallest check that exercises the change: inspection, formatting,
+  a focused target, an existing focused test, or a direct integration case.
+- Expand to the functional lane for shared networking/tunnel behavior or changes
+  spanning cases. Use routine production lanes plus native units for shared-core,
+  lifecycle/concurrency, multi-subsystem, security-sensitive, or difficult-to-bound
+  changes.
+- Documentation, comments, and clearly non-behavioral mechanical changes may need
+  only inspection, link/diff checks, or a relevant policy check. Do not run a broad
+  lane merely because code changed or because the lane is available.
+- New observable behavior, meaningful edge cases, changed contracts, and
+  reproducible bugs likely to regress normally receive focused coverage. When
+  practical, a regression test should fail before the fix and pass afterward.
+- A new test is unnecessary when existing coverage already demonstrates the exact
+  behavior, reproduction is impractical, or the change has no meaningful behavior
+  to assert. State that reason instead of manufacturing a test or a new harness.
+- One direct check may establish a narrow deterministic invariant. Use repetition,
+  sanitizers, stress, fault injection, or broader tests when concurrency, timing,
+  security, or nondeterminism makes one observation insufficient.
+
+A validation failure or unavailable environment is evidence about the validation
+attempt, not a pass and not automatic proof that the product is wrong. Preserve the
+exact failure and distinguish **failed** from **inconclusive** evidence.
 
 ## Building
 
@@ -37,6 +74,673 @@ configuration, e.g. `build/linux/Release/Waterwall` (also `Debug/` and
 `RelWithDebInfo/`). Other preset trees exist under `build/` (`linux-gcc-x64`,
 `linux-clang-x64`, `linux-tsan-unit`, and more); do not mix them within a single
 verification flow.
+
+### Build Rules
+
+- Do **not** run `cmake --build build ...` against an arbitrary `build/` tree
+  unless you have confirmed it is a healthy preset-created tree you intend to use.
+- Do **not** mix build trees (`build/`, `build/linux`, `build/linux-gcc-x64`)
+  inside one verification flow — you can end up testing a stale binary.
+- Prefer preset target builds over root-tree builds.
+
+## Formatting C And Headers
+
+Run the portable `clang-format` command with the repository's `.clang-format`
+file on every C or header file you modify:
+
+```bash
+clang-format -i --style=file path/to/changed_file.c
+clang-format --dry-run -Werror --style=file path/to/changed_file.c
+```
+
+Each development environment is responsible for making `clang-format` resolve to
+its installed project-compatible formatter; repository documentation must not pin
+a distribution-specific executable name. New files must be fully conformant. Some
+legacy files are not, so do not reformat untouched code wholesale: format and
+verify the changed ranges with `--lines=<start>:<end>` when a full-file pass would
+rewrite unrelated lines. If the command is unavailable, report what remains
+unformatted or unverified rather than silently skipping the check.
+
+## Testing
+
+Tests are registered with CTest under names like `waterwall.<case>` and are driven
+by the harness in `tests/`. Each integration case lives in `tests/cases/<case>/`.
+
+On Linux, deterministic integration tests execute inside private user and network
+namespaces created without root privileges, with loopback-only isolation
+(`tests/run_in_network_namespace.sh`),
+preventing port collisions and allowing concurrent execution. Tests are organized
+into lanes via `tests/run_test_lane.sh`:
+
+Deterministic cases must not use public DNS or depend on host-network port
+availability. A case that intentionally needs live internet belongs in the
+explicit `external` lane instead.
+
+The privileged lane uses the same network isolation, but because its wrapper is
+already invoked through `sudo -E`, it retains the caller's user namespace and
+creates only a private network namespace. This preserves access to runner-owned
+workspace paths; nesting root inside a mapped user namespace would lose that
+host-filesystem permission authority.
+
+The wrapper records its caller's network namespace in
+`WATERWALL_TEST_PARENT_NETNS` before entering the new namespace. Fixtures that
+modify interfaces compare their own namespace against this marker; they must
+not depend on reading `/proc/1/ns/net`, which may be inaccessible to namespace
+root on an unprivileged CI runner.
+
+Network namespaces do not isolate the host user's pipe-page accounting. Linux
+CI provisions a finite soft allowance for two maximum-sized 512 MiB splice
+inventories per parallel slot at the lane's 32-job cap, plus one inventory of headroom. A single
+runtime's pipe allowance cannot accommodate the parallel suite. Keep splice
+trace assertions active; an empty inventory is not evidence that the splice path
+passed. This CI setup changes the disposable runner's soft limit only, without
+changing production capacity ceilings or the kernel hard limit.
+
+- `support`: production policy and test-harness tests, run strictly serially.
+- `functional`: deterministic integration tests run in parallel (`min(32, max(4, 4 * CPUs))` jobs).
+- `external`: integration tests requiring live host internet access (e.g. Reality against Google), run strictly serially.
+- `speed`: opt-in multi-stream throughput benchmarks, run strictly serially (`RUN_SERIAL TRUE`) to avoid contention.
+- `stress`: opt-in longer traffic/churn probes, run serially.
+- `privileged`: root/TUN probe tests run under `sudo -E`.
+- `all`: runs support, functional, and external lanes in sequence.
+
+The production tree contains integration, smoke, and source-policy tests. Native
+unit tests live in the separate no-LTO tree below. The `linux` and `linux-packed`
+CTest presets exclude `speedtest` and `stress`; use the explicit lane commands
+for those workloads. Functional coverage includes short verified and unverified
+SpeedTestClient TCP smoke cases. The longer Mux parent-pressure probes belong
+to `stress`; deterministic native pressure coverage remains in both unit configurations.
+
+Source-only policy checks carry `source-policy` and run once in the
+production support lane for a source revision. Native Debug/Release presets and
+the macOS/Windows CI unit lanes exclude that label; actual build-policy and
+runtime checks remain configuration-specific. The abort and orderly-shutdown
+scanners run directly by default. Their optional `--mutation-test` mode is for
+changes to the scanners themselves.
+
+`waterwall.tunnel_callback_dispatch_policy` checks production tunnel C sources
+and headers for direct flow-callback calls or pointer captures. Handler
+assignments remain allowed; delivery must use the dispatch helpers described in
+[Part 2](./part2-lines-and-callbacks.mdx#dispatch-through-helpers).
+
+Lane durations depend on hardware and build warmth. Historical speed-lane
+measurements were 46–48 seconds on a 4-CPU host; that optional work is outside
+the routine `all` total. Measure the current lane selection when estimating a
+complete run. Cloud CI runs native Release and Debug in parallel.
+
+Use the full functional lane for shared networking or tunnel behavior and the
+ordinary integration sequence for broad tunnel or harness work. Run routine
+production coverage, including applicable privileged tests, plus both native-unit
+configurations for shared-core contracts, lifecycle/concurrency work,
+multi-subsystem changes, or any change whose impact is difficult to bound.
+Speed and stress lanes are opt-in: run them when requested or when directly
+validating their workloads. Focused checks remain appropriate for narrow or
+non-behavioral edits.
+
+```bash
+# Ordinary non-privileged production Release sequence across test lanes.
+cmake --preset linux
+cmake --build --preset linux --config Release --target check_waterwall_tests -j8
+
+# Run the production support lane (policy and test-harness checks).
+bash tests/run_test_lane.sh support build/linux Release
+
+# Run the deterministic functional lane directly in parallel.
+bash tests/run_test_lane.sh functional build/linux Release
+
+# Run all ordinary non-privileged production lanes in sequence.
+bash tests/run_test_lane.sh all build/linux Release
+
+# Optional throughput and longer traffic/churn workloads.
+bash tests/run_test_lane.sh speed build/linux Release
+bash tests/run_test_lane.sh stress build/linux Release
+
+# Complete native-unit suite: optimized Release plus asserted Debug behavior.
+cmake --preset linux-unit-tests
+cmake --build --preset linux-unit-release -j8
+ctest --preset linux-unit-release --output-on-failure
+cmake --build --preset linux-unit-debug -j8
+ctest --preset linux-unit-debug --output-on-failure
+```
+
+### Native Unit Tests
+
+Native unit tests have a dedicated multi-configuration tree with IPO/LTO disabled
+before any project target is created. Release preserves optimization and `NDEBUG`
+while avoiding mixed-LTO links; Debug activates assertions and other contract
+guardrails. Production Release remains IPO/LTO-enabled, so complete behavioral
+validation uses the production lane and both native-unit configurations:
+
+Native unit-test executables intentionally disable inherited precompiled headers.
+The production library and tunnel targets retain their shared PCH, but applying it
+to each independent test target would create a large duplicate artifact per test
+and configuration.
+
+To simulate a running loop with direct `wloopProcessEvents()` calls, establish
+`WLOOP_STATUS_RUNNING`, as `wloopRun()` normally does. A newly created loop is
+stopped; leaving it stopped can suppress timer collection after polling. Keep
+normal admission open until the scenario intentionally tests quiescence.
+
+`ww` directly depends on the C++ allocator object library so even pure-C consumers
+select the C++ linker and runtime. It also exports the allocator objects explicitly
+to keep the allocation overrides from being dropped by static archive extraction.
+
+```bash
+# Production Release: build the shipped binary plus the production-full suite.
+cmake --preset linux
+cmake --build --preset linux --config Release --target check_waterwall_tests -j8
+
+# Native units: optimized Release/no-LTO behavior.
+cmake --preset linux-unit-tests
+cmake --build --preset linux-unit-release -j8
+ctest --preset linux-unit-release --output-on-failure
+
+# Native units: assertions and Debug guardrails in the same no-LTO tree.
+cmake --build --preset linux-unit-debug -j8
+ctest --preset linux-unit-debug --output-on-failure
+```
+
+For focused behavioral work, prefer the relevant `linux-unit-debug` selection
+first: assertions usually identify a violated ownership, lifecycle, or state
+contract closer to its cause. Repeat that coverage with `linux-unit-release`
+before completion because optimization and `NDEBUG` can expose different behavior.
+Broad/shared changes run both complete presets. Debug is not a substitute for
+Release, AddressSanitizer, UndefinedBehaviorSanitizer, or ThreadSanitizer. Never
+build native unit tests in the production tree: it contains the LTO-enabled
+libraries used by `Waterwall`.
+
+Native source files live under `tests/unittests/{base,crypto,bufio,core,net,devices,lwip,tunnels}/`;
+the owning source documents its purpose, important cases, fixture and exact CTest
+selection. Multi-file suites refer to their driver, and shared fixture headers
+describe setup, ownership and cleanup. The worker driver under `net/worker/`
+keeps an explicit lifecycle order across accessor, message, pipe, HalfDuplex and
+teardown modules. Forked cases run before shared runtime initialization; cases
+requiring live workers precede teardown races that close worker admission.
+
+CTest registration stays in explicit CMake. `tests/cmake/TestHelpers.cmake`
+captures absolute test, native and support roots at its definition site and is
+shared by Linux and root platform registrations. `waterwall_add_native_executable`
+creates ordinary targets from explicit sources with optional private includes,
+libraries, definitions and test support. `waterwall_register_native_test`
+registers an existing target with its labels, execution allowance and selected
+aggregate. Its optional `SOURCE_DIR` lets standalone fixture projects expose the
+repository source root independently of their own project root. Keep linker
+wraps, source substitutions, feature variants and
+PCH/Unity exclusions beside the owning target. Native subsystem fragments live
+under `tests/cmake/native/`; integration family fragments live under
+`tests/cmake/integration/`. Public portable and specialized runner entry paths
+remain under `tests/unittests/`. Adding a test requires editing the owning
+registration, not a second source inventory or source glob.
+
+Each runnable `tests/cases/` or `tests/speedtests/` directory has a local README
+describing topology, settings that matter to the scenario, worker/feature
+variants, prerequisites and its actual success criterion. Script tests put this
+intent and their execution reference in module docstrings or opening comments.
+Benchmark documentation records workload, metrics and limits beside the code;
+refactoring test support does not change performance workloads or thresholds.
+Use `ctest --preset linux --show-only=json-v1` and the two native-unit presets to
+discover current names and properties. The repository testing READMEs provide
+directory maps, authoring steps and focused/full commands rather than duplicate
+test catalogs or planning timings.
+
+Native CTest auto-build runners execute in private directories beneath
+`<build>/test-runs/<configuration>/<test-name>/<invocation>/`, printing the path
+before lock acquisition or child startup. Build and executable stdout/stderr are
+captured separately. Registration passes explicit source and fixture directories;
+immutable input paths must resolve independently of CWD. The child environment
+also exposes `WATERWALL_TEST_SOURCE_DIR` and `WATERWALL_TEST_FIXTURE_DIR`.
+
+The shared portable CMake boundary holds `waterwall-native-test.lock` in the build
+tree across build and execution, including the hard-abort and DNS-bus fixtures.
+Keep existing CTest resource locks. Different build trees do not share this lock;
+manual builds outside the runner require an idle tree. Lock acquisition is bounded
+to 30 seconds, build to 60 seconds, and execution to the suite's original allowance.
+Outer native CTest timeouts add 95 seconds for lock/build/cleanup (120 becomes 215;
+30 becomes 125). Scenario deadlines, expected signals/exits and the Release-only
+abort suite remain unchanged.
+
+Native and shell run directories are retained on failure, interruption, timeout
+and initialized skip. Successful runs remove them by default; set
+`WATERWALL_TEST_KEEP_RUN_DIR=1` to retain them. An accepted expected failure is a
+successful enclosing test. Only clean idle trees with
+`tests/cleanup_generated_outputs.sh`; it selects generated native directories and
+legacy leftovers, preserving fixtures, build products and the cooperative lock.
+
+Test authors can link the private `ww_test_support` target and include
+`test_assert.h` for requirements that remain active under `NDEBUG`. Runtime
+fixtures include the WaterWall header first, in a separate include group, so its
+feature macros precede the support header's system includes after formatting.
+Comparisons evaluate operands once and report the case, original call site and values; byte
+diagnostics identify the first mismatch with bounded output. Choose `exit(1)` or
+`_Exit(1)` explicitly to preserve the fixture's failure boundary. These helpers
+do not replace production Debug assertions or their expected-failure tests.
+`TEST_CHECK` reports and returns a boolean without terminating; a suite using it
+retains its accumulated-failure, return-status, `abort()` or platform-exit policy.
+The pure library under `tests/support/c/` can be imported by standalone platform
+fixtures without registering other tests or linking runtime code. Standalone
+archive/header probes retain their independent link boundary where support would
+invalidate the probe.
+Use ordered `TEST_RUN_CASE` calls or explicit `testCaseSet` before parameterized
+cases. The executable has one case context across translation units: publish a
+static name before admitting work and keep it stable until all case threads and
+callbacks finish. Keep scenario setup and successful teardown visible.
+
+The line-failure harness remains a composition entry point for opt-in process
+guards, buffer accounting, callback observation and worker/normal-line setup in
+`tests/support/c/fixtures/`. Link support privately and preserve wrapper symbols,
+exact line ownership, buffer transfers and teardown ordering. Simple tests must
+not inherit runtime failure wrappers. Examples and API obligations live in
+`tests/support/README.md`, with base64, atomic and HeaderServer tests demonstrating
+the appropriate scope.
+
+Python entries using `tests/support/python/wwtest/` resolve imports from
+`__file__` and disable source-tree bytecode before importing. Socket exact reads
+and positive strace parsing preserve scenario semantics. Keep the private run
+directory outside process/socket/executor contexts so child/tracer cleanup and
+peer joins finish before deletion; retain failures, initialized skips and
+timeouts, with the same `WATERWALL_TEST_KEEP_RUN_DIR=1` success override. The POSIX
+process helper preserves `strace -D` runtime ownership and bounds cleanup while
+keeping the original scenario exception. Prerequisites, readiness behavior,
+expected exits and scenario deadlines stay explicit in each test.
+
+Copied case probes resolve support from the mirrored tests root; owners of
+arbitrary copied directories, including native Windows examples, pass
+`WATERWALL_TEST_SUPPORT_DIR` explicitly. Import reusable utilities and named
+protocol fixtures from support rather than executable test programs. Match exact
+read/EOF/timeout and readiness semantics: keep the scenario's successful TCP
+connection and never create an extra UDP association to establish readiness.
+Startup configuration tests retain complete captured command output under their
+private directory without recording environments. Mains returning captured
+failure/skip statuses settle the directory with that enclosing verdict after all
+resources finish; benchmark retention and workloads remain caller obligations.
+
+Shell entry points and `case_run_dir.lib.sh` retain their public paths while
+sharing private-directory, log, explicit-PID shutdown/reap and core-setting
+mechanics under `tests/support/shell/`. Traps capture the enclosing status first.
+Marker, expected-failure, report, probe, privileged and speed decisions remain in
+their runners. Specialized native build-lock orchestration, Win32 capability
+events, namespace holders and process-group fault injection retain their own
+ownership policy rather than acquiring another lock or borrowing a mismatched
+process abstraction. Put the actual setup, important checks, limits and CTest
+references beside each changed test and probe.
+
+On Win64, `waterwall_platform_unit_tests` also builds
+`device_reader_session_windows_fallback_compile`. This compile-only target
+compiles the real session, budget and dispatch sources separately with
+`WW_HAVE_C11_ATOMICS=0`,
+even when the compiler normally selects C11 atomics. Its source guard requires
+Win64 and the fallback branch, catching CAS expected-value pointer type/width
+errors. The diagnostic object is never linked into the runtime; its atomic
+representation may differ from the normal build. It also works with the
+`windows-cross-mingw-x64-unit` preset without executing a Windows binary.
+
+Crypto backend validation follows the same two-tree rule. Each production preset
+such as `linux-sodium-crypto` has a matching native-unit preset such as
+`linux-sodium-crypto-unit`. Build the shipped executable and run integration
+checks from the production tree; build and run native crypto tests only from the
+matching no-LTO unit tree. Production crypto presets intentionally do not define
+native-unit targets.
+
+The non-sanitizer crypto CI jobs prebuild `reality_close_lifecycle_test` in that
+unit tree before CTest. Its cold BoringSSL dependency build belongs in the normal
+build step, outside the native runner's 60-second incremental-build allowance.
+Building the production executable does not populate the separate unit tree.
+
+The focused shutdown concurrency lane is configured separately:
+
+```bash
+cmake --preset linux-tsan-unit
+cmake --build --preset linux-tsan-unit -j8
+ctest --preset linux-tsan-unit --output-on-failure
+```
+
+It covers the controller, worker-message/event-loop admission, reader-session,
+and real production-sequence shutdown fixtures under ThreadSanitizer. It is a
+focused concurrency lane, not a replacement for the Release/no-LTO unit lane.
+
+The registered no-LTO policy directly checks the unit-tree cache, reachable
+compile/link commands, and representative WaterWall, lwIP, and TlsClient
+artifacts. That is enough to catch the mixed-LTO regression without building a
+second attestation system around the compiler, build tool, or verifier.
+
+Linux cloud CI runs the complete `linux-unit-release` and `linux-unit-debug`
+presets as independent parallel jobs, with source-only checks retained in the
+single Linux production support job. On macOS and Windows, CI builds
+`waterwall_platform_unit_tests`, runs the same direct no-LTO policy, and executes
+the registered platform unit tests in Release.
+
+Run one case by its registered name (use an anchored regex):
+
+```bash
+ctest --preset linux --output-on-failure -R '^waterwall\.tls_roundtrip$'
+```
+
+To run a single integration case directly while debugging — passing the binary,
+the case directory, and a timeout in seconds:
+
+```bash
+bash tests/run_in_network_namespace.sh bash tests/run_waterwall_case.sh \
+  build/linux/Release/Waterwall \
+  tests/cases/tls_roundtrip \
+  60
+```
+
+There are many roundtrip cases to model new tests on, including
+`encryption_roundtrip`, `mux_*_roundtrip`, `http1_*` / `http2_*`,
+`packets_stream_bridge_roundtrip`, and the `ping_*_roundtrip` family. Pick the one
+closest to your tunnel as a structural reference, then verify that its assertions
+actually exercise the changed behavior and failure mode.
+
+Worker-owned TUN receive coverage includes `tun_linux_queues_test` for startup
+fallback and fixed steering, with an optional real-kernel BPF execution case;
+`device_reader_session_test` for nonblocking multi-producer budgets, notification
+quiescence and ordered inline delivery; and `device_frag_affinity_test` for shared
+fragment storage and independent release results. `tun_linux_message_lifetime_test`
+uses owner readiness callbacks to cover real reader lifecycle and checksum/GSO
+handoff. Linux steering coverage explicitly selects spread when checking repeated
+complete IPv4 non-TCP/UDP packets against the per-CPU cursor sequence and CPU-ID offset, independent CPU
+cursors and separate interface maps, and the map's 32-bit cursor geometry. Kernel
+checks pin execution to a CPU for deterministic local cycles and switch CPUs to
+verify independence. Exact global counts during overlapping updates are not part
+of the approximate distribution contract. Coverage retains TCP/UDP port affinity,
+fragment fallback and malformed-input checks, and exercises per-CPU
+map/program/attachment refusal through single-reader rollback. Reader coverage
+distinguishes receive-worker retention in multiqueue mode from single-reader
+native TCP/UDP flow locality and the selected opaque mode, including reassembled
+packets. Existing opaque rotation assertions explicitly request spread; omitted
+settings exercise the prefix default. Fixed independent common32 vectors retain
+full64 carrier/fingerprint vectors separately. The software distribution fixture
+also covers source addresses and ports that increase together. The C selector,
+serialized cBPF and loaded TUN eBPF cover prefix, peer and spread, options/short/truncated packets,
+fragments and non-power-of-two worker counts. Short opaque packets use the
+address/protocol fallback in prefix/peer and continue spreading in spread mode.
+Fragment coverage retains generic SCTP port association separately from its
+complete-packet opaque classification. Configuration fixtures cover exact
+mode strings and invalid JSON types on both nodes, including write-only capture.
+They reject embedded-NUL suffixes in values and setting names, including a
+malformed key following a valid setting.
+`packet_tunnel_test` covers direct receive-direction Ping decoding, encoding and
+indirect layouts, exact type versus instance name, omitted-prefix behavior and
+explicit-mode precedence. Native queue/session fixtures cover effective-mode
+propagation through fallback and generation restart. Ordinary input and checksum/GSO work of one visible flow
+must select the same worker and retain it across capacity retries. Consumer tests
+separately prove transport ownership after that receive placement. Run focused units in Debug and Release; unavailable
+kernel BPF execution is reported separately from deterministic fixture results.
+Windows `tun_windows_reader_test` exercises native thread-pool waits,
+bounded drains, coalescing, rearm-versus-stop, refused activation, restart and late
+notification cleanup. Native Windows or Wine execution is distinct from merely
+cross-compiling these tests.
+
+## Code Review Rules And Tunnel Checklist
+
+This checklist is a minimum, not the boundary of review. Inspect changed behavior
+and affected callers, callees, neighbors, and error paths for undefined behavior,
+bounds and integer errors, races, memory/resource leaks, exhaustion or denial of
+service, security problems, invalid configuration handling, compatibility,
+portability, and build/test defects. Existing patterns, passing tests, policy
+checks, and comments are evidence, not proof.
+
+Report a concrete trigger and impact for each finding, distinguish confirmed
+defects from questions or optional improvements, and report material out-of-scope
+defects without silently editing them. If no actionable finding exists, say so and
+name material residual risks or validation gaps rather than inventing stylistic
+findings.
+
+For a tunnel change, confirm every applicable item below:
+
+**Checks and state**
+
+- Changed guards and state flags follow [Part 5's reachability and API-contract
+  rules](./part5-tunnel-anatomy.mdx#avoiding-redundant-checks-and-state). Removing
+  redundancy preserves shared checked-API outcomes, external-input validation,
+  resource limits and callback-lifetime checks.
+
+**Lifecycle and direction**
+
+- `Init` initializes this tunnel's line state before any callback can use it.
+- Normal-line context selectors and rewriters complete and publish their own
+  context/admission decisions before outward `Init`, including decisions that
+  require payload or asynchronous work; see [Part 2](./part2-lines-and-callbacks.mdx#resolve-context-before-propagating-init).
+- Upstream callbacks are forwarded only with `tunnelNextUpStream*`.
+- Downstream callbacks are forwarded only with `tunnelPrevDownStream*`.
+- No `initialized` flag was added unless an explicitly documented line-role or
+  callback contract requires state before ordinary `Init`.
+
+**Line safety**
+
+- Every re-entrant callback either returns immediately or protects the line
+  (`lineCallWithRef()` / manual `lineRef()` + `lineIsAlive()`).
+- On a `false` from `lineCallWithRef()`, the code does not touch `line`, line state,
+  or `LinestateDestroy()`.
+- Only the line **owner** calls `lineDestroy()`.
+- Every normal-line owner receiving `Finish` detaches producers and inventories,
+  destroys its state, and returns with `! lineIsAlive(line)` on every error,
+  timeout, and terminal-verdict branch.
+- A borrowed-line path destroys only its own state and never calls
+  `lineDestroy()`.
+- `requestProgramShutdown()` is never used instead of closing an owned line.
+
+**Finish**
+
+- `Finish` destroys local state before propagating a real close.
+- Middle-tunnel teardown finishes upstream first, then downstream, then returns.
+- No `Payload`, `Est`, `Pause`, `Resume`, or `Finish` reflects toward the side that
+  sent `Finish`.
+- The same-line Finish guarantee is not treated as protection against callbacks on
+  sibling lines. Shared-resource retirement closes operation admission before its
+  first outward callback; cached writes and queue drains honor that gate. Review
+  and test a still-live sibling's nested send/close during notification, including
+  on a single worker; see [Part 2](./part2-lines-and-callbacks.mdx#finish-semantics).
+- If final protocol bytes are sent during `Finish`, the sender side is marked
+  finished before the re-entrant send while holding a line reference, and the
+  handler unrefs and returns without touching destroyed state.
+
+**Backpressure**
+
+- Classify each exact line and producer direction. Pure forwarders relay repeated
+  Pause/Resume. Every originator combines local and received pressure: incoming
+  Resume cannot release its own hold, and local release cannot override received
+  Pause. Due middle-node work retains its protocol progress; adapters, endpoints
+  and limiters retain their producer/drain gates and receive/write limits.
+- A local hold has an independent eventual release or close path. Test both
+  release orders, overlapping local reasons, repeated notifications and callback
+  reentry. Neither ordering may expose a transient Resume; the final release must
+  progress without another Payload.
+- For Trojan/VLESS UDP decoders, assert completion of all complete datagrams in the
+  current accepted input after Pause, stopping on Finish/closure. Do not preserve
+  a blanket zero-further-Payload assertion for that synchronous batch.
+- Receiver tolerance has finite byte and entry/allocation bounds, including tiny
+  and empty datagrams, with a defined overflow/close or documented UDP-drop path.
+- FIFO admission and ownership are published before reentrant pressure callbacks;
+  new input cannot overtake older work or extend an admitted batch indefinitely.
+- Retained storage has a concrete parsing, protocol, ordering or producer obligation.
+  Avoid redundant transport queues. Scheduling tests exercise FIFO, due-work
+  progress, hard limits and safe closure; a blanket no-output-while-paused assertion
+  is inappropriate for ordinary middle nodes. Verify pause gates for adapters,
+  exact-line boundaries and explicit exceptions according to their role in
+  [Part 2](./part2-lines-and-callbacks.mdx#flow-control-roles-and-admission).
+- Pre-Est payload tests distinguish valid post-Init admission from illegal calls
+  before Init, wire-order violations and callbacks after Finish.
+
+**Buffers and padding**
+
+- Every prepend fits inside the tunnel's advertised `required_padding_left`.
+- `sbufShiftLeft()` is only used when enough left capacity exists.
+- Buffers are recycled exactly on the paths that still own them; none leak.
+- Code that can receive splice input never treats logical length as proof that
+  the body is resident; raw access is limited to ordinary results or an explicit
+  resident-prefix guarantee.
+- Each splice wrapper retains exclusive ownership of one private pipe; tests
+  cover partial consumption, error/close settlement, and no duplicated pipe
+  descriptors.
+- BufferStream search/view tests cover ordinary input, delimiters split across
+  entries, returned offsets and unchanged output on no match. HTTP splice parsing
+  is outside this contract.
+- Splice-stream units cover split headers, repeated peeks, zero headers/bodies,
+  mixed ordinary/prefix/pipe ranges, exact source splits and multi-pipe assembly,
+  positive short transfers/EINTR, real one-slot exhaustion, complete fallback,
+  onward padding and tiny-fragment budget pressure.
+- Mux tests cover both directions, atomic large-splice batch publication, Pause
+  during delivery, nested Resume/input, reentrant Close, parent death, admission
+  equality/refusal, queue-capacity accounting and independent output ownership. Feasible
+  split/merge paths must demonstrate zero body-materialization reads.
+  Mux Ping/Pong coverage verifies its parent-line output gate, shared FIFO order,
+  whole-frame reentry and terminal queue settlement. KeepAlive coverage verifies
+  due probes and direct replies through advisory Pause, repeated signal relay,
+  parser-serialized nested Ping input, and Finish during reply delivery.
+  Mux health cases verify timer-driven soft retirement and idle closure without
+  Resume or a new-child request; KeepAlive cases verify elapsed reply deadlines
+  through repeated or overlapping directional pauses. Where a client gates unsent
+  probes, verify they remain due without timing out or producing a catch-up burst;
+  Mux also checks a timer reentering an active output callback.
+  Both clients verify the first ping waits a full interval after transport Est,
+  repeated Est does not postpone it, and waiting does not block application work
+  or start a reply deadline. Mux also covers a downstream junction marking the
+  shared line before forwarding Est; KeepAlive covers both sensitive modes.
+- Incoming stream, child/detached and output costs settle before callbacks and on
+  refusal/destruction. Incoming and attached-child charges share the parent receive
+  limit; beneficial pressure compaction preserves bytes. Raw carrier charge stays
+  separate from the mutable child aggregate.
+- Portability units compile the actual splice stream and representation helpers
+  with `WW_HAVE_SPLICE=0`, exercising ordinary fallback rather than linking only
+  normal splice-enabled implementation objects.
+- Eligibility coverage includes `misc.splice` on/off, ordinary receive fallback,
+  a non-capable node/helper, packet-chain exclusion, and unsupported builds.
+
+**Packet semantics (if applicable)**
+
+- Packet lines are kept alive during normal runtime.
+- Packet-line state is treated as worker-local shared state.
+- Packet-line init source (node manager vs. manual `onStart`) is verified.
+- Every packet-line `Finish` handler is classified for that exact role and
+  direction: fatal anchor, same-direction transparent forwarding, or documented
+  terminal absorption. No category destroys the packet line.
+
+**Validation**
+
+- Tests exercise the intended callback direction.
+- Validation used preset build metadata, not guessed compiler flags.
+- Every modified C/header file was formatted with `clang-format` (or the missing
+  tool was reported explicitly).
+- Regression coverage was added where it materially protects behavior, or the
+  reason existing coverage/non-test validation is sufficient is stated.
+- Validation scope is proportional: focused for narrow changes and broad/full for
+  shared, concurrent, security-sensitive, or difficult-to-bound work.
+
+## Common Pitfalls (Master List)
+
+A consolidated list of the failure modes this guide exists to prevent:
+
+- Accessing tunnel line state after `LinestateDestroy()` (or reading zeroed
+  fields).
+- Adding `initialized` flags to compensate for unsafe control flow.
+- Touching `line_t*` after an inter-tunnel callback without protection.
+- Calling `tunnelNext*` vs `tunnelPrev*` in the wrong direction.
+- Reflecting `Pause`/`Resume`/`Finish` back toward a finished direction.
+- Emitting `Est`, `Pause`, `Resume`, or `Finish` at the wrong time.
+- Keeping a line alive across `Finish` without `lineRef()`.
+- Forgetting that `lineDestroy()` expects tunnel states to be zeroed unless the
+  refcount is still positive.
+- Leaking buffers when a callback kills the line.
+- Misusing `sbufShiftLeft()` or ignoring `required_padding_left`.
+- Behavior that only works in one chain arrangement but breaks general
+  composition.
+- Treating packet-line state as per-connection state, or destroying packet lines
+  at runtime.
+- Assigning callbacks or accessing tunnel state before checking a nullable
+  `tunnelCreate()` / `adapterCreate()` / `packettunnelCreate()` result.
+- Indexing worker-owned arrays with raw `getWID()` instead of using line, worker,
+  loop, or checked event-worker context.
+- Treating an existing implementation as proof of correctness instead of checking
+  its contract and callers.
+- Hand-assembling compile commands when preset build metadata exists.
+- Reporting a compiler crash or unavailable environment as passed validation.
+
+## Expected Output From a Coding Agent
+
+Adapt the response to the request and lead with the outcome. A completed change or
+review should still make these facts easy to verify:
+
+1. **Result** — what changed, or the confirmed findings in severity order.
+2. **Correctness evidence** — the concrete behavior, callers, and applicable
+   lifecycle, line, direction, buffer, packet, worker, or shutdown contracts.
+3. **Validation** — commands actually run, their results, and any failed or
+   inconclusive checks. Do not imply that an unrun lane passed.
+4. **Residual risk** — material gaps, assumptions, or follow-up work.
+
+Do not force unrelated tunnel analysis into a documentation or tooling result.
+Conversely, a tunnel change that cannot identify its callback direction and exact
+line role is not ready. When something consequential remains unclear, investigate
+source, tests, callers, and documentation and ask a focused maintainer question if
+the repository cannot decide it; do not treat an existing pattern as proof or
+invent a lifecycle concept as an incidental workaround.
+
+## Syntax-Only Checks
+
+Do not hand-assemble compile commands. If you need a single-file or syntax-only
+compile, take the **exact** flags for that file from the generated
+`build/linux/compile_commands.json`.
+
+:::warning The `structure.h` collision trap
+Every tunnel has a tunnel-local header named `include/<Tunnel>/structure.h`. If you
+write a manual compile command that adds several tunnels' `include/` directories
+at once, the wrong `structure.h` can be picked up silently, producing confusing
+errors or — worse — a build that links the wrong layout. Validate one tunnel in
+isolation, or preserve the target's original include order from
+`compile_commands.json`. This is the single biggest reason to avoid hand-rolled
+compiles.
+:::
+
+Common manual-compile failure modes: missing generated dependency headers, wrong
+build-tree include roots, and the `structure.h` collision above.
+
+## When the Compiler Itself Crashes
+
+There is a known build-environment issue where an ad-hoc or non-preset build tree
+can trigger a GCC internal compiler error, for example:
+
+```text
+internal compiler error: Bus error
+```
+
+This often happens while compiling **core** files such as `ww/libc/wlibc.c` —
+before your edited tunnel is even reached.
+
+An ICE or bus error is **inconclusive**. It is often a stale/ad-hoc build-tree or
+host-resource failure, but it can also be a compiler defect exposed by the changed
+translation unit. It proves neither that the tunnel is wrong nor that it is
+correct. Reproduce first with a clean supported preset before deciding what to
+debug, and never report that lane as passed.
+
+### Fallback Strategy When Compilation Is Blocked
+
+Work down this list:
+
+1. `cmake --preset linux`
+2. `cmake --build --preset linux --target <ChangedTargets> -j8`
+3. `cmake --build --preset linux -j8`
+4. If the failure remains, try another supported project preset/toolchain when it
+   can answer the same question (for example, the corresponding Clang preset).
+5. Report the exact compiler failure and mark the affected validation
+   **inconclusive**.
+6. Continue with the strongest verification that still works:
+   - preset-based target builds,
+   - syntax-only checks using `build/linux/compile_commands.json`,
+   - focused code review against the contracts in this guide.
+
+Syntax-only checks and review are useful diagnostics, but they do not replace the
+missing link/runtime evidence for a behavioral change. State exactly what remains
+unverified.
+
+Summary of build priorities:
+
+- prefer the `linux` preset,
+- prefer preset target builds over the root `build/` tree,
+- prefer `build/linux/compile_commands.json` over guessed compile flags,
+- treat a GCC ICE / bus error as inconclusive until a clean supported build
+  establishes otherwise.
+
+## Platform and dependency build reference
 
 Linux application builds link bundled dependencies and compiler runtimes
 statically, allowing only glibc libraries and its dynamic loader as shared
@@ -603,32 +1307,6 @@ behavior, nor full runtime workers/TCP/TLS equivalence. Native application tests
 gate artifact publication; manual testing remains necessary for deployment-specific
 behavior.
 
-### Build Rules
-
-- Do **not** run `cmake --build build ...` against an arbitrary `build/` tree
-  unless you have confirmed it is a healthy preset-created tree you intend to use.
-- Do **not** mix build trees (`build/`, `build/linux`, `build/linux-gcc-x64`)
-  inside one verification flow — you can end up testing a stale binary.
-- Prefer preset target builds over root-tree builds.
-
-## Formatting C And Headers
-
-Run the portable `clang-format` command with the repository's `.clang-format`
-file on every C or header file you modify:
-
-```bash
-clang-format -i --style=file path/to/changed_file.c
-clang-format --dry-run -Werror --style=file path/to/changed_file.c
-```
-
-Each development environment is responsible for making `clang-format` resolve to
-its installed project-compatible formatter; repository documentation must not pin
-a distribution-specific executable name. New files must be fully conformant. Some
-legacy files are not, so do not reformat untouched code wholesale: format and
-verify the changed ranges with `--lines=<start>:<end>` when a full-file pass would
-rewrite unrelated lines. If the command is unavailable, report what remains
-unformatted or unverified rather than silently skipping the check.
-
 ### Build-Authority Modes
 
 The repository's Ninja authority model validates symlink-free graph traversal,
@@ -643,107 +1321,7 @@ with an immutable-toolchain boundary error. Use `--mode diagnostic` for ordinary
 CI until a reviewed immutable toolchain image or snapshot is available; do not
 describe a diagnostic record as a hermetic or hostile-same-user guarantee.
 
-## Testing
-
-Tests are registered with CTest under names like `waterwall.<case>` and are driven
-by the harness in `tests/`. Each integration case lives in `tests/cases/<case>/`.
-
-On Linux, deterministic integration tests execute inside private user and network
-namespaces created without root privileges, with loopback-only isolation
-(`tests/run_in_network_namespace.sh`),
-preventing port collisions and allowing concurrent execution. Tests are organized
-into lanes via `tests/run_test_lane.sh`:
-
-Deterministic cases must not use public DNS or depend on host-network port
-availability. A case that intentionally needs live internet belongs in the
-explicit `external` lane instead.
-
-The privileged lane uses the same network isolation, but because its wrapper is
-already invoked through `sudo -E`, it retains the caller's user namespace and
-creates only a private network namespace. This preserves access to runner-owned
-workspace paths; nesting root inside a mapped user namespace would lose that
-host-filesystem permission authority.
-
-The wrapper records its caller's network namespace in
-`WATERWALL_TEST_PARENT_NETNS` before entering the new namespace. Fixtures that
-modify interfaces compare their own namespace against this marker; they must
-not depend on reading `/proc/1/ns/net`, which may be inaccessible to namespace
-root on an unprivileged CI runner.
-
-Network namespaces do not isolate the host user's pipe-page accounting. Linux
-CI provisions a finite soft allowance for two maximum-sized 512 MiB splice
-inventories per parallel slot at the lane's 32-job cap, plus one inventory of headroom. A single
-runtime's pipe allowance cannot accommodate the parallel suite. Keep splice
-trace assertions active; an empty inventory is not evidence that the splice path
-passed. This CI setup changes the disposable runner's soft limit only, without
-changing production capacity ceilings or the kernel hard limit.
-
-- `support`: production policy and test-harness tests, run strictly serially.
-- `functional`: deterministic integration tests run in parallel (`min(32, max(4, 4 * CPUs))` jobs).
-- `external`: integration tests requiring live host internet access (e.g. Reality against Google), run strictly serially.
-- `speed`: opt-in multi-stream throughput benchmarks, run strictly serially (`RUN_SERIAL TRUE`) to avoid contention.
-- `stress`: opt-in longer traffic/churn probes, run serially.
-- `privileged`: root/TUN probe tests run under `sudo -E`.
-- `all`: runs support, functional, and external lanes in sequence.
-
-The production tree contains integration, smoke, and source-policy tests. Native
-unit tests live in the separate no-LTO tree below. The `linux` and `linux-packed`
-CTest presets exclude `speedtest` and `stress`; use the explicit lane commands
-for those workloads. Functional coverage includes short verified and unverified
-SpeedTestClient TCP smoke cases. The longer Mux parent-pressure probes belong
-to `stress`; deterministic native pressure coverage remains in both unit configurations.
-
-Source-only policy checks carry `source-policy` and run once in the
-production support lane for a source revision. Native Debug/Release presets and
-the macOS/Windows CI unit lanes exclude that label; actual build-policy and
-runtime checks remain configuration-specific. The abort and orderly-shutdown
-scanners run directly by default. Their optional `--mutation-test` mode is for
-changes to the scanners themselves.
-
-`waterwall.tunnel_callback_dispatch_policy` checks production tunnel C sources
-and headers for direct flow-callback calls or pointer captures. Handler
-assignments remain allowed; delivery must use the dispatch helpers described in
-[Part 2](./part2-lines-and-callbacks.mdx#dispatch-through-helpers).
-
-Lane durations depend on hardware and build warmth. Historical speed-lane
-measurements were 46–48 seconds on a 4-CPU host; that optional work is outside
-the routine `all` total. Measure the current lane selection when estimating a
-complete run. Cloud CI runs native Release and Debug in parallel.
-
-Use the full functional lane for shared networking or tunnel behavior and the
-ordinary integration sequence for broad tunnel or harness work. Run routine
-production coverage, including applicable privileged tests, plus both native-unit
-configurations for shared-core contracts, lifecycle/concurrency work,
-multi-subsystem changes, or any change whose impact is difficult to bound.
-Speed and stress lanes are opt-in: run them when requested or when directly
-validating their workloads. Focused checks remain appropriate for narrow or
-non-behavioral edits.
-
-```bash
-# Ordinary non-privileged production Release sequence across test lanes.
-cmake --preset linux
-cmake --build --preset linux --config Release --target check_waterwall_tests -j8
-
-# Run the production support lane (policy and test-harness checks).
-bash tests/run_test_lane.sh support build/linux Release
-
-# Run the deterministic functional lane directly in parallel.
-bash tests/run_test_lane.sh functional build/linux Release
-
-# Run all ordinary non-privileged production lanes in sequence.
-bash tests/run_test_lane.sh all build/linux Release
-
-# Optional throughput and longer traffic/churn workloads.
-bash tests/run_test_lane.sh speed build/linux Release
-bash tests/run_test_lane.sh stress build/linux Release
-
-# Complete native-unit suite: optimized Release plus asserted Debug behavior.
-cmake --preset linux-unit-tests
-cmake --build --preset linux-unit-release -j8
-ctest --preset linux-unit-release --output-on-failure
-cmake --build --preset linux-unit-debug -j8
-ctest --preset linux-unit-debug --output-on-failure
-```
+## Specialized validation reference
 
 ### Trojan UDP size coverage
 
@@ -1074,274 +1652,6 @@ archive link/startup check and participates in platform unit builds. A
 cross-compiled executable proves linking only; little-endian execution does not
 establish big-endian runtime coverage.
 
-### Native Unit Tests
-
-Native unit tests have a dedicated multi-configuration tree with IPO/LTO disabled
-before any project target is created. Release preserves optimization and `NDEBUG`
-while avoiding mixed-LTO links; Debug activates assertions and other contract
-guardrails. Production Release remains IPO/LTO-enabled, so complete behavioral
-validation uses the production lane and both native-unit configurations:
-
-Native unit-test executables intentionally disable inherited precompiled headers.
-The production library and tunnel targets retain their shared PCH, but applying it
-to each independent test target would create a large duplicate artifact per test
-and configuration.
-
-To simulate a running loop with direct `wloopProcessEvents()` calls, establish
-`WLOOP_STATUS_RUNNING`, as `wloopRun()` normally does. A newly created loop is
-stopped; leaving it stopped can suppress timer collection after polling. Keep
-normal admission open until the scenario intentionally tests quiescence.
-
-`ww` directly depends on the C++ allocator object library so even pure-C consumers
-select the C++ linker and runtime. It also exports the allocator objects explicitly
-to keep the allocation overrides from being dropped by static archive extraction.
-
-```bash
-# Production Release: build the shipped binary plus the production-full suite.
-cmake --preset linux
-cmake --build --preset linux --config Release --target check_waterwall_tests -j8
-
-# Native units: optimized Release/no-LTO behavior.
-cmake --preset linux-unit-tests
-cmake --build --preset linux-unit-release -j8
-ctest --preset linux-unit-release --output-on-failure
-
-# Native units: assertions and Debug guardrails in the same no-LTO tree.
-cmake --build --preset linux-unit-debug -j8
-ctest --preset linux-unit-debug --output-on-failure
-```
-
-For focused behavioral work, prefer the relevant `linux-unit-debug` selection
-first: assertions usually identify a violated ownership, lifecycle, or state
-contract closer to its cause. Repeat that coverage with `linux-unit-release`
-before completion because optimization and `NDEBUG` can expose different behavior.
-Broad/shared changes run both complete presets. Debug is not a substitute for
-Release, AddressSanitizer, UndefinedBehaviorSanitizer, or ThreadSanitizer. Never
-build native unit tests in the production tree: it contains the LTO-enabled
-libraries used by `Waterwall`.
-
-Native source files live under `tests/unittests/{base,crypto,bufio,core,net,devices,lwip,tunnels}/`;
-the owning source documents its purpose, important cases, fixture and exact CTest
-selection. Multi-file suites refer to their driver, and shared fixture headers
-describe setup, ownership and cleanup. The worker driver under `net/worker/`
-keeps an explicit lifecycle order across accessor, message, pipe, HalfDuplex and
-teardown modules. Forked cases run before shared runtime initialization; cases
-requiring live workers precede teardown races that close worker admission.
-
-CTest registration stays in explicit CMake. `tests/cmake/TestHelpers.cmake`
-captures absolute test, native and support roots at its definition site and is
-shared by Linux and root platform registrations. `waterwall_add_native_executable`
-creates ordinary targets from explicit sources with optional private includes,
-libraries, definitions and test support. `waterwall_register_native_test`
-registers an existing target with its labels, execution allowance and selected
-aggregate. Its optional `SOURCE_DIR` lets standalone fixture projects expose the
-repository source root independently of their own project root. Keep linker
-wraps, source substitutions, feature variants and
-PCH/Unity exclusions beside the owning target. Native subsystem fragments live
-under `tests/cmake/native/`; integration family fragments live under
-`tests/cmake/integration/`. Public portable and specialized runner entry paths
-remain under `tests/unittests/`. Adding a test requires editing the owning
-registration, not a second source inventory or source glob.
-
-Each runnable `tests/cases/` or `tests/speedtests/` directory has a local README
-describing topology, settings that matter to the scenario, worker/feature
-variants, prerequisites and its actual success criterion. Script tests put this
-intent and their execution reference in module docstrings or opening comments.
-Benchmark documentation records workload, metrics and limits beside the code;
-refactoring test support does not change performance workloads or thresholds.
-Use `ctest --preset linux --show-only=json-v1` and the two native-unit presets to
-discover current names and properties. The repository testing READMEs provide
-directory maps, authoring steps and focused/full commands rather than duplicate
-test catalogs or planning timings.
-
-Native CTest auto-build runners execute in private directories beneath
-`<build>/test-runs/<configuration>/<test-name>/<invocation>/`, printing the path
-before lock acquisition or child startup. Build and executable stdout/stderr are
-captured separately. Registration passes explicit source and fixture directories;
-immutable input paths must resolve independently of CWD. The child environment
-also exposes `WATERWALL_TEST_SOURCE_DIR` and `WATERWALL_TEST_FIXTURE_DIR`.
-
-The shared portable CMake boundary holds `waterwall-native-test.lock` in the build
-tree across build and execution, including the hard-abort and DNS-bus fixtures.
-Keep existing CTest resource locks. Different build trees do not share this lock;
-manual builds outside the runner require an idle tree. Lock acquisition is bounded
-to 30 seconds, build to 60 seconds, and execution to the suite's original allowance.
-Outer native CTest timeouts add 95 seconds for lock/build/cleanup (120 becomes 215;
-30 becomes 125). Scenario deadlines, expected signals/exits and the Release-only
-abort suite remain unchanged.
-
-Native and shell run directories are retained on failure, interruption, timeout
-and initialized skip. Successful runs remove them by default; set
-`WATERWALL_TEST_KEEP_RUN_DIR=1` to retain them. An accepted expected failure is a
-successful enclosing test. Only clean idle trees with
-`tests/cleanup_generated_outputs.sh`; it selects generated native directories and
-legacy leftovers, preserving fixtures, build products and the cooperative lock.
-
-Test authors can link the private `ww_test_support` target and include
-`test_assert.h` for requirements that remain active under `NDEBUG`. Runtime
-fixtures include the WaterWall header first, in a separate include group, so its
-feature macros precede the support header's system includes after formatting.
-Comparisons evaluate operands once and report the case, original call site and values; byte
-diagnostics identify the first mismatch with bounded output. Choose `exit(1)` or
-`_Exit(1)` explicitly to preserve the fixture's failure boundary. These helpers
-do not replace production Debug assertions or their expected-failure tests.
-`TEST_CHECK` reports and returns a boolean without terminating; a suite using it
-retains its accumulated-failure, return-status, `abort()` or platform-exit policy.
-The pure library under `tests/support/c/` can be imported by standalone platform
-fixtures without registering other tests or linking runtime code. Standalone
-archive/header probes retain their independent link boundary where support would
-invalidate the probe.
-Use ordered `TEST_RUN_CASE` calls or explicit `testCaseSet` before parameterized
-cases. The executable has one case context across translation units: publish a
-static name before admitting work and keep it stable until all case threads and
-callbacks finish. Keep scenario setup and successful teardown visible.
-
-The line-failure harness remains a composition entry point for opt-in process
-guards, buffer accounting, callback observation and worker/normal-line setup in
-`tests/support/c/fixtures/`. Link support privately and preserve wrapper symbols,
-exact line ownership, buffer transfers and teardown ordering. Simple tests must
-not inherit runtime failure wrappers. Examples and API obligations live in
-`tests/support/README.md`, with base64, atomic and HeaderServer tests demonstrating
-the appropriate scope.
-
-Python entries using `tests/support/python/wwtest/` resolve imports from
-`__file__` and disable source-tree bytecode before importing. Socket exact reads
-and positive strace parsing preserve scenario semantics. Keep the private run
-directory outside process/socket/executor contexts so child/tracer cleanup and
-peer joins finish before deletion; retain failures, initialized skips and
-timeouts, with the same `WATERWALL_TEST_KEEP_RUN_DIR=1` success override. The POSIX
-process helper preserves `strace -D` runtime ownership and bounds cleanup while
-keeping the original scenario exception. Prerequisites, readiness behavior,
-expected exits and scenario deadlines stay explicit in each test.
-
-Copied case probes resolve support from the mirrored tests root; owners of
-arbitrary copied directories, including native Windows examples, pass
-`WATERWALL_TEST_SUPPORT_DIR` explicitly. Import reusable utilities and named
-protocol fixtures from support rather than executable test programs. Match exact
-read/EOF/timeout and readiness semantics: keep the scenario's successful TCP
-connection and never create an extra UDP association to establish readiness.
-Startup configuration tests retain complete captured command output under their
-private directory without recording environments. Mains returning captured
-failure/skip statuses settle the directory with that enclosing verdict after all
-resources finish; benchmark retention and workloads remain caller obligations.
-
-Shell entry points and `case_run_dir.lib.sh` retain their public paths while
-sharing private-directory, log, explicit-PID shutdown/reap and core-setting
-mechanics under `tests/support/shell/`. Traps capture the enclosing status first.
-Marker, expected-failure, report, probe, privileged and speed decisions remain in
-their runners. Specialized native build-lock orchestration, Win32 capability
-events, namespace holders and process-group fault injection retain their own
-ownership policy rather than acquiring another lock or borrowing a mismatched
-process abstraction. Put the actual setup, important checks, limits and CTest
-references beside each changed test and probe.
-
-On Win64, `waterwall_platform_unit_tests` also builds
-`device_reader_session_windows_fallback_compile`. This compile-only target
-compiles the real session, budget and dispatch sources separately with
-`WW_HAVE_C11_ATOMICS=0`,
-even when the compiler normally selects C11 atomics. Its source guard requires
-Win64 and the fallback branch, catching CAS expected-value pointer type/width
-errors. The diagnostic object is never linked into the runtime; its atomic
-representation may differ from the normal build. It also works with the
-`windows-cross-mingw-x64-unit` preset without executing a Windows binary.
-
-Crypto backend validation follows the same two-tree rule. Each production preset
-such as `linux-sodium-crypto` has a matching native-unit preset such as
-`linux-sodium-crypto-unit`. Build the shipped executable and run integration
-checks from the production tree; build and run native crypto tests only from the
-matching no-LTO unit tree. Production crypto presets intentionally do not define
-native-unit targets.
-
-The non-sanitizer crypto CI jobs prebuild `reality_close_lifecycle_test` in that
-unit tree before CTest. Its cold BoringSSL dependency build belongs in the normal
-build step, outside the native runner's 60-second incremental-build allowance.
-Building the production executable does not populate the separate unit tree.
-
-The focused shutdown concurrency lane is configured separately:
-
-```bash
-cmake --preset linux-tsan-unit
-cmake --build --preset linux-tsan-unit -j8
-ctest --preset linux-tsan-unit --output-on-failure
-```
-
-It covers the controller, worker-message/event-loop admission, reader-session,
-and real production-sequence shutdown fixtures under ThreadSanitizer. It is a
-focused concurrency lane, not a replacement for the Release/no-LTO unit lane.
-
-The registered no-LTO policy directly checks the unit-tree cache, reachable
-compile/link commands, and representative WaterWall, lwIP, and TlsClient
-artifacts. That is enough to catch the mixed-LTO regression without building a
-second attestation system around the compiler, build tool, or verifier.
-
-Linux cloud CI runs the complete `linux-unit-release` and `linux-unit-debug`
-presets as independent parallel jobs, with source-only checks retained in the
-single Linux production support job. On macOS and Windows, CI builds
-`waterwall_platform_unit_tests`, runs the same direct no-LTO policy, and executes
-the registered platform unit tests in Release.
-
-Run one case by its registered name (use an anchored regex):
-
-```bash
-ctest --preset linux --output-on-failure -R '^waterwall\.tls_roundtrip$'
-```
-
-To run a single integration case directly while debugging — passing the binary,
-the case directory, and a timeout in seconds:
-
-```bash
-bash tests/run_in_network_namespace.sh bash tests/run_waterwall_case.sh \
-  build/linux/Release/Waterwall \
-  tests/cases/tls_roundtrip \
-  60
-```
-
-There are many roundtrip cases to model new tests on, including
-`encryption_roundtrip`, `mux_*_roundtrip`, `http1_*` / `http2_*`,
-`packets_stream_bridge_roundtrip`, and the `ping_*_roundtrip` family. Pick the one
-closest to your tunnel as a structural reference, then verify that its assertions
-actually exercise the changed behavior and failure mode.
-
-Worker-owned TUN receive coverage includes `tun_linux_queues_test` for startup
-fallback and fixed steering, with an optional real-kernel BPF execution case;
-`device_reader_session_test` for nonblocking multi-producer budgets, notification
-quiescence and ordered inline delivery; and `device_frag_affinity_test` for shared
-fragment storage and independent release results. `tun_linux_message_lifetime_test`
-uses owner readiness callbacks to cover real reader lifecycle and checksum/GSO
-handoff. Linux steering coverage explicitly selects spread when checking repeated
-complete IPv4 non-TCP/UDP packets against the per-CPU cursor sequence and CPU-ID offset, independent CPU
-cursors and separate interface maps, and the map's 32-bit cursor geometry. Kernel
-checks pin execution to a CPU for deterministic local cycles and switch CPUs to
-verify independence. Exact global counts during overlapping updates are not part
-of the approximate distribution contract. Coverage retains TCP/UDP port affinity,
-fragment fallback and malformed-input checks, and exercises per-CPU
-map/program/attachment refusal through single-reader rollback. Reader coverage
-distinguishes receive-worker retention in multiqueue mode from single-reader
-native TCP/UDP flow locality and the selected opaque mode, including reassembled
-packets. Existing opaque rotation assertions explicitly request spread; omitted
-settings exercise the prefix default. Fixed independent common32 vectors retain
-full64 carrier/fingerprint vectors separately. The software distribution fixture
-also covers source addresses and ports that increase together. The C selector,
-serialized cBPF and loaded TUN eBPF cover prefix, peer and spread, options/short/truncated packets,
-fragments and non-power-of-two worker counts. Short opaque packets use the
-address/protocol fallback in prefix/peer and continue spreading in spread mode.
-Fragment coverage retains generic SCTP port association separately from its
-complete-packet opaque classification. Configuration fixtures cover exact
-mode strings and invalid JSON types on both nodes, including write-only capture.
-They reject embedded-NUL suffixes in values and setting names, including a
-malformed key following a valid setting.
-`packet_tunnel_test` covers direct receive-direction Ping decoding, encoding and
-indirect layouts, exact type versus instance name, omitted-prefix behavior and
-explicit-mode precedence. Native queue/session fixtures cover effective-mode
-propagation through fallback and generation restart. Ordinary input and checksum/GSO work of one visible flow
-must select the same worker and retain it across capacity retries. Consumer tests
-separately prove transport ownership after that receive placement. Run focused units in Debug and Release; unavailable
-kernel BPF execution is reported separately from deterministic fixture results.
-Windows `tun_windows_reader_test` exercises native thread-pool waits,
-bounded drains, coalescing, rearm-versus-stop, refused activation, restart and late
-notification cleanup. Native Windows or Wine execution is distinct from merely
-cross-compiling these tests.
-
 ### TUN TCP Chain Correctness And Throughput
 
 On native Linux, `waterwall.tundevice_tcp_chain` exercises the exact chain
@@ -1449,403 +1759,6 @@ checks do not establish a throughput gain or loss-free operation at saturation.
 Any performance comparison must fix the workload, queue policy, MTU/offload,
 worker count, metrics and sample order before measuring, following the optional
 optimization policy below.
-
-## Choosing Validation And Regression Coverage
-
-Validation should answer the product question directly and remain proportional to
-risk:
-
-- Start with the smallest check that exercises the change: inspection, formatting,
-  a focused target, an existing focused test, or a direct integration case.
-- Expand to the functional lane for shared networking/tunnel behavior or changes
-  spanning cases. Use routine production lanes plus native units for shared-core,
-  lifecycle/concurrency, multi-subsystem, security-sensitive, or difficult-to-bound
-  changes.
-- Documentation, comments, and clearly non-behavioral mechanical changes may need
-  only inspection, link/diff checks, or a relevant policy check. Do not run a broad
-  lane merely because code changed or because the lane is available.
-- New observable behavior, meaningful edge cases, changed contracts, and
-  reproducible bugs likely to regress normally receive focused coverage. When
-  practical, a regression test should fail before the fix and pass afterward.
-- A new test is unnecessary when existing coverage already demonstrates the exact
-  behavior, reproduction is impractical, or the change has no meaningful behavior
-  to assert. State that reason instead of manufacturing a test or a new harness.
-- One direct check may establish a narrow deterministic invariant. Use repetition,
-  sanitizers, stress, fault injection, or broader tests when concurrency, timing,
-  security, or nondeterminism makes one observation insufficient.
-
-A validation failure or unavailable environment is evidence about the validation
-attempt, not a pass and not automatic proof that the product is wrong. Preserve the
-exact failure and distinguish **failed** from **inconclusive** evidence.
-
-## Syntax-Only Checks
-
-Do not hand-assemble compile commands. If you need a single-file or syntax-only
-compile, take the **exact** flags for that file from the generated
-`build/linux/compile_commands.json`.
-
-:::warning The `structure.h` collision trap
-Every tunnel has a tunnel-local header named `include/<Tunnel>/structure.h`. If you
-write a manual compile command that adds several tunnels' `include/` directories
-at once, the wrong `structure.h` can be picked up silently, producing confusing
-errors or — worse — a build that links the wrong layout. Validate one tunnel in
-isolation, or preserve the target's original include order from
-`compile_commands.json`. This is the single biggest reason to avoid hand-rolled
-compiles.
-:::
-
-Common manual-compile failure modes: missing generated dependency headers, wrong
-build-tree include roots, and the `structure.h` collision above.
-
-## When the Compiler Itself Crashes
-
-There is a known build-environment issue where an ad-hoc or non-preset build tree
-can trigger a GCC internal compiler error, for example:
-
-```text
-internal compiler error: Bus error
-```
-
-This often happens while compiling **core** files such as `ww/libc/wlibc.c` —
-before your edited tunnel is even reached.
-
-An ICE or bus error is **inconclusive**. It is often a stale/ad-hoc build-tree or
-host-resource failure, but it can also be a compiler defect exposed by the changed
-translation unit. It proves neither that the tunnel is wrong nor that it is
-correct. Reproduce first with a clean supported preset before deciding what to
-debug, and never report that lane as passed.
-
-### Fallback Strategy When Compilation Is Blocked
-
-Work down this list:
-
-1. `cmake --preset linux`
-2. `cmake --build --preset linux --target <ChangedTargets> -j8`
-3. `cmake --build --preset linux -j8`
-4. If the failure remains, try another supported project preset/toolchain when it
-   can answer the same question (for example, the corresponding Clang preset).
-5. Report the exact compiler failure and mark the affected validation
-   **inconclusive**.
-6. Continue with the strongest verification that still works:
-   - preset-based target builds,
-   - syntax-only checks using `build/linux/compile_commands.json`,
-   - focused code review against the contracts in this guide.
-
-Syntax-only checks and review are useful diagnostics, but they do not replace the
-missing link/runtime evidence for a behavioral change. State exactly what remains
-unverified.
-
-Summary of build priorities:
-
-- prefer the `linux` preset,
-- prefer preset target builds over the root `build/` tree,
-- prefer `build/linux/compile_commands.json` over guessed compile flags,
-- treat a GCC ICE / bus error as inconclusive until a clean supported build
-  establishes otherwise.
-
-## Optional Optimization And Evidence Review
-
-This section applies when an optional optimization candidate or the benchmark,
-parser, manifest, or evidence machinery used to decide it is in scope. It does not
-limit ordinary product review, and it does not limit a task that explicitly asks
-to repair reusable test or benchmark infrastructure. An explicit maintainer/user
-request for that infrastructure is the separate approval described below.
-
-Validation is support work, not a second product. It should catch a realistic
-regression or answer a predeclared engineering question without recursively trying
-to prove that every tool in the evidence chain is itself perfect.
-
-### Classify findings without suppressing them
-
-For optimization/evidence work, distinguish:
-
-1. **Production correctness** — a concrete contract, ownership, lifetime,
-   concurrency, security, portability, or user-visible defect in shipped code.
-2. **Direct regression coverage** — realistic missing coverage for changed product
-   behavior that is likely to regress.
-3. **Performance decision** — evidence that a specific production candidate meets,
-   misses, or cannot be measured against a frozen workload and gate.
-4. **Support-machinery quality** — a defect or hardening opportunity in a runner,
-   parser, manifest, test seam, artifact collector, or other evidence tool.
-
-This classification sets priority; it is never a reason to hide a valid finding.
-A support-tool defect blocks the current decision when it can skip relevant
-behavior, create a false pass/fail, corrupt the metric, or otherwise change that
-decision. Otherwise report it as non-blocking follow-up work instead of expanding
-the current candidate review. A production-review request does not authorize an
-unrelated benchmark-infrastructure redesign, and benchmark cleanup must not change
-production behavior merely to make evidence pass.
-
-### Force a terminal candidate decision
-
-Before collecting data, freeze the workload, metrics, thresholds, sample and order
-count, host requirements, and candidate boundaries. Then:
-
-- Give every isolated optional candidate one terminal disposition: **keep**,
-  **revert/defer**, or **inconclusive on this host**. Do not leave it indefinitely
-  pending while growing the acceptance system around it.
-- A measured regression or failure to earn the declared gain selects the simpler
-  baseline. An inconclusive result also defaults to the simpler production baseline;
-  the candidate may be deferred for a better benchmark host.
-- A host that cannot reliably execute the frozen workload is non-decision-capable.
-  Record that fact. Do not tune the workload after seeing results, retry until
-  favorable, weaken a gate, or create alternate harness identities to force a
-  decision.
-- By default, allow one bounded incidental harness-repair pass after the first
-  end-to-end attempt. Further repair belongs to an explicitly requested,
-  separately scoped infrastructure task.
-- Once direct correctness checks pass and the terminal disposition is recorded,
-  run broad product validation once on the final retained production set. Do not
-  repeatedly rerun it after every evidence-tool revision.
-
-When only non-blocking evidence-machinery limitations remain, report them with the
-terminal product disposition. Do not create another product implementation plan
-unless an independently reproducible production defect appears or reusable
-infrastructure was explicitly requested.
-
-### Do not create proofs of proofs
-
-Unless a separately scoped security, supply-chain, or reproducible-build threat
-model requires them, do not add or require:
-
-- verifier replay, validator self-validation, test-of-test mutation frameworks, or
-  attestations of the acceptance transaction;
-- binary/tool/source hashes, copied verifier source in every result directory,
-  child-process ancestry proofs, filesystem provenance, or CI-runner identity;
-- general shell/CMake command parsers whose purpose is only to prove that recorded
-  commands match recorded flags;
-- exhaustive fail-closed schemas for diagnostic fields that cannot change the
-  scoped correctness or keep/revert decision; or
-- a product setting, protocol field, runtime branch, counter, API, or lifecycle hook
-  added solely to make optional evidence easier to authenticate.
-
-A direct deterministic check is often enough for a narrow build option, path,
-ownership balance, timeout, or emitted metric. Timing, concurrency, security, and
-nondeterminism may require repeated or independent evidence; the rule forbids
-recursive meta-validation, not risk-appropriate testing.
-
-### Keep support code and artifacts subordinate
-
-- Prefer existing tests and small fixtures. If new evidence code materially exceeds
-  the production change or creates a framework, stop unless that infrastructure
-  scope was explicitly authorized.
-- Test seams and counters added solely for evidence must compile out of ordinary
-  production builds. A production API added only for a benchmark needs separate
-  product justification and approval.
-- Raw benchmark output, copied manifests, temporary state trees, and repeated runner
-  snapshots are generated artifacts. Keep one concise results summary in source and
-  bulky reproducibility bundles outside normal history unless requested.
-- If optional proof machinery becomes harder to trust than the direct check, prefer
-  simplifying, replacing, or removing it over adding another validator. Removal is
-  still a code change and follows the task's authorization boundary.
-
-## Code Review Rules And Tunnel Checklist
-
-This checklist is a minimum, not the boundary of review. Inspect changed behavior
-and affected callers, callees, neighbors, and error paths for undefined behavior,
-bounds and integer errors, races, memory/resource leaks, exhaustion or denial of
-service, security problems, invalid configuration handling, compatibility,
-portability, and build/test defects. Existing patterns, passing tests, policy
-checks, and comments are evidence, not proof.
-
-Report a concrete trigger and impact for each finding, distinguish confirmed
-defects from questions or optional improvements, and report material out-of-scope
-defects without silently editing them. If no actionable finding exists, say so and
-name material residual risks or validation gaps rather than inventing stylistic
-findings.
-
-For a tunnel change, confirm every applicable item below:
-
-**Checks and state**
-
-- Changed guards and state flags follow [Part 5's reachability and API-contract
-  rules](./part5-tunnel-anatomy.mdx#avoiding-redundant-checks-and-state). Removing
-  redundancy preserves shared checked-API outcomes, external-input validation,
-  resource limits and callback-lifetime checks.
-
-**Lifecycle and direction**
-
-- `Init` initializes this tunnel's line state before any callback can use it.
-- Normal-line context selectors and rewriters complete and publish their own
-  context/admission decisions before outward `Init`, including decisions that
-  require payload or asynchronous work; see [Part 2](./part2-lines-and-callbacks.mdx#resolve-context-before-propagating-init).
-- Upstream callbacks are forwarded only with `tunnelNextUpStream*`.
-- Downstream callbacks are forwarded only with `tunnelPrevDownStream*`.
-- No `initialized` flag was added unless an explicitly documented line-role or
-  callback contract requires state before ordinary `Init`.
-
-**Line safety**
-
-- Every re-entrant callback either returns immediately or protects the line
-  (`lineCallWithRef()` / manual `lineRef()` + `lineIsAlive()`).
-- On a `false` from `lineCallWithRef()`, the code does not touch `line`, line state,
-  or `LinestateDestroy()`.
-- Only the line **owner** calls `lineDestroy()`.
-- Every normal-line owner receiving `Finish` detaches producers and inventories,
-  destroys its state, and returns with `! lineIsAlive(line)` on every error,
-  timeout, and terminal-verdict branch.
-- A borrowed-line path destroys only its own state and never calls
-  `lineDestroy()`.
-- `requestProgramShutdown()` is never used instead of closing an owned line.
-
-**Finish**
-
-- `Finish` destroys local state before propagating a real close.
-- Middle-tunnel teardown finishes upstream first, then downstream, then returns.
-- No `Payload`, `Est`, `Pause`, `Resume`, or `Finish` reflects toward the side that
-  sent `Finish`.
-- The same-line Finish guarantee is not treated as protection against callbacks on
-  sibling lines. Shared-resource retirement closes operation admission before its
-  first outward callback; cached writes and queue drains honor that gate. Review
-  and test a still-live sibling's nested send/close during notification, including
-  on a single worker; see [Part 2](./part2-lines-and-callbacks.mdx#finish-semantics).
-- If final protocol bytes are sent during `Finish`, the sender side is marked
-  finished before the re-entrant send while holding a line reference, and the
-  handler unrefs and returns without touching destroyed state.
-
-**Backpressure**
-
-- Classify each exact line and producer direction. Pure forwarders relay repeated
-  Pause/Resume. Every originator combines local and received pressure: incoming
-  Resume cannot release its own hold, and local release cannot override received
-  Pause. Due middle-node work retains its protocol progress; adapters, endpoints
-  and limiters retain their producer/drain gates and receive/write limits.
-- A local hold has an independent eventual release or close path. Test both
-  release orders, overlapping local reasons, repeated notifications and callback
-  reentry. Neither ordering may expose a transient Resume; the final release must
-  progress without another Payload.
-- For Trojan/VLESS UDP decoders, assert completion of all complete datagrams in the
-  current accepted input after Pause, stopping on Finish/closure. Do not preserve
-  a blanket zero-further-Payload assertion for that synchronous batch.
-- Receiver tolerance has finite byte and entry/allocation bounds, including tiny
-  and empty datagrams, with a defined overflow/close or documented UDP-drop path.
-- FIFO admission and ownership are published before reentrant pressure callbacks;
-  new input cannot overtake older work or extend an admitted batch indefinitely.
-- Retained storage has a concrete parsing, protocol, ordering or producer obligation.
-  Avoid redundant transport queues. Scheduling tests exercise FIFO, due-work
-  progress, hard limits and safe closure; a blanket no-output-while-paused assertion
-  is inappropriate for ordinary middle nodes. Verify pause gates for adapters,
-  exact-line boundaries and explicit exceptions according to their role in
-  [Part 2](./part2-lines-and-callbacks.mdx#flow-control-roles-and-admission).
-- Pre-Est payload tests distinguish valid post-Init admission from illegal calls
-  before Init, wire-order violations and callbacks after Finish.
-
-**Buffers and padding**
-
-- Every prepend fits inside the tunnel's advertised `required_padding_left`.
-- `sbufShiftLeft()` is only used when enough left capacity exists.
-- Buffers are recycled exactly on the paths that still own them; none leak.
-- Code that can receive splice input never treats logical length as proof that
-  the body is resident; raw access is limited to ordinary results or an explicit
-  resident-prefix guarantee.
-- Each splice wrapper retains exclusive ownership of one private pipe; tests
-  cover partial consumption, error/close settlement, and no duplicated pipe
-  descriptors.
-- BufferStream search/view tests cover ordinary input, delimiters split across
-  entries, returned offsets and unchanged output on no match. HTTP splice parsing
-  is outside this contract.
-- Splice-stream units cover split headers, repeated peeks, zero headers/bodies,
-  mixed ordinary/prefix/pipe ranges, exact source splits and multi-pipe assembly,
-  positive short transfers/EINTR, real one-slot exhaustion, complete fallback,
-  onward padding and tiny-fragment budget pressure.
-- Mux tests cover both directions, atomic large-splice batch publication, Pause
-  during delivery, nested Resume/input, reentrant Close, parent death, admission
-  equality/refusal, queue-capacity accounting and independent output ownership. Feasible
-  split/merge paths must demonstrate zero body-materialization reads.
-  Mux Ping/Pong coverage verifies its parent-line output gate, shared FIFO order,
-  whole-frame reentry and terminal queue settlement. KeepAlive coverage verifies
-  due probes and direct replies through advisory Pause, repeated signal relay,
-  parser-serialized nested Ping input, and Finish during reply delivery.
-  Mux health cases verify timer-driven soft retirement and idle closure without
-  Resume or a new-child request; KeepAlive cases verify elapsed reply deadlines
-  through repeated or overlapping directional pauses. Where a client gates unsent
-  probes, verify they remain due without timing out or producing a catch-up burst;
-  Mux also checks a timer reentering an active output callback.
-  Both clients verify the first ping waits a full interval after transport Est,
-  repeated Est does not postpone it, and waiting does not block application work
-  or start a reply deadline. Mux also covers a downstream junction marking the
-  shared line before forwarding Est; KeepAlive covers both sensitive modes.
-- Incoming stream, child/detached and output costs settle before callbacks and on
-  refusal/destruction. Incoming and attached-child charges share the parent receive
-  limit; beneficial pressure compaction preserves bytes. Raw carrier charge stays
-  separate from the mutable child aggregate.
-- Portability units compile the actual splice stream and representation helpers
-  with `WW_HAVE_SPLICE=0`, exercising ordinary fallback rather than linking only
-  normal splice-enabled implementation objects.
-- Eligibility coverage includes `misc.splice` on/off, ordinary receive fallback,
-  a non-capable node/helper, packet-chain exclusion, and unsupported builds.
-
-**Packet semantics (if applicable)**
-
-- Packet lines are kept alive during normal runtime.
-- Packet-line state is treated as worker-local shared state.
-- Packet-line init source (node manager vs. manual `onStart`) is verified.
-- Every packet-line `Finish` handler is classified for that exact role and
-  direction: fatal anchor, same-direction transparent forwarding, or documented
-  terminal absorption. No category destroys the packet line.
-
-**Validation**
-
-- Tests exercise the intended callback direction.
-- Validation used preset build metadata, not guessed compiler flags.
-- Every modified C/header file was formatted with `clang-format` (or the missing
-  tool was reported explicitly).
-- Regression coverage was added where it materially protects behavior, or the
-  reason existing coverage/non-test validation is sufficient is stated.
-- Validation scope is proportional: focused for narrow changes and broad/full for
-  shared, concurrent, security-sensitive, or difficult-to-bound work.
-
-## Common Pitfalls (Master List)
-
-A consolidated list of the failure modes this guide exists to prevent:
-
-- Accessing tunnel line state after `LinestateDestroy()` (or reading zeroed
-  fields).
-- Adding `initialized` flags to compensate for unsafe control flow.
-- Touching `line_t*` after an inter-tunnel callback without protection.
-- Calling `tunnelNext*` vs `tunnelPrev*` in the wrong direction.
-- Reflecting `Pause`/`Resume`/`Finish` back toward a finished direction.
-- Emitting `Est`, `Pause`, `Resume`, or `Finish` at the wrong time.
-- Keeping a line alive across `Finish` without `lineRef()`.
-- Forgetting that `lineDestroy()` expects tunnel states to be zeroed unless the
-  refcount is still positive.
-- Leaking buffers when a callback kills the line.
-- Misusing `sbufShiftLeft()` or ignoring `required_padding_left`.
-- Behavior that only works in one chain arrangement but breaks general
-  composition.
-- Treating packet-line state as per-connection state, or destroying packet lines
-  at runtime.
-- Assigning callbacks or accessing tunnel state before checking a nullable
-  `tunnelCreate()` / `adapterCreate()` / `packettunnelCreate()` result.
-- Indexing worker-owned arrays with raw `getWID()` instead of using line, worker,
-  loop, or checked event-worker context.
-- Treating an existing implementation as proof of correctness instead of checking
-  its contract and callers.
-- Hand-assembling compile commands when preset build metadata exists.
-- Reporting a compiler crash or unavailable environment as passed validation.
-
-## Expected Output From a Coding Agent
-
-Adapt the response to the request and lead with the outcome. A completed change or
-review should still make these facts easy to verify:
-
-1. **Result** — what changed, or the confirmed findings in severity order.
-2. **Correctness evidence** — the concrete behavior, callers, and applicable
-   lifecycle, line, direction, buffer, packet, worker, or shutdown contracts.
-3. **Validation** — commands actually run, their results, and any failed or
-   inconclusive checks. Do not imply that an unrun lane passed.
-4. **Residual risk** — material gaps, assumptions, or follow-up work.
-
-Do not force unrelated tunnel analysis into a documentation or tooling result.
-Conversely, a tunnel change that cannot identify its callback direction and exact
-line role is not ready. When something consequential remains unclear, investigate
-source, tests, callers, and documentation and ask a focused maintainer question if
-the repository cannot decide it; do not treat an existing pattern as proof or
-invent a lifecycle concept as an incidental workaround.
-
----
-
-Continue to **[Part 7: Application Termination](./part7-shutdown-and-signals.mdx)**.
 
 ## Worker-engine lwIP validation
 
@@ -2101,3 +2014,103 @@ four-lane batch, and single-reader session rotation with exact worker counts.
 Kernel TCP/UDP receive steering and consumer flow ownership remain separate checks.
 These correctness fixtures do not establish a throughput gain or repair packet
 order lost before affinity admission.
+## Optional Optimization And Evidence Review
+
+This section applies when an optional optimization candidate or the benchmark,
+parser, manifest, or evidence machinery used to decide it is in scope. It does not
+limit ordinary product review, and it does not limit a task that explicitly asks
+to repair reusable test or benchmark infrastructure. An explicit maintainer/user
+request for that infrastructure is the separate approval described below.
+
+Validation is support work, not a second product. It should catch a realistic
+regression or answer a predeclared engineering question without recursively trying
+to prove that every tool in the evidence chain is itself perfect.
+
+### Classify findings without suppressing them
+
+For optimization/evidence work, distinguish:
+
+1. **Production correctness** — a concrete contract, ownership, lifetime,
+   concurrency, security, portability, or user-visible defect in shipped code.
+2. **Direct regression coverage** — realistic missing coverage for changed product
+   behavior that is likely to regress.
+3. **Performance decision** — evidence that a specific production candidate meets,
+   misses, or cannot be measured against a frozen workload and gate.
+4. **Support-machinery quality** — a defect or hardening opportunity in a runner,
+   parser, manifest, test seam, artifact collector, or other evidence tool.
+
+This classification sets priority; it is never a reason to hide a valid finding.
+A support-tool defect blocks the current decision when it can skip relevant
+behavior, create a false pass/fail, corrupt the metric, or otherwise change that
+decision. Otherwise report it as non-blocking follow-up work instead of expanding
+the current candidate review. A production-review request does not authorize an
+unrelated benchmark-infrastructure redesign, and benchmark cleanup must not change
+production behavior merely to make evidence pass.
+
+### Force a terminal candidate decision
+
+Before collecting data, freeze the workload, metrics, thresholds, sample and order
+count, host requirements, and candidate boundaries. Then:
+
+- Give every isolated optional candidate one terminal disposition: **keep**,
+  **revert/defer**, or **inconclusive on this host**. Do not leave it indefinitely
+  pending while growing the acceptance system around it.
+- A measured regression or failure to earn the declared gain selects the simpler
+  baseline. An inconclusive result also defaults to the simpler production baseline;
+  the candidate may be deferred for a better benchmark host.
+- A host that cannot reliably execute the frozen workload is non-decision-capable.
+  Record that fact. Do not tune the workload after seeing results, retry until
+  favorable, weaken a gate, or create alternate harness identities to force a
+  decision.
+- By default, allow one bounded incidental harness-repair pass after the first
+  end-to-end attempt. Further repair belongs to an explicitly requested,
+  separately scoped infrastructure task.
+- Once direct correctness checks pass and the terminal disposition is recorded,
+  run broad product validation once on the final retained production set. Do not
+  repeatedly rerun it after every evidence-tool revision.
+
+When only non-blocking evidence-machinery limitations remain, report them with the
+terminal product disposition. Do not create another product implementation plan
+unless an independently reproducible production defect appears or reusable
+infrastructure was explicitly requested.
+
+### Do not create proofs of proofs
+
+Unless a separately scoped security, supply-chain, or reproducible-build threat
+model requires them, do not add or require:
+
+- verifier replay, validator self-validation, test-of-test mutation frameworks, or
+  attestations of the acceptance transaction;
+- binary/tool/source hashes, copied verifier source in every result directory,
+  child-process ancestry proofs, filesystem provenance, or CI-runner identity;
+- general shell/CMake command parsers whose purpose is only to prove that recorded
+  commands match recorded flags;
+- exhaustive fail-closed schemas for diagnostic fields that cannot change the
+  scoped correctness or keep/revert decision; or
+- a product setting, protocol field, runtime branch, counter, API, or lifecycle hook
+  added solely to make optional evidence easier to authenticate.
+
+A direct deterministic check is often enough for a narrow build option, path,
+ownership balance, timeout, or emitted metric. Timing, concurrency, security, and
+nondeterminism may require repeated or independent evidence; the rule forbids
+recursive meta-validation, not risk-appropriate testing.
+
+### Keep support code and artifacts subordinate
+
+- Prefer existing tests and small fixtures. If new evidence code materially exceeds
+  the production change or creates a framework, stop unless that infrastructure
+  scope was explicitly authorized.
+- Test seams and counters added solely for evidence must compile out of ordinary
+  production builds. A production API added only for a benchmark needs separate
+  product justification and approval.
+- Raw benchmark output, copied manifests, temporary state trees, and repeated runner
+  snapshots are generated artifacts. Keep one concise results summary in source and
+  bulky reproducibility bundles outside normal history unless requested.
+- If optional proof machinery becomes harder to trust than the direct check, prefer
+  simplifying, replacing, or removing it over adding another validator. Removal is
+  still a code change and follows the task's authorization boundary.
+
+
+---
+
+Continue to **[Part 7: Application Termination](./part7-shutdown-and-signals.mdx)**.

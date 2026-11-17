@@ -5,7 +5,7 @@ sidebar_label: "Part 3: Buffers & Padding"
 description: "The sbuf_t buffer model, worker buffer pools, left-padding budgets, and how to prepend protocol headers without breaking chain composition."
 ---
 <!--
-Documentation version: 198
+Documentation version: 199
 -->
 
 # Part 3: Buffers, Padding & Shift Buffers
@@ -17,6 +17,14 @@ one chain layout and corrupt memory in another.
 
 Source of truth: `ww/bufio/shiftbuffer.h`, `ww/bufio/buffer_pool.h`, and the
 `required_padding_left` field in `ww/objects/node.h`.
+
+## Reading path
+
+- [Buffer geometry and operations](#the-sbuf_t-anatomy)
+- [Padding, pools and ownership contracts](#the-padding-contract-required_padding_left)
+- [Complete prepend example](#a-complete-prepend-example)
+- [Splice and staged-reader representations](#specialized-buffer-representations)
+- [Protocol-specific buffering reference](#protocol-buffering-reference)
 
 ## The `sbuf_t` Anatomy
 
@@ -375,6 +383,549 @@ the bit; an incremental correction covering only a transform's own edit preserve
 an earlier request. A terminal consumer may take it before repair because refusal
 discards the packet. A transform that declines and forwards unchanged preserves
 both bytes and request. See [packet boundaries in Part 4](./part4-packet-tunnels.mdx#packet-checksum-repair-boundaries).
+
+## The Padding Contract: `required_padding_left`
+
+A tunnel may only rely on left padding it **advertised** through its instance's
+`node->required_padding_left`. The `node.c` declaration supplies the default:
+
+```c
+.required_padding_left = kMyProtocolHeaderSize,
+```
+
+A constructor with mode-dependent framing resolves that instance's value before
+`tunnelchainInsertAt()` accumulates chain padding. Never defer this choice to
+`onPrepare` or borrow another node's reservation.
+
+During chain finalization, the runtime sums `required_padding_left` across every
+node in the chain and reserves that much left padding in the buffers it hands out
+(`tunnelchainInsert` accumulates `sum_padding_left`; `tunnelchainFinalize` calls
+`globalstateUpdateAllocationPadding`). In other words:
+
+> The left capacity available to your tunnel at runtime is the sum of the padding
+> budgets of **your tunnel and every tunnel closer to the adapter that produced
+> the buffer**. If you prepend bytes you never advertised, you are spending
+> someone else's budget, and the buffer may not have it in a different chain.
+
+This is why a framing tunnel that "works on my machine" can corrupt memory once a
+user puts a different node in front of it. Advertise what you prepend.
+
+Rules:
+
+- Use `sbufShiftLeft()` only when `sbufGetHeadroom()` is at least the header
+  size you need.
+- Keep every prepend within this tunnel's advertised `required_padding_left`.
+- If you must prepend more than your budget, either raise
+  `required_padding_left` to match, or build a fresh buffer (see below) instead of
+  shifting.
+
+## Buffer Pools
+
+Generic object-pool item sizes and their getter/constructor arguments use
+`size_t`, including the mutex-protected wrapper. Item size remains bounded by
+`UINT32_MAX`; constructors reject larger requests before allocating metadata or
+installing master callbacks. Cache widths and counts retain their bounded
+`uint32_t` representation. This is separate from buffer-tier sizes and the
+16-bit headroom reservation.
+
+For ordinary runtime buffers, do not `malloc`. Use the worker-local buffer pool so
+allocations are recycled and correctly padded. The pool is reachable from any
+line:
+
+```c
+buffer_pool_t *pool = lineGetBufferPool(line);     // this line's worker pool
+
+sbuf_t *big   = bufferpoolGetLargeBuffer(pool);    // ordinary read/working buffer
+sbuf_t *medium = bufferpoolGetMediumBuffer(pool); // 32 KiB in S1/S2, 64 KiB in higher profiles
+sbuf_t *small = bufferpoolGetSmallBuffer(pool);    // small working buffer
+sbuf_t *splice_buf = bufferpoolGetSpliceBuffer(pool); // leased private pipe, or NULL when exhausted
+
+// ... use the buffer ...
+
+bufferpoolReuseBuffer(pool, buf);                  // return it to the pool
+lineReuseBuffer(line, buf);                        // convenience: pool of line's worker
+```
+
+Pools are **per worker**. A line belongs to exactly one worker (`lineGetWID`), so
+always use that line's pool — never a different worker's. Buffers from a pool
+already carry the chain's reserved left padding, so a pooled buffer is the correct
+place to build a payload you intend to prepend onto.
+
+Pool metadata and ordinary buffer allocation follow the
+[fatal heap-allocation policy](./part5-tunnel-anatomy.mdx#heap-allocation-failure).
+`bufferpoolCreate()` remains nullable for invalid construction inputs or
+unrepresentable geometry. Bounded splice-inventory exhaustion is separate from heap
+exhaustion and keeps its documented ordinary-buffer fallback.
+
+Each buffer pool has large, medium and small ordinary caches backed by three
+shared ordinary masters. `bufferpoolCreate()` takes those masters in that order,
+then the ordinary cache width, large/medium/small payload capacities, the splice
+payload limit and the waiting-budget basis. The latter two values must be in
+`[1, INT_MAX]` and stay fixed after construction. Device pools inherit the sizes
+and limits from their worker pool. Splice caches use the shared bounded inventory
+without a separate wrapper master or a constructor argument for one.
+
+Device backends use `devicePoolCreate()` with an explicit, exclusively accessible
+worker pool and a backend-specific minimum small tier. Construction preserves
+zero initial padding; `devicePoolUpdatePadding()` copies all four finalized
+padding values during BringUp, before publishing I/O producers. Neither helper
+obtains a worker pool from thread-local identity. Private TUN reader pools use the packet
+MTU as their minimum; Linux worker readers use their owner worker pools and a
+shared fragment table with detached allocations. Darwin receives its family
+prefix into separate storage.
+The worker GSO output allowance and its exact-sized fallback remain a separate
+calculation.
+
+Worker and device pools select ordinary cache width with
+`PROPER_BUFFER_POOL_WIDTH()`. Ordinary masters use twice that width as their
+constructor argument. Splice caches have a fixed eight-entry limit; their global
+master is sized for the maximum permitted inventory; the configured profile and
+detected RAM ceiling affect its global budget, not local cache width.
+
+The master's mutex transfers ownership and visibility of cached item slots.
+Its atomic `len` uses relaxed loads/stores: reads outside the mutex are advisory
+empty/full probes, and slot access always holds the mutex. `checked_out` has a
+different role: terminal returns can finish outside that mutex, so their release
+decrements pair with acquire reads before teardown frees pool-family resources.
+Observing zero does not close checkout admission; the owner must prevent new
+checkouts and satisfy the existing lifecycle requirements before destruction.
+
+Master constructors double their argument, giving
+these actual entry capacities:
+
+| Profile | Ordinary local width | Each ordinary master |
+| --- | --- | --- |
+| S1 / `minimal` | 1 | 4 |
+| S2 | 4 | 16 |
+| M1 / `client` | 8 | 32 |
+| M2 / `client-larger` | 32 | 128 |
+| L1 | 64 | 256 |
+| L2 / `server` | 128 | 512 |
+
+Ordinary local pointer arrays hold twice their selected width. Recycling shrinks
+an ordinary tier once its cached count exceeds `floor(4 * width / 3)`, transferring
+up to one width of entries to its master; a full ordinary master destroys overflow.
+These are idle cache bounds, not limits on active allocations.
+
+Payload capacities, excluding reserved left padding, are:
+
+| Tier | Capacity | Use |
+| --- | --- | --- |
+| Small | 4 KiB | Small ordinary payloads and control messages |
+| Medium | 32 KiB in S1/S2; 64 KiB in M1/M2/L1/L2 | Framing, retained queues including paused Mux children, and best-fit UDP reads |
+| Large | 64 KiB in S1/S2; 128 KiB in M1/M2/L1/L2 | Ordinary event-loop read buffers and larger working payloads |
+| Splice storage | 32 bytes of control storage | Explicit splice wrappers; logical body size is independent of allocation size |
+| Splice payload limit | 1 MiB in every profile | Socket read limit and required new-pipe capacity |
+
+S1 and S2 share buffer sizes but retain different profile-based local and master
+cache capacities; S1 caches fewer allocations. Higher profiles retain 64 KiB
+medium and 128 KiB large buffers. Their independent splice target remains 1 MiB.
+NIO ordinary TCP reads use the large tier directly. Linux NIO UDP reads select an
+ordinary tier through best-fit allocation when a positive size hint is available.
+Medium buffers also serve nodes and retained queues. Mux selects the smallest
+fitting ordinary tier; a full 1 MiB frame requires dedicated ordinary storage in
+every profile. The wire payload maximum remains 1 MiB.
+
+`bufferpoolGetBestFit()` selects the smallest ordinary tier that satisfies both
+payload and padding requirements, comparing actual sizes across small, medium,
+and large. If no tier fits, it creates a dedicated padded buffer that is destroyed
+on return. `bufferpoolTryGetBestFit()` accepts a 64-bit computed length and returns
+`NULL` for unrepresentable geometry before using the same allocation path. Neither
+helper shrinks an existing buffer. Splice allocation stays explicit.
+
+A successful best-fit allocation already satisfies the requested payload capacity
+and left padding; callers need no undersized-success recovery branch. Use
+`bufferpoolGetBestFit()` when caller-established bounds guarantee representable
+geometry, including padding and alignment; otherwise preserve
+`bufferpoolTryGetBestFit()`'s geometry refusal. These guarantees describe the
+returned buffer at allocation time. Incoming or subsequently shifted buffers
+still need the applicable capacity and prepend checks.
+
+`sbufCreateWithPadding()` makes a separate ordinary `sbuf_t` and follows the same
+fatal heap-allocation policy as pool refill. Validate computed geometry with
+`sbufTryComputeCapacity()` before creating storage when an unrepresentable request
+must be refused locally. Destroy this direct buffer with
+`sbufDestroy()` after its last user has stopped.
+
+The 128 KiB tier is not a maximum payload or total-memory limit. Smaller pooled
+allocations do not cap process memory, kernel pipe memory, frame sizes, or
+dedicated ordinary allocations. Frequent large materializations can incur
+allocation/free work; these sizes make no throughput guarantee.
+
+Materialization callers must request the complete logical payload plus required
+headroom, including real prefixes, residual padding and any destination bytes
+already present. Low-level conversion helpers do not grow caller storage. For
+example, 600 KiB requires dedicated ordinary storage with a 128 KiB large tier;
+a pipe with 1 MiB capacity holding only 20 KiB needs storage for its logical bytes,
+not its kernel capacity. Dedicated buffers above all tiers are destroyed on
+recycling, while consumed splice wrappers return to their separate splice cache.
+
+Each tier refills at most four buffers at a time, further bounded by half the
+local cache capacity and its available slots. Pools whose previous refill batch
+was smaller than four retain that smaller batch. Cache capacities and shrink
+thresholds are independent of this refill limit.
+
+Fresh `sbuf_t` allocations with more than 2 KiB of physical buffer storage,
+including reserved left padding and alignment rounding but excluding the header,
+are prefaulted in `shiftbuffer.c`. Release builds write volatile zero bytes at
+4096-byte strides and at the final byte, covering trailing unaligned pages.
+Debug builds retain their existing full-storage diagnostic fill, which already
+touches every page. The supported minimum page size is assumed to be 4096 bytes;
+no OS page-size query is performed.
+
+This applies to newly allocated pool buffers, dedicated buffers and replacement
+allocations during growth. Pool checkout and recycling do not repeat the writes.
+Splice wrappers use only their physical padding and control-storage size, never
+their logical pipe payload size. Length, padding and ownership rules are unchanged;
+callers must still initialize payload bytes before use. Prefaulting pays possible
+first-write page faults during allocation, may populate unused capacity, and does
+not pin memory or guarantee a throughput improvement.
+
+`bufferpoolGetSpliceBufferStorageSize()` and `bufferpoolGetSpliceBufferPadding()` expose
+the splice geometry. `bufferpoolUpdateAllocationPaddings()` accepts separate
+large, medium, small, and splice padding arguments. Global chain-padding updates cover
+all four tiers, and device pools inherit each tier's padding value from their
+worker pool. Finalize padding before creating the splice inventory or populating
+local caches; splice padding cannot change after inventory initialization.
+
+The existing `lineGetBufferPool()`, `getWorkerBufferPool()`, and
+`getCurrentWorkerBufferPool()` accessors expose every tier through the same pool, including
+`bufferpoolGetMediumBuffer()` and `bufferpoolGetSpliceBuffer()`. `lineReuseBuffer()` and `reuseBuffer()` use the same
+recycling path as `bufferpoolReuseBuffer()`, subject to their existing worker
+ownership requirements. Ordinary recycling clears flags and length. Splice
+recycling preserves its representation/ownership flags and pipe, clears payload,
+and restores `capacity = initial_headroom + SPLICE_BUFFER_STORAGE_SIZE` and
+`data = head + initial_headroom`. Discard the pipe body before resetting these
+fields; resetting geometry does not drain the pipe.
+
+`bufferpoolGetSpliceBuffer(pool)` returns a complete buffer from the local cache,
+shared master or bounded lazy growth. A refusal returns `NULL` with `ENOBUFS`; unsupported
+builds use `ENOSYS`. Handle this before accessing the buffer, normally by choosing
+ordinary storage. Bypass uses the same bounded global inventory without local caching.
+Only checkout/refill may grow the inventory; returning a healthy buffer never
+creates, resizes or closes its pipe.
+
+If you need a buffer bigger than the current one for an append, use
+`sbufReserveSpace()` (it reallocates and copies only when necessary) rather than
+hand-rolling growth.
+
+`sbufCreateSplice(pad_left)` directly allocates an empty buffer with exactly
+32 bytes of payload capacity, plus left padding rounded up to a 32-byte
+boundary. Its payload capacity stays at 32 bytes regardless of the CPU cache
+line size. The buffer starts with zero length and only `kSbufFlagSplice` set;
+`sbufDestroy()` physically frees this unmanaged allocation. Inventory entries
+are acquired through the pool APIs and preserve their flags while cached.
+
+### Ordinary TCP and UDP receive sizing
+
+NIO ordinary TCP reads take the pool's large buffer directly and call `recv()`
+with its full writable payload capacity, without first querying `FIONREAD`.
+This also applies to an ordinary receive after a failed pipe allocation or a
+splice attempt that makes no progress. A receive may return fewer bytes than
+the capacity; remaining stream bytes stay queued for later reads. Its actual
+return value determines the published length, and zero confirms TCP EOF.
+Buffer capacity does not define TCP application message boundaries.
+
+On Linux, UDP uses `FIONREAD` as an allocation hint for the full size of the next
+datagram, not the sum of queued packets. `bufferpoolGetBestFit()` requests that
+complete size. It can select a larger tier or dedicated storage if the datagram
+exceeds a custom pool's large tier. Each receive still delivers one datagram.
+The socket has one serialized reader between the query and receive.
+
+UDP best-fit reads request at least the large tier's reserved left padding, so
+a smaller tier with insufficient padding is ineligible. A failed or zero size
+query falls back to a large-buffer receive. Zero never skips the receive: it
+may represent an empty UDP datagram or transient readiness. The actual receive
+result determines the published length, and Linux UDP truncation detection
+still drops incomplete datagrams.
+
+TunDevice uses its separate raw-IP/GSO reader and buffer sizing. Other NIO socket
+types and non-Linux/IOCP receive paths retain their own allocation policy.
+
+### Sizing Destination Buffers for Untrusted or Variable Payloads
+
+When sizing a destination buffer from an untrusted or variable payload length:
+
+- Use `bufferpoolGetBestFit()` (or another checked growth operation) rather than
+  assuming a fixed buffer tier fits the input. Supply the left padding required
+  by the onward buffer contract as well as the payload capacity: when no
+  pool tier fits, best-fit creates a dedicated buffer with exactly the requested
+  padding. Request zero only for a locally consumed buffer or a proven
+  zero-padding destination.
+- Compare the requested length with actual writable capacity
+  (`sbufGetWritableCapacity()`) in ordinary Release control flow before any
+  assert-only length mutator (such as `sbufSetLength()`) or write.
+- Publish actual produced length only after a partial or failing producer has
+  successfully written or validated that many bytes. Space append and prepend
+  may privately extend length for a guaranteed complete synchronous fill, but no
+  inspection, queue publication, callback, or ownership handoff may observe the
+  region before it is fully initialized.
+
+`sbufEnsureHeadroom(pool, buf, need)` consumes an exclusively owned buffer
+and returns the sole owned result. Sufficient headroom returns the original
+unchanged; otherwise replacement preserves the complete logical payload and
+reserves at least `max(need, large_pool_padding)`. Ordinary input remains ordinary.
+Splice input attempts a sufficiently padded splice destination, with ordinary
+fallback on checkout or transfer refusal, including partial transfer progress.
+It promises byte preservation, not a particular resident/pipe split or copying
+arbitrary metadata flags. The caller supplies representable replacement geometry
+and the owner-worker pool; there are no callbacks. Node padding declarations and
+actual prepend bounds remain the caller's obligations. Trojan UDP checks its
+actual header length before requesting maximum-header replacement padding;
+VLESS UDP requests its fixed two-byte prefix.
+
+## Buffer Ownership
+
+Buffer helpers returning the sole owned replacement are marked `WW_MUST_USE`,
+including `sbufReserveSpace()`, `sbufEnsureOrdinary()`,
+`sbufTryEnsureOrdinary()`, `sbufEnsureHeadroom()`, `sbufConcat()`,
+`sbufAppendMerge()`, `sbufMoveRangeTo()` and splice frame movement. Consume their
+returned result according to each ownership contract; the previous allocation
+may have been freed or recycled. Checked conversion still leaves the source
+owned by the caller on refusal. Cursor shifts do not replace storage, so their
+returned pointers remain optional.
+
+Buffer lifetime bugs are as common as line lifetime bugs. The rules:
+
+- **A callback takes ownership of the buffer you pass it.** After
+  `tunnelNextUpStreamPayload(t, line, buf)` (or the downstream form), `buf` is no
+  longer yours. Do not read it, reuse it, or free it.
+- **If you keep a buffer, you own it.** You are responsible for eventually
+  recycling it with `bufferpoolReuseBuffer` / `lineReuseBuffer`, or handing it to
+  a callback.
+- **On an error path that still owns a buffer**, return it to the pool (or the
+  line) before you close. Do not leak it, and do not touch it after the line dies.
+- **If a re-entrant callback killed the line** (a `false` from
+  `lineCallWithRef()` / `lineCallWithRefWithBuf()`), only recycle buffers you still hold; do not touch the dead
+  line's state to do it.
+
+ContextQueue owns enqueued contexts until pop or destruction. `contextqueuePop()`
+returns `NULL` when empty; otherwise ownership transfers to the caller.
+`contextqueuePush()` terminates on deque insertion failure.
+
+After transferring or recycling a context's payload, `contextDropPayload()`
+clears its payload pointer in every build configuration. It does not free the
+buffer. `contextReusePayload()` and `bufferStreamPushContextPayload()` perform
+this bookkeeping so later context destruction cannot recycle the payload again.
+
+### Payload length versus retained allocation charge
+
+`sbufGetLength()` measures buffer contents. That is the correct unit for ordinary
+queue byte counts, protocol thresholds, FIFO delivery statistics, and
+backpressure decisions, and `buffer_queue_t.total_len` intentionally keeps those
+logical payload semantics.
+
+Do not treat that content length as a memory charge when a security or resource
+limit specifically promises to bound allocations retained by a live queue. An
+empty or one-byte `sbuf_t` can still retain its full capacity, left padding,
+header, and allocator alignment overhead. Memory-sensitive code that needs such
+a hard bound must keep a separate storage/resource charge. Mux's child, parent,
+detached and outgoing queues use the queue-capacity policy above; it deliberately
+does not bound physical kernel resources. It must not replace logical length in
+BufferQueue or in the incoming-child FlowResume threshold.
+
+Use `bufferqueueGetCharge()` for an individual BufferQueue instead of maintaining
+a duplicate counter beside it. A whole-queue ownership transfer carries the budget binding and both cached
+totals; initialize the relinquished source as empty and unbound. Reserved pop
+keeps continued active retention charged. TCP adapters share one budget between
+the queue and active WIO reservation, retaining original capacity charge until
+completion or terminal callback detachment. Partial writes release logical bytes.
+Mux's children, parser and detached associations retain their existing policies.
+
+`sbufGetAllocationCharge(const sbuf_t *buf)` is the canonical O(1) charge for an
+allocated buffer's own userspace storage. For ordinary buffers it returns
+`sizeof(sbuf_t) + sbufGetTotalCapacity(buf) + kSbufAllocationAlignment`; capacity
+already includes left padding. For splice wrappers it returns the header plus
+original left padding, `SPLICE_BUFFER_STORAGE_SIZE`, and alignment overhead.
+Splice capacity and length are logical, so they cannot measure wrapper storage.
+The helper works before pipe initialization, makes no allocation or syscall, and
+reads no payload bytes. Cursor movement, consumption, and prepending leave the
+charge unchanged unless storage is replaced. It excludes kernel pipe memory,
+allocator bookkeeping beyond explicit
+alignment overhead, and pool/queue storage. The separate queue-charge helpers use sbuf capacity for both representations. This does not change `sbufGetAllocationCharge()` or
+BufferQueue's logical-byte accounting.
+
+`bufferpoolQueryBestFit()` predicts ordinary storage without allocating, consuming
+a cache entry, or making a reservation. It shares tier selection with
+`bufferpoolGetBestFit()` and reports aligned payload capacity, left padding,
+allocation charge, and whether a configured pool tier fits. Unrepresentable
+geometry returns false without changing the output. Predictions remain valid
+while pool geometry is unchanged. Mux uses this query for ordinary compaction
+and batch fallback reservations; compaction still requires a smaller pooled tier.
+
+Linux RawSocket capture uses the same nonblocking worker FIFO admission as
+Linux TUN, with a shared 8 MiB allocation-charge and 512-packet budget. Each queue
+worker owns receive scratch and a bounded fragment-release batch outside that
+budget. A received record remains private until its Netlink verdict succeeds;
+only NF_DROP can lead to chain publication. On capacity refusal, keep the
+unadmitted output and disable reads until credit notification. Shared fragment
+storage uses detached allocations, never a different worker's buffer pool.
+Inactive startup/cleanup service uses coordinator-owned storage and NF_ACCEPT;
+it never dispatches into the session FIFO. Once capture activates, coordinator
+service during the remaining worker startup gate uses detached storage and
+NF_DROP, then admits packets through the same bounded FIFO. Capacity refusal
+retains the current output and stops that lane's reads. No tunnel callback runs
+on the coordinator; worker delivery begins after packet Init.
+
+Windows, macOS and BSD TUN readers configure the session's byte/packet budget and
+worker FIFO before producer startup: 8 MiB of buffer allocation charge and
+1,024 packets. `deviceReaderDistributeBatchDroppingOverflow()` distributes complete
+visible native TCP/UDP packets by flow and other complete packets using a
+session-local sequence. It retains preserved-fragment association and groups
+packets in stable worker order to fit both limits before nonblocking
+admission. A capacity refusal drops and recycles the unadmitted remainder;
+worker 0 and the external macOS/BSD readers never wait for another worker. An
+individual allocation larger than the budget is dropped too. Accepted work retains its
+reservation through delivery or cancellation, including closed generations.
+Reader staging is bounded by one batch plus the existing fragment limits.
+Windows/macOS batches contain at most 128 packets. BSD uses
+`min(RAM_PROFILE, kMaxReadDistributeQueueSize)` with a 512-packet internal cap;
+supported profiles allow at most 256 packets (`server`). Message metadata is
+bounded separately by the packet limit. These
+limits bound receive dispatch, not total process memory or downstream retention.
+
+Linux TUN offload work reserves storage before transferring an aggregate,
+an assured complete ordinary TCP/UDP record, or ordinary checksum work to its
+selected receive-processing worker in either offload mode. Single-reader native
+TCP/UDP uses the same flow worker as ordinary input. The destination is retained
+across capacity retries and all segments of that record. Both modes
+prepare receive scratch, the capacity notifier and ordered worker queues before
+producer startup. Their session budget is 8 MiB of allocation charge and 512
+packet slots; common setup must admit the largest retained ordinary work item.
+Each GSO work item charges its actual aggregate buffer allocation, its
+work context, and one maximum output-buffer allocation allowance; it reserves
+two packet slots for the retained aggregate and active output. The worker
+allocates and delivers one independent segment at a time, or delivers an assured
+aggregate intact on an eligible trusted pair. The output allowance
+stays reserved through every segment's required checksum work and TunDevice
+delivery, so the worker never waits for reader budget capacity. Downstream
+retention follows ordinary packet-chain ownership after delivery.
+
+All non-segment ordinary work, including assured `DATA_VALID` and matching
+`NEEDS_CSUM` records, reserves one packet slot, its compact
+packet buffer's predicted allocation charge, and its private work context before
+allocation and copying from reader scratch. It needs no segmentation output
+allowance. Its reservation remains held through worker checksum completion and
+delivery (omitting checksum completion when assured), or settles on refusal,
+cancellation or stale generation. Scratch remains reader-owned and reusable for
+the next read.
+
+Before allocating each segment, the worker checks the current ordinary best-fit
+charge against its prepaid allowance. If custom ordinary pool geometry no longer
+fits that allowance, it creates an exact-sized
+ordinary buffer with this chain's original sufficient padding instead.
+
+Ordinary batches use the same per-worker FIFO and reserve their actual buffer
+allocation charges and packet slots before posting. Reader drain staging and
+fragment storage retain their separate existing bounds; session and FIFO-message
+metadata are bounded separately by the packet limit. The 8 MiB admission charge
+is not a total process-memory limit. Budget exhaustion makes
+the reader wait, retaining at most one unadmitted record in its current
+scratch buffer. Successful GSO admission transfers that buffer itself and
+replaces reader scratch without copying the aggregate payload. Non-segment
+admission copies the exact IP bytes and reuses reader scratch.
+Release each work reservation exactly once after completion, refusal,
+cancellation, or stale-generation discard. Posting a work item is not
+settlement, and cancellation must not borrow a device or worker buffer pool.
+
+### Buffers transferred to scheduled line tasks
+
+Calling `lineScheduleTaskWithBuf()` or
+`lineScheduleDelayedTaskWithBuf()` transfers the buffer on **every** result,
+including synchronous `RejectedSettled`. The caller must never recycle, destroy,
+or inspect it after the call. If the task executes, the task callback receives
+ownership. Otherwise the scheduler settles the buffer after optional
+cancellation notification: it returns the buffer to the line's pool only while
+cleanup runs in that owner event-worker context, including owner-bound teardown,
+and destroys it on a foreign or unbound cleanup thread.
+
+The cancellation callback does not receive or own the buffer. It runs before
+internal buffer release, while the scheduler's physical line reference remains
+held, and must not attempt to infer buffer lifetime from the cancellation
+reason. A null cancellation callback suppresses only notification; line death,
+submission refusal, quiescence, and teardown still release the buffer exactly
+once. This makes memory safety independent of task progress.
+
+In debug builds, `BUFFER_WONT_BE_REUSED(x)` swaps a buffer for a fresh duplicate
+and destroys the original, so any stale pointer to the old buffer is caught
+quickly. If you see it in reference tunnels, it marks "this buffer must not be
+touched again after this point."
+
+## Prepending a Header: `sbufShiftLeft`
+
+The initial headroom reservation lets a tunnel prepend a protocol header
+**without reallocating or memmoving** the payload. You move the cursor left and
+write into the exposed space. Given an encoded `wire_header` of `header_len`
+bytes:
+
+```c
+// Reserve room and move the cursor back by header_len bytes.
+assert(sbufGetHeadroom(buf) >= header_len);
+uint8_t *header = sbufShiftLeft(buf, header_len); // data -= header_len; len += header_len
+
+// Now write the header at the new front.
+sbufByteCopy(header, wire_header, header_len);
+```
+
+The returned pointer replaces a subsequent `sbufGetMutablePtr(buf)` when the
+caller needs the new front. Byte copying requires no aligned cursor; aligned
+integer writers still require the alignment described above. Fill the entire
+exposed header synchronously before any observer or ownership handoff; length has
+already been extended during this private initialization interval.
+
+`sbufShiftLeft` asserts that enough current headroom exists:
+
+```c
+static inline uint8_t *sbufShiftLeft(sbuf_t *const b, const size_t bytes)
+{
+    assert(sbufGetHeadroom(b) >= bytes);
+    b->data -= bytes;
+    b->len += bytes;
+    return b->data;
+}
+```
+
+If the assertion fires (or, in a release build, if you shift left past the start),
+you have prepended more than your padding budget allows — which is the next
+section.
+
+## A Complete Prepend Example
+
+Putting it together — a framing tunnel that prefixes a 2-byte big-endian length on
+the upstream path, having advertised `.required_padding_left = 2` in `node.c`:
+
+```c
+void myTunnelUpStreamPayload(tunnel_t *t, line_t *l, sbuf_t *buf)
+{
+    const uint16_t payload_len = (uint16_t) sbufGetLength(buf);
+
+    // We advertised 2 bytes of left padding, so this is guaranteed to fit.
+    assert(sbufGetHeadroom(buf) >= sizeof(uint16_t));
+    sbufShiftLeft(buf, sizeof(uint16_t));
+    sbufWriteUI16(buf, payload_len);      // (use the project's endianness helper as needed)
+
+    // Hand the buffer upstream; we no longer own it.
+    tunnelNextUpStreamPayload(t, l, buf);
+}
+```
+
+On the downstream side the paired tunnel reads and strips the header with
+`sbufReadUI16` + `sbufShiftRight`, then forwards with
+`tunnelPrevDownStreamPayload`.
+
+## Common Buffer Mistakes
+
+- Prepending without advertising padding, then relying on left capacity that only
+  exists in one chain layout.
+- Misusing `sbufShiftLeft` when left capacity is insufficient (the assert is your
+  friend in debug; release builds corrupt memory).
+- Reusing or reading a buffer after passing it to a forwarding callback.
+- Leaking a buffer on an error/close path.
+- Using a different worker's pool than the line's own.
+- Treating `sbufGetWritableCapacity` as "spare room beyond the payload" — it
+  is room from the cursor, so subtract the current length first.
+
+## Specialized buffer representations
 
 ### Splice payloads: `kSbufFlagSplice`
 
@@ -1084,367 +1635,9 @@ TrojanClient/Server share staged address gathering and UDP-header validation in
 callbacks remain node-local. Each internal library is enabled when either node
 of its own pair is selected; no Trojan node depends on a VLESS node or vice versa.
 
-## Prepending a Header: `sbufShiftLeft`
+## Protocol buffering reference
 
-The initial headroom reservation lets a tunnel prepend a protocol header
-**without reallocating or memmoving** the payload. You move the cursor left and
-write into the exposed space. Given an encoded `wire_header` of `header_len`
-bytes:
-
-```c
-// Reserve room and move the cursor back by header_len bytes.
-assert(sbufGetHeadroom(buf) >= header_len);
-uint8_t *header = sbufShiftLeft(buf, header_len); // data -= header_len; len += header_len
-
-// Now write the header at the new front.
-sbufByteCopy(header, wire_header, header_len);
-```
-
-The returned pointer replaces a subsequent `sbufGetMutablePtr(buf)` when the
-caller needs the new front. Byte copying requires no aligned cursor; aligned
-integer writers still require the alignment described above. Fill the entire
-exposed header synchronously before any observer or ownership handoff; length has
-already been extended during this private initialization interval.
-
-`sbufShiftLeft` asserts that enough current headroom exists:
-
-```c
-static inline uint8_t *sbufShiftLeft(sbuf_t *const b, const size_t bytes)
-{
-    assert(sbufGetHeadroom(b) >= bytes);
-    b->data -= bytes;
-    b->len += bytes;
-    return b->data;
-}
-```
-
-If the assertion fires (or, in a release build, if you shift left past the start),
-you have prepended more than your padding budget allows — which is the next
-section.
-
-## The Padding Contract: `required_padding_left`
-
-A tunnel may only rely on left padding it **advertised** through its instance's
-`node->required_padding_left`. The `node.c` declaration supplies the default:
-
-```c
-.required_padding_left = kMyProtocolHeaderSize,
-```
-
-A constructor with mode-dependent framing resolves that instance's value before
-`tunnelchainInsertAt()` accumulates chain padding. Never defer this choice to
-`onPrepare` or borrow another node's reservation.
-
-During chain finalization, the runtime sums `required_padding_left` across every
-node in the chain and reserves that much left padding in the buffers it hands out
-(`tunnelchainInsert` accumulates `sum_padding_left`; `tunnelchainFinalize` calls
-`globalstateUpdateAllocationPadding`). In other words:
-
-> The left capacity available to your tunnel at runtime is the sum of the padding
-> budgets of **your tunnel and every tunnel closer to the adapter that produced
-> the buffer**. If you prepend bytes you never advertised, you are spending
-> someone else's budget, and the buffer may not have it in a different chain.
-
-This is why a framing tunnel that "works on my machine" can corrupt memory once a
-user puts a different node in front of it. Advertise what you prepend.
-
-Rules:
-
-- Use `sbufShiftLeft()` only when `sbufGetHeadroom()` is at least the header
-  size you need.
-- Keep every prepend within this tunnel's advertised `required_padding_left`.
-- If you must prepend more than your budget, either raise
-  `required_padding_left` to match, or build a fresh buffer (see below) instead of
-  shifting.
-
-## Buffer Pools
-
-Generic object-pool item sizes and their getter/constructor arguments use
-`size_t`, including the mutex-protected wrapper. Item size remains bounded by
-`UINT32_MAX`; constructors reject larger requests before allocating metadata or
-installing master callbacks. Cache widths and counts retain their bounded
-`uint32_t` representation. This is separate from buffer-tier sizes and the
-16-bit headroom reservation.
-
-For ordinary runtime buffers, do not `malloc`. Use the worker-local buffer pool so
-allocations are recycled and correctly padded. The pool is reachable from any
-line:
-
-```c
-buffer_pool_t *pool = lineGetBufferPool(line);     // this line's worker pool
-
-sbuf_t *big   = bufferpoolGetLargeBuffer(pool);    // ordinary read/working buffer
-sbuf_t *medium = bufferpoolGetMediumBuffer(pool); // 32 KiB in S1/S2, 64 KiB in higher profiles
-sbuf_t *small = bufferpoolGetSmallBuffer(pool);    // small working buffer
-sbuf_t *splice_buf = bufferpoolGetSpliceBuffer(pool); // leased private pipe, or NULL when exhausted
-
-// ... use the buffer ...
-
-bufferpoolReuseBuffer(pool, buf);                  // return it to the pool
-lineReuseBuffer(line, buf);                        // convenience: pool of line's worker
-```
-
-Pools are **per worker**. A line belongs to exactly one worker (`lineGetWID`), so
-always use that line's pool — never a different worker's. Buffers from a pool
-already carry the chain's reserved left padding, so a pooled buffer is the correct
-place to build a payload you intend to prepend onto.
-
-Pool metadata and ordinary buffer allocation follow the
-[fatal heap-allocation policy](./part5-tunnel-anatomy.mdx#heap-allocation-failure).
-`bufferpoolCreate()` remains nullable for invalid construction inputs or
-unrepresentable geometry. Bounded splice-inventory exhaustion is separate from heap
-exhaustion and keeps its documented ordinary-buffer fallback.
-
-Each buffer pool has large, medium and small ordinary caches backed by three
-shared ordinary masters. `bufferpoolCreate()` takes those masters in that order,
-then the ordinary cache width, large/medium/small payload capacities, the splice
-payload limit and the waiting-budget basis. The latter two values must be in
-`[1, INT_MAX]` and stay fixed after construction. Device pools inherit the sizes
-and limits from their worker pool. Splice caches use the shared bounded inventory
-without a separate wrapper master or a constructor argument for one.
-
-Device backends use `devicePoolCreate()` with an explicit, exclusively accessible
-worker pool and a backend-specific minimum small tier. Construction preserves
-zero initial padding; `devicePoolUpdatePadding()` copies all four finalized
-padding values during BringUp, before publishing I/O producers. Neither helper
-obtains a worker pool from thread-local identity. Private TUN reader pools use the packet
-MTU as their minimum; Linux worker readers use their owner worker pools and a
-shared fragment table with detached allocations. Darwin receives its family
-prefix into separate storage.
-The worker GSO output allowance and its exact-sized fallback remain a separate
-calculation.
-
-Worker and device pools select ordinary cache width with
-`PROPER_BUFFER_POOL_WIDTH()`. Ordinary masters use twice that width as their
-constructor argument. Splice caches have a fixed eight-entry limit; their global
-master is sized for the maximum permitted inventory; the configured profile and
-detected RAM ceiling affect its global budget, not local cache width.
-
-The master's mutex transfers ownership and visibility of cached item slots.
-Its atomic `len` uses relaxed loads/stores: reads outside the mutex are advisory
-empty/full probes, and slot access always holds the mutex. `checked_out` has a
-different role: terminal returns can finish outside that mutex, so their release
-decrements pair with acquire reads before teardown frees pool-family resources.
-Observing zero does not close checkout admission; the owner must prevent new
-checkouts and satisfy the existing lifecycle requirements before destruction.
-
-Master constructors double their argument, giving
-these actual entry capacities:
-
-| Profile | Ordinary local width | Each ordinary master |
-| --- | --- | --- |
-| S1 / `minimal` | 1 | 4 |
-| S2 | 4 | 16 |
-| M1 / `client` | 8 | 32 |
-| M2 / `client-larger` | 32 | 128 |
-| L1 | 64 | 256 |
-| L2 / `server` | 128 | 512 |
-
-Ordinary local pointer arrays hold twice their selected width. Recycling shrinks
-an ordinary tier once its cached count exceeds `floor(4 * width / 3)`, transferring
-up to one width of entries to its master; a full ordinary master destroys overflow.
-These are idle cache bounds, not limits on active allocations.
-
-Payload capacities, excluding reserved left padding, are:
-
-| Tier | Capacity | Use |
-| --- | --- | --- |
-| Small | 4 KiB | Small ordinary payloads and control messages |
-| Medium | 32 KiB in S1/S2; 64 KiB in M1/M2/L1/L2 | Framing, retained queues including paused Mux children, and best-fit UDP reads |
-| Large | 64 KiB in S1/S2; 128 KiB in M1/M2/L1/L2 | Ordinary event-loop read buffers and larger working payloads |
-| Splice storage | 32 bytes of control storage | Explicit splice wrappers; logical body size is independent of allocation size |
-| Splice payload limit | 1 MiB in every profile | Socket read limit and required new-pipe capacity |
-
-S1 and S2 share buffer sizes but retain different profile-based local and master
-cache capacities; S1 caches fewer allocations. Higher profiles retain 64 KiB
-medium and 128 KiB large buffers. Their independent splice target remains 1 MiB.
-NIO ordinary TCP reads use the large tier directly. Linux NIO UDP reads select an
-ordinary tier through best-fit allocation when a positive size hint is available.
-Medium buffers also serve nodes and retained queues. Mux selects the smallest
-fitting ordinary tier; a full 1 MiB frame requires dedicated ordinary storage in
-every profile. The wire payload maximum remains 1 MiB.
-
-`bufferpoolGetBestFit()` selects the smallest ordinary tier that satisfies both
-payload and padding requirements, comparing actual sizes across small, medium,
-and large. If no tier fits, it creates a dedicated padded buffer that is destroyed
-on return. `bufferpoolTryGetBestFit()` accepts a 64-bit computed length and returns
-`NULL` for unrepresentable geometry before using the same allocation path. Neither
-helper shrinks an existing buffer. Splice allocation stays explicit.
-
-A successful best-fit allocation already satisfies the requested payload capacity
-and left padding; callers need no undersized-success recovery branch. Use
-`bufferpoolGetBestFit()` when caller-established bounds guarantee representable
-geometry, including padding and alignment; otherwise preserve
-`bufferpoolTryGetBestFit()`'s geometry refusal. These guarantees describe the
-returned buffer at allocation time. Incoming or subsequently shifted buffers
-still need the applicable capacity and prepend checks.
-
-`sbufCreateWithPadding()` makes a separate ordinary `sbuf_t` and follows the same
-fatal heap-allocation policy as pool refill. Validate computed geometry with
-`sbufTryComputeCapacity()` before creating storage when an unrepresentable request
-must be refused locally. Destroy this direct buffer with
-`sbufDestroy()` after its last user has stopped.
-
-The 128 KiB tier is not a maximum payload or total-memory limit. Smaller pooled
-allocations do not cap process memory, kernel pipe memory, frame sizes, or
-dedicated ordinary allocations. Frequent large materializations can incur
-allocation/free work; these sizes make no throughput guarantee.
-
-Materialization callers must request the complete logical payload plus required
-headroom, including real prefixes, residual padding and any destination bytes
-already present. Low-level conversion helpers do not grow caller storage. For
-example, 600 KiB requires dedicated ordinary storage with a 128 KiB large tier;
-a pipe with 1 MiB capacity holding only 20 KiB needs storage for its logical bytes,
-not its kernel capacity. Dedicated buffers above all tiers are destroyed on
-recycling, while consumed splice wrappers return to their separate splice cache.
-
-Each tier refills at most four buffers at a time, further bounded by half the
-local cache capacity and its available slots. Pools whose previous refill batch
-was smaller than four retain that smaller batch. Cache capacities and shrink
-thresholds are independent of this refill limit.
-
-Fresh `sbuf_t` allocations with more than 2 KiB of physical buffer storage,
-including reserved left padding and alignment rounding but excluding the header,
-are prefaulted in `shiftbuffer.c`. Release builds write volatile zero bytes at
-4096-byte strides and at the final byte, covering trailing unaligned pages.
-Debug builds retain their existing full-storage diagnostic fill, which already
-touches every page. The supported minimum page size is assumed to be 4096 bytes;
-no OS page-size query is performed.
-
-This applies to newly allocated pool buffers, dedicated buffers and replacement
-allocations during growth. Pool checkout and recycling do not repeat the writes.
-Splice wrappers use only their physical padding and control-storage size, never
-their logical pipe payload size. Length, padding and ownership rules are unchanged;
-callers must still initialize payload bytes before use. Prefaulting pays possible
-first-write page faults during allocation, may populate unused capacity, and does
-not pin memory or guarantee a throughput improvement.
-
-`bufferpoolGetSpliceBufferStorageSize()` and `bufferpoolGetSpliceBufferPadding()` expose
-the splice geometry. `bufferpoolUpdateAllocationPaddings()` accepts separate
-large, medium, small, and splice padding arguments. Global chain-padding updates cover
-all four tiers, and device pools inherit each tier's padding value from their
-worker pool. Finalize padding before creating the splice inventory or populating
-local caches; splice padding cannot change after inventory initialization.
-
-The existing `lineGetBufferPool()`, `getWorkerBufferPool()`, and
-`getCurrentWorkerBufferPool()` accessors expose every tier through the same pool, including
-`bufferpoolGetMediumBuffer()` and `bufferpoolGetSpliceBuffer()`. `lineReuseBuffer()` and `reuseBuffer()` use the same
-recycling path as `bufferpoolReuseBuffer()`, subject to their existing worker
-ownership requirements. Ordinary recycling clears flags and length. Splice
-recycling preserves its representation/ownership flags and pipe, clears payload,
-and restores `capacity = initial_headroom + SPLICE_BUFFER_STORAGE_SIZE` and
-`data = head + initial_headroom`. Discard the pipe body before resetting these
-fields; resetting geometry does not drain the pipe.
-
-`bufferpoolGetSpliceBuffer(pool)` returns a complete buffer from the local cache,
-shared master or bounded lazy growth. A refusal returns `NULL` with `ENOBUFS`; unsupported
-builds use `ENOSYS`. Handle this before accessing the buffer, normally by choosing
-ordinary storage. Bypass uses the same bounded global inventory without local caching.
-Only checkout/refill may grow the inventory; returning a healthy buffer never
-creates, resizes or closes its pipe.
-
-If you need a buffer bigger than the current one for an append, use
-`sbufReserveSpace()` (it reallocates and copies only when necessary) rather than
-hand-rolling growth.
-
-`sbufCreateSplice(pad_left)` directly allocates an empty buffer with exactly
-32 bytes of payload capacity, plus left padding rounded up to a 32-byte
-boundary. Its payload capacity stays at 32 bytes regardless of the CPU cache
-line size. The buffer starts with zero length and only `kSbufFlagSplice` set;
-`sbufDestroy()` physically frees this unmanaged allocation. Inventory entries
-are acquired through the pool APIs and preserve their flags while cached.
-
-### Ordinary TCP and UDP receive sizing
-
-NIO ordinary TCP reads take the pool's large buffer directly and call `recv()`
-with its full writable payload capacity, without first querying `FIONREAD`.
-This also applies to an ordinary receive after a failed pipe allocation or a
-splice attempt that makes no progress. A receive may return fewer bytes than
-the capacity; remaining stream bytes stay queued for later reads. Its actual
-return value determines the published length, and zero confirms TCP EOF.
-Buffer capacity does not define TCP application message boundaries.
-
-On Linux, UDP uses `FIONREAD` as an allocation hint for the full size of the next
-datagram, not the sum of queued packets. `bufferpoolGetBestFit()` requests that
-complete size. It can select a larger tier or dedicated storage if the datagram
-exceeds a custom pool's large tier. Each receive still delivers one datagram.
-The socket has one serialized reader between the query and receive.
-
-UDP best-fit reads request at least the large tier's reserved left padding, so
-a smaller tier with insufficient padding is ineligible. A failed or zero size
-query falls back to a large-buffer receive. Zero never skips the receive: it
-may represent an empty UDP datagram or transient readiness. The actual receive
-result determines the published length, and Linux UDP truncation detection
-still drops incomplete datagrams.
-
-TunDevice uses its separate raw-IP/GSO reader and buffer sizing. Other NIO socket
-types and non-Linux/IOCP receive paths retain their own allocation policy.
-
-### Sizing Destination Buffers for Untrusted or Variable Payloads
-
-When sizing a destination buffer from an untrusted or variable payload length:
-
-- Use `bufferpoolGetBestFit()` (or another checked growth operation) rather than
-  assuming a fixed buffer tier fits the input. Supply the left padding required
-  by the onward buffer contract as well as the payload capacity: when no
-  pool tier fits, best-fit creates a dedicated buffer with exactly the requested
-  padding. Request zero only for a locally consumed buffer or a proven
-  zero-padding destination.
-- Compare the requested length with actual writable capacity
-  (`sbufGetWritableCapacity()`) in ordinary Release control flow before any
-  assert-only length mutator (such as `sbufSetLength()`) or write.
-- Publish actual produced length only after a partial or failing producer has
-  successfully written or validated that many bytes. Space append and prepend
-  may privately extend length for a guaranteed complete synchronous fill, but no
-  inspection, queue publication, callback, or ownership handoff may observe the
-  region before it is fully initialized.
-
-`sbufEnsureHeadroom(pool, buf, need)` consumes an exclusively owned buffer
-and returns the sole owned result. Sufficient headroom returns the original
-unchanged; otherwise replacement preserves the complete logical payload and
-reserves at least `max(need, large_pool_padding)`. Ordinary input remains ordinary.
-Splice input attempts a sufficiently padded splice destination, with ordinary
-fallback on checkout or transfer refusal, including partial transfer progress.
-It promises byte preservation, not a particular resident/pipe split or copying
-arbitrary metadata flags. The caller supplies representable replacement geometry
-and the owner-worker pool; there are no callbacks. Node padding declarations and
-actual prepend bounds remain the caller's obligations. Trojan UDP checks its
-actual header length before requesting maximum-header replacement padding;
-VLESS UDP requests its fixed two-byte prefix.
-
-## Buffer Ownership
-
-Buffer helpers returning the sole owned replacement are marked `WW_MUST_USE`,
-including `sbufReserveSpace()`, `sbufEnsureOrdinary()`,
-`sbufTryEnsureOrdinary()`, `sbufEnsureHeadroom()`, `sbufConcat()`,
-`sbufAppendMerge()`, `sbufMoveRangeTo()` and splice frame movement. Consume their
-returned result according to each ownership contract; the previous allocation
-may have been freed or recycled. Checked conversion still leaves the source
-owned by the caller on refusal. Cursor shifts do not replace storage, so their
-returned pointers remain optional.
-
-Buffer lifetime bugs are as common as line lifetime bugs. The rules:
-
-- **A callback takes ownership of the buffer you pass it.** After
-  `tunnelNextUpStreamPayload(t, line, buf)` (or the downstream form), `buf` is no
-  longer yours. Do not read it, reuse it, or free it.
-- **If you keep a buffer, you own it.** You are responsible for eventually
-  recycling it with `bufferpoolReuseBuffer` / `lineReuseBuffer`, or handing it to
-  a callback.
-- **On an error path that still owns a buffer**, return it to the pool (or the
-  line) before you close. Do not leak it, and do not touch it after the line dies.
-- **If a re-entrant callback killed the line** (a `false` from
-  `lineCallWithRef()` / `lineCallWithRefWithBuf()`), only recycle buffers you still hold; do not touch the dead
-  line's state to do it.
-
-ContextQueue owns enqueued contexts until pop or destruction. `contextqueuePop()`
-returns `NULL` when empty; otherwise ownership transfers to the caller.
-`contextqueuePush()` terminates on deque insertion failure.
-
-After transferring or recycling a context's payload, `contextDropPayload()`
-clears its payload pointer in every build configuration. It does not free the
-buffer. `contextReusePayload()` and `bufferStreamPushContextPayload()` perform
-this bookkeeping so later context destruction cannot recycle the payload again.
+The ownership and allocation-charge rules above also apply to these protocol-specific paths.
 
 ### BufferStream representation, inspection, and extraction contracts
 
@@ -3501,149 +3694,6 @@ Finish order. Client encodes upstream and decodes downstream; Server decodes
 upstream and encodes downstream. Complete decoded records are aggregated before
 node dispatch; incomplete input remains in the bounded receive stream.
 
-### Payload length versus retained allocation charge
-
-`sbufGetLength()` measures buffer contents. That is the correct unit for ordinary
-queue byte counts, protocol thresholds, FIFO delivery statistics, and
-backpressure decisions, and `buffer_queue_t.total_len` intentionally keeps those
-logical payload semantics.
-
-Do not treat that content length as a memory charge when a security or resource
-limit specifically promises to bound allocations retained by a live queue. An
-empty or one-byte `sbuf_t` can still retain its full capacity, left padding,
-header, and allocator alignment overhead. Memory-sensitive code that needs such
-a hard bound must keep a separate storage/resource charge. Mux's child, parent,
-detached and outgoing queues use the queue-capacity policy above; it deliberately
-does not bound physical kernel resources. It must not replace logical length in
-BufferQueue or in the incoming-child FlowResume threshold.
-
-Use `bufferqueueGetCharge()` for an individual BufferQueue instead of maintaining
-a duplicate counter beside it. A whole-queue ownership transfer carries the budget binding and both cached
-totals; initialize the relinquished source as empty and unbound. Reserved pop
-keeps continued active retention charged. TCP adapters share one budget between
-the queue and active WIO reservation, retaining original capacity charge until
-completion or terminal callback detachment. Partial writes release logical bytes.
-Mux's children, parser and detached associations retain their existing policies.
-
-`sbufGetAllocationCharge(const sbuf_t *buf)` is the canonical O(1) charge for an
-allocated buffer's own userspace storage. For ordinary buffers it returns
-`sizeof(sbuf_t) + sbufGetTotalCapacity(buf) + kSbufAllocationAlignment`; capacity
-already includes left padding. For splice wrappers it returns the header plus
-original left padding, `SPLICE_BUFFER_STORAGE_SIZE`, and alignment overhead.
-Splice capacity and length are logical, so they cannot measure wrapper storage.
-The helper works before pipe initialization, makes no allocation or syscall, and
-reads no payload bytes. Cursor movement, consumption, and prepending leave the
-charge unchanged unless storage is replaced. It excludes kernel pipe memory,
-allocator bookkeeping beyond explicit
-alignment overhead, and pool/queue storage. The separate queue-charge helpers use sbuf capacity for both representations. This does not change `sbufGetAllocationCharge()` or
-BufferQueue's logical-byte accounting.
-
-`bufferpoolQueryBestFit()` predicts ordinary storage without allocating, consuming
-a cache entry, or making a reservation. It shares tier selection with
-`bufferpoolGetBestFit()` and reports aligned payload capacity, left padding,
-allocation charge, and whether a configured pool tier fits. Unrepresentable
-geometry returns false without changing the output. Predictions remain valid
-while pool geometry is unchanged. Mux uses this query for ordinary compaction
-and batch fallback reservations; compaction still requires a smaller pooled tier.
-
-Linux RawSocket capture uses the same nonblocking worker FIFO admission as
-Linux TUN, with a shared 8 MiB allocation-charge and 512-packet budget. Each queue
-worker owns receive scratch and a bounded fragment-release batch outside that
-budget. A received record remains private until its Netlink verdict succeeds;
-only NF_DROP can lead to chain publication. On capacity refusal, keep the
-unadmitted output and disable reads until credit notification. Shared fragment
-storage uses detached allocations, never a different worker's buffer pool.
-Inactive startup/cleanup service uses coordinator-owned storage and NF_ACCEPT;
-it never dispatches into the session FIFO. Once capture activates, coordinator
-service during the remaining worker startup gate uses detached storage and
-NF_DROP, then admits packets through the same bounded FIFO. Capacity refusal
-retains the current output and stops that lane's reads. No tunnel callback runs
-on the coordinator; worker delivery begins after packet Init.
-
-Windows, macOS and BSD TUN readers configure the session's byte/packet budget and
-worker FIFO before producer startup: 8 MiB of buffer allocation charge and
-1,024 packets. `deviceReaderDistributeBatchDroppingOverflow()` distributes complete
-visible native TCP/UDP packets by flow and other complete packets using a
-session-local sequence. It retains preserved-fragment association and groups
-packets in stable worker order to fit both limits before nonblocking
-admission. A capacity refusal drops and recycles the unadmitted remainder;
-worker 0 and the external macOS/BSD readers never wait for another worker. An
-individual allocation larger than the budget is dropped too. Accepted work retains its
-reservation through delivery or cancellation, including closed generations.
-Reader staging is bounded by one batch plus the existing fragment limits.
-Windows/macOS batches contain at most 128 packets. BSD uses
-`min(RAM_PROFILE, kMaxReadDistributeQueueSize)` with a 512-packet internal cap;
-supported profiles allow at most 256 packets (`server`). Message metadata is
-bounded separately by the packet limit. These
-limits bound receive dispatch, not total process memory or downstream retention.
-
-Linux TUN offload work reserves storage before transferring an aggregate,
-an assured complete ordinary TCP/UDP record, or ordinary checksum work to its
-selected receive-processing worker in either offload mode. Single-reader native
-TCP/UDP uses the same flow worker as ordinary input. The destination is retained
-across capacity retries and all segments of that record. Both modes
-prepare receive scratch, the capacity notifier and ordered worker queues before
-producer startup. Their session budget is 8 MiB of allocation charge and 512
-packet slots; common setup must admit the largest retained ordinary work item.
-Each GSO work item charges its actual aggregate buffer allocation, its
-work context, and one maximum output-buffer allocation allowance; it reserves
-two packet slots for the retained aggregate and active output. The worker
-allocates and delivers one independent segment at a time, or delivers an assured
-aggregate intact on an eligible trusted pair. The output allowance
-stays reserved through every segment's required checksum work and TunDevice
-delivery, so the worker never waits for reader budget capacity. Downstream
-retention follows ordinary packet-chain ownership after delivery.
-
-All non-segment ordinary work, including assured `DATA_VALID` and matching
-`NEEDS_CSUM` records, reserves one packet slot, its compact
-packet buffer's predicted allocation charge, and its private work context before
-allocation and copying from reader scratch. It needs no segmentation output
-allowance. Its reservation remains held through worker checksum completion and
-delivery (omitting checksum completion when assured), or settles on refusal,
-cancellation or stale generation. Scratch remains reader-owned and reusable for
-the next read.
-
-Before allocating each segment, the worker checks the current ordinary best-fit
-charge against its prepaid allowance. If custom ordinary pool geometry no longer
-fits that allowance, it creates an exact-sized
-ordinary buffer with this chain's original sufficient padding instead.
-
-Ordinary batches use the same per-worker FIFO and reserve their actual buffer
-allocation charges and packet slots before posting. Reader drain staging and
-fragment storage retain their separate existing bounds; session and FIFO-message
-metadata are bounded separately by the packet limit. The 8 MiB admission charge
-is not a total process-memory limit. Budget exhaustion makes
-the reader wait, retaining at most one unadmitted record in its current
-scratch buffer. Successful GSO admission transfers that buffer itself and
-replaces reader scratch without copying the aggregate payload. Non-segment
-admission copies the exact IP bytes and reuses reader scratch.
-Release each work reservation exactly once after completion, refusal,
-cancellation, or stale-generation discard. Posting a work item is not
-settlement, and cancellation must not borrow a device or worker buffer pool.
-
-### Buffers transferred to scheduled line tasks
-
-Calling `lineScheduleTaskWithBuf()` or
-`lineScheduleDelayedTaskWithBuf()` transfers the buffer on **every** result,
-including synchronous `RejectedSettled`. The caller must never recycle, destroy,
-or inspect it after the call. If the task executes, the task callback receives
-ownership. Otherwise the scheduler settles the buffer after optional
-cancellation notification: it returns the buffer to the line's pool only while
-cleanup runs in that owner event-worker context, including owner-bound teardown,
-and destroys it on a foreign or unbound cleanup thread.
-
-The cancellation callback does not receive or own the buffer. It runs before
-internal buffer release, while the scheduler's physical line reference remains
-held, and must not attempt to infer buffer lifetime from the cancellation
-reason. A null cancellation callback suppresses only notification; line death,
-submission refusal, quiescence, and teardown still release the buffer exactly
-once. This makes memory safety independent of task progress.
-
-In debug builds, `BUFFER_WONT_BE_REUSED(x)` swaps a buffer for a fresh duplicate
-and destroys the original, so any stale pointer to the old buffer is caught
-quickly. If you see it in reference tunnels, it marks "this buffer must not be
-touched again after this point."
-
 ### ENet native receive allocations
 
 The vendored ENet receive queue accounts for each incoming packet's requested
@@ -3713,42 +3763,6 @@ before the pool disappears. These internal wire copies and KCP/FEC heap storage
 are separate from sbuf allocation-charge accounting; these bounds do not provide
 a process-wide transport heap budget.
 
-## A Complete Prepend Example
-
-Putting it together — a framing tunnel that prefixes a 2-byte big-endian length on
-the upstream path, having advertised `.required_padding_left = 2` in `node.c`:
-
-```c
-void myTunnelUpStreamPayload(tunnel_t *t, line_t *l, sbuf_t *buf)
-{
-    const uint16_t payload_len = (uint16_t) sbufGetLength(buf);
-
-    // We advertised 2 bytes of left padding, so this is guaranteed to fit.
-    assert(sbufGetHeadroom(buf) >= sizeof(uint16_t));
-    sbufShiftLeft(buf, sizeof(uint16_t));
-    sbufWriteUI16(buf, payload_len);      // (use the project's endianness helper as needed)
-
-    // Hand the buffer upstream; we no longer own it.
-    tunnelNextUpStreamPayload(t, l, buf);
-}
-```
-
-On the downstream side the paired tunnel reads and strips the header with
-`sbufReadUI16` + `sbufShiftRight`, then forwards with
-`tunnelPrevDownStreamPayload`.
-
-## Common Buffer Mistakes
-
-- Prepending without advertising padding, then relying on left capacity that only
-  exists in one chain layout.
-- Misusing `sbufShiftLeft` when left capacity is insufficient (the assert is your
-  friend in debug; release builds corrupt memory).
-- Reusing or reading a buffer after passing it to a forwarding callback.
-- Leaking a buffer on an error/close path.
-- Using a different worker's pool than the line's own.
-- Treating `sbufGetWritableCapacity` as "spare room beyond the payload" — it
-  is room from the cursor, so subtract the current length first.
-
 ### HttpProxyClient framing and retention
 
 Optional origin DNS precedes client Init. DomainResolver retains early ordinary,
@@ -3791,10 +3805,6 @@ framing carry have explicit fixed bounds; they are not general body queues.
 Materialization may transiently allocate one additional complete ordinary input
 of at most 2 MiB payload with onward padding, independently of pool tier sizes.
 This is not a physical-memory or kernel-pipe capacity guarantee.
-
----
-
-Continue to **[Part 4: Packet Lines & Packet Tunnels](./part4-packet-tunnels.mdx)**.
 
 ## lwIP engine and shared buffer storage
 
@@ -3990,3 +4000,7 @@ own pool. During stop, native cancellation/completion and notification quiescenc
 must finish before any retained packet is destroyed. Refused `rawdeviceWrite()`
 keeps caller ownership; accepted output settles through the writer even when a
 later retry is cancelled.
+
+---
+
+Continue to **[Part 4: Packet Lines & Packet Tunnels](./part4-packet-tunnels.mdx)**.

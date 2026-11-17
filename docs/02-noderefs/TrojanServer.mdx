@@ -6,11 +6,13 @@ description: "Reference documentation for the TrojanServer node."
 ---
 
 <!--
-Documentation version: 157
+Documentation version: 158
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/TrojanServer/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/TrojanServer.mdx, and all files must keep the same documentation version.
 -->
 
 # TrojanServer
+
+## Overview
 
 `TrojanServer` is the server-side Trojan protocol tunnel for WaterWall. It parses a Trojan byte stream from the previous
 node, authenticates the standard SHA224 password hash, extracts the requested TCP or UDP destination, and forwards
@@ -21,17 +23,7 @@ for unauthenticated invalid probes.
 
 This current node replaces the older two-node setup that used separate `TrojanAuthServer` and `TrojanSocksServer` nodes.
 
-## Cached Account Admission
-
-With AuthenticationClient, admission uses its last valid RAM table and clock basis during ordinary network outages
-and re-authentication. Cached enabled status, expiry, traffic quota and local connection/IP reservations still apply.
-No initial cache, stopping, terminal accounting-continuity failure or explicit client credential rejection blocks new
-admission. Only validated authorization clears that rejection; existing authorized traffic keeps cached enforcement and
-accounting. Offline administrative changes apply after refresh. Local allowances can overshoot aggregate limits across
-multiple disconnected clients; they are not global reservations.
-
-
-## Typical Placement
+## Typical placement
 
 Normal Trojan server:
 
@@ -54,7 +46,17 @@ TcpListener -> TlsServer -> TrojanServer -> Router
 `TrojanServer` does not terminate TLS by itself. For public Trojan deployments, place `TlsServer` before it. Without TLS,
 the password hash and destination metadata are visible on the wire.
 
-## Minimal Local-Password Example
+
+The protocol node supplies no transport encryption. Configure the TLS nodes
+shown above and the matching peer credentials before exposing the service.
+
+## Minimal practical example
+
+This is a **node-array fragment**, not a complete config file. Add the entry listener
+and the neighboring nodes shown above, and replace the sample credentials and
+server addresses. Certificate/key paths must name your server files.
+
+### Minimal Local-Password Example
 
 ```json
 [
@@ -89,7 +91,96 @@ the password hash and destination metadata are visible on the wire.
 ]
 ```
 
-## Multiple Local Users
+
+## Configuration
+
+### Required Fields
+
+Top-level fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | string | User-chosen node name. Must be unique inside the config file. |
+| `type` | string | Must be exactly `"TrojanServer"`. |
+| `settings` | object | Non-empty Trojan server settings. |
+| `next` | string | Required. Accepted Trojan traffic is forwarded to this node. |
+
+Choose exactly one authentication mode.
+
+### Local Authentication Settings
+
+Use local authentication by omitting `auth-client-node-name` and configuring at least one raw password.
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `password` | string | One raw Trojan password. |
+| `pass` | string | Alias for `password`. Use either `password` or `pass`, not both. |
+| `passwords` | array of strings | Multiple raw Trojan passwords. |
+| `users` | array | Password strings or objects with `password` or `pass`. Objects can include `username`. |
+| `clients` | array | Alias for `users`. Use either `users` or `clients`, not both. |
+
+Password strings must be non-empty. Duplicate local passwords are fatal configuration errors, even when the duplicate
+entries use different usernames.
+
+### Database Authentication Settings
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `auth-client-node-name` | string | Name of an existing `AuthenticationClient` node in the same config file. |
+
+The referenced node must exist, must be an `AuthenticationClient`, and must not point back to the `TrojanServer` node
+itself. In database mode, do not configure `password`, `pass`, `passwords`, `users`, or `clients`.
+
+### Optional Settings
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `connect` | `true` | Enables Trojan TCP `CONNECT`, command `0x01`. |
+| `udp` | `true` | Enables Trojan UDP `ASSOCIATE`, command `0x03`. |
+| `verbose` | `false` | Enables focused authentication diagnostics. |
+| `fallback-node-name` | not set | Fallback branch for unauthenticated invalid probes. Aliases: `fallback-node`, `fallback`. |
+| `fallback-intentional-delay-ms` | `7` | Delay for upstream payloads sent to fallback. Nonzero delay uses configured jitter. At `0`, accepted input forwards synchronously, including completion under Pause; branch Init and reentry preserve FIFO. Must not be negative. |
+| `fallback-intentional-delay-jitter-ms` | `1` | Random jitter around delayed fallback payload scheduling. Ignored when delay is `0`. Must not be negative. |
+| `sweep-interval-ms` | `1000` | Optional setting forwarded to the internally created `UserController` in database mode. |
+
+At least one of `connect` or `udp` must be enabled.
+
+## Usage and troubleshooting
+
+### Fallback Example
+
+```json
+{
+  "name": "trojan-server",
+  "type": "TrojanServer",
+  "settings": {
+    "password": "secret-password",
+    "fallback-node-name": "fallback-service",
+    "fallback-intentional-delay-ms": 7,
+    "fallback-intentional-delay-jitter-ms": 1,
+    "connect": true,
+    "udp": true
+  },
+  "next": "outbound"
+}
+```
+
+Fallback is for active-probing resistance. Invalid unauthenticated traffic can be handed to another configured node
+instead of being closed immediately.
+
+### Common Mistakes
+
+- Do not expose `TrojanServer` directly on a public TCP listener without `TlsServer` unless you intentionally want plain
+  Trojan on the wire.
+- Do not configure local passwords together with `auth-client-node-name`.
+- Do not set the next node to a manual `UserController`; database mode inserts its own internal `UserController`.
+- Do not use the old `TrojanAuthServer` and `TrojanSocksServer` node names for new configurations.
+- Do not expect the initial UDP ASSOCIATE address to choose the final UDP target; each Trojan UDP packet carries its own
+  target address.
+
+## Advanced behavior
+
+### Multiple Local Users
 
 ```json
 {
@@ -113,7 +204,7 @@ the password hash and destination metadata are visible on the wire.
 In local allowlist mode, `TrojanServer` stores the matched raw password on the line so `Router` can match password rules.
 If the matching object has `username`, that username is also stored on the line for username-aware routing.
 
-## AuthenticationClient Mode
+### AuthenticationClient Mode
 
 ```json
 {
@@ -136,79 +227,7 @@ user object's `password` field; `AuthenticationClient` prepares the SHA224 looku
 When `auth-client-node-name` is configured, local password settings are rejected. `TrojanServer` internally inserts a
 `UserController` before the configured outbound node, so do not place a manual `UserController` directly after it.
 
-## Fallback Example
-
-```json
-{
-  "name": "trojan-server",
-  "type": "TrojanServer",
-  "settings": {
-    "password": "secret-password",
-    "fallback-node-name": "fallback-service",
-    "fallback-intentional-delay-ms": 7,
-    "fallback-intentional-delay-jitter-ms": 1,
-    "connect": true,
-    "udp": true
-  },
-  "next": "outbound"
-}
-```
-
-Fallback is for active-probing resistance. Invalid unauthenticated traffic can be handed to another configured node
-instead of being closed immediately.
-
-## Required Fields
-
-Top-level fields:
-
-| Field | Type | Description |
-| --- | --- | --- |
-| `name` | string | User-chosen node name. Must be unique inside the config file. |
-| `type` | string | Must be exactly `"TrojanServer"`. |
-| `settings` | object | Non-empty Trojan server settings. |
-| `next` | string | Required. Accepted Trojan traffic is forwarded to this node. |
-
-Choose exactly one authentication mode.
-
-## Local Authentication Settings
-
-Use local authentication by omitting `auth-client-node-name` and configuring at least one raw password.
-
-| Field | Type | Description |
-| --- | --- | --- |
-| `password` | string | One raw Trojan password. |
-| `pass` | string | Alias for `password`. Use either `password` or `pass`, not both. |
-| `passwords` | array of strings | Multiple raw Trojan passwords. |
-| `users` | array | Password strings or objects with `password` or `pass`. Objects can include `username`. |
-| `clients` | array | Alias for `users`. Use either `users` or `clients`, not both. |
-
-Password strings must be non-empty. Duplicate local passwords are fatal configuration errors, even when the duplicate
-entries use different usernames.
-
-## Database Authentication Settings
-
-| Field | Type | Description |
-| --- | --- | --- |
-| `auth-client-node-name` | string | Name of an existing `AuthenticationClient` node in the same config file. |
-
-The referenced node must exist, must be an `AuthenticationClient`, and must not point back to the `TrojanServer` node
-itself. In database mode, do not configure `password`, `pass`, `passwords`, `users`, or `clients`.
-
-## Optional Settings
-
-| Field | Default | Description |
-| --- | --- | --- |
-| `connect` | `true` | Enables Trojan TCP `CONNECT`, command `0x01`. |
-| `udp` | `true` | Enables Trojan UDP `ASSOCIATE`, command `0x03`. |
-| `verbose` | `false` | Enables focused authentication diagnostics. |
-| `fallback-node-name` | not set | Fallback branch for unauthenticated invalid probes. Aliases: `fallback-node`, `fallback`. |
-| `fallback-intentional-delay-ms` | `7` | Delay for upstream payloads sent to fallback. Nonzero delay uses configured jitter. At `0`, accepted input forwards synchronously, including completion under Pause; branch Init and reentry preserve FIFO. Must not be negative. |
-| `fallback-intentional-delay-jitter-ms` | `1` | Random jitter around delayed fallback payload scheduling. Ignored when delay is `0`. Must not be negative. |
-| `sweep-interval-ms` | `1000` | Optional setting forwarded to the internally created `UserController` in database mode. |
-
-At least one of `connect` or `udp` must be enabled.
-
-## Request Format
+### Request Format
 
 Accepted Trojan request:
 
@@ -238,7 +257,7 @@ separator:    CRLF
 payload:      length bytes
 ```
 
-## Authentication Flow
+### Authentication Flow
 
 Trojan clients send `hex(SHA224(password))` as 56 ASCII hex bytes. `TrojanServer` decodes that value and authenticates it
 against the selected mode.
@@ -253,7 +272,7 @@ bytes, may still arrive across later payload callbacks after the complete passwo
 
 There is no unauthenticated Trojan mode.
 
-## TCP CONNECT Runtime Behavior
+### TCP CONNECT Runtime Behavior
 
 For command `0x01`, the server:
 
@@ -268,7 +287,7 @@ For command `0x01`, the server:
 The configured `next` node is usually `TcpConnector`, `TcpUdpConnector`, `Router`, or another node that understands the
 destination context.
 
-## UDP ASSOCIATE Runtime Behavior
+### UDP ASSOCIATE Runtime Behavior
 
 For command `0x03`, the initial request address is only the association metadata. The real remote destination is carried
 by each Trojan UDP packet.
@@ -284,7 +303,7 @@ Malformed UDP packet headers, zero-length domain names, missing ports or bad CRL
 line. UDP bodies use the full 0–65,535-byte range of the two-byte length field. Backend replies are wrapped and forwarded
 synchronously without waiting for Est or Resume.
 
-## Fallback Behavior
+### Fallback Behavior
 
 Fallback is used only before successful password authentication. After authentication succeeds, malformed Trojan protocol
 data closes the line instead of being replayed to fallback.
@@ -316,7 +335,30 @@ The remaining intentional delay is not kept alive after upstream close.
 The default fallback delay is intentionally small. Tune delay and jitter against the public behavior the fallback is
 supposed to resemble; they are mitigations, not proof of timing indistinguishability.
 
-## Splice, buffering and backpressure
+### Unsupported Features
+
+This implementation does not create or manage:
+
+- TLS termination
+- WebSocket, HTTP, gRPC, or other transport wrappers
+- legacy `TrojanAuthServer` plus `TrojanSocksServer` composition
+- non-standard Trojan extensions
+
+Use separate WaterWall nodes such as `TlsServer`, `HttpServer`, `MuxServer`, `TcpUdpConnector`, or `Router` when you need
+those layers.
+
+## Implementation details
+
+### Cached Account Admission
+
+With AuthenticationClient, admission uses its last valid RAM table and clock basis during ordinary network outages
+and re-authentication. Cached enabled status, expiry, traffic quota and local connection/IP reservations still apply.
+No initial cache, stopping, terminal accounting-continuity failure or explicit client credential rejection blocks new
+admission. Only validated authorization clears that rejection; existing authorized traffic keeps cached enforcement and
+accounting. Offline administrative changes apply after refresh. Local allowances can overshoot aggregate limits across
+multiple disconnected clients; they are not global reservations.
+
+### Splice, buffering and backpressure
 
 TrojanServer accepts ordinary buffers, private-pipe splice buffers and mixed
 input in authentication, CONNECT, ASSOCIATE and fallback. The initial parser
@@ -422,7 +464,7 @@ for any chain containing them. Keep TLS in ordinary Trojan deployment guidance.
 Eligibility promises safe buffer handling, not universal zero-copy or measured
 speed improvements.
 
-## Finish Behavior
+### Finish Behavior
 
 `TrojanServer` destroys its own line state before propagating real `Finish` callbacks.
 
@@ -430,7 +472,7 @@ The client stream line is created by the previous adapter and is not destroyed b
 lines are created by `TrojanServer`; it owns those lines and destroys them safely when the client stream closes or when a
 backend UDP line closes.
 
-## Padding
+### Padding
 
 `TrojanServer` may prepend the largest possible Trojan UDP reply header:
 
@@ -440,29 +482,7 @@ required_padding_left = 263
 
 That covers `ATYP + domain length + 255-byte domain + port + payload length + CRLF`.
 
-## Unsupported Features
-
-This implementation does not create or manage:
-
-- TLS termination
-- WebSocket, HTTP, gRPC, or other transport wrappers
-- legacy `TrojanAuthServer` plus `TrojanSocksServer` composition
-- non-standard Trojan extensions
-
-Use separate WaterWall nodes such as `TlsServer`, `HttpServer`, `MuxServer`, `TcpUdpConnector`, or `Router` when you need
-those layers.
-
-## Common Mistakes
-
-- Do not expose `TrojanServer` directly on a public TCP listener without `TlsServer` unless you intentionally want plain
-  Trojan on the wire.
-- Do not configure local passwords together with `auth-client-node-name`.
-- Do not set the next node to a manual `UserController`; database mode inserts its own internal `UserController`.
-- Do not use the old `TrojanAuthServer` and `TrojanSocksServer` node names for new configurations.
-- Do not expect the initial UDP ASSOCIATE address to choose the final UDP target; each Trojan UDP packet carries its own
-  target address.
-
-## Node Metadata
+### Node Metadata
 
 Source-backed metadata:
 

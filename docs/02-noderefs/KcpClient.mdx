@@ -6,11 +6,13 @@ description: "Reference documentation for the KcpClient node."
 ---
 
 <!--
-Documentation version: 157
+Documentation version: 158
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/KcpClient/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/KcpClient.mdx, and all files must keep the same documentation version.
 -->
 
 # KcpClient
+
+## Overview
 
 `KcpClient` carries a TCP-like byte stream over a packet-preserving UDP path by running KCP internally. It accepts
 stream payload from the previous node, wraps that byte stream into KCP segments, and forwards the resulting datagrams to
@@ -36,7 +38,11 @@ UdpListener -> KcpServer -> MuxServer -> TcpConnector
 
 The node after `KcpClient` must preserve datagram boundaries. A normal UDP-style path is the intended transport.
 
-## Basic example
+## Minimal practical example
+
+The basic example is a complete node configuration. Pair it with the server setup linked below and the startup settings for your deployment.
+
+### Basic example
 
 Save this node config on the application machine. Connections to local TCP
 `18080` cross to the WaterWall gateway at `198.51.100.10:9000` over UDP. Pair it
@@ -76,32 +82,15 @@ the actual HTTP service on TCP `127.0.0.1:8080`. Replace the gateway address.
 }
 ```
 
+## Configuration
 
-## FEC example
-
-```json
-{
-  "name": "kcp-client",
-  "type": "KcpClient",
-  "settings": {
-    "fec": true,
-    "fec-data-shards": 10,
-    "fec-parity-shards": 3
-  },
-  "next": "udp-out"
-}
-```
-
-FEC must be enabled on both `KcpClient` and `KcpServer` with matching shard settings. If one side uses FEC
-and the other side does not, or if the shard counts differ, the peer will not decode the packet stream correctly.
-
-## Required fields
+### Required fields
 
 `settings` is optional. If it is absent or not an object, the node uses defaults.
 
 `next` is required in normal use. It should point to a packet-preserving transport or packet-preserving tunnel stack.
 
-## Optional settings
+### Optional settings
 
 | Field | Default | Validation | Description |
 | --- | --- | --- | --- |
@@ -122,45 +111,27 @@ and the other side does not, or if the shard counts differ, the peer will not de
 | `close-drain-timeout-ms` | `30000` | integer `1..2147483647` | Close interval; peers negotiate the minimum. |
 | `no-recv-timeout-ms` | `30000` | greater than `ping-interval-ms` | Idle receive interval before closing the line. |
 
-## KCP transport model
+## Usage and troubleshooting
 
-During application Init, the client borrows that application line and creates a separate owned UDP transport line on the same worker. It copies routing contexts, listener/source ports, credentials and read policy before transport Init. The application's source and destination protocols are preserved. Both source and destination protocols on the new transport line are set to UDP. Actual transport Est is relayed promptly to the attached application, independently of handshake readiness.
+### FEC example
 
-The peers establish a fresh session through HELLO, CHALLENGE, CONFIRM and READY. Independent 128-bit client/server nonces identify every KCP/FEC datagram before decoding. Handshake messages carry the close interval and exact FEC settings. The client retries its current request every 250 ms within the original `no-recv-timeout-ms` deadline. The server initializes a distinct service line only after fresh confirmation. Delayed traffic cannot reset an established session or recreate an old service. These identifiers provide no authentication or encryption.
+```json
+{
+  "name": "kcp-client",
+  "type": "KcpClient",
+  "settings": {
+    "fec": true,
+    "fec-data-shards": 10,
+    "fec-parity-shards": 3
+  },
+  "next": "udp-out"
+}
+```
 
-Accepted application data enters KCP's ordered send queue before readiness; ordinary wire output waits for matching READY. Nested callbacks are serialized with bounded retained-buffer storage.
+FEC must be enabled on both `KcpClient` and `KcpServer` with matching shard settings. If one side uses FEC
+and the other side does not, or if the shard counts differ, the peer will not decode the packet stream correctly.
 
-When stream payload arrives from the previous node:
-
-1. The payload is split into chunks no larger than the effective KCP write MTU.
-2. Each chunk is prefixed with a one-byte internal frame flag.
-3. The framed chunk is sent through KCP.
-4. KCP output datagrams are forwarded upstream to the next node.
-
-When datagrams come back from the next node:
-
-1. The complete session envelope, exact nonce pair and expected wire kind are validated before FEC decoding.
-2. KCP receives the datagram.
-3. Completed KCP payloads are drained.
-4. The one-byte internal frame flag is removed.
-5. Data frames are forwarded downstream to the previous node as reconstructed stream payload.
-
-## Internal frame flags
-
-Inside the KCP payload, `KcpClient` uses a one-byte flag:
-
-| Flag | Meaning |
-| --- | --- |
-| `0x00` | Data frame. Bytes after the flag are real stream payload. |
-| `0xF0` | Ping frame. Used as an internal keepalive marker. |
-| `0xFF` | Close frame. Requests shutdown of the paired line. |
-
-Data frames containing only the flag are discarded. An empty KCP message has no
-flag and closes the affected connection, as does an unknown flag or a completed
-KCP message larger than the local receive buffer. Incomplete KCP messages wait
-for their remaining fragments.
-
-## Sending MTU and padding
+### Sending MTU and padding
 
 Optional integer `send-mtu` inherits core `misc.mtu` at construction (the core fallback
 is 1500). The supported range is **118..65535 without FEC**, or **126..65535 with
@@ -198,7 +169,56 @@ more bytes than the fixed IPv4 allowance, so a 1500 budget can permit a 1520-byt
 IPv6 packet. IPv4 options, IPv6 extension headers and later wrappers need extra
 operator headroom. No family-dependent adjustment occurs.
 
-## FEC behavior
+### Common mistakes
+
+- Do not put a stream-only tunnel after `KcpClient`; the next side must preserve packet boundaries.
+- Do not enable FEC on only one side.
+- Do not use mismatched FEC shard counts.
+- Do not assume KCP removes all loss; it retransmits, and optional FEC can help with moderate loss, but severe or bursty
+  loss still hurts.
+- Do not set `no-recv-timeout-ms` less than or equal to `ping-interval-ms`.
+
+## Advanced behavior
+
+### KCP transport model
+
+During application Init, the client borrows that application line and creates a separate owned UDP transport line on the same worker. It copies routing contexts, listener/source ports, credentials and read policy before transport Init. The application's source and destination protocols are preserved. Both source and destination protocols on the new transport line are set to UDP. Actual transport Est is relayed promptly to the attached application, independently of handshake readiness.
+
+The peers establish a fresh session through HELLO, CHALLENGE, CONFIRM and READY. Independent 128-bit client/server nonces identify every KCP/FEC datagram before decoding. Handshake messages carry the close interval and exact FEC settings. The client retries its current request every 250 ms within the original `no-recv-timeout-ms` deadline. The server initializes a distinct service line only after fresh confirmation. Delayed traffic cannot reset an established session or recreate an old service. These identifiers provide no authentication or encryption.
+
+Accepted application data enters KCP's ordered send queue before readiness; ordinary wire output waits for matching READY. Nested callbacks are serialized with bounded retained-buffer storage.
+
+When stream payload arrives from the previous node:
+
+1. The payload is split into chunks no larger than the effective KCP write MTU.
+2. Each chunk is prefixed with a one-byte internal frame flag.
+3. The framed chunk is sent through KCP.
+4. KCP output datagrams are forwarded upstream to the next node.
+
+When datagrams come back from the next node:
+
+1. The complete session envelope, exact nonce pair and expected wire kind are validated before FEC decoding.
+2. KCP receives the datagram.
+3. Completed KCP payloads are drained.
+4. The one-byte internal frame flag is removed.
+5. Data frames are forwarded downstream to the previous node as reconstructed stream payload.
+
+### Internal frame flags
+
+Inside the KCP payload, `KcpClient` uses a one-byte flag:
+
+| Flag | Meaning |
+| --- | --- |
+| `0x00` | Data frame. Bytes after the flag are real stream payload. |
+| `0xF0` | Ping frame. Used as an internal keepalive marker. |
+| `0xFF` | Close frame. Requests shutdown of the paired line. |
+
+Data frames containing only the flag are discarded. An empty KCP message has no
+flag and closes the affected connection, as does an unknown flag or a completed
+KCP message larger than the local receive buffer. Incomplete KCP messages wait
+for their remaining fragments.
+
+### FEC behavior
 
 With `fec: true`, outbound KCP datagrams are wrapped in Reed-Solomon FEC packets. Data shards are emitted immediately.
 After each configured data-shard block, parity shards are emitted.
@@ -213,7 +233,9 @@ On receive, the decoder:
 FEC adds bandwidth overhead. With the default `10` data shards and `3` parity shards, a full block carries about 30
 percent extra parity traffic, plus FEC headers.
 
-## Backpressure
+## Implementation details
+
+### Backpressure
 
 The client combines its local KCP backlog pressure with carrier pressure before
 notifying the previous application stream. The application remains paused while
@@ -236,7 +258,7 @@ continue while the application is paused. KCP windows, timers and the receive
 timeout remain in force. Every payload still needs KCP/FEC processing, so the
 node cannot bypass itself.
 
-## Close and timeout behavior
+### Close and timeout behavior
 
 Application Finish immediately detaches and clears the borrowed application state. Its owner may destroy that line as soon as Finish returns. The owned transport and stable session continue draining previously accepted KCP output for the negotiated interval `D = min(client setting, server setting)`.
 
@@ -248,16 +270,7 @@ A peer-only responder remains until first CLOSE receipt plus D. A locally acknow
 
 `no-recv-timeout-ms` independently detects silence during ordinary operation; fixed close deadlines govern closing. Transport Finish, fatal protocol failure and process shutdown abort immediately. Worker quiescence detaches timer roots, and worker Stop drains all owned transports without waiting for graceful close. KCP acknowledgment confirms peer transport receipt, not remote application consumption or persistence. This protocol does not provide TCP half-close.
 
-## Common mistakes
-
-- Do not put a stream-only tunnel after `KcpClient`; the next side must preserve packet boundaries.
-- Do not enable FEC on only one side.
-- Do not use mismatched FEC shard counts.
-- Do not assume KCP removes all loss; it retransmits, and optional FEC can help with moderate loss, but severe or bursty
-  loss still hurts.
-- Do not set `no-recv-timeout-ms` less than or equal to `ping-interval-ms`.
-
-## Node Metadata
+### Node Metadata
 
 Source-backed metadata:
 
