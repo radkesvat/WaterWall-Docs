@@ -40,7 +40,7 @@ A packet line is a real `line_t`, but unlike a connection line it is:
 
 "Worker-owned" here means persistent, worker-local packet-pipeline state. It
 does not make a node on the left or right its connection owner. Normal lines
-created inside a packet chain, including WireGuardDevice's companion transport
+created inside a packet chain, including WireGuardClient's owned carrier
 lines and UdpStatelessSocket's incoming peer lines, still belong to their exact
 creators and close normally. Classify the actual `line_t`, not just its worker
 ID or whether the chain contains packet nodes.
@@ -127,7 +127,7 @@ void tundeviceTunnelDownStreamFinish(tunnel_t *t, line_t *l)
 Examples include `TunDevice` and `RawSocket`; the upstream packet sides of
 `PacketsToConnection` and `PacketsToStream`; the downstream packet side of
 `StreamToPackets`; `PacketSplitStream`; the packet modes of `TesterClient` and
-`TesterServer`; and the packet-line role of `WireGuardDevice`. These are
+`TesterServer`; and the packet-line role of `WireGuardServer`. These are
 per-handler classifications, not labels for the whole tunnel: the same bridge
 may own normal lines on its other side and close those normally.
 
@@ -229,10 +229,10 @@ what does the tunnel keep on this line, and who is still waiting on it?”**
 Some nodes see **both** a persistent packet line and normal lines they own. The
 handler must decide which one it was given before doing anything:
 
-- `WireGuardDevice` is a `packettunnelCreate()` tunnel on its packet side, but it
-  also creates one **normal transport line per worker** for its encrypted side.
-  A `Finish` on a transport line is an ordinary owned-line close (destroy the
-  slot, `lineDestroy()`); a `Finish` on the packet line is a violation and aborts.
+- `WireGuardClient` owns one normal carrier on worker 0 and accepts persistent
+  worker packet lines on its inner side. `WireGuardServer` borrows ingress normal
+  lines and publishes inner packet lines. Only PTC creates/destroys connection-mode
+  inner normal lines. Packet-line Finish is fatal; carrier Finish is local.
 - `PacketsToStream` and `PacketsToConnection` anchor bridge state on the packet
   line while owning the normal lines they create behind it.
 
@@ -333,7 +333,7 @@ static void packettunnelDefaultUpStreamPayload(tunnel_t *self, line_t *line, sbu
   forwarding, or an intentional terminal absorption as classified above.
 
 Examples: `IpOverrider`, `IpManipulator`, `PingClient`, `PingServer`,
-`WireGuardDevice`.
+`WireGuardServer`.
 
 For pure packet tunnels:
 
@@ -1715,8 +1715,9 @@ upstream entry boundary only for `first-sni`, `smuggle-sni`, `overlap-sni`,
 `synfin-sni`, `ech-sni-trick` or `smuggle-fin`; downstream it dispatches after
 protocol/port restoration and before stateful processing. Plain ProtoSwap
 encoding and decoding stay on the arrival worker; protocol/checksum conversion
-does not require a flow owner. PingClient/PingServer and WireGuardDevice also
-forward decoded inner packets on their arrival worker. PacketsToStream and
+does not require a flow owner. PingClient/PingServer forward decoded inner packets on their arrival worker.
+WireGuard wrappers marshal protocol work to worker 0 and publish decoded packets
+on that worker's persistent packet line; PTC then establishes its flow ownership. PacketsToStream and
 StreamToPackets map decoded packets to the receiving stream worker's packet
 line; StreamToPackets rechecks the authorized source generation before
 publication and retains return-carrier rendezvous selection. The next stateful
@@ -2306,3 +2307,64 @@ handler belongs in it:
 ---
 
 Continue to **[Part 5: Anatomy of a Tunnel & Workflow](./part5-tunnel-anatomy.mdx)**.
+
+## WireGuard authenticated packet-to-connection ownership
+
+WireGuard protocol state has one event-worker owner per node. Cross-worker input
+is bounded and never borrows a foreign pool. WireGuardClient owns one normal
+carrier and requires one complete WireGuard message per payload callback in both
+directions. Its endpoint seeds the destination address, port and UDP protocol
+before Init without pinning; subsequent nodes apply their ordinary destination
+selection. It neither searches for a named connector nor reads connector-private
+endpoint state. Framing nodes may convert these datagrams to a stream and back.
+The selected transport owns DNS and socket addressing.
+
+Client receive processing binds cookie challenges to a nonzero opaque carrier
+generation, renewed for each created carrier. It does not invent a network
+address or learn the physical endpoint from incoming data. Cryptographic peer
+authentication remains mandatory, and output uses the current owned carrier.
+
+WireGuardServer's UDP ingress snapshots use the source address and
+`routing_context.peer_source_port`; the address context's port can be the local
+listener port. Server cookies bind to that actual remote IP/port, and only
+authenticated proof/data updates a peer's learned endpoint. Server replies retain
+the exact ingress handle.
+
+Session-secret erasure is armed independently of current-key validity. The first
+unfinished handshake arms cleanup, and successful session derivation resets its
+540-second deadline, including responder next-only sessions. Ordinary data and
+retries do not extend it. Erasure securely clears all session slots and unfinished
+handshake state while preserving static peer configuration and the greatest
+authenticated initiation timestamp. Persistent keepalive scheduling is separate
+from the fixed 165-second receive rekey deadline and five-second initiation retry.
+Current, previous and next keypairs are also zeroed individually when each reaches
+180 seconds or its local sending-message limit. This leaves the independent
+handshake cleanup deadline armed. Session installation passes the new keypair by
+pointer so the caller can wipe its temporary without an extra by-value copy.
+
+Configured private, public and preshared keys require canonical Base64 encoding
+of exactly 32 bytes. Decode with an explicit 32-byte output capacity; checking the
+decoded length after an unbounded write cannot protect the destination.
+
+WireGuardServer's connection pipeline
+is `server (L3) -> PTC -> user binding -> UserController -> configured next`.
+The helper attaches a consistent current account/profile to each PTC-owned normal
+line before Init, preserving its inner client source. UserController reserves the
+inner source IP key, counts TCP/UDP flows, and charges inner payload only.
+
+Key/range continuity uses installed-table generations and a credential continuity
+floor preserved only across unchanged key/range membership. Close the binding gate
+before posting range retirement to every PTC owner. Retire owned normal lines, UDP
+entries and child PCBs, pending TCP PCBs/TIME_WAIT and post-line closers. Release
+reservations through ordinary closure. The old range stays reserved until all
+owner acknowledgments settle. Input affinity, deferred Init and reverse output
+carry/check a non-reused binding epoch. A stale packet cannot acquire the range's
+next owner. Cancellation only notifies the barrier and keeps admission closed.
+
+An already authenticated, usable binding validates its saved identity, key/range
+continuity and cached account eligibility during control credential rejection;
+it may rekey even after its crypto keys expire. An occupied provisional slot does
+not qualify. New peer bindings and every new PTC-owned inner Init require current
+fresh admission, including Init delayed across rejection. Denying one new flow
+must close only that flow. Retirement, key/range reassignment, cached account
+revocation and terminal continuity still close the binding gate.

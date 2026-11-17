@@ -7,82 +7,46 @@ description: "Reference documentation for the UserController node."
 
 <!--
 Documentation version: 159
-Sync note: Any change to this file must also be applied to WaterWall/tunnels/Internals/UserController/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/UserController.mdx, and all files must keep the same documentation version.
+Sync note: Any change to this file must also be applied to WaterWall/WaterWall-Docs/docs/02-noderefs/UserController.mdx and WaterWall/WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/UserController.mdx, and all files must keep the same documentation version.
 -->
 
-# UserController
+# UserController Node
 
 ## Overview
 
-`UserController` is an advanced support node that enforces authenticated-user limits for traffic-serving chains.
+`UserController` is a middle node for stream or datagram normal lines that enforces per-user limits for traffic-serving chains.
 
-Normal users usually should not place it manually. Server-side nodes such as `Socks5Server`, `TrojanServer`, and `VlessServer` create an internal `UserController` when they run in authenticated database-backed mode. Configure those higher-level nodes first unless you are building a custom tunnel that calls `lineAddUser()` and understands WaterWall's user-handle lifecycle.
-
-### Cached Admission And First Use
-
-New managed lines use AuthenticationClient's valid RAM cache during ordinary outages, subject to cached enabled
-status, expiry, traffic quota and local connection/IP reservations. No initial table/clock basis, stopping, terminal
-continuity failure or explicit client credential rejection blocks new admission; only validated authorization clears
-that rejection. Existing managed lines keep accounting, payload expiry checks, idle sweeps and reservation release.
-Local allowances can overshoot aggregate quotas across disconnected clients; administrative changes arrive on refresh.
-
-The AuthenticationClient accounting helper captures first nonzero local traffic, even offline or with duration zero,
-and starts relative expiry immediately. Login, reservation, zero-byte calls and rebasing do not start use. The server
-merges earliest producer observations; origins, elapsed age, report/ACK state and reservations migrate by durable ID,
-including same-ID credential changes. ACK/reconnect/unchanged pulls do not restart duration. Explicit duration and
-absolute-date edits recompute independent components; the earlier enabled deadline governs. Generic copies/JSON exclude
-this runtime state. Cross-machine time estimates include transit delay and drift; local monotonic suspend semantics
-are unchanged. State remains RAM-only with no crash recovery or guaranteed final delivery.
-
-### What It Does
-
-`UserController` sits after a node that has already authenticated a user and recorded a `user_handle_t` on the line. On each admitted authenticated line, it:
-
-- checks whether the user is enabled
-- checks expiry state
-- reserves a live outbound connection slot
-- reserves a source-IP slot when source IP is available
-- accounts upstream and downstream payload bytes
-- closes active lines when a user is disabled, expired, removed, or over traffic quota
-- releases connection/IP slots when the line finishes
-
-It does not parse login protocols and it does not store the authoritative user database. It depends on an existing `AuthenticationClient` node for user lookup, admission checks, and traffic accounting.
+It does not open sockets or perform protocol parsing. It sits behind a node that authenticates users (such as
+`Socks5Server`) and in front of the outbound side of the chain (such as `TcpConnector`). For every authenticated line
+it admits or rejects new connections, accounts traffic, and closes connections that are no longer allowed.
 
 ## Typical placement
 
-### Enforce limits on a managed VMess service
-
-Configure the data service and authentication control connection as separate
-chains. `VmessServer` references the local `AuthenticationClient` through
-`auth-client-node-name`; in managed mode it inserts its own `UserController`
-before the outbound connector.
+`Socks5Server` creates and inserts an internal `UserController` automatically in authenticated mode, so a SOCKS5 chain
+should normally be configured without a visible `UserController` node:
 
 ```text
-data:    TcpListener -> TlsServer -> VmessServer -> TcpUdpConnector
-control: AuthenticationClient -> TlsClient -> TcpConnector
-central: TcpListener -> TlsServer -> AuthenticationServer
+TcpListener <--> Socks5Server <--> TcpConnector
 ```
-Set `TcpUdpConnector.address` and `port` to `dest_context->address` and
-`dest_context->port` so it follows the authenticated VMess request. Configure
-matching control credentials at AuthenticationClient/Server, and verified TLS
-on the remote control transport. The [authentication example](../03-examples/api/authentication-users.mdx)
-shows database provisioning and management. The same automatic-controller pattern
-is available to managed SOCKS5, VLESS, Trojan, and HTTP proxy servers; use each
-server's documented authentication settings instead of adding a second controller.
 
-### Manual instances for custom authenticating nodes
+Manual placement is still useful for other tunnels that call `lineAddUser()` themselves.
 
-A custom preceding node must attach a valid user handle with `lineAddUser()`
-before this controller can enforce anything. The node fragment below is for
-that integration; it is not a standalone authentication service. Lines without
-a valid user handle pass through unmanaged. `WireGuardDevice` currently uses
-configured peers and does not attach database users, so adding a controller
-beside WireGuard alone does not enforce database-backed peer limits.
+`UserController` must be placed upstream (next) of a node that records the authenticated `user_handle_t` on the line with
+`lineAddUser()`. It reads the current handle with `lineGetCurrentUser()` and resolves it through the configured
+`AuthenticationClient` node. Lines without a valid user handle (for example a `Socks5Server` in `no-auth` mode) are
+passed through without enforcement.
 
-For custom nodes that authenticate after Init, use the
-[Programmatic Promotion API](#programmatic-promotion-api).
-`UserController` supports either line origin and uses it to distinguish upload
-from download; see [Direction Awareness](#direction-awareness).
+WireGuardServer connection mode inserts PTC, user binding and UserController
+before the configured outbound node. Accounts are attached to each inner TCP/UDP
+line before Init. WireGuard carriers and persistent packet lines consume no user
+connection or inner-IP reservations. Source-IP admission uses the preserved inner
+client source, so endpoint roaming does not change IP slots.
+
+`UserController` is bidirectional: it works whether the line is initiated from its `prev` side (an upstream `Init`) or
+its `next` side (a downstream `Init`), and it records that origin per line. The origin matters for traffic accounting —
+see [Direction Awareness](#direction-awareness-upload-vs-download).
+
+`UserController` does not open sockets; it requires both a `prev` and a `next` node.
 
 ## Minimal practical example
 
@@ -107,25 +71,39 @@ See [Configuration](#configuration) for defaults and conditional requirements an
 
 ## Configuration
 
-### Required Fields
+### Required JSON Fields
 
-| Field | Type | Description |
-|---|---|---|
-| `type` | string | Must be `UserController`. |
-| `settings` | object | Must be a non-empty object. |
-| `settings.auth-client-node-name` | string | Name of an existing `AuthenticationClient` node. It must not point to `UserController` itself. |
-| `settings.payload-mode` | string | Required for manual instances: `stream`, `datagram`, or `dest_context->protocol`. Internal creators supply an immutable resolver instead. |
+#### Top-level fields
 
-### Optional Settings
+- `name` `(string)`
+  A user-chosen name for this node.
 
-| Field | Default | Description |
-|---|---|---|
-| `sweep-interval-ms` | `1000` | Per-worker interval for checking active managed lines even when they are idle. Must be `>= 1`. |
-| `verbose` | `false` | Enables more detailed warning context for rejected or closed managed lines. |
+- `type` `(string)`
+  Must be exactly `"UserController"`.
+
+#### `settings`
+
+- `auth-client-node-name` `(string, required)`
+  Name of an existing `AuthenticationClient` node in the same config file. It must point to an `AuthenticationClient`,
+  not to `UserController` itself.
+
+- `payload-mode` `(string, required for manual instances)`
+  Exactly `"stream"`, `"datagram"`, or `"dest_context->protocol"`. The last option reads TCP/UDP destination metadata once
+  during Init. Internal creators bind a metadata resolver instead; conflicting or missing sources are rejected.
+
+- `verbose` `(optional boolean, default: false)`
+  Reserved for additional debug logging.
+
+- `sweep-interval-ms` `(optional integer, default: 1000)`
+  How often each worker checks open managed lines for disabled, expired, removed, or over-quota users that have gone
+  idle and are not currently sending payloads.
+
+`UserController` does not enforce live `devices` occupancy. Stored/exported device limits and diagnostic device
+gauges remain available; they do not provide a live device reservation limit.
 
 ## Usage and troubleshooting
 
-### Basic Example
+### Configuration Example
 
 ```json
 {
@@ -136,39 +114,58 @@ See [Configuration](#configuration) for defaults and conditional requirements an
     "payload-mode": "stream",
     "sweep-interval-ms": 1000,
     "verbose": false
-  },
-  "next": "outbound"
+  }
 }
 ```
 
-`auth-client` must be an `AuthenticationClient` node in the same config file. `UserController` only references that existing node; it does not create one.
+`auth-client` must be a configured `AuthenticationClient` node in the same config file. `UserController` only finds and
+uses that node instance; it does not create an authentication client.
 
 ### Enforced Limits
 
-`UserController` reads the user limit state from the local table maintained by `AuthenticationClient`.
+`UserController` reads each user's `limit` block from the local `AuthenticationClient` users table. A limit of `0`
+(or a missing field) means unlimited. The following limits are enforced:
 
-| Limit area | Behavior |
-|---|---|
-| `enabled` | Disabled users cannot open new managed lines; existing managed lines are closed by payload checks or the sweep timer. |
-| Time expiry | Expired users cannot open new managed lines; existing managed lines are closed. |
-| `traffic.up`, `traffic.down`, `traffic.total` | Actual payload bytes pass to AuthenticationClient, which applies its `traffic-multiplier` once and updates cumulative charged counters. Over-quota users are rejected or closed. |
-| `connections-out` | Maximum simultaneous managed outbound lines for the user. |
-| `ips` | Maximum simultaneous distinct source IPs for the user. Reusing an already-counted IP is allowed. |
+- `connections-out`
+  Maximum number of simultaneous outbound connections (lines) the user may hold. `connections-in` is intentionally
+  ignored; both fields conceptually mean "line count", and only the outbound count is tracked. When the limit is
+  reached, the next connection is rejected.
 
-`connections-in` and live `devices` occupancy are not enforced by this node. Stored/exported device limits and
-diagnostic device gauges remain available; they do not provide a live device reservation limit. `bandwidth.up` / `.down` are enforced locally as described below.
+- `ips`
+  Maximum number of distinct source IP addresses the user may use at the same time. With `ips: 1`, a second device
+  connecting from a different IP is rejected while the first IP still has an open connection. A new connection from an
+  already-counted IP is always allowed.
 
-A zero or missing limit means unlimited for that field.
+- `time`
+  Expired users (`expire-at-ms`, or `expire-after-first-usage-ms` after first usage) may not open new connections and
+  their existing connections are closed.
 
-### Operational Notes
+- `traffic` (`up` / `down` / `total`)
+  Each delivery's actual bytes are passed at handoff to AuthenticationClient, which applies its `traffic-multiplier` once and advances
+  cumulative charged upload/download counters. When the quota is reached, new
+  connections are rejected and already-open connections are closed. Quota is charged at onward handoff, independently
+  of bandwidth enforcement.
 
-- Manual placement requires a previous node that calls `lineAddUser()` with a valid user handle.
-- Authenticated `Socks5Server`, `TrojanServer`, and `VlessServer` create this node internally; do not manually place another `UserController` immediately after those nodes in that mode.
-- `UserController` never writes user configuration such as passwords, enabled state, or limits.
-- Live connection/IP counters are process-local runtime state held through `AuthenticationClient` helpers.
-- Charged traffic is added to normal user traffic stats. Set `traffic-multiplier` on AuthenticationClient; physical payload length, bandwidth and speed are unchanged.
-- First measured traffic starts expiry even when a discounted charge rounds to zero. Per-direction fractional charge remainders migrate by durable user ID during refresh and survive reconnects, in process memory only.
-- This support node borrows normal stream or datagram lines; it is not a packet tunnel.
+- `enabled`
+  Disabled users (`enabled: false`) may not open new connections and their existing connections are closed. The node
+  never writes the `enabled` field; it only reads it.
+
+When any of these conditions causes a rejection or a close, a warning is logged. `UserController` never modifies user
+configuration (passwords, limits, expiry, enabled state); it only updates process-local runtime usage and the synced
+cumulative traffic counters.
+
+New managed lines use AuthenticationClient cached-admission availability. Existing managed lines keep accounting,
+payload expiry checks, idle sweeps and reservation release during ordinary outages or explicit credential rejection.
+Cached quotas and reservations are local; multiple disconnected clients may overshoot aggregate quotas. Relative
+expiry starts with the first positive measured arrival, even while duration is initially zero; enabling duration
+later uses that retained age. Explicit duration and absolute-date edits recompute their components independently.
+
+### Notes And Caveats
+
+- This node requires `AuthenticationClient`; node creation fails if `auth-client-node-name` is missing or wrong.
+- This node does not require left padding and does not prepend in-place.
+- This node is not a packet tunnel and does not use packet-line semantics.
+- Bandwidth enforcement is provided by UserController itself; no SpeedLimit node is inserted.
 
 ## Advanced behavior
 
@@ -191,11 +188,11 @@ protocol-specific limits still apply.
 
 Retained data, prepared fragments and queue entries share these hard resource limits in both directions combined:
 
-| Scope | Logical bytes | Allocation charge | Queued direction tickets |
-| --- | ---: | ---: | ---: |
-| One managed line | 1 MiB | 2 MiB | 2 |
-| One user in one AuthenticationClient | 4 MiB | 8 MiB | 1024 |
-| One AuthenticationClient | 64 MiB | 128 MiB | 16384 |
+| Scope | Logical bytes | Allocation charge | Buffers | Queued direction tickets |
+| --- | ---: | ---: | ---: | ---: |
+| One managed line | 1 MiB | 2 MiB | 256 | 2 |
+| One user in one AuthenticationClient | 4 MiB | 8 MiB | 1024 | 1024 |
+| One AuthenticationClient | 64 MiB | 128 MiB | 16384 | 16384 |
 
 These are resource ceilings, not configurable bandwidth rates. Stream admission refusal closes the affected line and
 discards retained bytes. Datagram overflow drops only the newly refused datagram; accepted FIFO entries survive.
@@ -233,64 +230,97 @@ Internal creators instead bind `usercontrollerSetPayloadModeResolver(controller,
 construction, before preparation. A configured mode and a resolver cannot both be supplied. The pure owner-worker
 metadata query runs once in either Init direction; every mode source is resolved and saved before admission or forwarding.
 The saved mode also governs later promotion and cannot change with destination metadata.
-SOCKS/Trojan/VLESS resolve initialized TCP versus decoded UDP remote-line roles; HTTP fixes stream mode; WireGuard fixes
-datagram mode on its normal transport side in either orientation. Packet lines never enter UserController. This binding
-does not add WireGuard database-user authentication; its existing unmanaged transport behavior remains.
+SOCKS/Trojan/VLESS resolve initialized TCP versus decoded UDP remote-line roles; HTTP fixes stream mode.
+WireGuardServer's private connection pipeline selects stream for PTC-owned inner TCP lines and datagram for inner UDP
+lines. Its binding helper attaches the account before Init. Packet lines and encrypted carriers never enter UserController.
 
-### Direction Awareness
+### Direction Awareness (Upload vs Download)
 
-`UserController` records, per line, which side the line was initiated from, and uses it to map traffic to the user's upload and download counters correctly. "Upload" is traffic leaving the user toward the far side; "download" is traffic arriving at the user. The user always sits on the side the line started from.
+`UserController` records, per line, which side the line was initiated from, and uses it to map traffic to the user's
+upload and download counters correctly. "Upload" means traffic leaving the user toward the far side; "download" means
+traffic arriving at the user. The user always sits on the side the line started from.
 
 | Line origin | Initiated by | Upstream payload counts as | Downstream payload counts as |
 |---|---|---|---|
-| From `prev` (upstream `Init`) | a head/prev adapter (for example `UdpStatelessSocket` at the front) | upload | download |
-| From `next` (downstream `Init`) | a tail/next adapter (for example `UdpStatelessSocket` at the back) | download | upload |
+| From `prev` (upstream `Init`) | a head/prev adapter (e.g. `UdpStatelessSocket` at the front) | upload | download |
+| From `next` (downstream `Init`) | a next-side normal-line creator | download | upload |
 
-The forward row is the common case (`Socks5Server`, `TrojanServer`, `VlessServer`). The reverse row happens when the user-facing adapter is the chain tail, as in `TunDevice -> WireGuardDevice -> UserController -> UdpStatelessSocket`: there the user's packets arrive on the `next` side, so downstream payload is the user's upload. Quota enforcement is otherwise identical in both directions.
+The forward row applies to authenticated servers and WireGuardServer's inner
+connection pipeline. A reverse-origin normal line reverses this directional
+accounting; quota enforcement otherwise follows the same lifecycle.
 
 ## Implementation details
 
-### Runtime Flow
+### Where Limit State Lives
 
-On `Init` from either side (upstream `Init` for a line from `prev`, downstream `Init` for a line from `next`):
+Live enforcement state (connection/IP reservations, directional rate buckets and fair-turn tickets) is stored on the `user_t`
+object inside `AuthenticationClient`, in a dedicated process-local `runtime` field that is never serialized or synced to
+`AuthenticationServer`. Charged traffic is added to the normal `stats.traffic` counters. The multiplier is configured
+on AuthenticationClient, not UserController; physical payload length, bandwidth and speed are unchanged. The client
+accounting helper captures first nonzero local traffic, records an immutable first-use estimate, and starts relative expiry immediately, including
+offline. The server merges earliest authorized observations; client monotonic age persists across ACK and refresh.
+Login, reservation, zero-byte calls and rebasing do not start or restart it. All access goes through id-keyed
+`AuthenticationClient` helpers, so `UserController` never holds a raw `user_t` pointer.
 
-1. line state is initialized, the origin direction is recorded, and the payload mode is resolved and saved; an unresolved mode rejects even an anonymous line
-2. the current line user handle is read
-3. anonymous or invalid-handle lines are forwarded without enforcement (and may be promoted later, see below)
-4. authenticated lines are checked through `AuthenticationClient`
-5. accepted lines reserve connection/IP slots and are registered for sweep checks
-6. rejected lines finish back toward the side that initiated them, without opening the far side
+During a full users-table refresh (`GetAllUsers`), matching users are found by durable user id and their process-local runtime
+connection/IP counters and shaping state are moved to the refreshed user object. Runtime clock evidence, elapsed age and per-direction
+fractional charge remainders move with those reservations. New expiry policy is projected separately from canonical
+wall/accounting clock metadata; unchanged pulls never extend an existing countdown.
 
-Positive arrivals first record first-use evidence. The shaper previews current eligibility, prepares an exact stream fragment or whole datagram, then atomically grants bandwidth and charges its raw logical length before handoff. A final quota-exhausting candidate is forwarded once before close. Retained or discarded bytes are uncharged; see Bandwidth And Payload Framing.
+### Lifecycle Behavior
 
-On `Finish`, the node releases the reserved connection/IP accounting state, destroys its own line state, and propagates `Finish` only to the opposite side according to WaterWall's directional finish rules.
+- On `Init` from either side, the node initializes its line state, records the origin direction, resolves and saves the
+  payload mode, and reads the current user handle. An unresolved mode rejects even an anonymous line. For an authenticated
+  line it atomically checks all limits and reserves a connection slot (and an IP slot).
+  On an upstream `Init` (line from `prev`) it forwards `tunnelNextUpStreamInit()` on success and, on rejection, finishes
+  the prev side. On a downstream `Init` (line from `next`) it forwards `tunnelPrevDownStreamInit()` on success and, on
+  rejection, finishes the next side. In both cases the rejection path destroys its own line state and never opens the
+  far side. Lines that carry no user handle at `Init` pass through unmanaged and can be promoted later through the
+  [programmatic promotion API](#programmatic-promotion-api).
+
+- On positive payload arrival, it observes first use and checks eligibility before retaining any data. It prepares exact
+  delivery, then commits bandwidth and quota immediately before handoff. A final quota-exhausting candidate is forwarded
+  once before close; queued or discarded bytes are not charged. First-use reporting remains coalesced and independent of delivery.
+
+- A per-worker sweep timer checks open managed lines even when they are idle, so disabled, expired, removed, or
+  over-quota users are cut off without waiting for another payload.
+
+- On `Finish` from either side, it releases the user's reserved connection and IP slot, destroys its own line state, and
+  propagates the finish to the opposite side, following Waterwall's directional-finish rule.
 
 ### Programmatic Promotion API
 
-Some nodes authenticate a user only after the line is already open (see [Typical Placement](#typical-placement)). For them, `UserController` exposes a promotion function in its public `interface.h`:
+For nodes that authenticate a user only after the line is already open (see [Typical Placement](#typical-placement)),
+`UserController` exposes a promotion function in its public `interface.h`:
 
 ```c
 WW_EXPORT user_admission_result_t usercontrollerTunnelTryManageLine(tunnel_t *t, line_t *l);
 ```
 
-It runs the same admission as upstream `Init` — checking every limit and reserving a connection + IP slot — but on demand. A node that wants to use it:
+It runs the same admission as upstream `Init` — checking every limit and reserving a connection + IP slot — but on
+demand. A node that wants to use it:
 
-1. Keeps a pointer to its `UserController` instance (created the same way `Socks5Server` builds its internal `UserController`, via `nodeUserControllerGet()` and `createHandle`).
+1. Keeps a pointer to its `UserController` instance (created the same way `Socks5Server` builds its internal
+   `UserController`, via `nodeUserControllerGet()` + `createHandle`).
 2. Authenticates the peer and records the user on the line with `lineAddUser()`.
 3. Calls `usercontrollerTunnelTryManageLine(user_controller_instance, line)`.
 
 Return values:
 
 | Result | Meaning |
-|---|---|
+| --- | --- |
 | `kUserAdmissionOk` | The line is now managed (admitted), was already managed (idempotent), or carries no user and was left as an unmanaged passthrough. Proceed. |
 | any other `kUserAdmission*` | The user was rejected (disabled, expired, over quota, connection limit, or IP limit). The line is left **unmanaged and untouched**. |
 
 Contract:
 
-- On a non-OK result the function never sends a finish and never destroys line state. The **caller owns the rejection** and must close or drop the line itself; it must not treat a rejected line as admitted. A non-OK call reserves nothing, so retrying later is safe.
-- Call it on the line's owner worker (`lineIsOnCurrentWorker(l)`), and only on a normal line that already traversed this `UserController` instance. It retains the payload mode saved during Init. Do not call it on packet lines.
-- Once a line is managed this way, traffic accounting, the idle sweep, and `Finish`-time slot release apply exactly as they do for a line admitted at `Init`; no extra teardown wiring is needed on the caller side.
+- On any non-OK result the function never sends a finish and never destroys line state. The **caller owns the
+  rejection** and must close/drop the line itself; it must not treat a rejected line as admitted. A non-OK call reserves
+  nothing, so retrying later is safe.
+- Call it on the line's owner worker (`lineIsOnCurrentWorker(l)`), and only on a normal line that has already traversed
+  this `UserController` instance. It retains the payload mode saved during Init. Do not call it on packet lines.
+- Once a line is managed this way, traffic accounting, the idle sweep, and `Finish`-time slot release all apply exactly
+  as they do for a line admitted at `Init`; no extra teardown wiring is needed on the caller side.
 
 Example sketch (inside the authenticating node, after a successful handshake on `line`):
 
@@ -305,12 +335,6 @@ if (admission != kUserAdmissionOk)
 }
 // admitted: continue bringing the peer up.
 ```
-
-### Sweep Timer
-
-Each worker gets a periodic sweep timer. The sweep checks registered managed lines so disabled, expired, removed, or over-quota users can be disconnected even when no new payload arrives.
-
-The sweep registry holds line references while lines are managed and releases them when the line closes or the worker stops.
 
 ### Node Metadata
 

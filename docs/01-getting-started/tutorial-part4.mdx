@@ -32,7 +32,7 @@ TcpListener -> MuxClient -> VlessClient -> TlsClient -> TcpConnector
 For packets:
 
 ```text
-UdpStatelessSocket -> WireGuardDevice -> TunDevice
+UdpListener -> WireGuardServer(mode=packet) -> TunDevice
 ```
 
 ## Practical Selection Guide
@@ -91,14 +91,11 @@ packet side B: TcpListener -> StreamToPackets -> TunDevice
 For an IPv4, rootless SOCKS CONNECT-to-packet path:
 
 ```text
-local application branch: TcpListener -> Socks5Server -> ConnectionToPackets -> Bridge A
-local UDP branch:          UdpStatelessSocket -> WireGuardDevice -> Bridge B
-remote:                    UdpStatelessSocket -> WireGuardDevice -> PacketsToConnection -> TcpUdpConnector
+local:  TcpListener -> Socks5Server -> ConnectionToPackets -> WireGuardClient -> UdpConnector
+remote: UdpListener -> WireGuardServer(mode=connection) -> TcpUdpConnector
 ```
 
-Pair `Bridge A` and `Bridge B` so the connection-to-packet branch joins the
-WireGuard packet side. Each `UdpStatelessSocket` stays at the head of its own
-chain.
+The remote server references its named AuthenticationClient service.
 
 `Socks5Server` supplies the requested destination for `ConnectionToPackets`.
 Configure its `source-ipv4` as a unique virtual address that the remote peer
@@ -109,7 +106,7 @@ packet interface.
 For WireGuard:
 
 ```text
-UdpStatelessSocket -> WireGuardDevice -> TunDevice
+UdpListener -> WireGuardServer(mode=packet) -> TunDevice
 ```
 
 After choosing the high-level shape, read the node reference page for every node
@@ -281,7 +278,7 @@ Common packet nodes:
 | --- | --- |
 | `TunDevice` | Create or use a TUN interface for IP packets. |
 | `RawSocket` | Send and receive raw IP packets. |
-| `WireGuardDevice` | Implement WireGuard crypto and peer handling inside a WaterWall chain. |
+| `WireGuardServer` | Implement WireGuard crypto and peer handling inside a WaterWall chain. |
 | `IpOverrider` | Override packet source or destination addresses. |
 | `IpManipulator` | Apply packet-level manipulations for special routing or testing cases. |
 | [FakeTcpHeaderClient](../02-noderefs/FakeTcpHeaderClient.mdx) / [FakeTcpHeaderServer](../02-noderefs/FakeTcpHeaderServer.mdx) | Add and remove fake TCP headers on existing IPv4 packets for raw packet transport; this does not establish a TCP connection. |
@@ -328,30 +325,24 @@ The TLS nodes are optional in the abstract shape, but real deployments usually
 add encryption, authentication, or camouflage around the stream path.
 
 
-## WireGuard Inside WaterWall
+## WireGuard inside WaterWall
 
-`WireGuardDevice` performs WireGuard crypto and peer state, but it does not open
-the UDP socket by itself and it does not create an operating-system WireGuard
-interface.
-
-A typical topology is:
+`WireGuardClient` accepts inner packets on `prev` and emits encrypted datagrams
+on `next`. `WireGuardServer` accepts encrypted datagrams on `prev`; its explicit
+`mode` selects packet output or authenticated TCP/UDP connections. Both roles
+carry return traffic through reverse callbacks.
 
 ```text
-UdpStatelessSocket -> WireGuardDevice -> TunDevice
+TunDevice -> WireGuardClient -> JunkDatagramSender (optional) -> UdpConnector
+UdpListener -> WireGuardServer(mode=packet) -> TunDevice
+UdpListener -> WireGuardServer(mode=connection) -> TcpUdpConnector
 ```
 
-`UdpStatelessSocket` is chain-head-only. Keep it before `WireGuardDevice`; this
-socket cannot be placed after WireGuard. The layer solver still determines
-which adjacent side carries the L3 packets and which carries the L4 transport.
-
-Responsibilities are split:
-
-| Node | Responsibility |
-| --- | --- |
-| `TunDevice` | Inner IP packet interface. |
-| `WireGuardDevice` | WireGuard handshake, encryption, peer state, allowed IP routing, keepalive. |
-| `UdpStatelessSocket` | Outer UDP socket used to send and receive WireGuard packets. |
-
-This split is important: configure the UDP bind address and port on
-`UdpStatelessSocket`, and configure WireGuard keys and peers on
-`WireGuardDevice`.
+The client uses its peer endpoint as the initial destination before carrier Init.
+Later nodes may override that destination through their normal settings.
+The server learns endpoints only from authenticated traffic. Connection mode
+references a separate AuthenticationClient service and inserts PTC, account
+binding and UserController internally. Limits count inner connections, payload
+and active inner source IPs. Neither node creates OS interfaces or routes.
+See [WireGuardClient](../02-noderefs/WireGuardClient.mdx) and
+[WireGuardServer](../02-noderefs/WireGuardServer.mdx) for settings and complete examples.
