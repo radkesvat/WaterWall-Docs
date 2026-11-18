@@ -951,7 +951,10 @@ toward its sender; borrowed transports are closed through their owners.
 ### KCP node ownership, sessions and pressure {#kcp-node-ownership-sessions-and-pressure}
 
 KcpClient borrows its application line and creates an owned UDP transport
-line during Init. KcpServer borrows the UDP-facing carrier and creates a
+line during Init. Before carrier Init, the client clears the destination pin
+and resolver-DNS marker on the copy. The next connector can select its
+configured peer or use the copied address and port for dynamic routing.
+KcpServer borrows the UDP-facing carrier and creates a
 distinct owned service line for each confirmed session. Their KCP/FEC and timer
 state lives outside either application line. Application Finish detaches both
 association links and zeros that line's node state before returning; the server
@@ -966,11 +969,29 @@ the full nonce pair before KCP or FEC input. Unknown data cannot create a servic
 duplicate CONFIRM cannot initialize another one. Each carrier permits one pending
 challenge and at most 64 established/closing sessions, including ACK responders.
 Server startup gates KCP delivery until service Init safely begins/completes.
-Actual transport Est remains prompt and separate from handshake readiness.
-Application-side Pause/Resume maps onto the associated live carrier, including
-repeated notices. Toward the application, combine local KCP pressure with carrier
-pressure as described below. Advisory pressure never stops protocol updates,
-acknowledgements, retransmissions, due pings or ready wire output.
+The client maps carrier Est once to the attached application. The server
+remembers carrier Est for later services and maps it once to each attached
+service whose Init has begun, including during Init or deferred Pause. Each
+server service maps its first Est back to the carrier. Publish these deliveries
+before callbacks. Transport Est is independent of KCP handshake readiness.
+
+Application-side Pause/Resume controls reads on the live carrier. Each server
+service owns one hold with idempotent accounting. Resume reaches a shared
+carrier only when every service hold is clear. Relay repeated notifications
+when the aggregate holds permit them. During local application Finish or peer
+CLOSE, set the closing state and detach the application before releasing its
+hold. A last hold release allows a live carrier under normal dispatch to receive
+ACKs during drain. Session-local terminal retirement also clears its hold when
+the shared carrier survives. Carrier loss and worker shutdown abort the drain.
+Advisory pressure never stops protocol updates, acknowledgements,
+retransmissions, due pings or ready wire output.
+
+A ready, open session arms its worker timer for the earliest of the next KCP
+update, the next eligible ping and receive-idle expiry. Ping and expiry are
+measured from the last valid receive. At equality expire before sending a ping
+or accepting input. The driver flushes a due ping or segment retransmission
+even when the next periodic KCP flush is later. Ignored input leaves those
+deadlines in force.
 
 Both nodes negotiate `D = min(close-drain-timeout-ms)` with default 30000 and
 integer range `1..INT_MAX`. The first local or peer closing event fixes the send
@@ -1036,8 +1057,11 @@ data, including queued server-first output. It is never application data.
 
 Both nodes initialize and publish local state and companion-line linkage before
 forwarding next Init once on that owned line. Copy routing context before that
-handoff. An owned line receiving Finish must be logically dead before its handler
-returns; borrowed lines remain their creator's responsibility.
+handoff. On the client carrier, clear the destination pin and resolver-DNS
+marker so the connector can select its configured QUIC peer. The copied address
+and port remain available to dynamic routing. An owned line receiving Finish
+must be logically dead before its handler returns. Borrowed lines remain their
+creator's responsibility.
 Client handshake startup is independent of Est. Every supported downstream Est
 is relayed, including repeats; authenticated protocol readiness produces no
 extra Est. Application bytes wait under hard budgets until handshake/stream
@@ -1066,6 +1090,12 @@ and engine continue delivering accepted output and stream FIN, including when
 application Finish preceded handshake readiness. Do not admit new application
 input while closing. Carrier Finish aborts the session and destroys an owned
 client carrier before returning.
+
+On local application Finish or ordered peer FIN, publish the closing state and
+detach the application before releasing its carrier-read hold. Resume a live
+carrier while normal dispatch remains open so ACKs can reach the engine during
+the drain. Preserve the exact carrier reference and session lifetime across the
+callback, then recheck attachment and logical life before continuing.
 
 `close-drain-timeout-ms` defaults to 30,000 and accepts integer values
 1–86,400,000. The first local application Finish or peer FIN starts one fixed
