@@ -5,14 +5,14 @@ sidebar_label: "Part 6: Build, Test & Review"
 description: "CMake presets, focused builds, the integration test harness, build-environment gotchas, the full review checklist, and the report format expected from coding agents."
 ---
 <!--
-Documentation version: 177
+Documentation version: 178
 -->
 
 # Part 6: Building, Testing & Reviewing
 
-A tunnel change is not done when it compiles. It is done when it builds through a
-known-good preset, passes the relevant integration tests, and survives the review
-checklist. This part covers how to validate work and how to present it.
+For a local change, run the smallest check that would catch a regression in the
+behavior you changed. A native fixture can exercise a tunnel callback directly.
+Use an integration case when the result depends on how nodes interact in a chain.
 
 ## Reading path
 
@@ -25,18 +25,19 @@ checklist. This part covers how to validate work and how to present it.
 
 ## Choosing Validation And Regression Coverage
 
-Validation should answer the product question directly and remain proportional to
-risk:
+Identify what could break and which callers would observe it. Run the cases
+that exercise those paths. **Stop when those checks pass and cover the change.**
 
-- Start with the smallest check that exercises the change: inspection, formatting,
-  a focused target, an existing focused test, or a direct integration case.
-- Expand to the functional lane for shared networking/tunnel behavior or changes
-  spanning cases. Use routine production lanes plus native units for shared-core,
-  lifecycle/concurrency, multi-subsystem, security-sensitive, or difficult-to-bound
-  changes.
-- Documentation, comments, and clearly non-behavioral mechanical changes may need
-  only inspection, link/diff checks, or a relevant policy check. Do not run a broad
-  lane merely because code changed or because the lane is available.
+- For prose or comment edits, inspect the diff and verify changed links or
+  command examples. For a script or build rule, exercise the affected invocation
+  or target. For runtime behavior, run the closest native fixture or integration case.
+- For shared code, trace the affected callers. For example, a change to a decoder
+  used by two nodes can warrant the decoder fixture and a case for each affected
+  node. Add a configuration, sanitizer or lane when it covers a specific failure
+  mode the selected cases miss.
+- CI runs the routine full suites. Run a whole lane or native suite locally only
+  when explicitly requested or when a concrete risk spans the suite and smaller
+  selections cannot cover it.
 - New observable behavior, meaningful edge cases, changed contracts, and
   reproducible bugs likely to regress normally receive focused coverage. When
   practical, a regression test should fail before the fix and pass afterward.
@@ -53,16 +54,11 @@ exact failure and distinguish **failed** from **inconclusive** evidence.
 
 ## Building
 
-Prefer the `linux` CMake preset. Configure once, then build:
+For a production build, configure the `linux` preset once and build the target
+you need. This example compiles the `TlsClient` tunnel.
 
 ```bash
 cmake --preset linux
-cmake --build --preset linux -j8
-```
-
-For a focused build of one changed tunnel target (much faster while iterating):
-
-```bash
 cmake --build --preset linux --target TlsClient -j8
 ```
 
@@ -168,14 +164,20 @@ measurements were 46–48 seconds on a 4-CPU host; that optional work is outside
 the routine `all` total. Measure the current lane selection when estimating a
 complete run. Cloud CI runs native Release and Debug in parallel.
 
-Use the full functional lane for shared networking or tunnel behavior and the
-ordinary integration sequence for broad tunnel or harness work. Run routine
-production coverage, including applicable privileged tests, plus both native-unit
-configurations for shared-core contracts, lifecycle/concurrency work,
-multi-subsystem changes, or any change whose impact is difficult to bound.
-Speed and stress lanes are opt-in: run them when requested or when directly
-validating their workloads. Focused checks remain appropriate for narrow or
-non-behavioral edits.
+To check a TLS roundtrip, build the production executable and select the
+registered case from the repository root. Use its exact name so the selection
+stays narrow and an empty match fails.
+
+```bash
+cmake --preset linux
+cmake --build --preset linux --config Release --target Waterwall -j8
+ctest --preset linux --output-on-failure --no-tests=error -R '^waterwall\.tls_roundtrip$'
+```
+
+### Whole production lanes
+
+When the validation scope calls for a whole lane, choose the corresponding
+command below. Speed and stress are opt-in for their specific workloads.
 
 ```bash
 # Ordinary non-privileged production Release sequence across test lanes.
@@ -194,22 +196,28 @@ bash tests/run_test_lane.sh all build/linux Release
 # Optional throughput and longer traffic/churn workloads.
 bash tests/run_test_lane.sh speed build/linux Release
 bash tests/run_test_lane.sh stress build/linux Release
-
-# Complete native-unit suite: optimized Release plus asserted Debug behavior.
-cmake --preset linux-unit-tests
-cmake --build --preset linux-unit-release -j8
-ctest --preset linux-unit-release --output-on-failure
-cmake --build --preset linux-unit-debug -j8
-ctest --preset linux-unit-debug --output-on-failure
 ```
 
 ### Native Unit Tests
 
 Native unit tests have a dedicated multi-configuration tree with IPO/LTO disabled
-before any project target is created. Release preserves optimization and `NDEBUG`
-while avoiding mixed-LTO links; Debug activates assertions and other contract
-guardrails. Production Release remains IPO/LTO-enabled, so complete behavioral
-validation uses the production lane and both native-unit configurations:
+before any project target is created. Use one configuration that exercises the
+change. Start with `linux-unit-debug` for assertions and contract guardrails.
+Choose `linux-unit-release` for optimized or `NDEBUG` behavior. Run the same
+selection in both when each exercises a distinct path, such as an assertion
+in Debug and error handling in Release. Production Release keeps IPO/LTO enabled.
+
+Configure the unit tree once. For a base64 codec change, the following command
+builds the fixture and its dependencies and runs only its registered case.
+
+```bash
+cmake --preset linux-unit-tests
+ctest --preset linux-unit-debug --output-on-failure --no-tests=error -R '^waterwall\.base64_unit$'
+```
+
+Use `ctest --preset linux-unit-debug -N -R base64` to discover matching names.
+An unfiltered unit build preset builds the entire unit aggregate. If a selected
+fixture needs a cold prebuild, specify its CMake target with `--target`.
 
 Native unit-test executables intentionally disable inherited precompiled headers.
 The production library and tunnel targets retain their shared PCH, but applying it
@@ -224,30 +232,6 @@ normal admission open until the scenario intentionally tests quiescence.
 `ww` directly depends on the C++ allocator object library so even pure-C consumers
 select the C++ linker and runtime. It also exports the allocator objects explicitly
 to keep the allocation overrides from being dropped by static archive extraction.
-
-```bash
-# Production Release: build the shipped binary plus the production-full suite.
-cmake --preset linux
-cmake --build --preset linux --config Release --target check_waterwall_tests -j8
-
-# Native units: optimized Release/no-LTO behavior.
-cmake --preset linux-unit-tests
-cmake --build --preset linux-unit-release -j8
-ctest --preset linux-unit-release --output-on-failure
-
-# Native units: assertions and Debug guardrails in the same no-LTO tree.
-cmake --build --preset linux-unit-debug -j8
-ctest --preset linux-unit-debug --output-on-failure
-```
-
-For focused behavioral work, prefer the relevant `linux-unit-debug` selection
-first: assertions usually identify a violated ownership, lifecycle, or state
-contract closer to its cause. Repeat that coverage with `linux-unit-release`
-before completion because optimization and `NDEBUG` can expose different behavior.
-Broad/shared changes run both complete presets. Debug is not a substitute for
-Release, AddressSanitizer, UndefinedBehaviorSanitizer, or ThreadSanitizer. Never
-build native unit tests in the production tree: it contains the LTO-enabled
-libraries used by `Waterwall`.
 
 Native source files live under `tests/unittests/{base,crypto,bufio,core,net,devices,lwip,tunnels}/`;
 the owning source documents its purpose, important cases, fixture and exact CTest
@@ -405,15 +389,11 @@ second attestation system around the compiler, build tool, or verifier.
 
 Linux cloud CI runs the complete `linux-unit-release` and `linux-unit-debug`
 presets as independent parallel jobs, with source-only checks retained in the
-single Linux production support job. On macOS and Windows, CI builds
+single Linux production support job. To reproduce the full native Release job
+locally, configure the unit tree, run `cmake --build --preset linux-unit-release -j8`,
+then run `ctest --preset linux-unit-release --output-on-failure`. On macOS and Windows, CI builds
 `waterwall_platform_unit_tests`, runs the same direct no-LTO policy, and executes
 the registered platform unit tests in Release.
-
-Run one case by its registered name (use an anchored regex):
-
-```bash
-ctest --preset linux --output-on-failure -R '^waterwall\.tls_roundtrip$'
-```
 
 To run a single integration case directly while debugging — passing the binary,
 the case directory, and a timeout in seconds:
@@ -624,8 +604,8 @@ For a tunnel change, confirm every applicable item below:
   tool was reported explicitly).
 - Regression coverage was added where it materially protects behavior, or the
   reason existing coverage/non-test validation is sufficient is stated.
-- Validation scope is proportional: focused for narrow changes and broad/full for
-  shared, concurrent, security-sensitive, or difficult-to-bound work.
+- The selected checks cover the changed behavior and affected callers. Each
+  additional lane or configuration addresses an identified coverage gap.
 
 ## Common Pitfalls (Master List)
 
@@ -859,9 +839,9 @@ count, host requirements, and candidate boundaries. Then:
 - By default, allow one bounded incidental harness-repair pass after the first
   end-to-end attempt. Further repair belongs to an explicitly requested,
   separately scoped infrastructure task.
-- Once direct correctness checks pass and the terminal disposition is recorded,
-  run broad product validation once on the final retained production set. Do not
-  repeatedly rerun it after every evidence-tool revision.
+- Once the terminal disposition is recorded, apply the
+  [validation selection rule](#choosing-validation-and-regression-coverage) to the
+  retained production changes. Reuse passing results for the same revision.
 
 When only non-blocking evidence-machinery limitations remain, report them with the
 terminal product disposition. Do not create another product implementation plan
