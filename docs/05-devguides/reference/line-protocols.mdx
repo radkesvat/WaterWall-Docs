@@ -552,9 +552,8 @@ exact line logically dead, even when it reenters an active output callback.
 Never notify a detached or already-finished application. A line reference keeps
 memory available for post-call checks, not the dead carrier's protocol state.
 
-Successful HTTP/2 upload completion requests bounded socket-only linger from
-TcpConnector. This later adapter phase owns no HTTP state or carrier reference
-and is separate from the HTTP/2 deadline and remote application acknowledgment.
+After handing off the final HTTP/2 frames, HttpClient sends Finish. The TCP
+adapter follows the [TCP close policy](#tcp-socket-close-lingering).
 
 ### HttpServer HTTP/2 response completion {#httpserver-http2-response-completion}
 
@@ -574,12 +573,9 @@ not reflect Finish toward either already-finished side. The carrier's owner
 still destroys its line; HttpServer must never retain dirty state until a later
 callback on a logically dead line.
 
-After response DATA and END_STREAM reach the previous tunnel, destroy HTTP state
-and propagate Finish. The Linux TcpListener may retain only a detached socket
-context to finish accepted writes and read/discard residual peer input. That
-context owns no line reference or HTTP state. This is separate from HTTP/2's
-credit wait: a line reference preserves memory, not protocol delivery or logical
-life.
+After response DATA and END_STREAM reach the previous tunnel, destroy HTTP
+state and propagate Finish. The TCP adapter follows the
+[TCP close policy](#tcp-socket-close-lingering).
 
 The first service-side Finish starts a fixed `close-drain-timeout-ms` deadline
 (default 30000, integer range 1..86400000) on the line's owner worker. Incoming
@@ -589,8 +585,8 @@ still-live carrier direction; the finished service receives no more callbacks.
 Response completion, carrier closure, peer stream cancellation and owner shutdown
 cancel this wait and detach its timer. Do not wait to emit END_STREAM on a
 canceled stream. The deadline applies to ordinary and WebSocket HTTP/2, including
-h2c upgrade; it is independent of carrier idle limits and the later socket-only
-linger. See the [node reference](../../02-noderefs/HttpServer.mdx#http2-mode)
+h2c upgrade. Carrier idle limits apply independently. See the
+[node reference](../../02-noderefs/HttpServer.mdx#http2-mode)
 for the current pressure thresholds and adapter timeout limits.
 
 ### TLS close and fallback completion {#tls-close-and-fallback-completion}
@@ -734,31 +730,34 @@ and then trust the adapter to flush. Do **not** keep protocol state alive just t
 
 ### TCP socket close lingering {#tcp-socket-close-lingering}
 
-`lineRequestCloseLinger(line, reason)` requests bounded socket cleanup on that
-exact line. The reason mask distinguishes `kLineCloseLingerProtocolDrain` from
-`kLineCloseLingerPeerWriteShutdown`; either makes `lineShouldLingerOnClose()` true.
-Requests are idempotent owner-worker operations on a live normal line. Use
-`lineClearCloseLinger(line, reason)` only when the condition represented by that
-reason no longer applies; clearing one reason must preserve the other. This
-metadata does not retain the line, change Finish ownership, or automatically
-propagate to associated lines.
+On `Finish`, both `TcpListener` and `TcpConnector` must use ordinary full TCP
+close by default, regardless of chain composition, protocol or read pressure.
+The adapter hands accepted writes to WIO, which can finish pending writes before
+closing the socket. On Linux, unread peer data at close can cause a reset and
+truncate outgoing data that the kernel has accepted.
 
-HttpClient and HttpServer request the protocol-drain reason after handing off
-their final HTTP/2 output.
+**Only a positively detected fallback peer write shutdown may request bounded
+socket linger.** On clean EOF from a fallback connection, `TcpConnector` uses
+Linux TCP diagnostics to check the peer socket in its own network namespace.
+If the peer has shut down only its write side, the connector marks the exact
+line with `kLineCloseLingerPeerWriteShutdown` before propagating Finish.
+Without that evidence, including on platforms without this diagnostic, the
+default applies. A node mapping the same fallback connection onto a companion
+line may explicitly propagate the existing marker there. A node reusing a
+fallback line for a protected branch must clear the marker first.
 
-TcpListener and TcpConnector use the same socket executor in
-`Internals/TcpAdapterCommon`. `tcpAdapterBeginCloseLinger(io, table)` returns
-false without taking ownership, leaving ordinary close to the caller; true
-transfers the socket and may complete its cleanup inline. On Linux it flushes
-accepted writes for at most `WIO_DEFAULT_CLOSE_TIMEOUT` (60000 ms), then shuts
-down writes and reads/discards
-incoming data for at most 5000 ms of inactivity or 30000 ms total. Input can
-refresh only the idle limit, never the absolute limit. Peer close, errors and
-shutdown may finish cleanup sooner. Other platforms keep ordinary adapter close.
-The detached context owns the socket and its idle-table entry, with no line
-reference, protocol state or callbacks to finished tunnels. These socket limits
-are separate from HTTP/2 flow-control drain deadlines and do not acknowledge
-remote application receipt. This is software-managed cleanup, not `SO_LINGER`.
+Protocol nodes can complete their own bounded work before forwarding Finish.
+For example, HTTP/2 can wait for flow-control credit and hand off its final
+`END_STREAM` frame. The TCP adapter still applies the rule above when it
+receives Finish. If a late `WINDOW_UPDATE` is unread at socket close, the
+remote peer can receive a truncated upload or response even after this handoff.
+
+For the marked line, `Internals/TcpAdapterCommon` can detach the socket on its
+owner worker while normal dispatch is open. It allows up to
+`WIO_DEFAULT_CLOSE_TIMEOUT` (60000 ms) for accepted writes, then shuts down
+writes and reads and discards peer input until EOF, 5000 ms of inactivity or
+30000 ms total after write shutdown. Errors and worker shutdown can end this
+sooner. Only the socket and its idle-table entry survive the line's retirement.
 
 ### TCP adapter idle deadlines {#tcp-adapter-idle-deadlines}
 
