@@ -677,6 +677,13 @@ instant you receive `Finish` from a direction, that direction is closed for that
 line. No `Payload`, no `Est`, no `Pause`/`Resume`, no second `Finish`, for **any**
 reason, on **any** later event for that `line_t`.
 
+PipeTunnel may dispatch a worker message that was queued before its exact
+destination side sent `Finish` and detached. On an otherwise live pair it
+consumes that message locally, releasing its payload and references without a
+callback. The surviving side still receives its admitted payloads followed by
+the ordered `Finish`. Queue refusal, quiescence and worker shutdown still
+reconcile the entire pair.
+
 Also remember the destruction direction: a downstream `Finish` that reaches the
 adapter which created the line will lead to `lineDestroy()`. So after you
 propagate a downstream `Finish`, assume the line can be gone.
@@ -865,18 +872,18 @@ back on the finished side, so it has nothing to remember. A speculative
 "did this side finish?" boolean is almost always a control-flow problem being
 patched instead of fixed — the same anti-pattern as an `initialized` flag.
 
-There is exactly **one** situation that justifies directional-close state: the
-tunnel must **send final bytes before it closes**, including a bounded delayed
-fallback batch (the next subsections). That send re-enters the adapter or branch,
-which can emit `Pause`/`Resume`, and the flag is what lets handlers drop anything
-that would reflect toward the already-finished side. The flag is bookkeeping for
-that hazard and nothing else.
+Directional-close state is needed when the tunnel can still deliver final bytes
+after one side finishes, including worker messages already in flight or a bounded
+delayed fallback batch. Sending those bytes can re-enter the adapter or branch,
+which can emit `Pause` or `Resume`. The state prevents callbacks toward the
+finished side while its peer completes delivery.
 
 Real tunnels carry exactly this state and no more. The names differ; the role is
 identical:
 
 | Tunnel | Directional-close state | Why it needs it |
 | --- | --- | --- |
+| `PipeTunnel` | `prev_finished`, `next_finished` | Consumes late worker messages to a finished side while the surviving side dispatches admitted payloads and ordered Finish |
 | `TlsServer` | `upstream_finished`, `downstream_finishing`, `fallback_close_draining` and shared replay close-drain state | Sends TLS alert / close and settles delayed fallback before closing |
 | `TrojanServer`, `VlessServer`, `VmessServer` | Closing phase and shared replay close-drain state | Settles a delayed fallback batch without reflecting toward the finished previous side |
 | `KcpClient`, `KcpServer` | Detached application association plus shared session close state | Drain accepted KCP output and retain duplicate CLOSE acknowledgment state on independent carrier/session storage |
