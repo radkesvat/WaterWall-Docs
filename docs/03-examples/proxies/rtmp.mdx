@@ -1,0 +1,187 @@
+---
+sidebar_position: 8
+title: "SOCKS5 proxy over RTMPS"
+sidebar_label: "RTMPS transport"
+description: "Give local applications a SOCKS5 proxy and carry each TCP connection to a remote WaterWall server using VLESS over verified RTMPS."
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# SOCKS5 proxy over RTMPS
+
+Point an application at `127.0.0.1:1080`. For each SOCKS5 `CONNECT` request,
+the remote WaterWall server opens a TCP connection to the destination the
+application chose. VLESS carries that destination and authenticates the request
+with a UUID. Each proxied connection opens its own RTMP session. TLS protects
+that session between the two WaterWall hosts.
+
+```text
+Client: TcpListener → Socks5Server → VlessClient → RtmpClient → TlsClient → TcpConnector
+Server: TcpListener → TlsServer → RtmpServer → VlessServer → TcpConnector
+```
+
+Both hosts must support WaterWall’s `ww.data` RTMP profile. The local SOCKS
+listener accepts TCP connections on loopback. For a fixed destination such as
+a single HTTP service, see the [direct RTMP tunnel](../tunnels/direct-rtmp.mdx).
+
+## Before starting
+
+Use the [common proxy setup](./overview.mdx#prepare-the-configuration) to
+create `core.json` on each host. Save the matching tab below as `config.json`.
+
+- On the client, replace `198.51.100.20` with the WaterWall server’s reachable
+  address. Allow incoming TCP on port `443` on the server.
+- Replace `tunnel.example.com` throughout with the DNS name on the server
+  certificate. Install the certificate chain and private key at the paths in
+  `TlsServer`. Keep `verify: true` and use a chain trusted by `TlsClient`.
+- Generate a fresh UUID and put the same value in both VLESS nodes. The RTMP
+  `app` and `stream` names must also match. Those names select the publication.
+  The UUID is the credential.
+
+## Client and server
+
+<Tabs groupId="proxy-side" defaultValue="client">
+<TabItem value="client" label="Client">
+
+```json title="config.json — client"
+{
+  "name": "socks-vless-rtmps-client",
+  "nodes": [
+    {
+      "name": "local-socks",
+      "type": "TcpListener",
+      "settings": {"address": "127.0.0.1", "port": 1080},
+      "next": "socks"
+    },
+    {
+      "name": "socks",
+      "type": "Socks5Server",
+      "settings": {"no-auth": true, "connect": true, "udp": false},
+      "next": "vless"
+    },
+    {
+      "name": "vless",
+      "type": "VlessClient",
+      "settings": {
+        "uuid": "11111111-2222-4333-8444-555555555555",
+        "address": "dest_context->address",
+        "port": "dest_context->port",
+        "protocol": "tcp",
+        "dns-behaviour": {"resolve": false}
+      },
+      "next": "rtmp"
+    },
+    {
+      "name": "rtmp",
+      "type": "RtmpClient",
+      "settings": {
+        "app": "waterwall",
+        "stream": "tunnel",
+        "tc-url": "rtmps://tunnel.example.com:443/waterwall"
+      },
+      "next": "tls"
+    },
+    {
+      "name": "tls",
+      "type": "TlsClient",
+      "settings": {"sni": "tunnel.example.com", "verify": true, "alpns": []},
+      "next": "carrier"
+    },
+    {
+      "name": "carrier",
+      "type": "TcpConnector",
+      "settings": {"address": "198.51.100.20", "port": 443}
+    }
+  ]
+}
+```
+
+</TabItem>
+<TabItem value="server" label="Server">
+
+```json title="config.json — server"
+{
+  "name": "socks-vless-rtmps-server",
+  "nodes": [
+    {
+      "name": "carrier",
+      "type": "TcpListener",
+      "settings": {"address": "0.0.0.0", "port": 443},
+      "next": "tls"
+    },
+    {
+      "name": "tls",
+      "type": "TlsServer",
+      "settings": {
+        "sni": "tunnel.example.com",
+        "cert-file": "/etc/waterwall/fullchain.pem",
+        "key-file": "/etc/waterwall/privkey.pem",
+        "select-alpns": []
+      },
+      "next": "rtmp"
+    },
+    {
+      "name": "rtmp",
+      "type": "RtmpServer",
+      "settings": {"app": "waterwall", "stream": "tunnel"},
+      "next": "vless"
+    },
+    {
+      "name": "vless",
+      "type": "VlessServer",
+      "settings": {
+        "uuid": "11111111-2222-4333-8444-555555555555",
+        "connect": true,
+        "udp": false
+      },
+      "next": "destination"
+    },
+    {
+      "name": "destination",
+      "type": "TcpConnector",
+      "settings": {"address": "dest_context->address", "port": "dest_context->port"}
+    }
+  ]
+}
+```
+
+</TabItem>
+</Tabs>
+
+The client’s `TcpConnector` dials the RTMPS listener. Its `TlsClient` verifies
+the server certificate against `sni`. The `tc-url` is the application URL
+announced inside the RTMP handshake. Once RTMP accepts the publication,
+`VlessServer` can read the request header, authenticate the UUID and pass the
+requested address and port to the final `TcpConnector`.
+
+## Run and check
+
+Start WaterWall on the server, then on the client, using the [common startup
+command](./overview.mdx#start-and-test). To check the exit end, start a
+temporary HTTP service in a separate terminal on the **server**.
+
+```bash
+python3 -m http.server 8080 --bind 127.0.0.1 --directory "$(mktemp -d)"
+```
+
+On the **client**, request the server’s loopback service through SOCKS5.
+
+```bash
+curl --head --noproxy '' --socks5-hostname 127.0.0.1:1080 http://127.0.0.1:8080/
+```
+
+Expect `HTTP/1.0 200 OK` and a `HEAD /` request in the server’s Python log.
+The two loopback addresses refer to different machines. Curl connects to the
+SOCKS listener on the client, and VLESS asks the exit to dial port `8080` on
+the server. Change the URL to reach another destination through the same SOCKS
+port. Stop the temporary HTTP service with Ctrl+C.
+
+## Sharing an RTMPS connection with Mux
+
+To share one RTMPS connection across several proxy requests, insert `MuxClient`
+between `VlessClient` and `RtmpClient`, and `MuxServer` between `RtmpServer`
+and `VlessServer`. Each Mux stream then carries one VLESS request with its own
+destination. See the [SOCKS and Mux example](./socks-mux.mdx) for Mux settings
+and the [RtmpClient](../../noderefs/RtmpClient) and [RtmpServer](../../noderefs/RtmpServer)
+references for RTMP settings.
