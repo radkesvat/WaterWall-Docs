@@ -124,7 +124,7 @@ void tundeviceTunnelDownStreamFinish(tunnel_t *t, line_t *l)
 نمونه‌ها عبارت‌اند از `TunDevice` و `RawSocket`؛ سمت packet در upstream در
 `PacketsToConnection` و `PacketsToStream`؛ سمت packet در downstream در
 `StreamToPackets`؛ همچنین `PacketSplitStream`، حالت‌های packet در `TesterClient`
-و `TesterServer` و نقش packet line در `WireGuardDevice`. این دسته‌بندی برای هر
+و `TesterServer` و نقش packet line در `WireGuardServer`. این دسته‌بندی برای هر
 handler است، نه برچسبی برای کل تونل: همان Bridge ممکن است در سمت دیگر خود مالک
 line‌های عادی باشد و آن‌ها را به‌شکل معمول ببندد.
 
@@ -217,11 +217,11 @@ chain است؟» نیست. باید بپرسید: **«این handler دقیق و
 برخی node‌ها هم‌زمان هم یک packet line پایدار می‌بینند و هم مالک line‌های عادی
 هستند. handler باید پیش از انجام هر کاری تشخیص دهد کدام‌یک را دریافت کرده است:
 
-- `WireGuardDevice` در سمت packet خود تونلی ساخته‌شده با `packettunnelCreate()`
-  است، اما برای سمت رمزگذاری‌شده نیز به‌ازای هر worker یک **line انتقال عادی**
-  می‌سازد. `Finish` روی line انتقال، close عادیِ line تحت مالکیت است: slot را
-  نابود کنید و `lineDestroy()` را فراخوانی کنید. `Finish` روی packet line نقض
-  قرارداد است و باید abort کند.
+- WireGuardClient owns one normal carrier on worker 0. WireGuardServer
+  borrows normal ingress lines from UdpListener on their original workers.
+  Only the exact creator destroys each normal line. Packet lines remain owned
+  by the chain. Connection-mode PTC owns its inner TCP/UDP lines; account binding
+  and UserController borrow them.
 - `PacketsToStream` و `PacketsToConnection`، ‏state مربوط به Bridge را روی packet
   line نگه می‌دارند و در عین حال مالک line‌های عادی‌ای هستند که پشت آن می‌سازند.
 
@@ -408,7 +408,7 @@ static void packettunnelDefaultUpStreamPayload(tunnel_t *self, line_t *line, sbu
   close ناممکن در نقش لنگر، ‏forwarding صریح یا جذب انتهایی عمدی نیاز داشته باشد.
 
 نمونه‌ها: `IpOverrider`، ‏`IpManipulator`، ‏`PingClient`، ‏`PingServer` و
-`WireGuardDevice`.
+`WireGuardServer`.
 
 برای تونل‌های packet خالص:
 
@@ -617,3 +617,29 @@ Init -> Payload -> Finish برای هر اتصال‌اند. چنین نیستن
 ---
 
 ادامه: **[بخش ۵: ساختار یک تونل و روند کار](./part5-tunnel-anatomy.mdx)**.
+
+
+## WireGuard authenticated packet-to-connection ownership
+
+WireGuard protocol state has one event-worker owner per node. Cross-worker input
+is bounded and never borrows a foreign pool.
+
+The WireGuardClient timer can send handshake datagrams once next Init returns on
+the live current carrier and downstream pressure permits writes. The client
+processes messages from that exact carrier independently of transport Est. The
+inner packet FIFO drains when WireGuard session keys are ready.
+
+WireGuardServer's connection pipeline
+is `server (L3) -> PTC -> user binding -> UserController -> configured next`.
+The helper attaches a consistent current account/profile to each PTC-owned normal
+line before Init, preserving its inner client source. UserController reserves the
+inner source IP key, counts TCP/UDP flows, and charges inner payload only.
+
+Key/range continuity uses installed-table generations and a credential continuity
+floor preserved only across unchanged key/range membership. Close the binding gate
+before posting range retirement to every PTC owner. Retire owned normal lines, UDP
+entries and child PCBs, pending TCP PCBs/TIME_WAIT and post-line closers. Release
+reservations through ordinary closure. The old range stays reserved until all
+owner acknowledgments settle. Input affinity, deferred Init and reverse output
+carry/check a non-reused binding epoch. A stale packet cannot acquire the range's
+next owner. Cancellation only notifies the barrier and keeps admission closed.

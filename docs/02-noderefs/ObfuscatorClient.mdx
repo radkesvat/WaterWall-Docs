@@ -6,11 +6,13 @@ description: "Reference documentation for the ObfuscatorClient node."
 ---
 
 <!--
-Documentation version: 154
+Documentation version: 155
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/ObfuscatorClient/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/ObfuscatorClient.mdx, and all files must keep the same documentation version.
 -->
 
 # ObfuscatorClient
+
+## Overview
 
 `ObfuscatorClient` applies a reversible payload transform before traffic moves
 toward the transport side. In the current implementation, the only supported
@@ -24,7 +26,7 @@ not encryption. For confidentiality or authentication, use `EncryptionClient` /
 The option-off path remains stateless. TLS-like framing uses normal-line receive
 state for stream reassembly, while exact packet lines remain stateless.
 
-## Typical Placement
+## Typical placement
 
 Simple TCP path:
 
@@ -57,23 +59,11 @@ transport at `next`; `ObfuscatorServer` faces its transport at the previous node
 A `Bridge` reverses callback direction, so two legs whose `next` sides face a
 paired Bridge both use `ObfuscatorClient`.
 
-## What It Does
+## Minimal practical example
 
-- Requires `settings.method: "xor"`.
-- Requires `settings.xor_key`.
-- Applies XOR to upstream payload bytes before forwarding to `next`.
-- Optionally prepends a 5-byte TLS-like record header after upstream XOR.
-- Optionally strips the 5-byte TLS-like header before downstream XOR.
-- Applies XOR to downstream payload bytes before forwarding to the previous
-  node.
-- Can leave the IPv4 header, or IPv4 plus TCP/UDP header, unobfuscated.
-- Marks packet-line payloads for checksum recalculation after changing bytes.
-- Keeps bounded receive state only for ordinary streams with TLS-like framing enabled.
+These are node fragments; define the referenced neighboring nodes in the surrounding configuration.
 
-Because XOR is symmetric, applying the same transform twice with the same key
-recovers the original payload.
-
-## Configuration Example
+### Configuration Example
 
 ```json
 {
@@ -105,7 +95,9 @@ Matching server:
 }
 ```
 
-## Required Fields
+## Configuration
+
+### Required Fields
 
 Top-level fields:
 
@@ -123,7 +115,7 @@ Required `settings` fields:
 | `method` | string | Must be `"xor"` in the current implementation. |
 | `xor_key` | integer | XOR key. The value is stored as one byte, so values outside `0..255` are converted to `uint8_t`. |
 
-## Optional Settings
+### Optional Settings
 
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -131,7 +123,7 @@ Required `settings` fields:
 | `tls_record_header` | boolean | `false` | Adds/removes a 5-byte TLS-like application-data record header on the transport-facing payload. |
 | `tls_header` | boolean | unset | Deprecated compatibility alias for `tls_record_header`. If present, it is accepted and a warning is logged. |
 
-## Skip Modes
+### Skip Modes
 
 `skip` controls how many leading bytes are not XORed:
 
@@ -147,7 +139,39 @@ If the payload is too short or not a valid IPv4 packet, the skip length becomes
 For malformed or incomplete TCP/UDP headers under `skip: "transport"`, the
 implementation falls back to leaving only the IPv4 header clear.
 
-## TLS-Like Record Header
+## Usage and troubleshooting
+
+### Buffer And Padding Notes
+
+Node metadata advertises:
+
+```text
+required_padding_left = 5
+layer_group = kNodeLayerAnything
+```
+
+The 5 bytes are for the optional TLS-like header. If a buffer does not have
+enough left padding when `tls_record_header` is enabled, the node clones the
+payload into a new buffer with enough padding, recycles the original buffer, and
+then prepends the header.
+
+When the current line is the worker packet line, the node sets
+`sbufSetRecalculateChecksum(buf, true)` on the surviving buffer after transforming payload bytes.
+
+### Practical Notes
+
+- `ObfuscatorClient` and `ObfuscatorServer` must use the same `method`,
+  `xor_key`, `skip`, and `tls_record_header` settings.
+- This is obfuscation, not cryptographic security.
+- `skip: "none"` is simplest for ordinary byte streams.
+- `skip: "transport"` is useful for raw IPv4 TCP/UDP packets whose IP and
+  transport headers need to remain readable.
+- If you obfuscate raw packet headers, downstream packet output may no longer be
+  routable even though WaterWall marks checksums for recalculation.
+
+## Advanced behavior
+
+### TLS-Like Record Header
 
 When `tls_record_header` is enabled, upstream transport-facing payloads are sent
 as:
@@ -186,7 +210,25 @@ Exact packet lines still require one complete record per packet. Truncated,
 mismatched, malformed, or oversized datagrams retain the existing drop policy;
 this mode adds no datagram fragmentation or cross-packet reassembly.
 
-## Direction Behavior
+## Implementation details
+
+### What It Does
+
+- Requires `settings.method: "xor"`.
+- Requires `settings.xor_key`.
+- Applies XOR to upstream payload bytes before forwarding to `next`.
+- Optionally prepends a 5-byte TLS-like record header after upstream XOR.
+- Optionally strips the 5-byte TLS-like header before downstream XOR.
+- Applies XOR to downstream payload bytes before forwarding to the previous
+  node.
+- Can leave the IPv4 header, or IPv4 plus TCP/UDP header, unobfuscated.
+- Marks packet-line payloads for checksum recalculation after changing bytes.
+- Keeps bounded receive state only for ordinary streams with TLS-like framing enabled.
+
+Because XOR is symmetric, applying the same transform twice with the same key
+recovers the original payload.
+
+### Direction Behavior
 
 | Incoming callback | Behavior |
 | --- | --- |
@@ -201,24 +243,7 @@ admission failure destroys local state, finishes the opposite side, then the
 source side recorded during Init. The nodes remain active for XOR and record
 processing on every payload; they do not permanently bypass themselves.
 
-## Buffer And Padding Notes
-
-Node metadata advertises:
-
-```text
-required_padding_left = 5
-layer_group = kNodeLayerAnything
-```
-
-The 5 bytes are for the optional TLS-like header. If a buffer does not have
-enough left padding when `tls_record_header` is enabled, the node clones the
-payload into a new buffer with enough padding, recycles the original buffer, and
-then prepends the header.
-
-When the current line is the worker packet line, the node sets
-`sbufSetRecalculateChecksum(buf, true)` on the surviving buffer after transforming payload bytes.
-
-## Implementation Notes
+### Implementation Notes
 
 The XOR helper has optimized paths:
 
@@ -229,18 +254,7 @@ The XOR helper has optimized paths:
 These paths change performance only; visible behavior is still byte-wise XOR
 with the configured one-byte key.
 
-## Practical Notes
-
-- `ObfuscatorClient` and `ObfuscatorServer` must use the same `method`,
-  `xor_key`, `skip`, and `tls_record_header` settings.
-- This is obfuscation, not cryptographic security.
-- `skip: "none"` is simplest for ordinary byte streams.
-- `skip: "transport"` is useful for raw IPv4 TCP/UDP packets whose IP and
-  transport headers need to remain readable.
-- If you obfuscate raw packet headers, downstream packet output may no longer be
-  routable even though WaterWall marks checksums for recalculation.
-
-## Node Metadata
+### Node Metadata
 
 Source-backed metadata:
 

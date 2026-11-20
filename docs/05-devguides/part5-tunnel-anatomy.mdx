@@ -5,7 +5,7 @@ sidebar_label: "Part 5: Anatomy & Workflow"
 description: "The on-disk layout of a WaterWall tunnel, what each file owns, node.c metadata, the create/line-state patterns, HTTP constraints, and the implementation workflow."
 ---
 <!--
-Documentation version: 193
+Documentation version: 196
 -->
 
 # Part 5: Anatomy of a Tunnel & Workflow
@@ -14,6 +14,14 @@ This part maps the contracts from Parts 1-4 onto the actual files you edit. Once
 you know which file owns which responsibility, adding or fixing a tunnel becomes
 mechanical: make the smallest complete root-cause change in the right place and
 keep the lifecycle intact.
+
+## Reading path
+
+- [File responsibilities and mandatory failure contracts](#directory-layout)
+- [Ordinary implementation workflow](#the-implementation-workflow)
+- [Metadata, constructors and state reference](#nodec-declaring-the-node)
+- [Public operation boundaries](#apiserver-and-public-operation-boundaries)
+- [HTTP-specific contracts](#http-specific-rules)
 
 ## Directory Layout
 
@@ -120,12 +128,36 @@ pre-READY DATA; it does not select callback direction. Common cleanup clears lin
 state before the output Finish callback and destroys owned lines itself. Output
 callbacks only notify neighbours and never take over line destruction.
 
+`RtmpClient` and `RtmpServer` each borrow one normal line. Their directional
+callbacks identify the application or RTMP carrier, and each node's
+`common/output.c` maps generated payload and pressure to its neighbours.
+The client admits its carrier during Init. The server waits for a valid
+publication before admitting its backend. Both use the same pump for credit,
+pressure, ordered delivery and reentrant close handling.
+See [RTMP sessions and carrier handoff](./reference/line-protocols.mdx#rtmp-sessions-and-carrier-handoff).
+
+`EnetClient` and `EnetServer` keep admission decisions and carrier context setup
+in their upstream `init.c` callbacks. The client sets UDP on its owned carrier
+and clears the copied destination pin and resolver-DNS marker before carrier
+Init. The UDP adapter can then select the configured ENet peer. The server's
+`common/service.c` creates its owned application line only after ENet admits
+the peer. That factory prepares context without outward callbacks.
+`Internals/EnetCommon` keeps association state private, publishes line state before
+Init, and holds the references needed across Init and deferred Pause/Est delivery.
+It also owns session startup, pressure composition and cleanup. Each supported
+Est mapping delivers once per association, including a carrier Est received
+during service Init. Application Finish detaches the application. During graceful
+drain the live session releases any carrier read hold from the detached application
+so acknowledgements can arrive. A failed client attachment leaves the unpublished
+carrier for the client callback to destroy. A successful attachment owns its
+cleanup even when reentrant callbacks close it before returning.
+
 `Internals/FallbackReplay` is an internal component used by TrojanServer,
 VlessServer, VmessServer and TlsServer, with no node metadata or chain position. Nodes retain authentication,
 transcript reconstruction, branch Init/pressure notifications and terminal
 callbacks; the component owns their shared replay FIFO, scheduling and final
-batch mechanics. See [Part 2](./part2-lines-and-callbacks.mdx#shared-fallback-replay)
-for callback ordering and [Part 3](./part3-buffers-and-padding.mdx#shared-fallback-replay-ownership)
+batch mechanics. See [line ownership reference](./reference/line-protocols.mdx#shared-fallback-replay)
+for callback ordering and [protocol buffering reference](./reference/protocol-buffers.mdx#shared-fallback-replay-ownership)
 for ownership and budgeting.
 
 Most production presets enable unity builds, combining a target's C source files
@@ -377,6 +409,46 @@ lifecycle, such as a device reader thread, must close local admission and wait f
 active operations through an owner-specific mechanism such as
 `quiescence_gate_t` before the tunnel or device state is reclaimed.
 
+## The Implementation Workflow
+
+Use this order for any new feature or fix. Inspect the repository first; ask a
+focused question only when a consequential requirement, compatibility choice, or
+scope boundary cannot be resolved from code and documentation. Make and record
+reasonable assumptions for low-risk implementation details instead of delegating
+them back to the maintainer.
+
+1. **Draw the chain flow.** Mark the Up-end and Down-end, and label which callback
+   direction owns the transformation.
+2. **Identify the line owner.** Which tunnel creates and destroys the line?
+3. **Read the existing tunnel** and its immediate neighbors.
+4. **Read the contracts:** `ww/net/line.h`, `ww/net/tunnel.h`, and
+   `ww/net/chain.c`.
+5. **If framing/prepending is involved,** read `ww/bufio/shiftbuffer.h` and
+   `buffer_pool.h`, plus nearby tunnels' `node.c` padding.
+6. **Compare relevant mature tunnel patterns**, but verify them against the
+   contract, callers, and neighbors rather than copying them blindly.
+   Check [existing containers and helpers](./doc1.mdx#reuse-existing-containers-and-helpers)
+   before adding a private data structure, buffer utility, or timer-based idle
+   scheduler.
+7. **Implement the smallest complete root-cause fix** that preserves composition.
+   Do not minimize the diff by retaining a known defect, duplicating unsafe logic,
+   or patching only a symptom.
+8. **Decide whether focused regression coverage is warranted.** It normally is for
+   new behavior, a reproducible regression-prone bug, a meaningful edge case, or a
+   contract change—especially when a test can fail on reversed direction. Reuse
+   existing direct coverage when sufficient, and do not manufacture behavior tests
+   for mechanical or documentation-only work.
+9. **Validate** with the preset build and the relevant tests (see
+   [Part 6](./part6-build-test-review.mdx)).
+
+:::warning Avoid speculative abstractions
+A new generic layer is rarely the fix here. Preserve the established lifecycle
+contract and prefer a direct complete fix. If one tunnel appears to require a new
+lifecycle concept, stop and verify the need against the core contract and every
+affected caller; do not use a reference tunnel as proof that either the old or new
+shape is correct.
+:::
+
 ## `node.c`: Declaring the Node
 
 `node.c` is where a tunnel announces itself to the runtime. Here is
@@ -428,9 +500,7 @@ During chain startup, `NodeManager` strictly enforces node capabilities and laye
   layer requirements on their adjacent edges rather than claiming
   `kNodeLayerAnything`. `ConnectionToPackets` is L4 on `prev` and L3 on `next`;
   `PacketsToConnection` is L3 on `prev` and L4 on `next`; `StreamToPackets` is L4
-  on `prev` and L3 on `next`. Dynamic bidirectional bridges such as
-  `WireGuardDevice` declare `Opposite` relations that couple opposite edge domains
-  without prematurely collapsing unresolved intermediate subchains.
+  on `prev` and L3 on `next`. `WireGuardClient` fixes L3 on `prev` and L4 on `next`; `WireGuardServer` fixes L4 on `prev` and L3 on its real `next` edge. Connection mode inserts PTC, user binding and UserController before final indexing.
 - **Packet chain classification & bootstrap:** A chain allocates worker packet lines and sets `contains_packet_node = true` only when at least one edge is forced to `{L3}`, a node or edge requirement is fixed to `L3`, or an `Opposite` relation exists. Persistent packet line `Init` messages are queued at runtime only when the chain head's next edge is resolved to `{L3}`.
 - **Failure semantics:** Any validation or solver failure logs a fatal diagnostic (`LOGF`) and records a startup failure (`startupFailureRecord(1)`), causing WaterWall to reject the configuration and perform a clean startup rollback.
 
@@ -554,6 +624,14 @@ setup/drain; client main/child mapping and Finish ownership remain active. The
 server permanently bypasses after next Init and replay settle, with its full line
 state already destroyed. See Parts 2 and 3.
 
+ConnectionStripeClient and ConnectionStripeServer advertise splice support with
+24 bytes of required left padding. Their shared mechanics accept mixed input,
+retain suitable private-pipe DATA through framing and receive reordering, and
+use immediate ordinary fallback on resource refusal or oversized retained charge.
+The server's PipeTunnel copy preserves the capability; cross-worker JOIN replay
+is an ordinary setup copy. Whole-chain gating still excludes TLS and KCP paths.
+See [Stripe buffer bounds](./reference/protocol-buffers.mdx#connectionstripe-framing-and-receive-windows).
+
 HalfDuplexClient and HalfDuplexServer also advertise splice support. The client
 requires 17 bytes of left padding; the server requires zero. Client first-intro construction
 reuses ordinary buffers when headroom permits and materializes splice input. Server parsing/waiting
@@ -665,7 +743,7 @@ configurations remain excluded globally.
 ### External-node ABI
 
 External libraries must export `waterwallNodeLifecycleAbiVersion()` returning
-`WW_EXTERNAL_NODE_ABI_VERSION`, currently `9`. The loader rejects missing or
+`WW_EXTERNAL_NODE_ABI_VERSION`, currently `10`. The loader rejects missing or
 mismatched descriptors before resolving or invoking a node getter. Rebuild
 external libraries against the current headers: `line_t` stores four inline
 64-bit active-tunnel mask words for chains of up to 256 instances. Packet checksum
@@ -677,6 +755,7 @@ belongs to private SocketManager filters, not the public options structure.
 The worker-owned `dns_resolver_t` includes custom transport readiness state and
 is embedded in public `worker_t`; external nodes must use the matching worker
 layout when accessing worker resources.
+The gate also covers the capture and raw-device constructor signatures.
 `WW_EXTERNAL_NODE_LIFECYCLE_ABI_VERSION` remains an alias for this complete gate;
 the lifecycle callback semantics themselves are unchanged.
 
@@ -697,6 +776,11 @@ the lifecycle callback semantics themselves are unchanged.
 contract. They return `NULL` on invalid or overflowing state sizes. Heap
 allocation follows the [fatal policy](#heap-allocation-failure). Never assign a
 callback or call `tunnelGetState()` until the result has been checked.
+
+When settings are validated into a local structure, assign it through a typed
+pointer from `tunnelGetState()`. `tunnelSetState()` copies the full aligned
+tunnel-state size. Its source must provide readable storage for that size,
+including any trailing padding.
 
 The cleanup discipline is real and worth following. The distilled shape is:
 
@@ -793,11 +877,11 @@ Chain mode uses the configured ordinary `next` as its DNS entry when `dns-next`
 is omitted; application and separately owned DNS lines share that entry without
 sharing their destinations or lifetimes. An explicit nonempty `dns-next` overrides
 only DNS egress, and naming the ordinary next explicitly remains supported.
-Router warns at construction when its own shared DNS policy combines root
-sniffing, or a potentially reachable payload-dependent rule, with deferred route
-selection. TCP DNS waits for transport establishment before sending bytes. A
-preceding unconditional metadata rule accepting resolver TCP traffic avoids the
-rule-order warning; a separate `dns-next` avoids sharing the application classifier.
+Shared Router entries preserve configured rule precedence and sniffing. A
+payload-dependent Router can consume TCP DNS query bytes after its Init returns
+with the owned DNS line alive and writes are permitted. A separate `dns-next`
+avoids sharing the application classifier. See
+[DomainResolver application and DNS lines](./reference/line-protocols.mdx#domainresolver-application-and-dns-lines).
 Resolve the selected entry through the existing branch-entry mechanism after
 private predecessors have been inserted. A distinct branch must be unowned by
 another predecessor; arbitrary earlier Routers and existing bound VPN paths are
@@ -1313,7 +1397,7 @@ retained first-use evidence; the manual projection setter does not erase that
 evidence. Runtime migration targets unpublished staging users, preserving new
 policy/timeinfo while transferring old reservations and accounting clocks, then
 rebuilding each projection before publication. See
-[accounting ownership](./part2-lines-and-callbacks.mdx#account-configuration-and-accounting-ownership).
+[accounting ownership](./reference/line-protocols.mdx#account-configuration-and-accounting-ownership).
 
 Missing old credential ownership, impossible index entry counts and missing reserved insertion capacity are internal
 corruption: emit a fixed fatal diagnostic and terminate directly. Ordinary duplicate and capacity refusals remain typed
@@ -1565,7 +1649,7 @@ pairing precede waiting checks. The 32 KiB divisor is a fixed budget reference. 
 ReverseServer uses fixed per-half application FIFO limits of 2 MiB logical bytes
 and 8 MiB queue charge, shared by waiting and startup retention and independent of pool profile.
 Its activation prefix has a separate protocol bound; see
-[Part 3](./part3-buffers-and-padding.mdx#reverse-activation-prefix).
+[protocol buffering reference](./reference/protocol-buffers.mdx#reverse-activation-prefix).
 
 If you work on `HttpClient` or `HttpServer`, these source-backed constraints
 apply:
@@ -1580,7 +1664,7 @@ apply:
   serializes nested input behind the active suffix, including split pairing and
   upgrade transitions; validate line life and association after each output.
   Chunk metadata and retained input have separate bounds described in
-  [Part 3](./part3-buffers-and-padding.mdx#http-receive-framing-and-retention).
+  [protocol buffering reference](./reference/protocol-buffers.mdx#http-receive-framing-and-retention).
   Feed nghttp2 in bounded steps and drain decoded events outside its callbacks.
 - WaterWall targets HTTP/1.x and **single-stream** HTTP/2 only. Do not add HTTP/3.
   Do not support more than one logical HTTP/2 stream. If a peer opens extra
@@ -1628,7 +1712,7 @@ apply:
   [Part 2](./part2-lines-and-callbacks.mdx). HttpServer's HTTP/2 service-side
   Finish may retain protocol state on the still-live borrowed carrier while
   waiting for credit to emit accepted response DATA and END_STREAM, as described
-  in [HTTP/2 response completion](./part2-lines-and-callbacks.mdx#httpserver-http2-response-completion).
+  in [HTTP/2 response completion](./reference/line-protocols.mdx#httpserver-http2-response-completion).
   Carrier Finish must cancel that wait and settle local state before the owner
   destroys the line. Holding a reference does not permit dirty state on a dead line.
 - **HttpClient upload completion**: HTTP/2-capable modes own an independent
@@ -1637,9 +1721,11 @@ apply:
   fixed close-drain deadline. Continue control input but discard response bodies
   toward a detached application. Distinguish ordinary response END_STREAM from
   stream cancellation, and immediately destroy the owned carrier on real carrier
-  Finish. The owner-worker inventory aborts every carrier during shutdown. See
-  [upload completion](./part2-lines-and-callbacks.mdx#httpclient-http2-upload-completion)
-  and [provider budgets](./part3-buffers-and-padding.mdx#http-receive-framing-and-retention).
+  Finish. With `stay-alive` enabled, keep the HTTP/2 session processing control
+  frames after successful upload completion. The owner-worker inventory aborts
+  every carrier during shutdown. See
+  [upload completion](./reference/line-protocols.mdx#httpclient-http2-upload-completion)
+  and [provider budgets](./reference/protocol-buffers.mdx#http-receive-framing-and-retention).
 - **HttpClient split teardown**: retain the borrowed main line and both owned
   transport lines before final-byte or close callbacks. A callback on one
   transport can close its sibling and clear main state while the borrowed main
@@ -1675,50 +1761,6 @@ apply:
   requires both borrowed pending maps to be empty and never reclaims their line
   state or buffered payload on behalf of the real line owners.
 
-## The Implementation Workflow
-
-Use this order for any new feature or fix. Inspect the repository first; ask a
-focused question only when a consequential requirement, compatibility choice, or
-scope boundary cannot be resolved from code and documentation. Make and record
-reasonable assumptions for low-risk implementation details instead of delegating
-them back to the maintainer.
-
-1. **Draw the chain flow.** Mark the Up-end and Down-end, and label which callback
-   direction owns the transformation.
-2. **Identify the line owner.** Which tunnel creates and destroys the line?
-3. **Read the existing tunnel** and its immediate neighbors.
-4. **Read the contracts:** `ww/net/line.h`, `ww/net/tunnel.h`, and
-   `ww/net/chain.c`.
-5. **If framing/prepending is involved,** read `ww/bufio/shiftbuffer.h` and
-   `buffer_pool.h`, plus nearby tunnels' `node.c` padding.
-6. **Compare relevant mature tunnel patterns**, but verify them against the
-   contract, callers, and neighbors rather than copying them blindly.
-   Check [existing containers and helpers](./doc1.mdx#reuse-existing-containers-and-helpers)
-   before adding a private data structure, buffer utility, or timer-based idle
-   scheduler.
-7. **Implement the smallest complete root-cause fix** that preserves composition.
-   Do not minimize the diff by retaining a known defect, duplicating unsafe logic,
-   or patching only a symptom.
-8. **Decide whether focused regression coverage is warranted.** It normally is for
-   new behavior, a reproducible regression-prone bug, a meaningful edge case, or a
-   contract change—especially when a test can fail on reversed direction. Reuse
-   existing direct coverage when sufficient, and do not manufacture behavior tests
-   for mechanical or documentation-only work.
-9. **Validate** with the preset build and the relevant tests (see
-   [Part 6](./part6-build-test-review.mdx)).
-
-:::warning Avoid speculative abstractions
-A new generic layer is rarely the fix here. Preserve the established lifecycle
-contract and prefer a direct complete fix. If one tunnel appears to require a new
-lifecycle concept, stop and verify the need against the core contract and every
-affected caller; do not use a reference tunnel as proof that either the old or new
-shape is correct.
-:::
-
----
-
-Continue to **[Part 6: Building, Testing & Reviewing](./part6-build-test-review.mdx)**.
-
 ## Attaching a tunnel to lwIP
 
 `initTcpIpStack()` is an idempotent construction-time shared-bootstrap facade;
@@ -1747,3 +1789,7 @@ contract across Linux, Darwin and Windows. No public node/tunnel layout changes
 are required. PTC tests exact reciprocal adjacency, L3 sink capability and owner
 packet-line identity; it never infers this promise from type names or checksum
 trust. Removing the promise requires returning that edge to deferred dispatch.
+
+---
+
+Continue to **[Part 6: Building, Testing & Reviewing](./part6-build-test-review.mdx)**.

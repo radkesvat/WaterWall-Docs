@@ -1,0 +1,250 @@
+---
+sidebar_position: 18
+title: "Direct tunnel over RTMP and RTMPS"
+sidebar_label: "Direct RTMP / RTMPS"
+description: "Forward a TCP port in Iran to an HTTP service in Kharej using WaterWall's RTMP transport, with plain TCP and verified TLS configurations for both hosts."
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# Direct tunnel over RTMP and RTMPS
+
+A user connects to TCP port `9000` on Iran and receives a response from the
+HTTP service at `127.0.0.1:8080` on Kharej. Each incoming connection opens one
+RTMP session between the two WaterWall instances. The application and service
+both speak ordinary HTTP. Only the two WaterWall peers need to understand the
+`ww.data` RTMP profile.
+
+## Prepare the hosts
+
+1. On each host, create the matching `core.json` from the [tunnel setup guide](./overview.mdx#create-corejson) with `mtu: 1500`.
+2. Choose the same transport tab on both hosts. Save the Iran file as `config_iran.json` and the Kharej file as `config_kharej.json`.
+3. In Iran's `variables`, replace `198.51.100.20` with Kharej's reachable address. Update `tc_url` to describe the same RTMP endpoint, including its application path. For RTMPS, also replace `tunnel.example.com` with the DNS name on Kharej's certificate and set the certificate chain and private key paths on Kharej.
+4. Allow your users to reach Iran's TCP port `9000`. Allow Iran's egress IP to reach Kharej's TCP transport port, `1935` for plain RTMP or `443` for this RTMPS example. The HTTP service can stay bound to Kharej's loopback address.
+
+In both variants, `app` and `stream` select the publication. Anyone who can
+reach the transport port and knows those names can request the same tunnel.
+The RTMPS variant authenticates Kharej to Iran through the server certificate.
+
+## Choose the transport
+
+<Tabs groupId="direct-rtmp-transport" defaultValue="rtmps">
+<TabItem value="rtmps" label="RTMPS (verified TLS)">
+
+```text
+Iran:   TcpListener → RtmpClient → TlsClient → TcpConnector
+Kharej: TcpListener → TlsServer → RtmpServer → TcpConnector
+```
+
+`TcpConnector` dials Kharej's IP. `TlsClient` verifies the certificate chain
+against its bundled trust roots and checks the certificate name against
+`tls_name`. After TLS connects, `RtmpClient` sends `tc-url` during RTMP setup.
+TLS protects the link between the two servers. The empty ALPN lists leave HTTP
+protocol negotiation disabled on this dedicated RTMPS port.
+
+<Tabs groupId="tunnel-location" defaultValue="iran">
+<TabItem value="iran" label="Iran">
+
+```json title="config_iran.json"
+{
+  "name": "iran-direct-rtmps",
+  "variables": {
+    "user_port": 9000,
+    "ip_server_kharej": "198.51.100.20",
+    "transport_port": 443,
+    "tls_name": "tunnel.example.com",
+    "tc_url": "rtmps://tunnel.example.com:443/waterwall"
+  },
+  "nodes": [
+    {
+      "name": "users_inbound",
+      "type": "TcpListener",
+      "settings": {"address": "0.0.0.0", "port": $user_port$},
+      "next": "rtmp_client"
+    },
+    {
+      "name": "rtmp_client",
+      "type": "RtmpClient",
+      "settings": {"tc-url": $tc_url$, "app": "waterwall", "stream": "tunnel"},
+      "next": "tls_client"
+    },
+    {
+      "name": "tls_client",
+      "type": "TlsClient",
+      "settings": {"sni": $tls_name$, "verify": true, "alpns": []},
+      "next": "tcp_to_kharej"
+    },
+    {
+      "name": "tcp_to_kharej",
+      "type": "TcpConnector",
+      "settings": {"address": $ip_server_kharej$, "port": $transport_port$}
+    }
+  ]
+}
+```
+
+</TabItem>
+<TabItem value="kharej" label="Kharej">
+
+```json title="config_kharej.json"
+{
+  "name": "kharej-direct-rtmps",
+  "variables": {
+    "transport_port": 443,
+    "certificate_path": "/etc/waterwall/fullchain.pem",
+    "key_path": "/etc/waterwall/privkey.pem",
+    "final_port": 8080
+  },
+  "nodes": [
+    {
+      "name": "transport_inbound",
+      "type": "TcpListener",
+      "settings": {"address": "0.0.0.0", "port": $transport_port$},
+      "next": "tls_server"
+    },
+    {
+      "name": "tls_server",
+      "type": "TlsServer",
+      "settings": {
+        "cert-file": $certificate_path$,
+        "key-file": $key_path$,
+        "select-alpns": []
+      },
+      "next": "rtmp_server"
+    },
+    {
+      "name": "rtmp_server",
+      "type": "RtmpServer",
+      "settings": {"app": "waterwall", "stream": "tunnel"},
+      "next": "service"
+    },
+    {
+      "name": "service",
+      "type": "TcpConnector",
+      "settings": {"address": "127.0.0.1", "port": $final_port$}
+    }
+  ]
+}
+```
+
+</TabItem>
+</Tabs>
+
+</TabItem>
+<TabItem value="rtmp" label="Plain RTMP">
+
+```text
+Iran:   TcpListener → RtmpClient → TcpConnector
+Kharej: TcpListener → RtmpServer → TcpConnector
+```
+
+Use this variant on a trusted link or for a local test. The RTMP carrier
+exposes the tunnel traffic in cleartext.
+
+<Tabs groupId="tunnel-location" defaultValue="iran">
+<TabItem value="iran" label="Iran">
+
+```json title="config_iran.json"
+{
+  "name": "iran-direct-rtmp",
+  "variables": {
+    "user_port": 9000,
+    "ip_server_kharej": "198.51.100.20",
+    "transport_port": 1935,
+    "tc_url": "rtmp://198.51.100.20:1935/waterwall"
+  },
+  "nodes": [
+    {
+      "name": "users_inbound",
+      "type": "TcpListener",
+      "settings": {"address": "0.0.0.0", "port": $user_port$},
+      "next": "rtmp_client"
+    },
+    {
+      "name": "rtmp_client",
+      "type": "RtmpClient",
+      "settings": {"tc-url": $tc_url$, "app": "waterwall", "stream": "tunnel"},
+      "next": "tcp_to_kharej"
+    },
+    {
+      "name": "tcp_to_kharej",
+      "type": "TcpConnector",
+      "settings": {"address": $ip_server_kharej$, "port": $transport_port$}
+    }
+  ]
+}
+```
+
+</TabItem>
+<TabItem value="kharej" label="Kharej">
+
+```json title="config_kharej.json"
+{
+  "name": "kharej-direct-rtmp",
+  "variables": {
+    "transport_port": 1935,
+    "final_port": 8080
+  },
+  "nodes": [
+    {
+      "name": "transport_inbound",
+      "type": "TcpListener",
+      "settings": {"address": "0.0.0.0", "port": $transport_port$},
+      "next": "rtmp_server"
+    },
+    {
+      "name": "rtmp_server",
+      "type": "RtmpServer",
+      "settings": {"app": "waterwall", "stream": "tunnel"},
+      "next": "service"
+    },
+    {
+      "name": "service",
+      "type": "TcpConnector",
+      "settings": {"address": "127.0.0.1", "port": $final_port$}
+    }
+  ]
+}
+```
+
+</TabItem>
+</Tabs>
+
+</TabItem>
+</Tabs>
+
+## Run and check
+
+On Kharej, start a small HTTP service for the test and leave it running.
+
+```bash
+demo_dir=$(mktemp -d)
+printf 'through Kharej\n' > "$demo_dir/health.txt"
+python3 -m http.server 8080 --bind 127.0.0.1 --directory "$demo_dir"
+```
+
+Start WaterWall on Kharej, then on Iran, using each host's own
+`core.json`. [Startup command](./overview.mdx#start-the-tunnel)
+
+On Iran, request the file through the user-facing port. A remote user can
+substitute Iran's reachable address for `127.0.0.1`.
+
+```bash
+curl --fail --show-error --silent http://127.0.0.1:9000/health.txt
+```
+
+The expected response body is `through Kharej`. The URL uses HTTP in both
+variants because curl talks to the service through the tunnel.
+
+If RTMP setup fails, check that Iran can reach the selected transport port
+and both peers use the same `app` and `stream`. For a TLS handshake failure,
+check Kharej's certificate chain and Iran's `tls_name`. If RTMP connects but
+the HTTP request fails, run curl directly on Kharej using port `8080`.
+RTMP can accept the publication while the connection to the service is still pending.
+
+Applications that need a final reply should read it while the connection is
+open. Closing the application side ends the stream in both directions. See
+[RtmpClient](../../noderefs/RtmpClient) and
+[RtmpServer](../../noderefs/RtmpServer) for session limits and close behavior.
+To let each request choose its destination, see the [SOCKS5 proxy over RTMPS](../proxies/rtmp.mdx).

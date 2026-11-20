@@ -6,11 +6,13 @@ description: "Reference documentation for the SniffRouter node."
 ---
 
 <!--
-Documentation version: 154
+Documentation version: 155
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/SniffRouter/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/SniffRouter.mdx, and all files must keep the same documentation version.
 -->
 
 # SniffRouter
+
+## Overview
 
 `SniffRouter` is primarily a simple, convenient layer-4 routing node for common
 domain-sniffing setups. It waits for the first upstream payload of a connection,
@@ -23,33 +25,7 @@ want a short domain-to-destination configuration. Use `Router` for HTTP/2 or
 HTTP/3 sniffing, source or destination IP/port matching, GeoIP/GeoSite,
 authenticated identity, combined conditions, or other advanced routing needs.
 
-## Mental Model
-
-`SniffRouter` is a deferred branch selector:
-
-- It does not forward upstream `Init` immediately.
-- It waits for the first upstream payload.
-- It buffers the first bytes while sniffing.
-- It checks routes in JSON order.
-- The first matching route wins.
-- If no route matches, the connection uses top-level `next`.
-- The selected branch is initialized and the buffered bytes are replayed to it.
-- Later payloads keep using the same selected branch.
-
-```mermaid
-flowchart LR
-    In[TcpListener / TlsServer] --> SR[SniffRouter]
-    SR -->|Host or SNI route| A[target branch]
-    SR -->|no match| D[default next]
-```
-
-:::warning
-`SniffRouter` needs client-side bytes before it can choose a route. Protocols
-where the server must speak first cannot be routed until upstream payload
-arrives.
-:::
-
-## Typical Placement
+## Typical placement
 
 Route by decrypted HTTP/1 Host after TLS termination:
 
@@ -69,7 +45,138 @@ TcpListener -> SniffRouter
                  `-- default next      -> default_tls_site
 ```
 
-## Configuration Example
+## Minimal practical example
+
+Node fragment; define the referenced neighbors and peers in the same deployment.
+
+Replace the example domains and define each named destination, including `default_destination`. Feed clear HTTP Host or the supported TLS ClientHello bytes at the placement described above. Route order and detection limits are specified below.
+
+```json
+{
+  "name": "sniff-router",
+  "type": "SniffRouter",
+  "settings": {
+    "routes": [
+      {
+        "domain": "one.example.com",
+        "next": "destination_one"
+      },
+      {
+        "domain": "two.example.com",
+        "next": "destination_two"
+      },
+      {
+        "domain": "three.example.com",
+        "next": "destination_three"
+      }
+    ]
+  },
+  "next": "default_destination"
+}
+```
+
+See [Configuration](#configuration) for defaults and conditional requirements and [Usage and troubleshooting](#usage-and-troubleshooting) for complete examples and operational limits.
+
+## Configuration
+
+### Required Fields
+
+Top-level fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | string | User-chosen node name. Must be unique inside the config file. |
+| `type` | string | Must be exactly `"SniffRouter"`. |
+| `next` | string | Required. This is the fallback route when no configured route matches. |
+
+`settings` may be omitted or empty. With no routes, all connections use
+top-level `next`.
+
+### Settings
+
+| Setting | Type | Default | Description |
+| --- | --- | --- | --- |
+| `routes` | array | unset | Ordered list of sniff routes. If present, it must be a non-empty array. |
+
+### Route Object
+
+Each route object accepts:
+
+| Field | Type | Required | Description |
+| --- | --- | --- | --- |
+| `domains` | string or array | Required. Domain patterns used by HTTP/1 Host and TLS SNI detection. |
+| `domain` | string | Alias for a single `domains` entry. Cannot be used together with `domains`. |
+| `detection` | string or array | Optional. Omitted means both `["http1", "tls"]`. |
+| `next` | string | Required. Target node name for matching connections. |
+| `target` | string | Alias for route `next`. |
+
+Detection values:
+
+| Value | Meaning |
+| --- | --- |
+| `http1` | Sniff HTTP/1 request Host. Enabled by default. |
+| `tls` | Sniff TLS ClientHello SNI. Enabled by default. |
+
+Removed values:
+
+| Old value | Use instead |
+| --- | --- |
+| `http` | `http1` |
+| `client-hello` | `tls` |
+| `tls-client-hello` | `tls` |
+
+### Route Order
+
+Routes are checked in JSON order. The first matching route wins.
+
+```json
+{
+  "routes": [
+    {
+      "domain": "api.example.com",
+      "next": "api_backend"
+    },
+    {
+      "domain": "*.example.com",
+      "next": "wildcard_backend"
+    }
+  ]
+}
+```
+
+In this example, `api.example.com` reaches `api_backend` because the exact route
+appears before the wildcard route. If the wildcard route came first, it would
+catch `api.example.com` only if the wildcard pattern matched it; note that
+`*.example.com` matches subdomains but not `example.com` itself.
+
+### Domain Matching
+
+Domain matching is case-insensitive. Configured domain patterns are normalized
+to lowercase and trailing dots are removed.
+
+Supported patterns:
+
+| Pattern | Meaning |
+| --- | --- |
+| `example.com` | Exact match. |
+| `*.example.com` | Matches subdomains such as `www.example.com`; does not match `example.com`. |
+| `*` | Matches any non-empty Host/SNI value. |
+
+Invalid domain patterns:
+
+- empty strings
+- `*.` without a suffix
+- wildcard forms other than `*.example.com`
+- URLs such as `https://example.com`
+- host:port values such as `example.com:443`
+- values containing `/` or `\`
+
+HTTP Host values may include a port on the wire. The sniffer strips the port
+before matching, so `Host: example.com:443` matches configured `example.com`.
+
+## Usage and troubleshooting
+
+### Configuration Example
 
 HTTP Host routing:
 
@@ -128,276 +235,7 @@ Omitting `detection` enables both HTTP/1 Host and TLS ClientHello SNI sniffing
 for that route. Set it explicitly to `"http1"` or `"tls"` only when the route
 must use one of those methods exclusively.
 
-## Required Fields
-
-Top-level fields:
-
-| Field | Type | Description |
-| --- | --- | --- |
-| `name` | string | User-chosen node name. Must be unique inside the config file. |
-| `type` | string | Must be exactly `"SniffRouter"`. |
-| `next` | string | Required. This is the fallback route when no configured route matches. |
-
-`settings` may be omitted or empty. With no routes, all connections use
-top-level `next`.
-
-## Settings
-
-| Setting | Type | Default | Description |
-| --- | --- | --- | --- |
-| `routes` | array | unset | Ordered list of sniff routes. If present, it must be a non-empty array. |
-
-## Route Object
-
-Each route object accepts:
-
-| Field | Type | Required | Description |
-| --- | --- | --- | --- |
-| `domains` | string or array | Required. Domain patterns used by HTTP/1 Host and TLS SNI detection. |
-| `domain` | string | Alias for a single `domains` entry. Cannot be used together with `domains`. |
-| `detection` | string or array | Optional. Omitted means both `["http1", "tls"]`. |
-| `next` | string | Required. Target node name for matching connections. |
-| `target` | string | Alias for route `next`. |
-
-Detection values:
-
-| Value | Meaning |
-| --- | --- |
-| `http1` | Sniff HTTP/1 request Host. Enabled by default. |
-| `tls` | Sniff TLS ClientHello SNI. Enabled by default. |
-
-Removed values:
-
-| Old value | Use instead |
-| --- | --- |
-| `http` | `http1` |
-| `client-hello` | `tls` |
-| `tls-client-hello` | `tls` |
-
-## Route Order
-
-Routes are checked in JSON order. The first matching route wins.
-
-```json
-{
-  "routes": [
-    {
-      "domain": "api.example.com",
-      "next": "api_backend"
-    },
-    {
-      "domain": "*.example.com",
-      "next": "wildcard_backend"
-    }
-  ]
-}
-```
-
-In this example, `api.example.com` reaches `api_backend` because the exact route
-appears before the wildcard route. If the wildcard route came first, it would
-catch `api.example.com` only if the wildcard pattern matched it; note that
-`*.example.com` matches subdomains but not `example.com` itself.
-
-## Domain Matching
-
-Domain matching is case-insensitive. Configured domain patterns are normalized
-to lowercase and trailing dots are removed.
-
-Supported patterns:
-
-| Pattern | Meaning |
-| --- | --- |
-| `example.com` | Exact match. |
-| `*.example.com` | Matches subdomains such as `www.example.com`; does not match `example.com`. |
-| `*` | Matches any non-empty Host/SNI value. |
-
-Invalid domain patterns:
-
-- empty strings
-- `*.` without a suffix
-- wildcard forms other than `*.example.com`
-- URLs such as `https://example.com`
-- host:port values such as `example.com:443`
-- values containing `/` or `\`
-
-HTTP Host values may include a port on the wire. The sniffer strips the port
-before matching, so `Host: example.com:443` matches configured `example.com`.
-
-## HTTP Host Detection
-
-HTTP/1 Host detection is enabled by default for every route whose `detection`
-field is omitted.
-
-```json
-{
-  "domains": [
-    "app.example.com"
-  ],
-  "next": "app_backend"
-}
-```
-
-With `http1`, `SniffRouter` expects the first visible payload to be an HTTP/1
-request and reads the `Host` header. It then matches that host against the route
-domain patterns.
-
-Use this after TLS termination if the inbound wire traffic is HTTPS:
-
-```text
-TcpListener -> TlsServer -> SniffRouter
-```
-
-HTTP/2 cleartext prefaces do not carry an HTTP/1 Host header, so they fall back
-to `next` unless some other route detection matches.
-
-## TLS SNI Detection
-
-TLS ClientHello SNI detection is also enabled by default when `detection` is
-omitted:
-
-```json
-{
-  "domains": [
-    "*.example.com"
-  ],
-  "next": "tls_branch"
-}
-```
-
-Use `"detection": "tls"` when this route should inspect only TLS and should
-not also accept an HTTP/1 Host match.
-
-This mode is useful before TLS termination:
-
-```text
-TcpListener -> SniffRouter -> TlsServer
-```
-
-The sniffer accepts ClientHellos split across TLS records, including splits
-inside the handshake header or SNI. Fragmented handshakes use at most 8192 bytes
-of reassembly storage; incomplete input still uses the sniff-window cutoff.
-Complete single-record ClientHellos use direct parsing. If no SNI is found, or
-the SNI does not match any route, the connection uses top-level `next`.
-
-## First-Payload Buffering
-
-SniffRouter buffers initial upstream bytes until it can classify the connection.
-
-HTTP Host and TLS SNI sniffing can ask for more bytes while the first request or
-ClientHello is incomplete. The shared sniff window is bounded:
-
-```text
-8192 bytes
-```
-
-Exact classification and buffering rules:
-
-- Complete single-record ClientHellos are parsed and classified first, even if larger than 8192 bytes. Fragmented handshakes have an 8192-byte reassembly limit.
-- If an input is incomplete and the accumulated prefix reaches 8192 bytes, SniffRouter stops waiting and selects the default `next` branch.
-- Incomplete ClientHellos below 8192 bytes remain unassigned; SniffRouter has no classification timer, so listener idle timeouts (e.g. `TcpListener`) govern the unassigned timeout.
-- Initial stream bytes buffered during sniffing are replayed intact to the selected branch in FIFO order; callback and TCP packet segmentation are not preserved. UDP replay preserves each datagram, including empty datagrams.
-
-After a route is selected, later payloads are forwarded directly to the selected
-target or to the default `next`. The connection is not reclassified.
-
-Branch initialization and initial replay preserve FIFO order: input received
-reentrantly during those callbacks waits behind the already accepted first bytes.
-For streams, that additional input shares one ordinary buffer with a 2 MiB
-logical-byte limit; exceeding it closes the line. The limit does not reject a
-previously accepted complete first delivery merely because it exceeds the sniff
-window. SniffRouter records whether incoming payloads are UDP during `Init`,
-before the selected branch can rewrite the destination context. UDP input retains
-each datagram separately and supplies the sniffer with a separate byte view.
-Its pending FIFO admits at most 2 MiB of payload, 4 MiB of buffer capacity charge,
-and 1,024 datagrams. Empty datagrams consume entry and capacity allowance.
-Exceeding any limit closes only initialized sides. Replay preserves each
-datagram's contents, boundaries and order, including startup reentry. Once startup
-replay finishes, later payloads pass through without a SniffRouter output queue.
-
-## TLS SNI Routing and Nginx Camouflage
-
-`SniffRouter` can be placed **before** `TlsServer` to inspect the TLS ClientHello SNI and route matching domains to a protected TLS termination pipeline, while falling back all other connections to a real cover service (such as an nginx HTTPS server).
-
-```text
-TcpListener :443 -> SniffRouter
-                      |-- route (expected SNI) -> TlsServer -> VlessServer -> ...
-                      `-- default (unmatched)  -> TcpConnector -> real nginx :443
-```
-
-Configuration example:
-
-```json
-{
-  "name": "sniff-router",
-  "type": "SniffRouter",
-  "settings": {
-    "routes": [
-      {
-        "domain": "vpn.example.com",
-        "detection": "tls",
-        "next": "protected-tls-server"
-      }
-    ]
-  },
-  "next": "nginx-fallback-connector"
-}
-```
-
-### Key Deployment Aspects
-
-- **Matching SNI**: Connections presenting a valid TLS ClientHello with an SNI matching the configured domain route to `protected-tls-server`.
-- **Default Fallback**: Connections with mismatched SNI, absent SNI, unparseable input, or plaintext HTTP on the TLS port route to top-level `next` (`nginx-fallback-connector`).
-- **Why a Real Nginx TLS Fallback**: Routing default traffic to a real nginx HTTPS listener ensures unknown SNI handshakes, no-SNI handshakes, and plaintext HTTP receive authentic nginx responses and error pages (such as HTTP 400 "The plain HTTP request was sent to HTTPS port"), avoiding synthetic handshake rejection fingerprints.
-- See `tests/examples/vless_tls_sni_camouflage_server.json` for a complete server example.
-
-## Target Branches
-
-Each route `next` or `target` is the name of a real node in the same config.
-
-At chain construction time, SniffRouter folds route targets into its own chain
-so that:
-
-- target nodes get per-line state slots
-- downstream traffic from target branches returns through SniffRouter
-- lifecycle callbacks remain composable
-
-Target rules:
-
-- the target node must exist
-- the target cannot be the SniffRouter itself
-- the target branch must not already be bound to an incompatible previous node
-- sharing a chain does not make a node inside another configured branch a valid
-  target; the default branch and repeated explicit targets remain valid,
-  including their private inserted helpers
-- the target may be the same node as top-level `next`
-
-Use a `Bridge` target when the branch lives elsewhere in the config.
-
-## Lifecycle Behavior
-
-Source-backed behavior:
-
-| Callback | Behavior |
-| --- | --- |
-| upstream `Init` | Initializes SniffRouter line state only. It does not initialize a branch yet. |
-| first upstream `Payload` | Buffers bytes, classifies routes, initializes selected target or default `next`, replays buffered bytes. |
-| later upstream `Payload` | Goes directly to the selected target or default `next`. |
-| upstream `Pause` / `Resume` | Forwarded to the selected branch, including duplicates; ignored before selection. They do not gate payload replay. |
-| upstream `Est` | Forwarded only to the default branch. Route targets are often adapter/server nodes where upstream `Est` is not valid. |
-| upstream `Finish` | Destroys local line state and finishes the selected target/default branch if one exists. |
-| downstream `Payload` / `Pause` / `Resume` / `Est` | Forwarded back to the previous node. |
-| downstream `Finish` | Destroys local line state before forwarding finish to the previous node. |
-
-Pause/Resume are advisory in both directions. SniffRouter keeps no consumer-pause
-state and does not wait for Resume to finish branch startup or deliver ready input.
-
-After default-branch Init returns and initial replay settles, SniffRouter destroys
-and zeros its line state and permanently bypasses itself on that line. Configured
-target routes remain active for branch dispatch and upstream Est suppression,
-including a configured target equal to top-level `next`. Bypass does not change
-the selected destination or remove downstream nodes from the chain.
-
-## SniffRouter vs Router
+### SniffRouter vs Router
 
 For basic HTTP/1 domain sniffing on a line where no earlier node supplied a
 destination domain, the configurations are conceptually very similar. This
@@ -456,23 +294,185 @@ Read the [`Router` documentation](./Router.mdx) when:
 - you need `protocol` or `attributes` combined with other conditions
 - you need multiple conditions combined with AND or more flexible routing rules
 
-## Node Metadata
+## Advanced behavior
 
-SniffRouter does not prepend protocol headers and does not need left padding.
+### Mental Model
 
-Source-backed metadata:
+`SniffRouter` is a deferred branch selector:
 
-| Property | Value |
-| --- | --- |
-| node flags | `kNodeFlagSupportsSplice` |
-| `can_have_prev` | `true` |
-| `can_have_next` | `true` |
-| `layer_group` | `kNodeLayer4` |
-| `layer_group_prev_node` | `kNodeLayer4` |
-| `layer_group_next_node` | `kNodeLayer4` |
-| `required_padding_left` | `0` bytes |
+- It does not forward upstream `Init` immediately.
+- It waits for the first upstream payload.
+- It buffers the first bytes while sniffing.
+- It checks routes in JSON order.
+- The first matching route wins.
+- If no route matches, the connection uses top-level `next`.
+- The selected branch is initialized and the buffered bytes are replayed to it.
+- Later payloads keep using the same selected branch.
 
-## Advanced: Reverse-Tunnel Handshake Routing
+```mermaid
+flowchart LR
+    In[TcpListener / TlsServer] --> SR[SniffRouter]
+    SR -->|Host or SNI route| A[target branch]
+    SR -->|no match| D[default next]
+```
+
+:::warning
+`SniffRouter` needs client-side bytes before it can choose a route. Protocols
+where the server must speak first cannot be routed until upstream payload
+arrives.
+:::
+
+### HTTP Host Detection
+
+HTTP/1 Host detection is enabled by default for every route whose `detection`
+field is omitted.
+
+```json
+{
+  "domains": [
+    "app.example.com"
+  ],
+  "next": "app_backend"
+}
+```
+
+With `http1`, `SniffRouter` expects the first visible payload to be an HTTP/1
+request and reads the `Host` header. It then matches that host against the route
+domain patterns.
+
+Use this after TLS termination if the inbound wire traffic is HTTPS:
+
+```text
+TcpListener -> TlsServer -> SniffRouter
+```
+
+HTTP/2 cleartext prefaces do not carry an HTTP/1 Host header, so they fall back
+to `next` unless some other route detection matches.
+
+### TLS SNI Detection
+
+TLS ClientHello SNI detection is also enabled by default when `detection` is
+omitted:
+
+```json
+{
+  "domains": [
+    "*.example.com"
+  ],
+  "next": "tls_branch"
+}
+```
+
+Use `"detection": "tls"` when this route should inspect only TLS and should
+not also accept an HTTP/1 Host match.
+
+This mode is useful before TLS termination:
+
+```text
+TcpListener -> SniffRouter -> TlsServer
+```
+
+The sniffer accepts ClientHellos split across TLS records, including splits
+inside the handshake header or SNI. Fragmented handshakes use at most 8192 bytes
+of reassembly storage; incomplete input still uses the sniff-window cutoff.
+Complete single-record ClientHellos use direct parsing. If no SNI is found, or
+the SNI does not match any route, the connection uses top-level `next`.
+
+### First-Payload Buffering
+
+SniffRouter buffers initial upstream bytes until it can classify the connection.
+
+HTTP Host and TLS SNI sniffing can ask for more bytes while the first request or
+ClientHello is incomplete. The shared sniff window is bounded:
+
+```text
+8192 bytes
+```
+
+Exact classification and buffering rules:
+
+- Complete single-record ClientHellos are parsed and classified first, even if larger than 8192 bytes. Fragmented handshakes have an 8192-byte reassembly limit.
+- If an input is incomplete and the accumulated prefix reaches 8192 bytes, SniffRouter stops waiting and selects the default `next` branch.
+- Incomplete ClientHellos below 8192 bytes remain unassigned; SniffRouter has no classification timer, so listener idle timeouts (e.g. `TcpListener`) govern the unassigned timeout.
+- Initial stream bytes buffered during sniffing are replayed intact to the selected branch in FIFO order; callback and TCP packet segmentation are not preserved. UDP replay preserves each datagram, including empty datagrams.
+
+After a route is selected, later payloads are forwarded directly to the selected
+target or to the default `next`. The connection is not reclassified.
+
+Branch initialization and initial replay preserve FIFO order: input received
+reentrantly during those callbacks waits behind the already accepted first bytes.
+For streams, that additional input shares one ordinary buffer with a 2 MiB
+logical-byte limit; exceeding it closes the line. The limit does not reject a
+previously accepted complete first delivery merely because it exceeds the sniff
+window. SniffRouter records whether incoming payloads are UDP during `Init`,
+before the selected branch can rewrite the destination context. UDP input retains
+each datagram separately and supplies the sniffer with a separate byte view.
+Its pending FIFO admits at most 2 MiB of payload, 4 MiB of buffer capacity charge,
+and 1,024 datagrams. Empty datagrams consume entry and capacity allowance.
+Exceeding any limit closes only initialized sides. Replay preserves each
+datagram's contents, boundaries and order, including startup reentry. Once startup
+replay finishes, later payloads pass through without a SniffRouter output queue.
+
+### TLS SNI Routing and Nginx Camouflage
+
+`SniffRouter` can be placed **before** `TlsServer` to inspect the TLS ClientHello SNI and route matching domains to a protected TLS termination pipeline, while falling back all other connections to a real cover service (such as an nginx HTTPS server).
+
+```text
+TcpListener :443 -> SniffRouter
+                      |-- route (expected SNI) -> TlsServer -> VlessServer -> ...
+                      `-- default (unmatched)  -> TcpConnector -> real nginx :443
+```
+
+Configuration example:
+
+```json
+{
+  "name": "sniff-router",
+  "type": "SniffRouter",
+  "settings": {
+    "routes": [
+      {
+        "domain": "vpn.example.com",
+        "detection": "tls",
+        "next": "protected-tls-server"
+      }
+    ]
+  },
+  "next": "nginx-fallback-connector"
+}
+```
+
+#### Key Deployment Aspects
+
+- **Matching SNI**: Connections presenting a valid TLS ClientHello with an SNI matching the configured domain route to `protected-tls-server`.
+- **Default Fallback**: Connections with mismatched SNI, absent SNI, unparseable input, or plaintext HTTP on the TLS port route to top-level `next` (`nginx-fallback-connector`).
+- **Why a Real Nginx TLS Fallback**: Routing default traffic to a real nginx HTTPS listener ensures unknown SNI handshakes, no-SNI handshakes, and plaintext HTTP receive authentic nginx responses and error pages (such as HTTP 400 "The plain HTTP request was sent to HTTPS port"), avoiding synthetic handshake rejection fingerprints.
+- See `tests/examples/vless_tls_sni_camouflage_server.json` for a complete server example.
+
+### Target Branches
+
+Each route `next` or `target` is the name of a real node in the same config.
+
+At chain construction time, SniffRouter folds route targets into its own chain
+so that:
+
+- target nodes get per-line state slots
+- downstream traffic from target branches returns through SniffRouter
+- lifecycle callbacks remain composable
+
+Target rules:
+
+- the target node must exist
+- the target cannot be the SniffRouter itself
+- the target branch must not already be bound to an incompatible previous node
+- sharing a chain does not make a node inside another configured branch a valid
+  target; the default branch and repeated explicit targets remain valid,
+  including their private inserted helpers
+- the target may be the same node as top-level `next`
+
+Use a `Bridge` target when the branch lives elsewhere in the config.
+
+### Advanced: Reverse-Tunnel Handshake Routing
 
 This feature is only for a reverse-tunneling topology that actually contains
 `ReverseClient` and `ReverseServer`. It is not a general “send traffic backward”
@@ -543,3 +543,45 @@ Placement and buffering rules:
 - Strip any fronting proxy's PROXY-protocol header before SniffRouter.
 - `Router` does not currently have this detector; this is a current capability
   difference, not a reason to use this setting in ordinary routing chains.
+
+## Implementation details
+
+### Lifecycle Behavior
+
+Source-backed behavior:
+
+| Callback | Behavior |
+| --- | --- |
+| upstream `Init` | Initializes SniffRouter line state only. It does not initialize a branch yet. |
+| first upstream `Payload` | Buffers bytes, classifies routes, initializes selected target or default `next`, replays buffered bytes. |
+| later upstream `Payload` | Goes directly to the selected target or default `next`. |
+| upstream `Pause` / `Resume` | Forwarded to the selected branch, including duplicates; ignored before selection. They do not gate payload replay. |
+| upstream `Est` | Forwarded only to the default branch. Route targets are often adapter/server nodes where upstream `Est` is not valid. |
+| upstream `Finish` | Destroys local line state and finishes the selected target/default branch if one exists. |
+| downstream `Payload` / `Pause` / `Resume` / `Est` | Forwarded back to the previous node. |
+| downstream `Finish` | Destroys local line state before forwarding finish to the previous node. |
+
+Pause/Resume are advisory in both directions. SniffRouter keeps no consumer-pause
+state and does not wait for Resume to finish branch startup or deliver ready input.
+
+After default-branch Init returns and initial replay settles, SniffRouter destroys
+and zeros its line state and permanently bypasses itself on that line. Configured
+target routes remain active for branch dispatch and upstream Est suppression,
+including a configured target equal to top-level `next`. Bypass does not change
+the selected destination or remove downstream nodes from the chain.
+
+### Node Metadata
+
+SniffRouter does not prepend protocol headers and does not need left padding.
+
+Source-backed metadata:
+
+| Property | Value |
+| --- | --- |
+| node flags | `kNodeFlagSupportsSplice` |
+| `can_have_prev` | `true` |
+| `can_have_next` | `true` |
+| `layer_group` | `kNodeLayer4` |
+| `layer_group_prev_node` | `kNodeLayer4` |
+| `layer_group_next_node` | `kNodeLayer4` |
+| `required_padding_left` | `0` bytes |

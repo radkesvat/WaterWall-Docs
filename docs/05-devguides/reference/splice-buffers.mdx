@@ -1,0 +1,495 @@
+---
+sidebar_position: 2
+title: "Splice buffers and socket I/O"
+description: "Private-pipe representation, bounded inventory, conversion, recycling, and socket I/O."
+---
+
+# Splice buffers and socket I/O
+
+Read [Part 3](../part3-buffers-and-padding.mdx) for ordinary geometry and the shared ownership contract. Read this reference before interpreting, moving, materializing or releasing splice payloads.
+
+## Splice payloads: kSbufFlagSplice {#splice-payloads-ksbufflagsplice}
+
+A splice allocation keeps the common 32-byte `sbuf_t` header and exactly
+32 bytes of control storage plus reserved left padding. Metadata at
+`head + initial_headroom` contains its `int pipefd[2]` and actual kernel capacity.
+A complete `sbuf_t *` is itself the master-pool entry: there is no separate pipe
+record or entry pointer.
+`kSbufFlagSplicePooled` identifies fixed inventory entries and remains set while
+cached or awaiting release after retirement. No source socket or WIO is retained.
+
+`sbufSplicePoolInitialize(capacity_limit, pipe_capacity, max_pipe_count, padding)`
+runs during exclusive startup, after every configuration's chains have finalized
+padding and before any prepare/start hook or producer runs. It freezes the aligned
+padding and configures empty master storage and the capacity/count ceilings. It
+returns whether configuration succeeded and allocates no buffers or pipes.
+Checkout reuses existing entries first, then creates only the missing requested
+batch under a shared growth mutex. Only nonblocking, close-on-exec pipes meeting
+the required capacity and remaining aggregate budget enter the inventory; account
+their actual kernel-reported capacity. A pipe creation or sizing refusal stops
+that refill, retains earlier successes and delays further creation attempts for
+one second across all workers. Ordinary-buffer fallback remains available.
+Heap allocation follows the
+[fatal policy](../part5-tunnel-anatomy.mdx#heap-allocation-failure).
+
+Production requests 1 MiB pipes. The process-wide capacity ceiling follows the
+RAM profile:
+
+| Profile | Capacity ceiling |
+| --- | --- |
+| S1 (`minimal` / `ultralow`, numeric 0/1) | 32 MiB |
+| S2 (numeric 2) | 64 MiB |
+| M1 (`client`, numeric 3) | 128 MiB |
+| M2 (`client-larger`, numeric 4) | 256 MiB |
+| L1 (numeric 5) | 384 MiB |
+| L2 (`server`, numeric 6) and higher internal profiles | 512 MiB |
+
+When a successful initial memory snapshot is available, cap this ceiling at one fifth
+of `effective_total_bytes`: host RAM bounded by every applicable visible finite
+cgroup limit. Use total capacity, never free/available RAM, and round down to
+whole 1 MiB pipes. The resulting ceiling may be below 32 MiB or zero. If memory
+detection is unsupported or unavailable, retain the profile ceiling and emit a
+diagnostic. Freeze the budget immediately after global-state construction; its
+initial total remains usable even if startup has outlasted the sampler's freshness
+window. Do not recalculate it from runtime pressure samples. Empty pipe
+capacity does not reserve all corresponding payload memory.
+
+The shared inventory owns one `master_pool_t` with room for every permitted entry,
+so cache overflow cannot close a healthy pipe.
+Each worker buffer pool caches at most eight complete empty splice buffers,
+independently of its ordinary cache width. A local miss takes up to four existing
+entries from the master or bounded lazy growth; a partial batch is valid.
+`masterpoolTryGetItems()` itself never allocates missing entries. On local cache overflow, four entries return to the
+master before retaining the new return. These limits count unused cached buffers,
+not active buffers held by a worker. Local plus master plus active entries never
+exceed the admitted inventory. Healthy entries remain allocated until final
+teardown. Lifetime admitted bytes/count enforce the growth limits separately
+from current usable bytes/count, so retiring a failed pipe does not permit a
+replacement.
+
+If both the requesting worker's cache and the master are empty and bounded growth
+cannot supply an entry, checkout returns `NULL` with `ENOBUFS`, even when another
+worker retains unused cached entries.
+Unsupported builds use `ENOSYS`. The caller chooses whether to defer reading or
+use ordinary storage; existing I/O paths use ordinary fallback where possible.
+There is no cross-worker cache stealing or waiting for a return.
+
+Every pooled buffer retains its original aligned `initial_headroom`. Inventory
+padding is shared through `GSTATE.splice_inventory`. Allocation, recycling,
+direct destruction and padding updates reject a mismatch with a fatal diagnostic in every build,
+before interpreting metadata using an altered offset. `data` may still move
+within advertised headroom. `sbufCreateSplice(pad_left)` only allocates an unmanaged
+empty representation; it cannot acquire or create an inventory pipe. Its separate
+geometry is useful for explicit representation fixtures, not inventory growth.
+
+`kSbufFlagSplice` identifies the splice representation and stays set while cached.
+Use the inline `sbufIsSplice(buf)` helper to query it on a valid buffer; it does
+not inspect payload bytes or require a pipe syscall.
+Any claimed body bytes must already be in the wrapper's private pipe. There is
+no separate body-location flag. An empty body may have an uninitialized pipe
+or an existing empty pair; empty-body helpers need no pipe creation.
+The real prefix occupies reserved headroom:
+
+```text
+prefix_bytes = sbufGetInitialHeadroom(buf) - sbufGetHeadroom(buf)
+body_bytes   = sbufGetLength(buf) - prefix_bytes
+```
+
+Length and capacity describe logical payload, not resident bytes. Neither
+`data + len` nor `head + capacity` may be used as a resident end for a splice
+buffer. `sbufShiftRight()` may consume only resident prefix bytes. After the last
+prefix byte, its returned pointer is at `head + initial_headroom`, the metadata
+boundary, even when the logical body is nonempty. Do not dereference it as body
+payload. Body consumption reduces length and logical capacity without moving
+`data`; use the dedicated pipe helpers. Prepending within advertised padding
+is permitted. Inspecting or overwriting the kernel-backed body or control storage
+through generic byte accessors is not permitted; those accessors do not add
+splice checks. Opaque synchronous forwarding and size accounting remain valid.
+
+`sbufGetResidentView()` pairs the current data pointer with the addressable
+prefix of a splice buffer, or the full active payload of an ordinary buffer.
+`sbufGetResidentPrefixLength()` supplies that same resident bound when no pointer
+is needed. A body without a prefix has a zero-length view at the metadata
+boundary even when its logical length is positive; accessing the view does not
+read or consume the private pipe. Reacquire this borrowed snapshot after mutation.
+After successful pipe I/O, `sbufSpliceConsumeBody(buf, bytes)` updates length and
+logical capacity together
+without moving the cursor. This accounting helper does not read or discard pipe
+bytes itself; use it only for bytes already removed from the private pipe.
+
+`sbufEnsureOrdinary(pool, buf)` returns ordinary input unchanged. For exclusively
+owned splice input it materializes the complete resident prefix and private-pipe
+body into best-fit ordinary storage with the pool's large-buffer padding, then
+recycles the source wrapper. The caller owns only the returned buffer. No callbacks
+occur, and allocation follows `bufferpoolGetBestFit()`'s fail-fast contract. The
+checked counterpart, `sbufTryEnsureOrdinary(pool, buf)`, returns `NULL` when the
+destination geometry cannot be represented, leaving the source unchanged and
+caller-owned. Allocation otherwise retains the pool's fail-fast behavior.
+HalfDuplexServer uses this checked helper so refusal still closes its association
+without consuming the rejected input. The node chooses when ordinary storage is
+needed; custom framing, range extraction, and pre-conversion retained-charge
+checks keep their specialized conversion paths.
+
+### Mode selection and pipe-backed reads {#mode-selection-and-pipe-backed-reads}
+
+The core `misc.splice` boolean defaults to `true`. Setting it to `false` keeps
+`chain->supports_splice` off for every chain. Finalization evaluates this startup
+policy after topology expansion, alongside platform support, absence of packet
+nodes, and splice support from every node. Enabling the option does not override
+those eligibility checks or change node capability flags.
+
+When splice is enabled on a supported Linux build, core startup first tries to
+raise `fs.pipe-user-pages-soft` to the smaller of the calculated capacity ceiling converted
+to system pages and a finite `fs.pipe-user-pages-hard`. An unlimited hard limit
+(`0`) does not reduce the target. Page conversion rounds up if needed. These
+live system-wide settings govern each user's aggregate pipe-page allowance;
+they are not per-process resource limits. An unlimited soft limit (`0`), or a
+soft value already at or above the target, causes no change. Read/parse/write
+and page-size-query failures are nonfatal. The hard limit and `fs.pipe-max-size`
+are never changed, and no persistent sysctl configuration is written. A
+successful increase remains in effect after WaterWall exits.
+
+Core constructs global state and tunes pipe limits. `sbufSplicePoolPrepare()`
+publishes the small shared control object before imports can copy global state,
+without allocating buffers or pipes. Its heap allocation follows the fatal policy;
+unsupported builds have no inventory. Core then builds all configurations
+with `nodemanagerBuildConfigFile()`. Chain finalization accumulates the maximum
+padding across configurations. The core configures the empty inventory with that
+padding, then `nodemanagerStartConfigs()` admits packet bootstrap, prepares all
+configurations, and starts producers. `GSTATE.splice_inventory` owns the master,
+capacity/count ceilings, live count/capacity, growth synchronization, immutable
+padding and optional discard descriptor. State copies
+share this object even when taken before final padding is known. Final inventory
+configuration fills that same object; it never replaces it. Padding is unset during
+exclusive configuration and frozen before any checkout. State copies do
+not copy counters or create another inventory.
+In addition to the capacity budget,
+the pipe count is capped at one eighth of the remaining descriptor allowance:
+subtract current open descriptors from the process's soft `RLIMIT_NOFILE`, then
+divide by eight. Its two descriptors per pipe therefore use at most one quarter
+of the allowance still available at startup. The Linux descriptor scan includes
+its own temporary descriptor conservatively; an unavailable limit or scan leaves
+the inventory empty. Kernel resource limits may reduce successful acquisition
+further. Startup reports the configured capacity ceiling and zero allocation;
+`sbufSplicePoolCapacityLimit()` exposes the immutable byte ceiling.
+`sbufSplicePoolCount()` and `sbufSplicePoolCapacity()` expose current usable
+inventory, including pipes leased to buffers. Retiring a failed pipe reduces
+these values; no replacement is created. Disabled splice skips both the sysctl
+operation and inventory allocation.
+
+`wioEnableSplice()` and `wioDisableSplice()` select the read mode on the WIO's
+owning worker. The WIO must be open. Selection may change before or after reads
+start, including from a read callback; no read stop/restart is needed. The next
+read observes the selected mode. Already delivered buffers, retained private
+pipes, and queued writes keep their representations and ownership. Writes
+dispatch by the buffer's representation, independently of the read mode.
+Enabling on supported builds returns zero without creating a pipe; unsupported
+builds return `-1` with `ENOSYS`. New descriptor adoption resets the mode.
+
+A normal line has two one-way ordinary-read preferences, initially clear:
+
+- `linePreferOrdinaryReadUpstream(l)` requests ordinary source reads that produce
+  upstream payload: TcpListener applies it to its accepted socket.
+- `linePreferOrdinaryReadDownstream(l)` requests ordinary source reads that produce
+  downstream payload: TcpConnector applies it to its connected socket.
+- `linePreferOrdinaryReadBoth(l)` requests both directions on the same line by
+  calling the two directional helpers.
+
+Call these helpers on the live line's owning worker. Requests may occur during
+Init or later, are idempotent, and remain set for that exact line's lifetime.
+There is no clear operation: one node must not undo another node's preference.
+The `linePrefersOrdinaryReadUpstream()` and `linePrefersOrdinaryReadDownstream()`
+queries expose the flags. A clear flag permits the adapter's normal splice policy;
+it never overrides chain eligibility or the core setting.
+
+TcpListener initially selects splice only for an eligible finalized chain, then
+applies its preference after Init and before reading. TcpConnector consults its
+preference when adopting the socket and again before connected reads start.
+Both adapters also apply preferences at receive and payload/write callback entry,
+including queued payload, write completion and read Resume. Applying a preference
+only disables splice; it never re-enables it. TcpListener owns its normal line;
+TcpConnector borrows it. These two sockets can share the same line and consult
+different flags. No WIO pointer or ownership is stored in the line header.
+
+These preferences are advisory, not representation guarantees. The receive
+callback runs after its input was read: that delivery can still be splice, and
+a preference requested while processing it may only be noticed on the following
+receive. Nodes must still handle both representations and must not use the flag
+as permission to inspect private pipe bytes as ordinary memory. Preferences do
+not propagate to associated lines: a Mux child cannot disable its shared parent's
+socket, and Mux need not materialize child payload because of a preference.
+Choosing ordinary reads for a short parsing phase still applies for the rest of
+the line; there is no automatic restoration after a handshake.
+
+For NIO TCP splice reads, the read loop checks out a splice wrapper with its
+private pipe already initialized by the pool and calls `splice()` directly. Each
+request uses `bufferpoolGetSplicePayloadLimit()`, independently of ordinary
+allocation sizes: 1 MiB in every memory profile.
+There is no socket `FIONREAD` query before a
+successful splice delivery. The socket and pipe are nonblocking, and the transfer
+happens **before invoking the Payload callback**.
+
+Production pipe capacity and the read limit are both 1 MiB. A full-sized pipe
+does not promise a full-sized transfer: pipe slot layout and available input
+can still produce a shorter result. Initialized pipes continue consuming their
+per-user capacity allowance and two descriptors while idle in the inventory.
+
+Only the actual positive splice result is published as the body length. Logical
+capacity becomes left padding plus that count; `kSbufFlagSplice` stays set.
+A positive short splice produces a smaller valid buffer; remaining socket bytes
+are handled by later reads. The requested count is an upper bound, not a promise
+of a full-size transfer.
+
+`EINTR` retries the transfer. On `EAGAIN` or a zero result, the empty wrapper is
+recycled and the loop attempts one ordinary nonblocking receive through the
+large-buffer path. TCP urgent data can stop splice at the urgent boundary while
+`recv()` can advance and deliver subsequent ordinary bytes. With a peer FIN
+already received, splice can even return zero at that boundary before those bytes
+are drained. The ordinary receive confirms EOF rather than treating a zero splice
+result alone as proof that the stream has no remaining data.
+
+A successful fallback delivers ordinary bytes with the actual received length.
+Ordinary `EAGAIN`/`EINTR` returns to the event loop; ordinary zero closes the stream.
+Other splice errors recycle the wrapper and follow normal read-error closure.
+If the inventory cannot reuse or create a pipe within its limits, checkout
+returns `NULL` with `ENOBUFS`; the read loop also falls back to an
+ordinary receive. None of these fallbacks has consumed socket bytes in the splice attempt.
+Splice mode stays enabled for later reads.
+
+These ordinary fallbacks take the pool's large buffer directly without a socket
+`FIONREAD` query. Successful splice reads and ordinary fallbacks leave the WIO's
+ordinary TCP receive tier unchanged. When splice is disabled or unsupported,
+TCP follows the [small-to-large receive policy](../part3-buffers-and-padding.mdx#ordinary-tcp-and-udp-receive-sizing).
+Linux UDP retains its size hint; other socket types retain their allocation policy.
+
+The common NIO event handler checks admission before entering the read path;
+the read path checks again before delivery. If shutdown suppresses delivery
+after a successful splice, WIO drains and recycles the
+still-local wrapper. A missing read callback also releases the undelivered buffer.
+After invoking the callback, the read path accesses neither the buffer nor the
+source WIO. The callback may close/free the source immediately.
+
+There is no FD-backed wrapper state, socket reservation, or post-callback source
+reference check. WIO owns its primary descriptor directly; emitted buffers
+have no dependency on that descriptor's lifetime.
+
+### Independent private bodies {#independent-private-bodies}
+
+```text
+Socket -> this buffer's private pipe -> Payload callback
+
+Buffer A -> private pipe A: [AAA]
+Buffer B -> private pipe B: [BBB]
+```
+
+Every emitted splice body is independent as soon as the callback receives it.
+Splice-aware code may retain the whole buffer or a partially consumed remainder
+for later use, including after source WIO reclamation. No preparation call
+or source reference is needed before deferral. Consume the private body through
+the dedicated pipe helpers and preserve exclusive buffer ownership.
+
+Converting B first reads BBB and leaves AAA intact, including when A is queued.
+Final stream delivery must still preserve A-before-B order. Pool access remains
+worker-affine; an explicitly transferred wrapper may use its receiving worker's
+pool. BufferQueue preserves these owned entries. The fixed-header splice stream accepts ordinary and splice entries together;
+BufferStream is ordinary-only. Callers must not scan private-pipe metadata as payload.
+
+### Conversion and partial reads {#conversion-and-partial-reads}
+
+`sbufSpliceMaterializeToBuffer(buf, dest, pool)` replaces an ordinary
+destination payload with the real prefix and body, preserving the source cursor
+and total length. It checks destination capacity through sbuf accessors; the
+destination's allocation geometry and left padding remain unchanged.
+It recycles the consumed wrapper, which callers
+must not access afterward.
+
+`sbufSpliceReadToBuffer(buf, dest, bytes)` appends exactly the requested
+prefix/body bytes. It validates source length, cursor, and destination append
+space, without growing storage or consuming destination headroom. Zero bytes
+is a validated no-op. The caller retains both buffers and returns the wrapper
+through `bufferpoolReuseBuffer()` when finished, discarding any unconsumed remainder.
+
+Router and SniffRouter establish an ordinary-memory boundary while their route
+state is undecided: each complete splice delivery is materialized before pending
+storage or classification, preserving onward pool padding. Their pending buffers
+remain ordinary and are replayed intact when the selected branch is initialized.
+After route commitment, both callback directions forward opaque buffers unchanged.
+Metadata-only Router rules can commit during Init and preserve the first splice
+delivery. Complete-delivery materialization preserves the existing sniff-window
+semantics, including classification of complete headers larger than the
+incomplete-input cutoff.
+
+TLS protocol/SNI sniffing reassembles a fragmented ClientHello in bounded caller
+scratch without modifying the retained wire bytes. The SNI result borrows either
+the original single-record payload or that scratch; both must remain alive until
+the caller consumes the view. Router and SniffRouter use this sniffing path.
+`tlsclienthelloParseRecord()` retains its single-record offsets and semantics for
+callers that inspect or rewrite encoded records.
+
+StreamFragmenter's optional ClientHello inspection consumes only the bounded
+initial wire prefix through these range helpers, including private-pipe and
+resident-prefix-plus-pipe input. Its ordinary accumulator retains the original
+record headers for byte-identical replay on unsupported framing or deadline
+expiry. The replacement is reserved alongside the accumulator before record
+headers are rewritten; an already-admitted opaque suffix remains in the normal
+FIFO budget. Later opaque splice wrappers retain their direct forwarding path.
+
+Its candidate allocation requests start at 4 KiB and grow to at most 393,216
+bytes; rewriting adds at most 320 bytes. A pool may supply a larger buffer, whose
+actual capacity still counts against the budget. Generic fragments come from
+jobs already admitted under the 8 MiB logical-byte limit. With the pool's
+validated, aligned padding, these requested sizes
+have representable allocation geometry on supported targets. Keep budget and
+timer refusals, but do not add recoverable heap or geometry failures to these
+bounded allocations. At rewrite commitment, allocating the computed rewrite
+length guarantees the helper's output capacity; assert that result while keeping
+the rewrite call outside the assertion and the helper's checked capacity API intact.
+
+Both read helpers require `kSbufFlagSplice` and read only
+from the wrapper's private pipe. A nonempty body requires an initialized pair.
+Positive short reads accumulate until the required byte count is reached, and
+`EINTR` retries without losing progress. Invalid flags/bounds, EOF, or any other
+read error before completion use `LOGF()` and `abortProgramNow(1)`. This includes
+`EAGAIN`: the private pipe must already hold all claimed bytes, so an incomplete
+body cannot be deferred until more bytes arrive. These exact-size helper reads
+are distinct from the read loop's socket-to-pipe transfer, whose actual positive
+result determines delivery length.
+Unsupported conversion and partial reads abort.
+
+### Recycling, discard, and physical destruction {#recycling-discard-and-physical-destruction}
+
+`bufferpoolReuseBuffer(pool, buf)` takes exclusive ownership and discards remaining
+payload. Healthy inventory entries retain both descriptors and return to the local
+cache or shared master; pool bypass returns directly to the master. Unmanaged
+wrappers are freed, and failed inventory entries are retired without replacement.
+WIO cleanup, BufferQueue destruction, `lineReuseBuffer()` and `reuseBuffer()` share
+this behavior. Ordinary cache overflow never controls splice inventory lifetime.
+
+A wrapper claiming zero length must already have an empty pipe. The pool uses
+`sbufSpliceIsReusable(buf)` to check kernel emptiness with `FIONREAD` only when
+`BUFFER_POOL_DEBUG == 1`, including when pooling is bypassed. Failure uses
+`LOGF()` and `abortProgramNow(1)` before the pipe becomes available to another
+buffer. This check is independent of `NDEBUG`. With pool debugging disabled,
+recycling trusts the consumption helpers' byte accounting. Resetting sbuf
+fields never empties a pipe.
+
+`sbufSpliceDiscard()` requires exclusive ownership and leaves an empty wrapper
+without freeing it or returning a healthy lease. For nonempty payloads it drops
+the real prefix and drains the private pipe with nonblocking `splice()` to
+`/dev/null`, retrying `EINTR` and accepting positive short transfers until
+`EAGAIN` confirms emptiness. Startup opens one optional discard descriptor after
+configuring the empty inventory; it stays open and unchanged through all worker and foreign-thread
+buffer cleanup and closes at final inventory destruction. If opening the sink
+fails or a splice fails with an error other than `EINTR` or `EAGAIN`, discard
+falls back to nonblocking reads with bounded scratch storage for that call.
+The read fallback also retries `EINTR` and drains until `EAGAIN`. EOF or a failed
+read closes both owned ends and retires the inventory entry permanently.
+A later checkout may borrow another remaining pipe but must never recreate
+the retired one.
+
+`sbufDestroySplice()` drains and returns a healthy complete inventory buffer to the
+global master without accessing a worker-local pool. It physically frees retired
+entries and unmanaged wrappers. This is also `sbufDestroy()`'s splice path, so
+foreign-thread cancellation safely returns scarce resources. There is a separate
+physical destructor for final inventory destruction; it cannot recursively recycle
+entries into the master being destroyed.
+
+Local caches keep their splice flags and pipe metadata. Their entries count as
+checked out from the master until returned to it. Worker/device pool destruction
+flushes them into the global master. After workers, callbacks, active buffers and
+local caches have settled, `sbufSplicePoolDestroy()` requires zero outstanding
+entries, closes remaining pipes, destroys the master and discard descriptor, and
+frees and clears the owning global-state pointer. Imported state copies borrow the
+same inventory and must finish before owner destruction. Outstanding entries are
+a fatal lifecycle invariant violation.
+
+### Writing splice payloads {#writing-splice-payloads}
+
+Supported NIO TCP writes accept splice buffers whose body bytes are already in
+their private pipes. Empty and prefix-only wrappers need no initialized pipe.
+Writing or queueing never reads the source socket. Real prefixes use send before bodies
+use nonblocking splice to the destination. When supported, TCP prefix sends use
+`MSG_MORE` when that same buffer has a nonempty private-pipe body, including
+partial-prefix retries. Ordinary and prefix-only sends also use `MSG_MORE` when
+nonempty bytes follow in the same socket's WIO queue; body splices then use
+`SPLICE_F_MORE` alongside `SPLICE_F_NONBLOCK`. Each queued attempt recomputes
+whether bytes remain beyond the current buffer, so the last send/body clears
+the hint. The hint permits TCP to coalesce adjacent writes. They remain separate
+system calls; the hint does not guarantee packet boundaries or immediate
+transmission if a following write stalls. UDP has its separate datagram contract.
+
+`wioWriteWithHint()` lets a caller advertise nonempty bytes following in its
+current drain to the same TCP socket. TcpListener and TcpConnector derive this
+from their pause queue's remaining byte count after popping the current entry,
+both on resumed drains and Finish flushes. Empty entries do not count. This hint
+applies only to the immediate write attempt; it is never stored on a queued
+buffer. After a partial write or yield, WIO retries use only their own actual
+queue, which may split a batch but cannot retain a stale caller hint. Ordinary
+`wioWrite()` supplies no caller hint. Unsupported backends ignore it.
+
+Actual combined progress drives
+logical queue accounting. Short sends, `EAGAIN`, and `EINTR` retain the remainder
+in the existing WIO FIFO, shared with ordinary writes. Queued buffers require no
+source handle and remain valid after source reclamation.
+
+Completion recycles empty wrappers. Rejection, output error, overflow, timeout,
+forced close, and teardown discard private bodies through the same cleanup path.
+Graceful TCP close drains the queue normally. Supported NIO UDP destinations
+instead use the one-datagram path below. Generic `wioWrite()` rejects splice
+input fatally on unsupported builds or destinations other than TCP/UDP;
+`wioWriteDatagram()` consumes raw-IP splice input and returns `-1` with `EINVAL`.
+The shared `udpSendBuffer()` returns `ENOSYS` for splice input on unsupported
+builds, which never enable splice chains. Callback admission and reentrancy
+follow the normal WIO contracts.
+
+### UDP datagram sending {#udp-datagram-sending}
+
+`udpSendBuffer()` in the event layer retains caller ownership of the buffer on
+all results, consumes accepted splice prefixes and actual pipe bytes, and returns
+whole-datagram success, captured error and a separate socket-retirement verdict.
+NIO and UdpStatelessSocket share it. UDP receives remain ordinary; raw-IP writes
+never gain splice support. The caller runs the complete transaction and any
+retirement on the socket's owning worker; the helper does not transfer ownership.
+The caller supplies that socket owner's buffer pool. Any materialization fallback
+uses best-fit storage with zero required left padding and returns the temporary
+buffer to the same pool on success or failure. The input remains caller-owned,
+including when it was posted from another worker.
+All sends on that socket, including ordinary sends, remain serialized across the
+transaction. No callback or other send may run while assembly is pending.
+
+One sbuf is one datagram. Prefix-only and empty splice inputs use one ordinary
+send. For nonempty bodies, send the real prefix (possibly empty) to the immutable
+explicit destination with `MSG_MORE`, transfer the entire body with
+`SPLICE_F_NONBLOCK | SPLICE_F_MORE`, then issue an empty send without `MSG_MORE`
+to commit. These empty operations do not publish extra datagrams. Do not change
+a shared socket's connection or default peer. IPv4 and mapped destinations allow
+at most 65,507 payload bytes; IPv6 allows 65,527, including resident prefixes.
+Route/MTU errors still belong to the kernel. There is no splitting or UDP retry
+queue; ordinary sends retain their one-shot policy (UdpStatelessSocket retains
+its ordinary/priming EINTR retry).
+
+Older Linux UDP sendpage implementations have a finite skb fragment limit, so a
+small logical body can still be unrepresentable when spread over many pipe slots.
+A pipe-capacity bound of at most 64 KiB limits its slot count conservatively;
+resident prefix pages reduce that budget, rounded down to a power-of-two number
+of pipe slots. For larger or unknown-capacity pipes, select full materialization and one
+ordinary send before touching the socket. Runtime UDP sends never allocate or
+resize a probe pipe. This conservative layout fallback preserves datagram
+atomicity without exceeding the fixed inventory. Pipes whose capacity proves
+the fragment bound may splice their bodies without userspace reads.
+Kernel-internal copies are still possible, and no measured performance improvement
+is promised. The fragment
+bound follows Linux's [skb fragment limit](https://github.com/torvalds/linux/blob/v5.15/include/linux/skbuff.h)
+and [UDP sendpage assembly](https://github.com/torvalds/linux/blob/v5.15/net/ipv4/udp.c);
+newer kernels use [splice-to-socket](https://github.com/torvalds/linux/blob/master/fs/splice.c).
+
+Before priming, normal errors/drop policy settles the untouched input. After
+successful priming, any short/failed splice or failed final commit retires the
+socket through its owner. A positive short count may conceal an error that
+already discarded the pending datagram, so never loop over it or send its suffix.
+Account actual pipe consumption before recycling. Never clear `UDP_CORK` or
+connect to `AF_UNSPEC` as an abort trick. The shared helper closes no FD itself;
+its caller must prevent further writes and retire through WIO after settling the
+buffer, before returning. Write/close callbacks may destroy associated lines.
+See [Part 7](../part7-shutdown-and-signals.mdx#8-lines-during-drain) for socket-owned
+peer cleanup.

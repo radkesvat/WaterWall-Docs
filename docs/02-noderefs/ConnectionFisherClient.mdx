@@ -6,11 +6,13 @@ description: "Reference documentation for the ConnectionFisherClient node."
 ---
 
 <!--
-Documentation version: 152
+Documentation version: 153
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/ConnectionFisherClient/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/ConnectionFisherClient.mdx, and all files must keep the same documentation version.
 -->
 
 # ConnectionFisherClient
+
+## Overview
 
 `ConnectionFisherClient` is the client-side peer for
 `ConnectionFisherServer`. For every incoming WaterWall line, it creates several
@@ -21,7 +23,7 @@ This is useful when the outbound path is unstable or when you intentionally want
 to race several connection attempts and keep the first path that proves it
 reached a matching `ConnectionFisherServer`.
 
-## Typical Placement
+## Typical placement
 
 Race several connections to a gateway before forwarding a local TCP service:
 
@@ -48,24 +50,11 @@ certificate and key. Each candidate performs its own TLS handshake. The server
 must receive the original `FISH?` probe after TLS decryption; keep the Fisher
 server before the service-facing connector.
 
+## Minimal practical example
 
-## What It Does
+These are node fragments; define the referenced neighboring nodes in the surrounding configuration.
 
-- Reads `settings.simultaneous-tries-perline`.
-- Creates up to that many internal child lines for each upstream `Init`; synchronous selection stops new attempts.
-- Sends upstream `Init` to `next` on every child line.
-- Sends the fixed client probe `FISH?` on every child line.
-- Waits for the fixed server reply `FISH!`.
-- Buffers upstream payload on the main line while no child has been selected.
-- Selects the first child that receives a valid reply.
-- Closes all non-selected child lines.
-- Flushes queued upstream payload to the selected child in order.
-- Bridges downstream payload from the selected child back to the main line.
-
-`ConnectionFisherClient` is a middle stream tunnel. It does not create sockets
-directly and it does not create packet lines.
-
-## Configuration Example
+### Configuration Example
 
 ```json
 {
@@ -88,7 +77,9 @@ Matching server side:
 }
 ```
 
-## Required Fields
+## Configuration
+
+### Required Fields
 
 Top-level fields:
 
@@ -101,7 +92,7 @@ Top-level fields:
 `ConnectionFisherClient` must also have a previous node in the chain. It is not
 a chain head or chain end.
 
-## Optional Settings
+### Optional Settings
 
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
@@ -109,7 +100,35 @@ a chain head or chain end.
 
 `settings` may be omitted. If present, values smaller than `1` are rejected.
 
-## Probe Exchange
+## Usage and troubleshooting
+
+### Buffering and Limits
+
+| Limit | Value | Behavior |
+| --- | --- | --- |
+| Selection timeout | `5000 ms` | Main line closes if no child is selected in time. |
+| Pending upstream payload | `2 MiB` | Main line closes if its retained protocol/order backlog exceeds this. |
+| Incomplete child reply | `4 bytes` | A complete five-byte reply is validated immediately. |
+| Coalesced reply body / selection ordering | `2 MiB` | Marker bytes do not consume this application-data allowance. |
+| Pending upstream charge | `8 MiB` | Retained allocation capacity is charged; empty TCP input is recycled. |
+| Required left padding | `0` | The client does not prepend protocol headers to existing payload buffers. |
+
+The `FISH?` probe is allocated as its own small buffer. User payload is queued
+or forwarded as existing WaterWall buffers.
+
+### Notes and Caveats
+
+- Use it with a matching `ConnectionFisherServer`.
+- It is intended for stream-style chains, not packet-line chains.
+- It creates multiple outbound candidate lines for each incoming line, so
+  increasing `simultaneous-tries-perline` also increases connection load.
+- The probe is fixed and public; use TLS, encryption, authentication, or routing
+  nodes around it when the path needs security.
+- Upstream `Est` and downstream `Init` are disabled callbacks for this node.
+
+## Advanced behavior
+
+### Probe Exchange
 
 The probe is fixed and has no configurable secret:
 
@@ -122,21 +141,7 @@ These markers only prove that the child line reached a matching
 `ConnectionFisherServer`. They are not authentication, encryption, or traffic
 integrity protection.
 
-## Line Model
-
-`ConnectionFisherClient` uses two kinds of lines:
-
-| Line | Purpose |
-| --- | --- |
-| main line | The original incoming line from the previous node. It stays on the previous side. |
-| child lines | Internal candidate lines created by the client and sent only toward `next`. |
-
-The original main line is never sent directly to `next`. Child lines are never
-sent toward `prev`. After one child is selected, the tunnel manually bridges
-payload, `Est`, `Pause`, `Resume`, and `Finish` between the main line and the
-selected child.
-
-## Selection Flow
+### Selection Flow
 
 For each upstream `Init` on the main line:
 
@@ -153,21 +158,39 @@ For each upstream `Init` on the main line:
 
 If no child validates before the timeout, the main line is closed.
 
-## Buffering and Limits
+## Implementation details
 
-| Limit | Value | Behavior |
-| --- | --- | --- |
-| Selection timeout | `5000 ms` | Main line closes if no child is selected in time. |
-| Pending upstream payload | `2 MiB` | Main line closes if its retained protocol/order backlog exceeds this. |
-| Incomplete child reply | `4 bytes` | A complete five-byte reply is validated immediately. |
-| Coalesced reply body / selection ordering | `2 MiB` | Marker bytes do not consume this application-data allowance. |
-| Pending upstream charge | `8 MiB` | Retained allocation capacity is charged; empty TCP input is recycled. |
-| Required left padding | `0` | The client does not prepend protocol headers to existing payload buffers. |
+### What It Does
 
-The `FISH?` probe is allocated as its own small buffer. User payload is queued
-or forwarded as existing WaterWall buffers.
+- Reads `settings.simultaneous-tries-perline`.
+- Creates up to that many internal child lines for each upstream `Init`; synchronous selection stops new attempts.
+- Sends upstream `Init` to `next` on every child line.
+- Sends the fixed client probe `FISH?` on every child line.
+- Waits for the fixed server reply `FISH!`.
+- Buffers upstream payload on the main line while no child has been selected.
+- Selects the first child that receives a valid reply.
+- Closes all non-selected child lines.
+- Flushes queued upstream payload to the selected child in order.
+- Bridges downstream payload from the selected child back to the main line.
 
-## Lifecycle Behavior
+`ConnectionFisherClient` is a middle stream tunnel. It does not create sockets
+directly and it does not create packet lines.
+
+### Line Model
+
+`ConnectionFisherClient` uses two kinds of lines:
+
+| Line | Purpose |
+| --- | --- |
+| main line | The original incoming line from the previous node. It stays on the previous side. |
+| child lines | Internal candidate lines created by the client and sent only toward `next`. |
+
+The original main line is never sent directly to `next`. Child lines are never
+sent toward `prev`. After one child is selected, the tunnel manually bridges
+payload, `Est`, `Pause`, `Resume`, and `Finish` between the main line and the
+selected child.
+
+### Lifecycle Behavior
 
 Before selection:
 
@@ -199,20 +222,13 @@ and nested application input appends behind older retained bytes. Empty stream
 buffers need no retained entry. Main-side reply Pause is recorded before selection
 and applied to the chosen backend after its handshake, so it cannot stall FISH!.
 Temporary downstream ordering during selection also has a 2 MiB bound and keeps
-coalesced reply bytes before reentrant replies. Close settles all retained bytes
-and exact child/main references.
+coalesced reply bytes before reentrant replies. On orderly main Finish, a
+validated winner takes ownership of the admitted upstream FIFO. It drains in
+order as transport permission allows, then receives one Finish. The drain ends
+on winner closure, worker shutdown or 30 seconds from main Finish. Without a
+validated winner, main Finish aborts setup.
 
-## Notes and Caveats
-
-- Use it with a matching `ConnectionFisherServer`.
-- It is intended for stream-style chains, not packet-line chains.
-- It creates multiple outbound candidate lines for each incoming line, so
-  increasing `simultaneous-tries-perline` also increases connection load.
-- The probe is fixed and public; use TLS, encryption, authentication, or routing
-  nodes around it when the path needs security.
-- Upstream `Est` and downstream `Init` are disabled callbacks for this node.
-
-## Splice Support and Setup Retirement
+### Splice Support and Setup Retirement
 
 Both nodes accept ordinary buffers and private-pipe payloads. Complete deliveries entering handshake
 or selection parsing are materialized with `sbufEnsureOrdinary()`; application FIFOs retain buffers
@@ -226,7 +242,7 @@ and replay settle. Ready payloads preserve their buffers without inspection, mat
 backlog limit. Server backend initialization still waits for the first application payload, so losing
 candidates create no backend connection. Neither node requests ordinary reads for the established TCP stream.
 
-## Node Metadata
+### Node Metadata
 
 Source-backed metadata:
 

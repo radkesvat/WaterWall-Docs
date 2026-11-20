@@ -5,7 +5,7 @@ sidebar_label: "Part 4: Packet Tunnels"
 description: "Packet-line semantics, pure packet tunnels, packet/stream bridges, packet-line initialization, and paired-tunnel direction rules for layer-3 work."
 ---
 <!--
-Documentation version: 168
+Documentation version: 173
 -->
 
 # Part 4: Packet Lines & Packet Tunnels
@@ -20,6 +20,14 @@ Read this part before touching anything under a layer-3 node. Source of truth:
 `ww/net/chain.c`, `ww/net/packet_tunnel.c`, `ww/net/line.h`, and the packet
 tunnels themselves.
 
+## Reading path
+
+- [Packet ownership and runtime Finish](#what-a-packet-line-is)
+- [Choose the packet-tunnel or bridge role](#two-kinds-of-packet-tunnels)
+- [Initialization and paired callback directions](#packet-line-initialization)
+- [Device, checksum and fragment reference](#device-implementation-boundaries)
+- [Packet validation](#testing-packet-tunnels)
+
 ## What a Packet Line Is
 
 A packet line is a real `line_t`, but unlike a connection line it is:
@@ -32,7 +40,7 @@ A packet line is a real `line_t`, but unlike a connection line it is:
 
 "Worker-owned" here means persistent, worker-local packet-pipeline state. It
 does not make a node on the left or right its connection owner. Normal lines
-created inside a packet chain, including WireGuardDevice's companion transport
+created inside a packet chain, including WireGuardClient's owned carrier
 lines and UdpStatelessSocket's incoming peer lines, still belong to their exact
 creators and close normally. Classify the actual `line_t`, not just its worker
 ID or whether the chain contains packet nodes.
@@ -119,7 +127,7 @@ void tundeviceTunnelDownStreamFinish(tunnel_t *t, line_t *l)
 Examples include `TunDevice` and `RawSocket`; the upstream packet sides of
 `PacketsToConnection` and `PacketsToStream`; the downstream packet side of
 `StreamToPackets`; `PacketSplitStream`; the packet modes of `TesterClient` and
-`TesterServer`; and the packet-line role of `WireGuardDevice`. These are
+`TesterServer`; and the packet-line role of `WireGuardServer`. These are
 per-handler classifications, not labels for the whole tunnel: the same bridge
 may own normal lines on its other side and close those normally.
 
@@ -144,9 +152,9 @@ its hold with received pressure for the same producer; a documented packet
 endpoint may absorb signals. Keep packet loss/admission policy explicit and never destroy the
 persistent packet line to implement per-flow pressure handling.
 
-`PingClient` and `PingServer` inherit these lifecycle pass-throughs from
+`PingClient`, `PingServer`, `Ping6Client` and `Ping6Server` inherit these lifecycle pass-throughs from
 `packettunnelCreate()`. Payload support
-is a separate contract: both Ping v2 endpoints require the chain's exact worker
+is a separate contract: all four Ping/Ping6 endpoints require the chain's exact worker
 packet line for buffer ownership and worker validation. Their supported edge
 orders are:
 
@@ -157,7 +165,7 @@ RawSocket -> PingServer -> TunDevice
 
 An ordinary normal-line topology such as
 `UdpListener <-> PingServer <-> UdpConnector` is therefore not a supported Ping
-v2 composition. `packettunnelCreate()` keeps standard lifecycle pass-throughs,
+composition. `packettunnelCreate()` keeps standard lifecycle pass-throughs,
 but an implemented payload handler may still enforce a stricter packet-line role.
 
 ### Category 3 — intentional terminal absorber: handle locally and document
@@ -221,10 +229,10 @@ what does the tunnel keep on this line, and who is still waiting on it?”**
 Some nodes see **both** a persistent packet line and normal lines they own. The
 handler must decide which one it was given before doing anything:
 
-- `WireGuardDevice` is a `packettunnelCreate()` tunnel on its packet side, but it
-  also creates one **normal transport line per worker** for its encrypted side.
-  A `Finish` on a transport line is an ordinary owned-line close (destroy the
-  slot, `lineDestroy()`); a `Finish` on the packet line is a violation and aborts.
+- `WireGuardClient` owns one normal carrier on worker 0 and accepts persistent
+  worker packet lines on its inner side. `WireGuardServer` borrows ingress normal
+  lines and publishes inner packet lines. Only PTC creates/destroys connection-mode
+  inner normal lines. Packet-line Finish is fatal; carrier Finish is local.
 - `PacketsToStream` and `PacketsToConnection` anchor bridge state on the packet
   line while owning the normal lines they create behind it.
 
@@ -267,6 +275,441 @@ If you need real per-flow or per-connection lifecycle behind packet traffic,
 **create normal lines behind the packet side** — do not try to make the packet
 line behave like a connection.
 
+## Two Kinds of Packet Tunnels
+
+Not every tunnel that touches packet lines is the same kind of tunnel. There are
+two distinct categories, and they have different rules.
+
+### 1. Pure Packet Tunnels (`packettunnelCreate`)
+
+Some tunnels are created with `packettunnelCreate()` instead of `tunnelCreate()`.
+From `ww/net/packet_tunnel.c`:
+
+```c
+tunnel_t *packettunnelCreate(node_t *node, size_t tstate_size, size_t lstate_size)
+{
+    if (UNLIKELY(lstate_size != 0))
+    {
+        return NULL; // pure packet tunnels have no per-line state
+    }
+
+    tunnel_t *t = tunnelCreate(node, tstate_size, 0);
+    if (! t)
+    {
+        return NULL; // invalid or overflowing state size
+    }
+
+    // ... explicitly installs upstream Est and downstream Init forwarding ...
+    // ... installs mandatory packet-payload defaults ...
+    return t;
+}
+```
+
+Key facts:
+
+- `packettunnelCreate()` **requires `lstate_size == 0`** and returns `NULL` when
+  that contract or state-size validation fails. Heap allocation follows the
+  [fatal policy](./part5-tunnel-anatomy.mdx#heap-allocation-failure). Pure packet tunnels
+  have no per-line state, and their constructors must check the result before
+  assigning callbacks or accessing tunnel state.
+- They are expected to **override the packet payload callbacks**.
+- The default payload callbacks are intentionally invalid: they call `LOGF(...)`
+  and `abortProgramNow(1)`, so they crash loudly if you forget to override them:
+
+```c
+static void packettunnelDefaultUpStreamPayload(tunnel_t *self, line_t *line, sbuf_t *payload)
+{
+    LOGF("Unexpected call to default up stream payload for a packet tunnel, "
+         "this function must be overridden");
+    abortProgramNow(1);
+}
+```
+
+- `Init`, `Est`, `Pause`, `Resume`, and `Finish` use same-direction lifecycle
+  pass-throughs. `packettunnelCreate()` explicitly installs upstream `Est` and
+  downstream `Init` forwarding because `tunnelCreate()` rejects those events.
+  An individual tunnel overrides one
+  only when its exact handler role requires an anchoring rejection, explicit
+  forwarding, or an intentional terminal absorption as classified above.
+
+Examples: `IpOverrider`, `IpManipulator`, `PingClient`, `PingServer`,
+`WireGuardServer`.
+
+For pure packet tunnels:
+
+- Do not add connection-style line lifecycle logic casually.
+- `lstate_size == 0` does **not** mean "packet lines only". A
+  `kNodeLayerAnything` packet tunnel also carries normal connection lines.
+- Some default callbacks deliberately abort; know which ones you must override.
+
+### 2. Packet-Line Anchored Bridges (`tunnelCreate`)
+
+Other tunnels are ordinary `tunnelCreate()` tunnels that **use the worker packet
+line as an anchor** for worker-local bridge state. They cross the boundary between
+packet-oriented runtime and connection-oriented runtime.
+
+Examples and what they anchor:
+
+| Bridge | Role |
+| --- | --- |
+| `PacketsToStream` | packet line to a worker-local stream-facing line; stores that line and a read buffer |
+| `StreamToPackets` | borrowed stream lines to packet lines; each stream has a parser, with a shared source registry and per-flow return-carrier selection |
+| `PacketsToConnection` | packet traffic to lwIP to normal WaterWall connection lines behind the packet side |
+| `PacketSplitStream` | splits packet traffic across stream paths |
+
+State stored on a packet line is worker-local bridge state, not per-connection state.
+If you need closable per-connection behavior behind packet traffic, create or
+manage normal lines behind the packet line instead of closing the packet line.
+
+### Stream/packet bridge flow control
+
+`PacketsToStream` owns its normal stream lines and keeps its bridge state on each
+worker packet line. `StreamToPackets` borrows normal stream lines and stores its
+parser state on those lines; its packet lines are forwarding targets. Both are
+endpoints for the exact lines they join. Neither may use permanent tunnel bypass:
+payload still requires IPv4 boundary parsing, carrier ownership and
+mapping between different line identities.
+
+Keep their endpoint Pause state. `PacketsToStream` maps stream pressure to the
+packet source and drops additional packets while paused. `StreamToPackets`
+excludes a paused carrier from return selection and drops return packets if no
+eligible carrier remains. Repeated notifications are idempotent, not counted
+holds. Sensitive-mode Ping and Pong may cross Pause; they do not release ordinary
+packet admission or suspend the Pong deadline.
+
+After creating a live, unpaused stream line, `PacketsToStream` sends packet-side
+Resume so a Pause from an earlier carrier cannot strand the packet producer.
+Replacement Init must settle first; a Pause during Init prevents that release.
+If creation happened while handling a packet or heartbeat, settle that buffer
+before Resume can reenter and release more input. Reset, failed Init and shutdown
+do not send a recovery Resume.
+
+### Obfuscator stream and packet roles
+
+ObfuscatorClient encodes upstream and decodes downstream. ObfuscatorServer
+decodes upstream and encodes downstream, so framed traffic arriving through a
+server-side TcpListener is unwrapped before forwarding to the next application
+node. Bridge reverses callback direction; two transport-at-next Bridge legs use
+the Client role. Shared codec operations make no tunnel callbacks; wrappers keep
+same-direction publication and the exact line's lifecycle obligations.
+
+With `tls_record_header` enabled, ObfuscatorClient and ObfuscatorServer reserve
+normal-line receive state through `tunnelCreate()`. Both supported Init directions
+initialize that state before forwarding; upstream Est remains pass-through.
+Exact worker packet lines bypass this state and preserve one-packet/one-record
+validation, checksum requests, and oversized-datagram drops. Packet Finish remains
+same-direction forwarding and never destroys the packet line.
+
+Ordinary stream deliveries split into records with at most 65,535 body bytes.
+XOR and skip operate per record. One encoded aggregate is sent per delivery;
+complete received records become one decoded aggregate, with partial tails kept
+for later input. Receive retention is bounded by 2 MiB plus one maximum wire record
+(65,540 bytes), for a fixed total of 2,162,692 bytes. This is independent of
+pool sizes, RAM profile and splice settings.
+Pause/Resume use transparent defaults in both directions, including repeats.
+Complete records decode into the current aggregate without waiting for Resume;
+only an incomplete suffix remains in the read stream. XOR and record processing
+remain necessary for every payload, so these nodes do not permanently bypass.
+Aggregate
+transformation follows [Part 2's FIFO and advisory Pause rules](./part2-lines-and-callbacks.mdx#flow-control-roles-and-admission).
+Malformed records and overflow close the borrowed normal line through its owner.
+Record the Init source direction before forwarding. Error close destroys local
+state, finishes the opposite side, then the still-live source side while holding
+a line reference. This supports both upstream and downstream Init without
+destroying a right-side owner's line before left-side cleanup. Received Finish
+releases state and continues only away from its sender.
+
+## Packet-Line Initialization
+
+Packet lines are initialized differently from connection lines.
+
+For a chain whose **head is a layer-3 packet node**, the node manager sends one
+upstream `Init` on each worker's packet line during startup — **once per worker,
+not once per packet**. So packet-line `Init` is a worker/bootstrap event, not a
+connection-open event.
+
+But if a bridge relies on packet lines while the chain head is **not** itself a
+layer-3 packet node, that automatic init does not happen, and the bridge must
+trigger it. `StreamToPackets` does exactly this in `onStart()`, queueing the
+bootstrap onto every worker so packet-side tunnels see their `Init` after startup
+rather than re-entering init paths inline:
+
+```c
+static void streamtopacketsQueueWorkerPacketInit(void *worker, void *arg1, void *arg2, void *arg3)
+{
+    discard worker;
+    discard arg2;
+    discard arg3;
+
+    tunnel_t *t = arg1;
+    line_t   *l = tunnelchainGetWorkerPacketLine(tunnelGetChain(t), getCurrentWorkerWID());
+
+    if (UNLIKELY(! lineCallWithRef(l, tunnelNextUpStreamInit, t)))
+    {
+        LOGF("StreamToPackets: worker packet line died during packet-side init");
+        abortProgramNow(1);
+    }
+}
+
+void streamtopacketsTunnelOnStart(tunnel_t *t)
+{
+    for (wid_t wi = 0; wi < getWorkersCount(); wi++)
+    {
+        if (UNLIKELY(
+                sendWorkerMessageForceQueueWithCleanup(wi, streamtopacketsQueueWorkerPacketInit, NULL, t, NULL, NULL) !=
+                kWorkerMessageSubmitAccepted))
+        {
+            LOGF("StreamToPackets: failed to admit required packet-side Init on worker %u", (unsigned int) wi);
+            startupFailureRecord(1);
+            return;
+        }
+    }
+}
+```
+
+So if you create or modify a packet bridge: do not assume packet-line init
+happened automatically. Verify whether the init comes from the node manager (chain
+head is layer-3) or whether your tunnel must trigger it in `onStart()`.
+
+### External readers and packet startup
+
+**A constructor must not start a reader or enable external callbacks that can
+immediately enqueue packet delivery.** Creating an inactive device handle is
+different from bringing it up and launching its reader. If a creation/open API
+also starts reading, call that API from the later startup callback instead of
+`createHandle`. TunDevice keeps device creation and `tundeviceBringUp()` in
+`onStart`; the latter queues receive activation behind packet Init and opens worker-output
+admission on Linux and Windows. Darwin/BSD retain their external reader.
+Native output remains deferred onto event workers.
+
+The risk is initialization order, even when workers have not started dispatching.
+`createHandle` runs before chain finalization establishes packet lines, line-state
+offsets and buffer padding. An early reader can create buffers with insufficient
+padding or enqueue delivery before the packet side's `Init`. Workers wait behind
+`workers_run_flag` until startup finishes, but queued messages retain their order:
+a Payload queued ahead of Init can later access uninitialized state and crash.
+Do not rely on a quiet device, low packet rates, or sleeps to avoid this.
+
+Use this startup sequence:
+
+1. In `createHandle`, validate settings and allocate inactive state. Keep reader
+   threads and automatic callback delivery disabled.
+2. In `onPrepare`, finish setup that needs finalized topology or buffer padding,
+   while keeping the reader inactive.
+3. In `onStart`, bind the publication target and finish reader-visible settings,
+   buffer geometry and lifetime gates. Ensure the required packet Init has been
+   successfully queued for every destination worker **before** starting the reader.
+   Required bootstrap admission failure must fail startup; do not start reading.
+
+For a layer-3 head, NodeManager queues Init after finalization and before
+`onPrepare` and `onStart`. For a stream-headed chain, a bridge such as
+StreamToPackets or ConnectionToPackets queues its packet bootstrap in `onStart`.
+If another node owns that bootstrap, explicitly establish its ordering before
+reader activation; choosing `onStart` alone does not establish ordering between
+different nodes' hooks. Queue admission is not Init completion, but placing Init
+ahead of delivery in the same worker FIFO preserves the required order.
+
+An auxiliary reader thread is not an event worker. Use a device-owned buffer pool
+and an explicit destination worker; never index worker state with its raw
+`getWID()`, borrow a worker-local pool, or invoke tunnel flow callbacks directly
+from that thread. Post ownership-bearing delivery through
+`sendWorkerMessageForceQueueWithCleanup()` or the existing
+`device_reader_session` APIs. Resolve the packet line and invoke tunnel callbacks
+inside the destination worker callback, using its supplied worker identity.
+Cancellation cleanup must release message-owned storage and references without
+borrowing worker-local state. Follow [Part 1's worker-context rules](./doc1.mdx#choosing-a-worker-context-helper)
+and [Part 7's reader lifetime rules](./part7-shutdown-and-signals.mdx#10-external-devices-and-lwip)
+to close admission and join the reader before reclaiming its reachable state.
+
+## Paired Tunnel Direction (the PingClient / PingServer Rule)
+
+Transform role and callback forwarding direction are separate decisions. Ping
+and Ping6 each use two independent Echo request sessions:
+
+```text
+client data: Client -- Echo Request --> Server
+             Client <-- optional exact Echo Reply -- Server
+server data: Client <-- Echo Request -- Server
+             Client -- optional exact Echo Reply --> Server
+```
+
+Client upstream and server downstream encode; client downstream and server
+upstream decode. Each accepted original continues in its received callback
+direction. The independent optional reply clone travels back toward the sender:
+PingServer/Ping6Server use `tunnelPrevDownStreamPayload()` for the clone and
+`tunnelNextUpStreamPayload()` for native delivery; PingClient/Ping6Client use
+`tunnelNextUpStreamPayload()` for the clone and `tunnelPrevDownStreamPayload()`
+for native delivery. Reflecting the original request would violate the contract.
+
+Ordinary Ping and direct Ping6 use `[existing IPv4 H][Echo 8][native body B][P 1]`.
+Ping6 `ipv6-in-ipv4` uses `[existing IPv4 H][IPv6 40][Echo 8][native body B][P 1]`.
+Actual H = 20..60 includes options, and P = 0..255 is the original protocol in the
+**final declared IP byte**. There is no second IPv4 header. Visible protocols are
+1 (Ping), 58 (direct Ping6) and 41 (IPv6-in-IPv4 Ping6); request/reply types are
+8/0 or 128/129, code zero. Framing F is 9 or 49, total length is N+F and tracked
+Echo payload length is B+1. Both inputs and decoded outputs remain native IPv4.
+
+Ping6 mode omission selects `direct`; only exact `direct` and `ipv6-in-ipv4`
+strings are accepted. Direct forbids either IPv6 address key by presence and uses
+fixed zero/zero pseudo-addresses, including when unused codec fields are nonzero.
+The new mode requires `local-ipv6`/`peer-ipv6` as actual inner local/peer endpoints,
+mirrored at the peer. Bare IPv6 syntax accepts compressed IPv4 tails, ULA, global
+and link-local unicast; reject unspecified, loopback, multicast, IPv4-mapped,
+brackets, zones, prefixes, malformed encoding and embedded NULs. No public IPv6,
+OS assignment or common subnet is required; the pair is not authentication.
+No negotiation, automatic mode detection or runtime switching is supported.
+
+Generated inner IPv6 has version 6, native TOS as Traffic Class, Flow Label zero,
+Next Header 58, Hop Limit 64 and Payload Length 8+B+1. Admission proves the complete
+base header, exact inner/outer lengths, immediate Next Header 58 and explicit
+peer-to-local 16-byte endpoint pair before repair, reply or tracker admission.
+Extensions, Fragment headers and jumbograms are rejected. Accept other received
+Traffic Class, Flow Label and Hop Limit values, including zero; consume as an
+endpoint without forwarding decrements or outer/inner Traffic Class equality.
+
+ICMPv6 uses Next Header 58, full Echo length (8+B+1), and the actual validated
+inner addresses in the new mode, fixed zeros in direct. Exclude both IP headers
+from Echo bytes and include final P at its actual parity. Preserve arithmetic-zero
+checksums without UDP substitution. The IPv6 header has no checksum. This is a
+fixed WaterWall carrier convention, not a general IPv6 router, full RFC 4213
+implementation or automatic native recovery using ordinary ping tools.
+
+TCP requires a complete minimum header and valid data offset; UDP requires its
+minimum header and a declared length within B, retaining accepted IP padding;
+ICMP requires its generic header. Other protocols are opaque, including empty B.
+A zero trailer is valid; a missing trailer is not. Exact buffer/IP total length
+agreement is mandatory. Valid unmatched replies need no trailer/native framing:
+consume an exact outstanding match or forward the whole carrier unchanged.
+Candidates with unsupported type/code, invalid geometry/checksums or oversize
+are dropped. Valid unrelated protocols retain bytes and pending repair intent.
+The chain selects a dedicated carrier stream: the trailer is not a signature,
+ordinary pings can satisfy the format, and no peer authentication is provided.
+Each node's correlation scope is one logical carrier peer, selected by the chain.
+
+Preserve source/destination, options, ID, DF, TTL and TOS/DSCP/ECN locally. Only
+protocol, length and IPv4 checksum change for framing. Transit changes survive;
+no original header copy exists. No `local-ipv4`, `peer-ipv4`, `ttl` or `tos`
+settings remain; unknown settings are rejected. Keep identifier, sequence-start
+and send-replies, plus Ping6's mode-dependent address settings above. Empty
+or omitted settings select direct mode. Address rewriting/restoration belongs
+to the chain:
+
+```text
+TunDevice -> PingClient/Ping6Client -> IpOverrider -> RawSocket
+RawSocket -> IpOverrider -> PingServer/Ping6Server -> TunDevice
+```
+
+Capture the peer's network address and protocol 1/58/41 according to the mode.
+An intervening IpOverrider
+breaks direct decoder discovery, so examples intending carrier locality use
+explicit `opaque-flow-mode: "peer"`. Do not change automatic-neighbour discovery.
+
+Before framing, complete an explicit native repair request under original
+protocol/addresses. Then use `updateIpv4TransportChecksumAddresses()` for TCP/UDP
+actual-address to zero/zero normalization. After stripping, restore zero/zero to
+current addresses and recalculate only the surviving IPv4 header checksum.
+Disabled UDP zero and invalid native residuals survive absent native repair.
+Carrier repair authorizes visible checksums only, never hidden native repair.
+Opaque protocols can protect addresses/header fields themselves; preserve or
+restore those fields or use a protocol-aware transform. ICMP quoted bytes are
+not translated. Native checksum lengths exclude framing/trailer and UDP padding.
+
+Advertise per-instance F = 9 or 49 bytes of left padding during construction;
+never assume tailroom. Encode shifts left F, overlap-safely moves the actual
+header left F then body left one, and writes P into the final free byte. Decode
+saves P, moves body right one then header right F and advances the cursor F.
+Reacquire pointers after shifts. Packed header and byte/checksum operations must support unaligned input.
+Refuse malformed geometry, fragments, excess size and insufficient headroom
+before repair/mutation or sequence/tracker admission; call mutating helpers
+outside assertions so Release performs them too.
+
+Both entry points reject MF or nonzero offset, for all native protocols and with
+either repair-flag value, before native parsing or mutation. DF alone is accepted
+and preserved. Reassemble native fragments before encoding and fragmented
+carriers before decoding; preserve-fragments does not make them admissible.
+Inner IPv6 Fragment headers are rejected rather than reassembled here.
+The 1500-byte final ceiling permits at most 1491 bytes of **complete native IP**
+for ordinary Ping/direct Ping6 or 1451 for IPv6-in-IPv4 Ping6, not application
+payload. The user budgets all chain overhead and actual path MTU through TunDevice device-mtu, applicable CTP/PTC mtu and core misc.mtu in
+both directions. Larger core/device MTUs do not waive the ceiling. No PMTU,
+negotiation, MSS, segmentation, fragmentation or automatic MTU configuration is
+added. Drops retain the shared five-second ERROR limiter and report geometry,
+reassembly, size, checksum, headroom and bounded tracking failures with byte limits.
+
+A new-mode reply also reverses the received inner pair, preserves exact Echo
+length and payload, copies inner Traffic Class independently of outer TOS, and
+sets Flow Label zero, Next Header 58 and Hop Limit 64. Outer reply policy remains
+reverse received addresses, generated ID, TTL 64, copied outer TOS and cleared
+fragment flags. Clone before native restoration/stripping. Carrier repair only
+repairs admitted visible IPv4/ICMPv6; hidden native checksum restoration still
+uses the surviving outer IPv4 pair, never the inner IPv6 endpoints.
+
+Each node has synchronized 1024-entry outstanding/replay rings and a local random
+key. Correlation uses type/code, identifier, sequence, Echo payload length and
+keyed digest of exact normalized body plus trailer, excluding network addresses
+and WID. Matching replies clear their entry; bounded replacement permits an old
+evicted identity to return. Mark requests before callbacks; duplicate requests
+deliver data once while remembered and can receive another optional reply.
+Tracking remains active with send-replies false and works across arrival workers.
+It is bookkeeping, not authentication or reliability.
+
+Send-replies defaults false independently at each endpoint. True clones before
+native restoration, preserving identifier, sequence and exact body/trailer;
+reverse the received addresses, copy TOS, use TTL 64, the existing reply-ID
+generator and cleared fragmentation flags. Recalculate checksums over actual IHL
+and full Echo length. Do not repair hidden native checksums in the clone. Hold a
+temporary line reference and check logical aliveness across the reply callback
+before continuing with the still-owned original. These zero-line-state middle
+transforms retain lifecycle forwarding and never create/destroy normal lines,
+destroy packet lines, start private readers or redistribute native packets.
+
+The procedure for any packet tunnel:
+
+1. Draw the packet flow with arrows.
+2. Place the encode/decode step in the callback direction that flow requires.
+3. Use `tunnelNextUpStreamPayload()` only for upstream forwarding and
+   `tunnelPrevDownStreamPayload()` only for downstream forwarding.
+4. Do not treat packet lines as per-connection lines.
+5. Do not call `lineDestroy()` on packet lines at runtime.
+6. Do not add stream-style lifecycle to a pure packet tunnel unless its design
+   requires it.
+
+## Rules for Packet-Oriented Changes (Summary)
+
+- Do not close packet lines during runtime, and never `lineDestroy()` one.
+- The owner Finish postcondition from Part 2 does **not** apply to packet lines.
+- Classify each packet-line `Finish` handler and direction as one of three roles:
+  an anchor rejects an impossible close with `LOGF` + `abortProgramNow(1)`; a
+  transparent middle transform forwards it in the same direction; an intentional
+  terminal absorber documents why there is nothing to forward or release.
+- `PacketGenerator` is direction-specific: downstream absorbs a legitimate close
+  from a packet-line terminal such as an active `BlackHole`, while upstream
+  remains fatal. `PacketCounter` is also an intentional terminal absorber.
+- A handler that can receive both a packet line and a normal line must branch on
+  the exact role (`tunnelchainIsWorkerPacketLine()`) before any cleanup.
+- `packettunnelCreate()` only means `lstate_size == 0`; several such nodes are
+  `kNodeLayerAnything` and carry ordinary connection lines too, which is why its
+  lifecycle callbacks stay plain pass-throughs.
+- A `Finish` handler that does nothing must say why: propagate, release, report,
+  or document that you own no per-line state and have no onward direction.
+- Do not run normal per-connection `Finish` logic on packet lines unless the exact
+  handler-role contract explicitly requires it.
+- Treat packet-line state as worker-local shared state.
+- Treat routing context as mutable packet-line scratch metadata,
+  never as durable session identity.
+- For per-flow lifecycle, create normal lines behind the packet side.
+- A `packettunnelCreate()` tunnel has no per-line state (`lstate_size == 0`).
+- A bridge that anchors state on the packet line keeps that state across many
+  packets on the worker.
+- If your code depends on packet-line init, verify where that init comes from.
+
+The single most common mistake to avoid:
+
+```text
+Using packet lines as if they were normal connection lines with an ordinary
+Init -> Payload -> Finish per-connection lifecycle. They are not.
+```
+
 ## Packet checksum repair boundaries
 
 Use `sbufSetRecalculateChecksum()` / `sbufGetRecalculateChecksum()` for an
@@ -284,9 +727,11 @@ refuse and pass unchanged must preflight and preserve bytes and intent on refusa
 TunDevice, RawSocket and packet/connection bridges consume the actual packet's
 request. Aligned copies retain intent locally until finalization; raw-byte
 ConnectionToPackets messages complete repair before queueing. Packet/stream
-bridges finish repair before serialization; no local flag is serialized. Ping
-repairs inner packets before encapsulation and requested outer packets before
-validation, then clears outer intent when stripping to the inner packet.
+bridges finish repair before serialization; no local flag is serialized. Ping/Ping6
+preflight native geometry, fragment/size/headroom refusal and requested native
+repair before sequence admission. Carrier repair affects only the visible
+IPv4/Echo checksums; decode restores native address contributions without
+repairing hidden corruption. Unrelated protocols retain bytes and pending intent.
 Generated replies, originals and duplicates own independent requests.
 
 Mark the surviving allocation after replacement and each generated packet
@@ -462,8 +907,8 @@ construction, including a malformed duplicate after a valid setting.
 Omission remains `prefix` beside a decoder. Requested and effective values are
 kept separately. Explicit values are unchanged. Auto checks only the device's
 physical publication neighbour after topology and packet binding are finalized:
-upstream toward `next` requires exact type `PingServer`; downstream toward `prev`
-requires exact type `PingClient`. Instance names, indirect Ping, wrappers,
+upstream toward `next` requires exact type `PingServer` or `Ping6Server`; downstream toward `prev`
+requires exact type `PingClient` or `Ping6Client`. Instance names, indirect Ping, wrappers,
 encoding directions and opposite RawSocket endpoints do not qualify. Auto never
 selects `spread`. Thus `TunDevice -> PingClient -> RawSocket` resolves to
 `prefix`/`peer`, and `RawSocket -> PingServer -> TunDevice` to `peer`/`prefix`.
@@ -587,8 +1032,8 @@ must explicitly select spread.
 
 Each multiqueue source range has one flow rule per receive queue; spread adds
 one opaque rule per queue. Opaque rules have independent owned identities and
-rollback records. Only one NOTRACK rule is installed per range. Protocol exclusions
-apply equally to every receive family and NOTRACK. Fixed queue identities,
+rollback records. Protocol exclusions and the raw PREROUTING local-unicast
+scope apply equally to every receive family. Fixed queue identities,
 source matching, partial rollback, cleanup retry and cleanup-before-single-queue
 fallback remain unchanged; incomplete cleanup fails startup. Deterministic
 eligible packets cannot fall through into a random rule family. Spread can
@@ -911,17 +1356,13 @@ packet-to-stack input.
 
 ## Linux capture conntrack policy
 
-`RawSocket` uses one `bypass-conntrack` setting for capture and raw output,
-defaulting to true. When enabled, Linux capture pairs each source-range NFQUEUE
-rule in `filter INPUT` with a `CT --notrack` rule in `raw PREROUTING`. NOTRACK
-additionally matches `addrtype --dst-type LOCAL`, so ordinary transit traffic, broadcast, and multicast
-are not exempted. The INPUT source-only capture match remains unchanged.
-Matching occurs before DNAT; selected local-unicast traffic must not depend on
-host conntrack-based NAT or connection-state filtering. Setting the option to
-false installs neither capture nor output NOTRACK rules; NFQUEUE capture and
-its drop-and-dispatch behavior remain active.
-Keep normal raw priority: NOTRACK must not move fragment reassembly or change the
-capture payload limit. PMTU/ICMP delivery remains a separate responsibility.
+Linux `RawSocket` capture always uses NFQUEUE in `raw PREROUTING` with source
+and protocol filters plus `addrtype --dst-type LOCAL`. Only local-unicast input
+is captured; ordinary transit traffic, broadcasts and multicast continue through
+the host stack. Active NF_DROP consumes the original before conntrack, DNAT and
+the normal routing decision. No incoming NOTRACK rule is installed. Preserve
+ordinary raw priority, fragment reassembly ordering and the capture payload limit.
+PMTU/ICMP delivery remains separate.
 
 `dont-capture-protocols` is a set of literal IPv4 Protocol bytes (integers
 0..255); omission and `[]` exclude nothing and duplicates are idempotent.
@@ -929,7 +1370,7 @@ Alternatively, `capture-protocols` accepts the same values as an allowlist;
 omission selects all protocols and an explicit empty array selects none.
 The two keys are mutually exclusive, including empty arrays. Compile the
 allowlist into the same exclusion predicate once at creation. Apply the same
-predicate to NFQUEUE and incoming NOTRACK, so an unselected protocol from a
+predicate to every NFQUEUE rule, so an unselected protocol from a
 configured source reaches ordinary host conntrack and firewall processing.
 Filtering only after queue delivery is too late to preserve conntrack. These
 options never change the marked raw socket's OUTPUT exemption.
@@ -953,33 +1394,35 @@ The constructor consumes the borrowed exclusion set synchronously; neither
 backend retains a pointer into the node's settings.
 
 Prepare the inactive queue readers before rule installation and service them
-with NF_ACCEPT from the lifecycle coordinator during commands. Install all INPUT
-rules before any enabled NOTRACK rules and activate worker capture only after
-all selected rules succeed.
-The lifecycle owner removes NOTRACK before NFQUEUE, including startup rollback,
-normal stop, and cleanup following reader failure. Attempt queue cleanup even if
-NOTRACK cleanup fails. Account for each rule kind independently, including
+with NF_ACCEPT from the lifecycle coordinator during commands. Activate worker
+capture only after every selected queue rule succeeds. The lifecycle owner
+removes owned queue rules during startup rollback, normal stop and cleanup after
+reader failure. Account for flow and opaque rules independently, including
 commands that may have committed before a timeout; reconcile those outcomes
-against the corresponding table and chain. Retain failed cleanup ownership for
-retry and report residual rules. Do not mutate the rule ledger from a normal worker receive callback or run
-blocking firewall commands in the nonblocking stop-request phase.
+against raw PREROUTING. Retain failed cleanup ownership for retry
+and report residual rules. Do not mutate the rule ledger from a normal worker
+receive callback or run blocking firewall commands in the stop-request phase.
 
-Rule removal affects future packets. Already-marked or queued packets remain
-untracked. `--queue-bypass` cannot undo NOTRACK; abrupt process death or final
-cleanup failure can leave `WWCAP_NOTRACK_...` rules in `raw PREROUTING` requiring
-administrator removal. This implementation does not reclaim another process's
-rules. `skip-sysctl` suppresses Capture's global sysctl tuning batch only, never
-either rule kind or the independent per-device `kernel-queue-tune` setting.
+Queue-number selection must inspect both filter INPUT and raw PREROUTING
+to avoid reactivating stale or foreign rules that reference the same queues. Closed queues use `--queue-bypass`; accepted packets resume at later
+tables, skipping remaining rules in the queued table. Early accepted packets
+can undergo normal conntrack processing. Residual NFQUEUE rules still require
+cleanup; this implementation never reclaims another process's rules.
+`skip-sysctl` suppresses Capture's global sysctl tuning batch only, never queue
+rules or the independent per-device `kernel-queue-tune` setting.
 
 ## Linux raw output conntrack policy
 
-`RawSocket` defaults `bypass-conntrack` to true. A configured `mark` field is
-rejected while it is enabled, including zero or null. Disabling the option
-preserves explicit output marks and installs neither capture nor output
-NOTRACK exemptions. The Windows backend accepts the setting without changing
-WinDivert behavior.
+Linux raw output always bypasses conntrack. An explicit `mark` must be an
+integer from `1` through `UINT32_MAX`, dedicated to WaterWall traffic. Validate
+before narrowing to `uint32_t`; reject zero, fractions and other types. The exact
+configured value serves both policy routing and the output NOTRACK rule. Shared
+marks also exempt unrelated traffic, so their dedication is an operator contract.
+Omitting `mark` requests automatic selection on each start. Keep the configured
+mark separate from the effective mark so restarts preserve explicit values and
+repeat automatic collision checks. Windows WinDivert behavior is unchanged.
 
-The Linux raw device selects a random mark from values at least `0x00010000`,
+When no mark is configured, the Linux raw device selects a random mark from values at least `0x00010000`,
 preferring the high half of the 32-bit space. Selection checks `iptables-save`
 mark comparisons/literal assignments and IPv4 `ip rule` fwmark selectors. It
 preserves their match results for an unmarked packet, including masked and
@@ -1272,8 +1715,9 @@ upstream entry boundary only for `first-sni`, `smuggle-sni`, `overlap-sni`,
 `synfin-sni`, `ech-sni-trick` or `smuggle-fin`; downstream it dispatches after
 protocol/port restoration and before stateful processing. Plain ProtoSwap
 encoding and decoding stay on the arrival worker; protocol/checksum conversion
-does not require a flow owner. PingClient/PingServer and WireGuardDevice also
-forward decoded inner packets on their arrival worker. PacketsToStream and
+does not require a flow owner. PingClient/PingServer forward decoded inner packets on their arrival worker.
+WireGuard wrappers marshal protocol work to worker 0 and publish decoded packets
+on that worker's persistent packet line; PTC then establishes its flow ownership. PacketsToStream and
 StreamToPackets map decoded packets to the receiving stream worker's packet
 line; StreamToPackets rechecks the authorized source generation before
 publication and retains return-carrier rendezvous selection. The next stateful
@@ -1390,13 +1834,15 @@ There is no record reader, chunking, retained fragment, per-flow state or timer.
 
 The packet profile only accepts `xchacha20-poly1305`, also its omitted-algorithm
 default. Stream mode retains ChaCha20-Poly1305/AES-GCM and rejects XChaCha;
-`max-frame-size` is rejected in packet mode. Password/salt/iteration derivation
-uses SHA-256(password) as the fixed-size key for repeated BLAKE2s rounds in
-packet mode, producing a base key from which separate client-to-server and
-server-to-client keys are derived. Stream derivation remains unchanged. Each outgoing packet draws a fresh 24-byte nonce from the
-cryptographic random source; opposite directions cannot decrypt one another's
-packets. Nonce independence supports packet loss and reordering, not replay
-rejection.
+`max-frame-size` is rejected in packet mode. Both modes use the salt as the
+BLAKE2s key for the first round, so the salt may contain at most 32 bytes.
+Repeated rounds use the password directly in stream mode, where more than one
+round limits the password to 32 bytes. Packet mode uses SHA-256(password) as
+the fixed-size key for repeated rounds and derives separate client-to-server
+and server-to-client keys from the resulting base key. Each outgoing packet
+draws a fresh 24-byte nonce from the cryptographic random source. Opposite
+directions cannot decrypt one another's packets. Receivers can decrypt packets
+after loss or reordering. They can also accept a replayed authenticated packet.
 
 ```text
 plain:     [IPv4][visible TCP/UDP header + options][transport payload]
@@ -1676,396 +2122,6 @@ range rather than recomputing the native hash. `ConnectionToPackets` and
 `PacketsToConnection` remain TCP/UDP-only; direct suitable packet paths such as
 TUN can use broader carriage.
 
-## Two Kinds of Packet Tunnels
-
-Not every tunnel that touches packet lines is the same kind of tunnel. There are
-two distinct categories, and they have different rules.
-
-### 1. Pure Packet Tunnels (`packettunnelCreate`)
-
-Some tunnels are created with `packettunnelCreate()` instead of `tunnelCreate()`.
-From `ww/net/packet_tunnel.c`:
-
-```c
-tunnel_t *packettunnelCreate(node_t *node, size_t tstate_size, size_t lstate_size)
-{
-    if (UNLIKELY(lstate_size != 0))
-    {
-        return NULL; // pure packet tunnels have no per-line state
-    }
-
-    tunnel_t *t = tunnelCreate(node, tstate_size, 0);
-    if (! t)
-    {
-        return NULL; // invalid or overflowing state size
-    }
-
-    // ... explicitly installs upstream Est and downstream Init forwarding ...
-    // ... installs mandatory packet-payload defaults ...
-    return t;
-}
-```
-
-Key facts:
-
-- `packettunnelCreate()` **requires `lstate_size == 0`** and returns `NULL` when
-  that contract or state-size validation fails. Heap allocation follows the
-  [fatal policy](./part5-tunnel-anatomy.mdx#heap-allocation-failure). Pure packet tunnels
-  have no per-line state, and their constructors must check the result before
-  assigning callbacks or accessing tunnel state.
-- They are expected to **override the packet payload callbacks**.
-- The default payload callbacks are intentionally invalid: they call `LOGF(...)`
-  and `abortProgramNow(1)`, so they crash loudly if you forget to override them:
-
-```c
-static void packettunnelDefaultUpStreamPayload(tunnel_t *self, line_t *line, sbuf_t *payload)
-{
-    LOGF("Unexpected call to default up stream payload for a packet tunnel, "
-         "this function must be overridden");
-    abortProgramNow(1);
-}
-```
-
-- `Init`, `Est`, `Pause`, `Resume`, and `Finish` use same-direction lifecycle
-  pass-throughs. `packettunnelCreate()` explicitly installs upstream `Est` and
-  downstream `Init` forwarding because `tunnelCreate()` rejects those events.
-  An individual tunnel overrides one
-  only when its exact handler role requires an anchoring rejection, explicit
-  forwarding, or an intentional terminal absorption as classified above.
-
-Examples: `IpOverrider`, `IpManipulator`, `PingClient`, `PingServer`,
-`WireGuardDevice`.
-
-For pure packet tunnels:
-
-- Do not add connection-style line lifecycle logic casually.
-- `lstate_size == 0` does **not** mean "packet lines only". A
-  `kNodeLayerAnything` packet tunnel also carries normal connection lines.
-- Some default callbacks deliberately abort; know which ones you must override.
-
-### 2. Packet-Line Anchored Bridges (`tunnelCreate`)
-
-Other tunnels are ordinary `tunnelCreate()` tunnels that **use the worker packet
-line as an anchor** for worker-local bridge state. They cross the boundary between
-packet-oriented runtime and connection-oriented runtime.
-
-Examples and what they anchor:
-
-| Bridge | Role |
-| --- | --- |
-| `PacketsToStream` | packet line to a worker-local stream-facing line; stores that line and a read buffer |
-| `StreamToPackets` | borrowed stream lines to packet lines; each stream has a parser, with a shared source registry and per-flow return-carrier selection |
-| `PacketsToConnection` | packet traffic to lwIP to normal WaterWall connection lines behind the packet side |
-| `PacketSplitStream` | splits packet traffic across stream paths |
-
-State stored on a packet line is worker-local bridge state, not per-connection state.
-If you need closable per-connection behavior behind packet traffic, create or
-manage normal lines behind the packet line instead of closing the packet line.
-
-### Stream/packet bridge flow control
-
-`PacketsToStream` owns its normal stream lines and keeps its bridge state on each
-worker packet line. `StreamToPackets` borrows normal stream lines and stores its
-parser state on those lines; its packet lines are forwarding targets. Both are
-endpoints for the exact lines they join. Neither may use permanent tunnel bypass:
-payload still requires IPv4 boundary parsing, carrier ownership and
-mapping between different line identities.
-
-Keep their endpoint Pause state. `PacketsToStream` maps stream pressure to the
-packet source and drops additional packets while paused. `StreamToPackets`
-excludes a paused carrier from return selection and drops return packets if no
-eligible carrier remains. Repeated notifications are idempotent, not counted
-holds. Sensitive-mode Ping and Pong may cross Pause; they do not release ordinary
-packet admission or suspend the Pong deadline.
-
-After creating a live, unpaused stream line, `PacketsToStream` sends packet-side
-Resume so a Pause from an earlier carrier cannot strand the packet producer.
-Replacement Init must settle first; a Pause during Init prevents that release.
-If creation happened while handling a packet or heartbeat, settle that buffer
-before Resume can reenter and release more input. Reset, failed Init and shutdown
-do not send a recovery Resume.
-
-### Obfuscator stream and packet roles
-
-ObfuscatorClient encodes upstream and decodes downstream. ObfuscatorServer
-decodes upstream and encodes downstream, so framed traffic arriving through a
-server-side TcpListener is unwrapped before forwarding to the next application
-node. Bridge reverses callback direction; two transport-at-next Bridge legs use
-the Client role. Shared codec operations make no tunnel callbacks; wrappers keep
-same-direction publication and the exact line's lifecycle obligations.
-
-With `tls_record_header` enabled, ObfuscatorClient and ObfuscatorServer reserve
-normal-line receive state through `tunnelCreate()`. Both supported Init directions
-initialize that state before forwarding; upstream Est remains pass-through.
-Exact worker packet lines bypass this state and preserve one-packet/one-record
-validation, checksum requests, and oversized-datagram drops. Packet Finish remains
-same-direction forwarding and never destroys the packet line.
-
-Ordinary stream deliveries split into records with at most 65,535 body bytes.
-XOR and skip operate per record. One encoded aggregate is sent per delivery;
-complete received records become one decoded aggregate, with partial tails kept
-for later input. Receive retention is bounded by 2 MiB plus one maximum wire record
-(65,540 bytes), for a fixed total of 2,162,692 bytes. This is independent of
-pool sizes, RAM profile and splice settings.
-Pause/Resume use transparent defaults in both directions, including repeats.
-Complete records decode into the current aggregate without waiting for Resume;
-only an incomplete suffix remains in the read stream. XOR and record processing
-remain necessary for every payload, so these nodes do not permanently bypass.
-Aggregate
-transformation follows [Part 2's FIFO and advisory Pause rules](./part2-lines-and-callbacks.mdx#flow-control-roles-and-admission).
-Malformed records and overflow close the borrowed normal line through its owner.
-Record the Init source direction before forwarding. Error close destroys local
-state, finishes the opposite side, then the still-live source side while holding
-a line reference. This supports both upstream and downstream Init without
-destroying a right-side owner's line before left-side cleanup. Received Finish
-releases state and continues only away from its sender.
-
-## Packet-Line Initialization
-
-Packet lines are initialized differently from connection lines.
-
-For a chain whose **head is a layer-3 packet node**, the node manager sends one
-upstream `Init` on each worker's packet line during startup — **once per worker,
-not once per packet**. So packet-line `Init` is a worker/bootstrap event, not a
-connection-open event.
-
-But if a bridge relies on packet lines while the chain head is **not** itself a
-layer-3 packet node, that automatic init does not happen, and the bridge must
-trigger it. `StreamToPackets` does exactly this in `onStart()`, queueing the
-bootstrap onto every worker so packet-side tunnels see their `Init` after startup
-rather than re-entering init paths inline:
-
-```c
-static void streamtopacketsQueueWorkerPacketInit(void *worker, void *arg1, void *arg2, void *arg3)
-{
-    discard worker;
-    discard arg2;
-    discard arg3;
-
-    tunnel_t *t = arg1;
-    line_t   *l = tunnelchainGetWorkerPacketLine(tunnelGetChain(t), getCurrentWorkerWID());
-
-    if (UNLIKELY(! lineCallWithRef(l, tunnelNextUpStreamInit, t)))
-    {
-        LOGF("StreamToPackets: worker packet line died during packet-side init");
-        abortProgramNow(1);
-    }
-}
-
-void streamtopacketsTunnelOnStart(tunnel_t *t)
-{
-    for (wid_t wi = 0; wi < getWorkersCount(); wi++)
-    {
-        if (UNLIKELY(
-                sendWorkerMessageForceQueueWithCleanup(wi, streamtopacketsQueueWorkerPacketInit, NULL, t, NULL, NULL) !=
-                kWorkerMessageSubmitAccepted))
-        {
-            LOGF("StreamToPackets: failed to admit required packet-side Init on worker %u", (unsigned int) wi);
-            startupFailureRecord(1);
-            return;
-        }
-    }
-}
-```
-
-So if you create or modify a packet bridge: do not assume packet-line init
-happened automatically. Verify whether the init comes from the node manager (chain
-head is layer-3) or whether your tunnel must trigger it in `onStart()`.
-
-### External readers and packet startup
-
-**A constructor must not start a reader or enable external callbacks that can
-immediately enqueue packet delivery.** Creating an inactive device handle is
-different from bringing it up and launching its reader. If a creation/open API
-also starts reading, call that API from the later startup callback instead of
-`createHandle`. TunDevice keeps device creation and `tundeviceBringUp()` in
-`onStart`; the latter queues receive activation behind packet Init and opens worker-output
-admission on Linux and Windows. Darwin/BSD retain their external reader.
-Native output remains deferred onto event workers.
-
-The risk is initialization order, even when workers have not started dispatching.
-`createHandle` runs before chain finalization establishes packet lines, line-state
-offsets and buffer padding. An early reader can create buffers with insufficient
-padding or enqueue delivery before the packet side's `Init`. Workers wait behind
-`workers_run_flag` until startup finishes, but queued messages retain their order:
-a Payload queued ahead of Init can later access uninitialized state and crash.
-Do not rely on a quiet device, low packet rates, or sleeps to avoid this.
-
-Use this startup sequence:
-
-1. In `createHandle`, validate settings and allocate inactive state. Keep reader
-   threads and automatic callback delivery disabled.
-2. In `onPrepare`, finish setup that needs finalized topology or buffer padding,
-   while keeping the reader inactive.
-3. In `onStart`, bind the publication target and finish reader-visible settings,
-   buffer geometry and lifetime gates. Ensure the required packet Init has been
-   successfully queued for every destination worker **before** starting the reader.
-   Required bootstrap admission failure must fail startup; do not start reading.
-
-For a layer-3 head, NodeManager queues Init after finalization and before
-`onPrepare` and `onStart`. For a stream-headed chain, a bridge such as
-StreamToPackets or ConnectionToPackets queues its packet bootstrap in `onStart`.
-If another node owns that bootstrap, explicitly establish its ordering before
-reader activation; choosing `onStart` alone does not establish ordering between
-different nodes' hooks. Queue admission is not Init completion, but placing Init
-ahead of delivery in the same worker FIFO preserves the required order.
-
-An auxiliary reader thread is not an event worker. Use a device-owned buffer pool
-and an explicit destination worker; never index worker state with its raw
-`getWID()`, borrow a worker-local pool, or invoke tunnel flow callbacks directly
-from that thread. Post ownership-bearing delivery through
-`sendWorkerMessageForceQueueWithCleanup()` or the existing
-`device_reader_session` APIs. Resolve the packet line and invoke tunnel callbacks
-inside the destination worker callback, using its supplied worker identity.
-Cancellation cleanup must release message-owned storage and references without
-borrowing worker-local state. Follow [Part 1's worker-context rules](./doc1.mdx#choosing-a-worker-context-helper)
-and [Part 7's reader lifetime rules](./part7-shutdown-and-signals.mdx#10-external-devices-and-lwip)
-to close admission and join the reader before reclaiming its reachable state.
-
-## Paired Tunnel Direction (the PingClient / PingServer Rule)
-
-Transform role and callback forwarding direction are separate decisions. Ping
-wire v2 uses two independent Echo sessions:
-
-```text
-client data: PingClient -- Echo Request --> PingServer
-             PingClient <-- optional exact Echo Reply -- PingServer
-
-server data: PingClient <-- Echo Request -- PingServer
-             PingClient -- optional exact Echo Reply --> PingServer
-```
-
-- PingClient upstream and PingServer downstream originate type-8 requests with
-  their local data. Their peer decodes the request in its corresponding
-  callback and forwards the inner packet in the same callback direction.
-- Inbound parsing validates exact IPv4 framing and the IPv4 header checksum
-  before classifying the configured peer/local/ICMP tuple. Carrier-only
-  restrictions, including a 20-byte outer header and no outer fragmentation,
-  apply only after that match. Unrelated valid IPv4 packets, including options
-  and fragments, pass through unchanged in the received direction.
-- Validation failures expose a concrete diagnostic reason without changing
-  classification or forwarding. Packet drops log at `ERROR` with packet length,
-  inner/carrier limits, wrapper overhead and available/required left headroom.
-  The existing five-second gate stays shared per node across reasons and workers.
-- `send-replies` is a boolean configured independently on each endpoint and
-  defaults to `false`. Only `true` allocates a reply clone and emits the received
-  request's exact type-0 reply back to its sender before delivering the original
-  request. False or omission skips reply allocation and output. A reply is an
-  acknowledgement only; the sender consumes a matching reply instead of
-  delivering its payload regardless of its own `send-replies` setting. Data
-  delivery does not wait for a reply.
-- Correlation and replay suppression belong to one bounded synchronized tracker
-  per Ping node. The arrival worker runs correlation and reply generation;
-  its WID is not request/reply correlation identity. Both remain
-  active when reply generation is disabled. Duplicate requests deliver inner
-  data once and receive another reply only when local reply generation is enabled.
-- With reply generation enabled, a request receiver publishes two distinct
-  buffers. The generated reply clone travels back toward the request sender,
-  while the decoded original continues in the received direction. With it
-  disabled, only the decoded original is published. Decoded originals and replies
-  remain on the arrival worker. Inner fragments are forwarded immediately with
-  their bytes and boundaries intact; Ping does not hold later fragments for a
-  leading fragment or select a transport-flow worker.
-- The shared codec keeps its checked input APIs. At the nodes' reply and strip
-  call sites, the validated envelope, exact independent clone and locally retained
-  original already establish success. Assert those caller guarantees rather than
-  adding packet-drop or acknowledgement fallback paths. Execute the codec calls
-  outside assertions so Release builds still perform them.
-- Consequently, PingServer's upstream request handler sends an enabled reply
-  clone with `tunnelPrevDownStreamPayload()` and the decoded original with
-  `tunnelNextUpStreamPayload()`. PingClient's downstream request handler sends
-  the clone with `tunnelNextUpStreamPayload()` and the decoded original with
-  `tunnelPrevDownStreamPayload()`.
-
-Sending the **original received request** back toward its sender would be an
-invalid reflection. An enabled, separately generated exact Echo Reply travels
-in that opposite direction. Likewise, encapsulating the original in PingServer's
-upstream callback would transform it twice.
-
-The procedure for any packet tunnel:
-
-1. Draw the packet flow with arrows.
-2. Place the encode/decode step in the callback direction that flow requires.
-3. Use `tunnelNextUpStreamPayload()` only for upstream forwarding and
-   `tunnelPrevDownStreamPayload()` only for downstream forwarding.
-4. Do not treat packet lines as per-connection lines.
-5. Do not call `lineDestroy()` on packet lines at runtime.
-6. Do not add stream-style lifecycle to a pure packet tunnel unless its design
-   requires it.
-
-## Testing Packet Tunnels
-
-Packet tunnel tests must exercise the **real intended direction**. The canonical
-Ping test is one direct packet chain:
-
-```text
-TesterClient(packet-mode=true)
-    -> PingClient
-    -> PingServer
-    -> TesterServer(packet-mode=true)
-```
-
-The upstream request must be restored before TesterServer sees it; reverse data
-must become a separate Echo Request and be restored before TesterClient sees
-it. Exercise omitted/false and true `send-replies` settings at both endpoints,
-including asymmetric settings. Enabled replies must precede inner delivery and
-be consumed by the originator; disabled replies must cause no clone or reply
-output. Add coverage that would fail if PingServer upstream encapsulated instead
-of decoding, if an inner request were delivered twice, if reply consumption or
-deduplication depended on local reply generation, or if server data were put
-into the original request's reply.
-
-The packet-line `Finish` contract has its own coverage, and a new packet-side
-handler belongs in it:
-
-- `tests/unittests/tunnels/abort/tunnels_abort_runtime_test.c` calls the anchoring adapters'
-  `Finish` handlers in child processes; the CMake runner requires exact exit
-  status `1` rather than a return or signal.
-- `tests/unittests/tunnels/packet_io/packetgenerator_orderly_shutdown_test.c` proves that
-  `PacketGenerator` cancels a pending worker timer and stops a ready multi-packet
-  batch when a payload emits downstream `Finish` re-entrantly, without
-  destroying the worker packet line.
-
-## Rules for Packet-Oriented Changes (Summary)
-
-- Do not close packet lines during runtime, and never `lineDestroy()` one.
-- The owner Finish postcondition from Part 2 does **not** apply to packet lines.
-- Classify each packet-line `Finish` handler and direction as one of three roles:
-  an anchor rejects an impossible close with `LOGF` + `abortProgramNow(1)`; a
-  transparent middle transform forwards it in the same direction; an intentional
-  terminal absorber documents why there is nothing to forward or release.
-- `PacketGenerator` is direction-specific: downstream absorbs a legitimate close
-  from a packet-line terminal such as an active `BlackHole`, while upstream
-  remains fatal. `PacketCounter` is also an intentional terminal absorber.
-- A handler that can receive both a packet line and a normal line must branch on
-  the exact role (`tunnelchainIsWorkerPacketLine()`) before any cleanup.
-- `packettunnelCreate()` only means `lstate_size == 0`; several such nodes are
-  `kNodeLayerAnything` and carry ordinary connection lines too, which is why its
-  lifecycle callbacks stay plain pass-throughs.
-- A `Finish` handler that does nothing must say why: propagate, release, report,
-  or document that you own no per-line state and have no onward direction.
-- Do not run normal per-connection `Finish` logic on packet lines unless the exact
-  handler-role contract explicitly requires it.
-- Treat packet-line state as worker-local shared state.
-- Treat routing context as mutable packet-line scratch metadata,
-  never as durable session identity.
-- For per-flow lifecycle, create normal lines behind the packet side.
-- A `packettunnelCreate()` tunnel has no per-line state (`lstate_size == 0`).
-- A bridge that anchors state on the packet line keeps that state across many
-  packets on the worker.
-- If your code depends on packet-line init, verify where that init comes from.
-
-The single most common mistake to avoid:
-
-```text
-Using packet lines as if they were normal connection lines with an ordinary
-Init -> Payload -> Finish per-connection lifecycle. They are not.
-```
-
----
-
-Continue to **[Part 5: Anatomy of a Tunnel & Workflow](./part5-tunnel-anatomy.mdx)**.
-
 ## Worker-owned lwIP bridge engines
 
 PTC validates a complete IPv4 packet, settles its checksum request, rejects
@@ -2216,3 +2272,106 @@ can make recovery input appear ordinary.
 Piggybacked or immediate ACK output clears the normal ACK flags, suppressing a
 redundant batch flush. Pending PCBs unlink before purge, free or flush output;
 failed output retains lwIP's existing ACK retry flags and timer.
+## Testing Packet Tunnels
+
+Packet tunnel tests must exercise the **real intended direction**. The canonical
+Ping test is one direct packet chain:
+
+```text
+TesterClient(packet-mode=true)
+    -> PingClient
+    -> PingServer
+    -> TesterServer(packet-mode=true)
+```
+
+The upstream request must be restored before TesterServer sees it; reverse data
+must become a separate Echo Request and be restored before TesterClient sees
+it. Exercise omitted/false and true `send-replies` settings at both endpoints,
+including asymmetric settings. Enabled replies must precede inner delivery and
+be consumed by the originator; disabled replies must cause no clone or reply
+output. Add coverage that would fail if PingServer upstream encapsulated instead
+of decoding, if an inner request were delivered twice, if reply consumption or
+deduplication depended on local reply generation, or if server data were put
+into the original request's reply.
+
+The packet-line `Finish` contract has its own coverage, and a new packet-side
+handler belongs in it:
+
+- `tests/unittests/tunnels/abort/tunnels_abort_runtime_test.c` calls the anchoring adapters'
+  `Finish` handlers in child processes; the CMake runner requires exact exit
+  status `1` rather than a return or signal.
+- `tests/unittests/tunnels/packet_io/packetgenerator_orderly_shutdown_test.c` proves that
+  `PacketGenerator` cancels a pending worker timer and stops a ready multi-packet
+  batch when a payload emits downstream `Finish` re-entrantly, without
+  destroying the worker packet line.
+
+
+---
+
+Continue to **[Part 5: Anatomy of a Tunnel & Workflow](./part5-tunnel-anatomy.mdx)**.
+
+## WireGuard authenticated packet-to-connection ownership
+
+WireGuard protocol state has one event-worker owner per node. Cross-worker input
+is bounded and never borrows a foreign pool. WireGuardClient owns one normal
+carrier and requires one complete WireGuard message per payload callback in both
+directions. Its endpoint seeds the destination address, port and UDP protocol
+before Init without pinning; subsequent nodes apply their ordinary destination
+selection. It neither searches for a named connector nor reads connector-private
+endpoint state. Framing nodes may convert these datagrams to a stream and back.
+The selected transport owns DNS and socket addressing.
+
+The WireGuardClient timer can send handshake datagrams once next Init returns on
+the live current carrier and downstream pressure permits writes. The client
+processes messages from that exact carrier independently of transport Est. The
+inner packet FIFO drains when WireGuard session keys are ready.
+
+Client receive processing binds cookie challenges to a nonzero opaque carrier
+generation, renewed for each created carrier. It does not invent a network
+address or learn the physical endpoint from incoming data. Cryptographic peer
+authentication remains mandatory, and output uses the current owned carrier.
+
+WireGuardServer's UDP ingress snapshots use the source address and
+`routing_context.peer_source_port`; the address context's port can be the local
+listener port. Server cookies bind to that actual remote IP/port, and only
+authenticated proof/data updates a peer's learned endpoint. Server replies retain
+the exact ingress handle.
+
+Session-secret erasure is armed independently of current-key validity. The first
+unfinished handshake arms cleanup, and successful session derivation resets its
+540-second deadline, including responder next-only sessions. Ordinary data and
+retries do not extend it. Erasure securely clears all session slots and unfinished
+handshake state while preserving static peer configuration and the greatest
+authenticated initiation timestamp. Persistent keepalive scheduling is separate
+from the fixed 165-second receive rekey deadline and five-second initiation retry.
+Current, previous and next keypairs are also zeroed individually when each reaches
+180 seconds or its local sending-message limit. This leaves the independent
+handshake cleanup deadline armed. Session installation passes the new keypair by
+pointer so the caller can wipe its temporary without an extra by-value copy.
+
+Configured private, public and preshared keys require canonical Base64 encoding
+of exactly 32 bytes. Decode with an explicit 32-byte output capacity; checking the
+decoded length after an unbounded write cannot protect the destination.
+
+WireGuardServer's connection pipeline
+is `server (L3) -> PTC -> user binding -> UserController -> configured next`.
+The helper attaches a consistent current account/profile to each PTC-owned normal
+line before Init, preserving its inner client source. UserController reserves the
+inner source IP key, counts TCP/UDP flows, and charges inner payload only.
+
+Key/range continuity uses installed-table generations and a credential continuity
+floor preserved only across unchanged key/range membership. Close the binding gate
+before posting range retirement to every PTC owner. Retire owned normal lines, UDP
+entries and child PCBs, pending TCP PCBs/TIME_WAIT and post-line closers. Release
+reservations through ordinary closure. The old range stays reserved until all
+owner acknowledgments settle. Input affinity, deferred Init and reverse output
+carry/check a non-reused binding epoch. A stale packet cannot acquire the range's
+next owner. Cancellation only notifies the barrier and keeps admission closed.
+
+An already authenticated, usable binding validates its saved identity, key/range
+continuity and cached account eligibility during control credential rejection;
+it may rekey even after its crypto keys expire. An occupied provisional slot does
+not qualify. New peer bindings and every new PTC-owned inner Init require current
+fresh admission, including Init delayed across rejection. Denying one new flow
+must close only that flow. Retirement, key/range reassignment, cached account
+revocation and terminal continuity still close the binding gate.

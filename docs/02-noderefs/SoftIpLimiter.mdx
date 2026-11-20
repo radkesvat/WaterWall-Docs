@@ -6,11 +6,13 @@ description: "Reference documentation for the SoftIpLimiter node."
 ---
 
 <!--
-Documentation version: 152
+Documentation version: 154
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/SoftIpLimiter/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/SoftIpLimiter.mdx, and all files must keep the same documentation version.
 -->
 
 # SoftIpLimiter
+
+## Overview
 
 `SoftIpLimiter` publishes its continuing-path state before calling the next Init, so a synchronous transport Est is
 forwarded promptly and once. Input submitted reentrantly from Init, Est or initial replay stays behind the original
@@ -33,7 +35,16 @@ be recognized, the default behavior is to pass the connection through without IP
 that to close the connection. It does not authenticate users, parse destinations, add headers, remove headers, or rewrite
 payload. `VlessServer` or `TrojanServer` must still run after it and perform the real protocol authentication.
 
-## Typical Placement
+### Supported Traffic Shape
+
+`SoftIpLimiter` must receive a plain TCP stream whose first application bytes are the VLESS or Trojan identity bytes.
+TLS-wrapped clients are supported only when Waterwall terminates TLS before this node, usually with `TlsServer`.
+
+Unsupported client-side shapes include WebSocket, gRPC, XHTTP, HTTP `Host`/header-based wrappers, UDP placement, and
+packet chains. In those cases the VLESS/Trojan identity is not at the beginning of the clear TCP stream, so this node
+cannot identify the user.
+
+## Typical placement
 
 VLESS over plain TCP for local or test deployments:
 
@@ -63,16 +74,59 @@ Place `SoftIpLimiter` after any encryption or transport wrapper that hides the V
 protocol server or raw TCP relay that consumes/forwards those bytes. This node is stream-only; do not use it in packet
 chains.
 
-## Supported Traffic Shape
+## Minimal practical example
 
-`SoftIpLimiter` must receive a plain TCP stream whose first application bytes are the VLESS or Trojan identity bytes.
-TLS-wrapped clients are supported only when Waterwall terminates TLS before this node, usually with `TlsServer`.
+Node fragment; define the referenced neighbors and peers in the same deployment.
 
-Unsupported client-side shapes include WebSocket, gRPC, XHTTP, HTTP `Host`/header-based wrappers, UDP placement, and
-packet chains. In those cases the VLESS/Trojan identity is not at the beginning of the clear TCP stream, so this node
-cannot identify the user.
+Place this after transport decryption and before VlessServer, with the VLESS identity at the start of the TCP stream. Define `vless-server` to perform real authentication. The explicit `passthrough` policy leaves unrecognized identities unlimited; choose `close` for the documented strict policy.
 
-## VLESS Example
+```json
+{
+  "name": "soft-ip-limit",
+  "type": "SoftIpLimiter",
+  "settings": {
+    "identifier": "vless",
+    "simultaneous-user-limit": 2,
+    "tolerance-ms": 30000,
+    "on-identification-failure": "passthrough"
+  },
+  "next": "vless-server"
+}
+```
+
+See [Configuration](#configuration) for defaults and conditional requirements and [Usage and troubleshooting](#usage-and-troubleshooting) for complete examples and operational limits.
+
+## Configuration
+
+### Required Fields
+
+Top-level fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | string | User-chosen node name. Must be unique inside the config file. |
+| `type` | string | Must be exactly `"SoftIpLimiter"`. |
+| `settings` | object | Non-empty SoftIpLimiter settings. |
+| `next` | string | Required. Accepted traffic is forwarded to this node. |
+
+Required settings:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `identifier` | string | Must be exactly `vless` or `trojan`. |
+| `simultaneous-user-limit` | integer | Number of distinct source IP addresses allowed for one identity at the same time. Must be from `1` through `6`. |
+| `tolerance-ms` | integer | Milliseconds after which an inactive IP row is considered stale. Must be at least `1`. |
+
+### Optional Settings
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `on-identification-failure` | `passthrough` | What to do when early bytes are definitely not valid for the configured `identifier`: `passthrough` forwards the line without IP limiting; `close` rejects it. Aliases for `passthrough`: `pass`, `pass-through`. |
+| `verbose` | `false` | Enables warning logs for rejected admissions and active payload closures. |
+
+## Usage and troubleshooting
+
+### VLESS Example
 
 Allow each VLESS UUID to be active from at most two source IP addresses at a time:
 
@@ -129,7 +183,7 @@ Allow each VLESS UUID to be active from at most two source IP addresses at a tim
 ]
 ```
 
-## Trojan Example
+### Trojan Example
 
 Allow each Trojan password identity to be active from one source IP address at a time:
 
@@ -194,56 +248,7 @@ Minimal relay example when another server will parse Trojan after Waterwall forw
 }
 ```
 
-## Required Fields
-
-Top-level fields:
-
-| Field | Type | Description |
-| --- | --- | --- |
-| `name` | string | User-chosen node name. Must be unique inside the config file. |
-| `type` | string | Must be exactly `"SoftIpLimiter"`. |
-| `settings` | object | Non-empty SoftIpLimiter settings. |
-| `next` | string | Required. Accepted traffic is forwarded to this node. |
-
-Required settings:
-
-| Field | Type | Description |
-| --- | --- | --- |
-| `identifier` | string | Must be exactly `vless` or `trojan`. |
-| `simultaneous-user-limit` | integer | Number of distinct source IP addresses allowed for one identity at the same time. Must be from `1` through `6`. |
-| `tolerance-ms` | integer | Milliseconds after which an inactive IP row is considered stale. Must be at least `1`. |
-
-## Optional Settings
-
-| Field | Default | Description |
-| --- | --- | --- |
-| `on-identification-failure` | `passthrough` | What to do when early bytes are definitely not valid for the configured `identifier`: `passthrough` forwards the line without IP limiting; `close` rejects it. Aliases for `passthrough`: `pass`, `pass-through`. |
-| `verbose` | `false` | Enables warning logs for rejected admissions and active payload closures. |
-
-## Identity Extraction
-
-In `vless` mode, the first upstream bytes must start with:
-
-```text
-version:  1 byte, must be 00
-uuid:     16 raw UUID bytes
-```
-
-The 16 UUID bytes are reduced to the internal 64-bit key with `calcHashBytes(uuid, 16)`.
-
-In `trojan` mode, the first upstream bytes must begin with:
-
-```text
-password hash: 56 ASCII hex bytes, hex(SHA224(password))
-```
-
-`SoftIpLimiter` validates and decodes the 56 hex characters, then reduces the 28 SHA224 bytes to the internal 64-bit key
-with `calcHashBytes(sha224, 28)`.
-
-The identity bytes are not consumed or rewritten. After admission, the complete buffered stream is forwarded unchanged to
-the next node.
-
-## Identification Failure Behavior
+### Identification Failure Behavior
 
 `SoftIpLimiter` waits while the buffer is too short to decide. Once the bytes are definitely invalid for the configured
 mode, `on-identification-failure` decides the next step.
@@ -255,7 +260,7 @@ and future payload/lifecycle callbacks pass through normally.
 Use `passthrough` when the following `VlessServer` or `TrojanServer` has its own fallback behavior, or when the same chain
 is intentionally shared with non-VLESS/Trojan probes. Use `close` when malformed early data must not reach the next node.
 
-## Limit Behavior
+### Limit Behavior
 
 The limit is per identity, not global for the node. If `simultaneous-user-limit` is `2`, one UUID or Trojan password hash
 may be used by two distinct source IP addresses at the same time. A third active source IP for the same identity is
@@ -264,7 +269,7 @@ rejected, but a different identity has its own independent IP list.
 Multiple connections from the same source IP and same identity count as one IP address. The row keeps a reference count,
 so it remains alive until the last live line for that source IP is released or until the row becomes stale.
 
-## Tolerance Behavior
+### Tolerance Behavior
 
 `tolerance-ms` is checked lazily when the table is touched:
 
@@ -286,7 +291,7 @@ moves from mobile data to Wi-Fi, the first IP may keep occupying the identity's 
 stops sending data. For common mobile or roaming clients, a short tolerance such as `3000` to `5000` ms is often a more
 practical starting point.
 
-## Source IP Requirement
+### Source IP Requirement
 
 For recognized identities, `SoftIpLimiter` requires a valid source IP in the WaterWall line source context. Normal stream
 listener nodes such as `TcpListener` provide this.
@@ -296,7 +301,7 @@ If the source context is missing or is not an IPv4 or IPv6 address, the connecti
 If identification fails and `on-identification-failure` is `passthrough`, no source-IP row is created and this source-IP
 requirement is not used for that line.
 
-## Logging
+### Logging
 
 The node is silent by default.
 
@@ -304,7 +309,7 @@ When `verbose` is `true`, rejected admissions and active payload closures are lo
 64-bit identifier, source IP, worker id, reason, current IP count, and configured limit. Raw VLESS UUIDs and raw Trojan
 SHA224 values are not logged.
 
-## Operational Notes
+### Operational Notes
 
 The node advertises `kNodeFlagSupportsSplice`. While identifying the connection,
 it materializes each complete incoming delivery through `sbufEnsureOrdinary()`
@@ -327,7 +332,7 @@ support across the complete finalized chain, so a TLS node in that chain disable
 - Enable `verbose` temporarily when you need to confirm whether a connection was rejected or actively closed because of
   the IP limit.
 
-## Common Mistakes
+### Common Mistakes
 
 - Placing `SoftIpLimiter(identifier=trojan)` before `TlsServer`. Trojan bytes are still encrypted there, so the limiter
   cannot identify the connection.
@@ -340,7 +345,34 @@ support across the complete finalized chain, so a TLS node in that chain disable
 - Setting `simultaneous-user-limit` higher than `6`.
 - Using it in packet chains.
 
-## Node Metadata
+## Advanced behavior
+
+### Identity Extraction
+
+In `vless` mode, the first upstream bytes must start with:
+
+```text
+version:  1 byte, must be 00
+uuid:     16 raw UUID bytes
+```
+
+The 16 UUID bytes are reduced to the internal 64-bit key with `calcHashBytes(uuid, 16)`.
+
+In `trojan` mode, the first upstream bytes must begin with:
+
+```text
+password hash: 56 ASCII hex bytes, hex(SHA224(password))
+```
+
+`SoftIpLimiter` validates and decodes the 56 hex characters, then reduces the 28 SHA224 bytes to the internal 64-bit key
+with `calcHashBytes(sha224, 28)`.
+
+The identity bytes are not consumed or rewritten. After admission, the complete buffered stream is forwarded unchanged to
+the next node.
+
+## Implementation details
+
+### Node Metadata
 
 Source-backed metadata:
 

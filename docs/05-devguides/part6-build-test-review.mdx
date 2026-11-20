@@ -5,27 +5,61 @@ sidebar_label: "Part 6: Build, Test & Review"
 description: "CMake presets, focused builds, the integration test harness, build-environment gotchas, the full review checklist, and the report format expected from coding agents."
 ---
 <!--
-Documentation version: 173
+Documentation version: 179
 -->
 
 # Part 6: Building, Testing & Reviewing
 
-A tunnel change is not done when it compiles. It is done when it builds through a
-known-good preset, passes the relevant integration tests, and survives the review
-checklist. This part covers how to validate work and how to present it.
+Run all focused tests that exercise the changed behavior, its affected callers
+and relevant failure paths. A change confined to one callback may need one native
+fixture. A change shared by several nodes may also need tests for each caller
+and an integration case for the chain.
+
+## Reading path
+
+- [Select proportionate validation and regression coverage](#choosing-validation-and-regression-coverage)
+- [Build, format and run the ordinary test lanes](#building)
+- [Review checklist and reporting](#code-review-rules-and-tunnel-checklist)
+- [Platform and dependency build reference](./reference/platform-builds.mdx#platform-and-dependency-build-reference)
+- [Specialized validation reference](./reference/specialized-validation.mdx#specialized-validation-reference)
+- [Optional optimization evidence policy](#optional-optimization-and-evidence-review)
+
+## Choosing Validation And Regression Coverage
+
+Identify what could break and which callers would observe it. Run the cases
+that exercise those paths. **Stop when those checks pass and cover the change.**
+
+- For prose or comment edits, inspect the diff and verify changed links or
+  command examples. For a script or build rule, exercise the affected invocations
+  or targets. For runtime behavior, include integration cases when they exercise
+  interactions that native fixtures miss.
+- For shared code, trace the affected callers and select their cases together
+  with the component tests. Add a configuration, sanitizer or lane when it
+  covers a specific failure mode the selected cases miss.
+- CI runs the routine full suites. Run a whole lane or native suite locally only
+  when explicitly requested or when a concrete risk spans the suite and smaller
+  selections cannot cover it.
+- New observable behavior, meaningful edge cases, changed contracts, and
+  reproducible bugs likely to regress normally receive focused coverage. When
+  practical, a regression test should fail before the fix and pass afterward.
+- A new test is unnecessary when existing coverage already demonstrates the exact
+  behavior, reproduction is impractical, or the change has no meaningful behavior
+  to assert. State that reason instead of manufacturing a test or a new harness.
+- One direct check may establish a narrow deterministic invariant. Use repetition,
+  sanitizers, stress, fault injection, or broader tests when concurrency, timing,
+  security, or nondeterminism makes one observation insufficient.
+
+A validation failure or unavailable environment is evidence about the validation
+attempt, not a pass and not automatic proof that the product is wrong. Preserve the
+exact failure and distinguish **failed** from **inconclusive** evidence.
 
 ## Building
 
-Prefer the `linux` CMake preset. Configure once, then build:
+For a production build, configure the `linux` preset once and build the target
+you need. This example compiles the `TlsClient` tunnel.
 
 ```bash
 cmake --preset linux
-cmake --build --preset linux -j8
-```
-
-For a focused build of one changed tunnel target (much faster while iterating):
-
-```bash
 cmake --build --preset linux --target TlsClient -j8
 ```
 
@@ -37,571 +71,6 @@ configuration, e.g. `build/linux/Release/Waterwall` (also `Debug/` and
 `RelWithDebInfo/`). Other preset trees exist under `build/` (`linux-gcc-x64`,
 `linux-clang-x64`, `linux-tsan-unit`, and more); do not mix them within a single
 verification flow.
-
-Linux application builds link bundled dependencies and compiler runtimes
-statically, allowing only glibc libraries and its dynamic loader as shared
-dependencies. This applies to ordinary CMake builds as well as presets and CI,
-in every build configuration. `-static-libstdc++` and `-static-libgcc` do not
-control `libatomic`: WaterWall replaces mimalloc's detected atomic dependency
-with `libatomic.a`, found in the target compiler's library search directories.
-The target toolchain must provide that archive; configuration fails if only the
-shared library is available. This policy does not require a static glibc.
-
-`waterwall.linux_runtime_dependencies` checks ELF `DT_NEEDED` entries in the
-application and, when packing is enabled, its launcher. It runs without executing
-the target, so Linux CI runs it for native and cross-built artifacts before
-upload. Run it locally with `ctest --test-dir build/linux-clang-x64 -C Release
--R '^waterwall\.linux_runtime_dependencies$' --output-on-failure`. Sanitizer and
-native-unit trees omit this production dependency check. Intentionally supplied
-shared dependencies do not satisfy the production check; optional external nodes
-loaded at runtime are outside its scope.
-
-Linux runtime code uses the `waterwall_runtime_options` interface, exported
-publicly by `ww`: C/C++ compilation receives `-fno-pic -fno-pie`, and executable
-links receive `-no-pie`. This covers `ww`, the application, tunnels, their reused
-PCH, and runtime-linked tests. The lwIP, UUID, freeres, KCP/FEC, and Brotli wrapper helper targets attach
-the same interface directly without inheriting ww's headers or PCH. Application
-targets also use `POSITION_INDEPENDENT_CODE OFF` with `CheckPIESupported`.
-The policy applies to ordinary and packed builds across Linux CPU variants;
-Android, Apple, and other non-Windows operating systems retain their existing policy.
-ThreadSanitizer builds retain PIE because the sanitizer requires it. The selected
-static runtime dependencies also use this policy: mimalloc, MaxMindDB, c-ares,
-libsodium, nghttp2, BoringSSL, and Brotli. Komihash is header-only and inherits the
-including runtime source's flags. `waterwall_configure_runtime_dependency()`
-applies the interface's compile options, disables an upstream PIC property when
-non-PIC compilation is active, and exports the matching executable link options.
-This avoids changing vendored sources or mixing upstream CMake link signatures.
-Preprocessed assembly receives the same non-PIC options as C/C++; NASM keeps its
-own instruction/relocation implementation. The packed launcher, host encoder,
-and XZ Embedded retain their own relocation settings.
-The startup guard and decoder wrapper are compiled separately for the
-application and launcher so their object code follows the respective policy. Do not link the non-PIC runtime
-archives into a shared library. This removes ASLR for the application's executable
-image but does not eliminate dynamic-library PLT/GOT calls; throughput gains must
-be measured. Results from changing only the executable link policy do not measure
-this runtime-wide code-generation policy.
-
-The in-tree OpenSSL static build receives `no-pic no-pie` through its own
-Configure options on Linux (excluding Android and ThreadSanitizer) and Windows
-x86/x64. GCC/Clang builds also receive `-fno-pic -fno-pie` to override default-PIE
-toolchains; MSVC does not receive those Unix compiler flags. Other platforms and
-Windows ARM retain their existing settings. Imported OpenSSL targets supplied
-externally retain their provider's build policy. OpenSSL's `no-pic` also disables
-building loadable modules: the default provider remains built in, and the enabled
-legacy provider is linked into libcrypto instead of built as a separate module.
-This is not a FIPS-module build. The wrapper detects changed Configure options and
-recreates its generated OpenSSL build directory before rebuilding the archives.
-
-Windows x86/x64 runtime consumers use the same interface for fixed-base executable
-linking. MSVC uses `/DYNAMICBASE:NO /FIXED /INCREMENTAL:NO` and, on x64,
-`/HIGHENTROPYVA:NO`. MinGW uses `-fno-pic -fno-pie` for C/C++ runtime compilation
-and `--disable-dynamicbase --disable-reloc-section` for executable linking, plus
-`--disable-high-entropy-va` on x64. These apply in every configuration, including
-Debug; MSVC incremental linking is disabled to permit fixed-base output.
-Dependency DLLs retain their own relocation policy. Windows ARM targets retain
-ASLR because the platform requires it. Removing the executable's base relocations
-requires its preferred address to be available; OS policies that require
-relocatable images may reject it. This is an executable-image policy, not a
-system-wide override of DLL, heap, stack, or OS-enforced randomization.
-See Microsoft's [DYNAMICBASE](https://learn.microsoft.com/en-us/cpp/build/reference/dynamicbase)
-and [FIXED](https://learn.microsoft.com/en-us/cpp/build/reference/fixed-fixed-base-address)
-references, and the [GNU PE linker options](https://sourceware.org/binutils/docs/ld/Options.html).
-
-Windows lwIP targets receive `LWIP_NO_UNISTD_H=1` directly, including standalone
-archives. The engine includes `wdef.h` before lwIP headers to establish MSVC
-compatibility types first; otherwise lwIP's `int` fallback for `ssize_t` conflicts
-with WaterWall's 64-bit Windows definition.
-
-### Google QUICHE and the shared BoringSSL provider
-
-`INCLUDE_QUIC_CLIENT` and `INCLUDE_QUIC_SERVER` independently enable the raw
-QUIC nodes. The dependency graph is constructed only when either is enabled;
-when both are disabled, their dependencies are not fetched. TlsClient and both
-QUIC nodes use one `WaterWall::BoringSSL` interface over the existing prefixed
-vendor provider. Enabling QUIC does not enable TlsClient or introduce a second
-unprefixed crypto library. Existing RealityClient/IpManipulator TlsClient
-requirements remain separate feature dependencies.
-
-The BoringSSL subdirectory is excluded from the default build so only libraries
-required by consumers (`ssl`, `crypto`, and their dependencies) are built. Its
-unused `pki` and `decrepit` libraries remain outside the production build.
-On MSVC, the embedding removes upstream's private `_HAS_EXCEPTIONS=0` override
-so BoringSSL and its C++ consumers use the same STL exception-class ABI. Release
-IPO and warnings-as-errors remain enabled.
-
-The pinned production closure is embedded through
-`ww/cmake/dependencies/quiche.cmake`, with notices in the adjacent `NOTICE.md`:
-Google QUICHE, Abseil, protobuf-lite/generated QUIC protos, Google URL with
-ASCII-only IDNA, zlib and the shared BoringSSL provider. Runtime dependencies
-use the existing static-link, CPU and relocation policy. QUICHE/QuicCommon and
-required C++ dependencies use private C++20, without changing the C++17 baseline
-when QUIC is disabled. C wrappers remain C11. Incompatible C++ targets disable
-the inherited C precompiled header and unity build. A separately built native
-host protoc matches the pinned protobuf runtime; target cross-build binaries
-are never executed for code generation, and host flags remain separate from
-runtime IPO/CPU settings.
-
-The native protoc build exposes a root `waterwall_host_protoc` target so Visual
-Studio includes the required excluded protobuf subproject. On Apple hosts, it
-explicitly selects the macOS SDK and clears inherited device/simulator SDK,
-architecture and deployment settings. `WW_HOST_PROTOC_CC` and
-`WW_HOST_PROTOC_CXX` select host compilers independently of the application when
-using a non-Visual-Studio generator. The MinGW32 CI job uses x64 host compilers
-for protoc while keeping the application and runtime dependencies x86. MinGW
-protoc statically links its compiler runtimes so the target's PATH cannot load
-DLLs of the wrong architecture.
-The staged host protobuf sources also backport upstream `3b1ba48c` to defer the
-JSON parser's recursive variant instantiation until its message type is complete.
-This C++20 compatibility fix leaves the dependency pin, source cache and runtime
-protobuf-lite sources unchanged.
-
-The pinned Google URL dependency uses generated header overlays for GCC 11 and
-Clang 14 compatibility. These defer unsupported template assertions, avoid newer
-constexpr string requirements, spell dependent numeric types with `typename`, and
-brace-initialize checked-iterator pointer aggregates. Keep the downloaded sources
-unchanged; both fixed and dynamic span iterators retain their existing bounds
-checks and pointer values. QUICHE source overlays also brace-initialize
-structured-header and ACK-timestamp aggregates while preserving string copy/move
-behavior, the selected variant alternative, and the timestamp exponent.
-
-Windows QUICHE builds and header consumers use `NOMINMAX`, `NOGDI`, and
-`WIN32_LEAN_AND_MEAN` to avoid Windows macro collisions with C++ and logging.
-For MSVC, the standalone Google URL subset uses its portable checked/clamped
-arithmetic and supported attribute fallbacks. Its generated headers omit the
-Chromium-wide compiler-policy rejection and recognize `_M_ARM64` for mandatory
-ARM64 NEON support. Overflow and iterator bounds checks remain enabled.
-MSVC QUICHE consumers enable the conforming C++ preprocessor. Source overlays
-spell out the two variant comparisons and bind WebTransport fields through
-ordinary pointers into each call's header. This avoids MSVC's constant-initialized
-member-pointer limitation while preserving field names, order and constness,
-without global initialization.
-
-Linux Clang CI installs LLVM 19 from the official LLVM package repository on
-Ubuntu 22.04 and explicitly selects `clang-19` and `clang++-19` for both x64 CPU
-variants. The compatibility overlays continue to support local Clang 14 builds.
-
-Focused coverage is registered under `waterwall.quic`: production carrier, engine
-and node callback units in both native configurations; direct, real UDP/framed-TCP, server-first,
-deterministic UDP impairment, configuration and shutdown integrations through
-the namespace harness. `waterwall.quic_speedtest_vless_udp` is the optional
-serial throughput case for the exact VLESS/QUIC/UDP SpeedTest chain; its fixed
-workload, measured byte-derived rates and limits live beside the JSON fixture.
-The production Linux runtime-dependency check also covers the statically linked
-QUIC closure. Cross-compilation proves compile/link behavior only; unavailable
-target execution is reported separately.
-
-QUIC configuration startup coverage has separate client and server CTest entries.
-Each retains every constructor case and the existing per-process startup and
-shutdown deadlines; packed startup cost is bounded separately for each role.
-
-### Vendored XZ Embedded
-
-`waterwall_cpu_options` carries the selected architecture flags separately from
-the runtime's non-PIC/non-PIE policy. `ww` exports this interface to its consumers;
-the root build attaches it privately to the decoder engines and both wrappers.
-The existing AVX/AVX2/AVX512 switches, baseline selection and old-CPU presets
-therefore also control decoder compilation. Launcher startup code and its CPU
-guard do not inherit these flags. Standalone host-tool and launcher-fixture builds
-retain their own compiler defaults. This permits compiler optimization for the
-selected CPU; it adds no SIMD implementation or runtime CPU dispatch to XZ and
-does not change the payload format or encoder settings.
-
-`ww/vendor/xz-embedded/README.waterwall.md` records the pinned upstream revision
-and source mapping. The root build always builds `xz_embedded` as a static
-library and links the ordinary application through `WaterWall::XZDecoder` to
-`XZEmbedded::XZEmbedded` on every platform, without fetching XZ sources or requiring system liblzma. Other targets
-link `XZEmbedded::XZEmbedded` directly to obtain `<xz.h>`; `ww` does not re-export
-this dependency. Unused code remains subject to normal static linker elimination.
-The compiled decoder uses the XZ container layout with Waterwall-specific
-identifiers, LZMA2 + x86 BCJ, CRC32 integrity checks, and only `XZ_SINGLE` decoding.
-CRC64, SHA-256, other BCJ filters, multi-call
-allocation modes, and concatenated-stream support are disabled. Initialize the
-CRC32 table once before concurrent use, as documented in the vendored header.
-XZ Embedded provides decompression only.
-
-### Build-time XZ payload tools
-
-`core/tools/xz_encoder/README.md` documents the independent native encoder project.
-From `core/tools/xz_encoder`, configure with `cmake --preset host`, build with
-`cmake --build --preset host-release -j8`, and test with
-`ctest --preset host-release`; repeat with `host-debug` for asserted builds.
-The encoder uses pinned upstream liblzma through CPM only in this host build.
-Never configure it with the production cross-compilation toolchain. Its code and
-libraries are not dependencies of the shipped executable.
-
-Packing itself requires CMake and native C tools, with no Python dependency.
-`core/build_host_encoder.cmake` serializes the native configure/build with
-`file(LOCK)` and disables tests for the automatic host build. The manual `host`
-preset enables the Python regression tests. `core/generate_packed_payload.cmake`
-owns staging, stripping, tool invocation and atomic publication under a per-output
-lock. The CRT-only `waterwall_payload_tool` validates ELF/PE images and emits
-compressed bytes and metadata as C source; `waterwall_xz_encoder` owns compression.
-Python remains in test runners, including the Windows launcher fixture. Production
-builds with tests disabled do not require Python for these packing steps.
-
-The fixed encoder format is one CRC32 stream with the XZ layout and Waterwall
-identifiers, using x86 BCJ at offset zero, then LZMA2 (8 MiB dictionary,
-lc/lp/pb 3/0/2, normal mode, BT4, nice length 64,
-search depth 64). The separate `WaterWall::XZDecoder` target exposes
-`<ww_xz_decoder.h>` and uses XZ Embedded single-call decoding into a bounded
-caller-owned buffer. Call `wwXzDecoderInit()` once before concurrent use. Success
-requires complete input consumption and the trusted expected output length;
-output must be discarded on failure. The wrapper accepts only CRC32 checks.
-The shared `ww/vendor/xz-embedded/include/ww_xz_format.h` defines a six-byte
-`MUFASA` header magic, a two-byte `gg` footer magic (no terminating NULs), and
-`FF` as the private CRC32 selector. The encoder replaces those identifiers in
-liblzma output. Both copies of the stream flags become `00 FF`: the selector
-is at offset 7 and three bytes before the stream end. Their stored CRCs remain
-calculated over the original `00 01` flags. The decoder requires the private
-CRC32 marker and normalizes only its own copied header/footer buffers before
-CRC validation; caller input stays unchanged. Header, footer, index and block
-data checksum validation are enabled by default. Compression algorithms, sizes, filters,
-indexes and checksum values stay intact. Both native launchers use this format.
-Ordinary XZ tools cannot decode it until the magic and both selectors are
-restored. The internal `.xz` suffix does not denote a standard XZ file.
-
-`WW_PACKED_PAYLOAD_CRC32` defaults to `OFF`. Configure a packed Linux or Windows
-build with `-DWW_PACKED_PAYLOAD_CRC32=OFF` to omit only the launcher's CRC32
-calculation and comparison over decompressed Block data. The encoder continues
-writing the same checksums and the launcher still consumes all four check bytes.
-Stream header/footer, Block Header and Index CRCs, format validation, bounds,
-exact output length and full input consumption remain mandatory. Payload damage
-may go undetected when its checksum is skipped. This option has no effect on
-ordinary decoding or Waterwall traffic processing.
-
-With checking disabled, `ww_launcher_xz_embedded` compiles the same vendored
-sources with the private `WW_XZ_SKIP_BLOCK_CRC32` define. `XZEmbedded::Launcher`
-selects this engine for `ww_launcher_xz_decoder`; checked launchers reuse
-`xz_embedded`. `WaterWall::XZDecoder` and `XZEmbedded::XZEmbedded` always retain
-payload checking. The optional launcher engine receives the same CPU flags as
-the ordinary engine without inheriting runtime non-PIC/non-PIE flags.
-The independent host test project exercises both decoder wrappers. Run its
-`host` preset with the option `OFF` and `ON`, building and testing Debug and
-Release: altered payload checks pass only for an opted-out launcher, while
-metadata checks, malformed LZMA2, truncated checks and output bounds remain
-enforced. The output fixture remains byte-identical with either policy.
-
-This boundary has no Linux loading or startup dependencies. Tests round-trip a
-compiled module and exercise malformed inputs and capacity/length failures.
-Encoder and payload-source output are created exclusively; existing output and an input/output path
-collision must leave existing bytes intact. Windows uses `_open` with `_O_EXCL`
-and binary mode before `_fdopen`, because the legacy MSVCRT used by MINGW32/MINGW64
-does not implement `fopen`'s C11 `x` mode. Other hosts retain `fopen(..., "wbx")`.
-
-### Optional Linux packed executable
-
-`WW_PACK_RUNTIME` defaults to `OFF`. Native Linux x86-64 builds may use a separate
-production tree with identical enabled features and Release LTO:
-
-```bash
-cmake --preset linux-packed
-cmake --build --preset linux-packed -j8
-ctest --preset linux-packed --output-on-failure
-```
-
-Linux x64 artifact jobs in GitHub CI enable `WW_PACK_RUNTIME` on the configure
-command for GCC, Clang, old-CPU, and AVX512 builds. Presets keep their development
-defaults. Artifact names stay the same, and each x64 upload contains only the final
-`Release/Waterwall`, excluding the private application. The existing GCC x64
-integration lanes exercise that packed executable. Native units, sanitizer jobs,
-and other platform/architecture artifacts keep their existing build modes.
-
-The public `Waterwall` target builds the final executable in both ordinary and
-packed configurations, including explicit `--target Waterwall` builds. Packed
-builds use the private `WaterwallApplication` target for the ordinary application.
-The final artifact is `build/linux-packed/Release/Waterwall`. Deploy it with user
-configuration, existing system libraries, and any intentionally supplied external
-node libraries. The private `waterwall_application` comparison executable is a
-normal executable built with the ordinary dependency graph and optimization,
-allocator, CPU, and linking policies. Packing adds no global PIC or shared-runtime
-requirements. Linux packing remains native x86-64 only. Windows packing accepts x86/x64
-targets, including MinGW cross-compilation; Windows ARM and other packed targets
-fail configuration. Ordinary builds do not invoke the host encoder or payload generator.
-
-Core-file open failures include the program version on stderr before the error.
-The ordinary application and packed launcher use the same startup input-error
-reporting, so a missing core file still identifies the executable version without
-runtime initialization or decompression.
-
-The shared startup parser accepts `--verbose` and its equivalent aliases
-`--log`, `-log`, `-verbose`, `--showlog`, `-showlog`, and `--debug-log` with normal
-launch input and restricted-config options. After a successful core-settings parse
-and before logger construction, `enableCoreSettingsVerboseLogging()` replaces all four
-owned level strings with `VERBOSE` and enables their console outputs. File paths
-keep their configured values; enabled files receive the additional messages.
-The override changes only in-memory settings. Ordinary and packed executables
-share the parser, and packed launchers forward the flag to the application.
-The logging switch is accepted once across all aliases and cannot accompany a
-version or Windows recovery request; `-v` keeps its version meaning.
-
-A serialized independent native build checks both payload tools' dependencies in
-`build/xz-encoder-host-<compiler/generator identity>` without inheriting target
-compiler environment flags. `WW_HOST_C_COMPILER` selects a native host compiler;
-`WW_HOST_ENCODER_GENERATOR` selects its generator. Windows host builds retain
-the MSVC environment and use the host `.exe` suffix. The independent manual
-encoder presets continue using `build/xz-encoder-host`.
-On a Windows Visual Studio build, the native encoder generator selects its own
-MSVC compiler without searching for GCC or Clang. Explicitly setting
-`CMAKE_SYSTEM_NAME` in a native Windows preset still makes CMake report
-`CMAKE_CROSSCOMPILING`; that flag alone does not determine host executability.
-Generation finalizes a private executable copy, checks its target identity, compresses
-it, and atomically publishes one source containing bytes and exact size/target
-metadata under `packed/<configuration>`. The executable, native tools, CMake scripts, and
-strip tool are declared dependencies. Failure stops the build without changing the
-input executable or publishing partial output. The launcher links
-`ww_launcher_xz_decoder`, basic JSON and plain-C input support, without `ww`,
-full settings, C++ runtime, networking, or crypto dependencies.
-The final launcher is also stripped during linking in every configuration,
-including Debug: static symbols and debug information are omitted while symbols
-needed for dynamic linking remain. The ordinary application and private comparison
-executable retain their normal configuration's debugging information.
-
-The Linux backend requires Linux 3.19 or newer with `memfd_create`, sealing,
-`execveat`, and permission to execute anonymous files. `/proc/self/exe` must be
-readable to capture the effective outer executable location, including PATH and
-symlink invocation. The backend restores directly into a shared writable mapping,
-unmaps it, seals the executable, and calls `execveat` with `AT_EMPTY_PATH`. The
-kernel/interpreter handles ordinary ELF execution. New executable-memfd flags are
-retried only on unsupported-flag errors, never on policy denial. All failures are
-nonzero; there is no disk extraction, cache, shell, or supervisor fallback. The
-conservative CPU guard runs before both launcher and application startup.
-
-The startup-only handoff uses four reserved arguments:
-`--ww-internal-fd=`, `--ww-internal-len=`, `--ww-internal-src=`, and
-`--ww-internal-exe=`. The outer launcher rejects these from users. The ordinary
-application accepts a complete, nonduplicate set as untrusted configuration input,
-strips it before normal CLI validation, reads the declared regular-file snapshot
-from offset zero, and closes the descriptor on success or failure. Only the input
-descriptor deliberately survives exec; launcher descriptors are above the standard
-streams even when those streams were closed. Input remains byte-for-byte intact,
-including bytes after a NUL. CLI arguments, environment, CWD, PID, and standard
-streams retain their normal meanings. The captured executable path supplies the
-existing executable-relative external-library search; it does not change the
-kernel's `/proc/self/exe` identity. Restricted mode still prohibits external nodes
-and user scripts. Set-ID/file-capability deployment is not a supported packing
-contract; this backend adds no credential transfer or privilege workaround.
-
-Native no-LTO unit trees own full-settings cleanup coverage and launcher failure
-fixtures. The snapshot unit also crosses a real exec and checks exact large-input
-receipt, offset, PID, restricted selection, and descriptor closure. Production
-tests select the final launcher explicitly and exercise real restoration,
-constructors, TLS, workers, networking, and shutdown. Fixture tests alone cannot
-establish full runtime equivalence; unavailable platform, namespace, or privileged
-checks must be reported as unverified.
-
-The public-target regression check operates on generated artifacts in an idle,
-configured packed tree. Run it separately from other builds/tests of that tree:
-
-```bash
-python3 tests/packed_build_target_test.py --build-dir build/linux-packed --config Release
-python3 tests/packed_build_target_test.py --build-dir build/linux-packed --config Debug
-```
-
-It uses `readelf` (override with `--readelf PATH`) to verify the final launcher has
-no static symbol table or debug sections, recreates a missing final executable,
-checks regeneration after an application update, and verifies that an unchanged
-build leaves the payload stable.
-
-### Windows packed executable bootstrap
-
-Windows x86/x64 builds can opt in with `-DWW_PACK_RUNTIME=ON`. GitHub CI enables
-packing for MSVC x86/x64 and every MSYS artifact job (MINGW32, MINGW64, UCRT64 and
-CLANG64), while development presets retain their defaults. Existing artifact names
-contain only the final `Release/Waterwall.exe`; the private application and debug
-files are excluded. Public target `Waterwall` builds the launcher and its ordinary
-`WaterwallApplication` payload. Windows ARM64 artifacts remain ordinary because
-Windows ARM packing is unsupported.
-
-The launcher is a C executable using CRT allocation, shared startup/basic JSON,
-XZ Embedded, and Windows system APIs. It does not link WaterWall runtime libraries.
-The ordinary application inherits `CJSON_HIDE_SYMBOLS` from `ww`; the launcher
-and standalone Windows fixtures currently use cJSON's default Windows exports.
-
-Both application and launcher request static compiler-library linkage on MinGW
-and MSYS2 Clang. This does not embed the Windows CRT: MINGW32/MINGW64 still import
-`msvcrt.dll`, while UCRT64/CLANG64 use UCRT DLL imports, including API-set names.
-MSVC uses its static CRT setting; Windows system API DLLs remain dependencies.
-`CMAKE_MSVC_RUNTIME_LIBRARY` does not select a static CRT for MinGW-targeting Clang.
-
-The vendored mimalloc automatic process-start hook is guarded with its own
-`mi_atomic_do_once`, in addition to the allocator's core initialization guard.
-Windows TLS callbacks and the compiler constructor can both invoke that hook;
-output setup and the remaining loader work must execute only once. The ordinary
-and packed startup comparison keeps stdout/stderr byte-exact, including for
-`--version`. Local allocator patches are recorded in
-`ww/vendor/mimalloc/radkesvat.notes.txt`.
-
-The inner application keeps the ordinary fixed-base options. The launcher explicitly
-retains ASLR, base relocations, and DEP. Both executables retain the existing
-`requireAdministrator` manifest. GNU-compatible stripping applies only to staged
-payload copies and the final launcher. MSVC preserves the application's separate
-PDB policy; launcher links disable incremental linking and debug generation.
-The PE debug directory may still contain VC_FEATURE, POGO, ILTCG, REPRO, or
-extended DLL-characteristics metadata with `/DEBUG:NONE`. Its presence alone
-does not indicate retained debug symbols. The packed-target check reads the
-individual record types, allowing this metadata while rejecting CodeView/PDB,
-COFF and other debug records, debug sections, and COFF symbol tables. Extended
-DLL-characteristics records can carry CET policy and must not be removed merely
-to empty the directory. See the [PE debug types](https://learn.microsoft.com/en-us/windows/win32/debug/pe-format#debug-type).
-No PE loader sections are removed manually. Payload generation identifies PE32
-and PE32+, rejects DLLs, wrong machines, invalid entry points and section ranges,
-and validates again after finalization. Both platforms use the same private
-compression stream format described above.
-
-After basic validation, the Windows launcher copies the exact input into an
-unnamed pagefile mapping, drops writable access, and inherits only a read-only
-snapshot handle and duplicated intended standard handles. The startup boundary
-uses `--ww-internal-map=` in place of Linux's descriptor argument, validates a
-bounded transport header and committed read-only pages across the complete view,
-copies the snapshot into owned CRT memory, and closes the handle. A successful
-mapping alone does not establish that reserved pages can be read. All internal
-arguments are removed before normal CLI parsing.
-Restricted validation remains mandatory. Ordinary Windows stdin retains its CRT
-text semantics; restricted stdin retains binary semantics, with no second text
-conversion at receipt.
-
-The executable is decoded into non-executable storage and written into a new
-private temporary directory. Its protected ACL admits the current user and
-SYSTEM and carries the token's integrity label. Extraction requires a local
-ACL-capable volume; network/FAT-style temporary roots have no weaker fallback.
-Reparse-point roots are refused, the resolved root and every canonical ancestor
-are pinned against replacement, and the owned directory and executable stay
-protected while in use. Directory pins request traverse access and deny write
-and delete sharing; attribute-only opens do not enforce these
-[sharing restrictions](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fsa/8c0e3f4f-0729-49f4-a14d-7f7add593819).
-Only completely decoded and identified PE bytes are started. New filesystem and
-process operations use wide APIs; conversion to the existing active-code-page
-startup boundary rejects unrepresentable paths.
-
-`CreateProcessW` loads the child normally with the original CWD, environment and
-standard streams. Correct CRT quoting preserves argument boundaries. Captured
-outer executable location supplies the runtime's existing resource/node path
-override. DLL files directly beside the launcher are copied into the private
-extraction directory with its restrictive ACL and held read-only until child
-exit. This preserves executable-directory precedence for implicit imports and
-bare-name DLL loads while keeping the native CWD/system/PATH search policy and
-inherited DLL-directory settings intact. No `SetDllDirectoryW`, PATH expansion,
-recursive deployment copy, or stream proxy is added. CWD-only companions remain
-in CWD and use the ordinary loader fallback. DLL copies are startup snapshots;
-their Windows module paths point into the extraction directory. Resources needed
-by a companion through its own module-relative paths are not copied. Such
-deployments must use an ordinary build unless those resources are located
-explicitly. See Microsoft's
-[DLL search order](https://learn.microsoft.com/en-us/windows/win32/dlls/dynamic-link-library-search-order).
-
-The child has its own PID and temporary Windows image path. The public process
-joins its private kill-on-close Job before any child creation, so membership is
-inherited without a suspended-child admission gap. Incompatible enclosing Jobs
-fail startup; no client-owned Job is required. The public process waits for the
-runtime and cleans up its own extraction paths. Failed deletion records inactive
-file residue, and full DWORD runtime status remains intact.
-
-Part 7 describes independent lifecycle capabilities, console presentation,
-controller-loss deadlines, and the public recovery boundary. An exit code alone
-must not be treated as proof of core-session completion. Native Windows tests
-must qualify Job inheritance, console/desktop behavior, token permissions, and
-adapter/DNS/route settlement for each supported OS and exact packed artifact.
-A Windows Firewall rule for the outer path does not identify the temporary child;
-packing neither installs client firewall policy nor bypasses UAC.
-
-The independent `core/tools/windows_launcher` project compiles the actual launcher
-and startup sources with a small PE fixture and companion DLL. From that directory:
-
-```bash
-cmake --preset mingw-x64
-cmake --build --preset mingw-release -j8
-ctest --preset mingw-release --output-on-failure
-cmake --build --preset mingw-debug -j8
-ctest --preset mingw-debug --output-on-failure
-```
-
-For a build-only PE32 cross-check, use `mingw-x86`, `mingw-x86-release`, and
-`mingw-x86-debug` with an i686 MinGW compiler. It does not assume Wine32 is installed.
-On Windows, use `native`, `native-release`, and `native-debug` from a compiler
-environment. The fixture covers exact snapshots, large input, text/binary modes,
-source deletion after capture, original location, companion imports from an
-unrelated CWD, TLS initialization, child status, malformed handoffs, handle
-closure, and concurrent cleanup. The Python fixture normalizes paths to Windows backslashes
-at its process boundary, including in MSYS2 environments whose Python defaults
-to forward slashes; the original-executable handoff check remains exact.
-Native platform unit trees register
-`waterwall.windows_packed_startup_unit` and
-`waterwall.windows_launcher_arguments_unit` outside the Linux-only test subtree.
-Native packed application builds register `waterwall.windows_packed_application`,
-which compares startup/settings behavior, requires a size reduction against the
-finalized payload, and runs the existing four-worker in-process TLS workload on
-both ordinary and packed executables. Registration uses the Windows host and
-runnable target architecture, so the native x86/x64 presets register it even
-when their explicit system settings make `CMAKE_CROSSCOMPILING` true.
-The existing Windows x86/x64 artifact jobs run the MSVC bootstrap fixture and
-public-target checks in Debug and Release before upload, using the matching
-compiler environment. ARM64 skips these packing checks. The MSYS artifact jobs
-run the same bootstrap checks with their own toolchains. Packed artifact builds
-explicitly enable tests and run `waterwall.windows_packed_application` against
-the same Release launcher that will be uploaded. The comparison checks startup,
-worker/TLS behavior and size reduction using the private ordinary application
-from that build; a second full application build is unnecessary. Test failure
-prevents upload, and a missing artifact is an error.
-These tests do not replace manual deployment acceptance.
-
-All four MSYS2 artifact jobs retain failure diagnostics separately from release
-artifacts: available application binaries, configure/build/bootstrap output,
-CMake and CTest logs, recent application crash events, and Defender detection/action
-events and engine status. Event-log access failures are recorded rather than treated as proof that
-Defender took no action. Collection does not change antivirus settings or test
-outcomes. MSVC jobs use their existing artifact policy.
-
-For packed-application failures, MSYS jobs also retain the temporary fixture
-(including generated settings, test certificates and complete application logs),
-the failing command, exit status or timeout, and full stdout/stderr. The test uses
-`WW_WINDOWS_TEST_DIAGNOSTICS` to select the destination. MSYS jobs install GDB before
-validation and set `WW_WINDOWS_TEST_DEBUGGER=gdb`: the ordinary application's TLS
-workload runs under GDB from its first launch, within its existing 60-second budget.
-The ordinary and packed workload checks also run directly in fresh fixture directories,
-so debugger timing cannot replace either normal validation gate. Startup/settings
-output comparisons remain direct.
-
-The debugger records abort/assert callers, all thread backtraces, registers and
-loaded modules in the workload directory's `gdb.log`. Signal stops are recorded
-and passed to the application, so a handled signal can still complete normally.
-It uses `--return-child-result` so a nonzero child exit fails the test; an unexpected
-stop without termination also fails. The
-unqualified `_amsg_exit` breakpoint is excluded because it can resolve to a harmless
-KernelBase file-opening stub. An already captured first execution is not replayed.
-Other failures receive one GDB replay on a separate fixture copy, bounded to
-90 seconds, with logs under `packed-application-debugger` in the recorded CWD.
-Timeout cleanup includes debugger descendants on native Windows. Replay cannot
-make the original test pass. Windows GDB does not automatically trace a packed
-launcher's child, and native Windows qualification remains necessary.
-
-Release application linker maps (`WW_WINDOWS_LINK_MAP=ON`) stay in separate failure
-artifacts to resolve addresses without changing optimization or stripping. Product
-uploads select only the final `Waterwall` or `Waterwall.exe`. Release packaging
-excludes diagnostic artifact directories and archives only those executable names;
-private application binaries, PDBs, maps, logs and test fixtures are never release
-assets. A product artifact without its final executable fails packaging.
-
-iOS device and simulator jobs extract `Release-*/Waterwall.app/Waterwall` into
-`artifacts/<preset>/Waterwall` before upload. This flat executable path matches
-release packaging; bundle metadata and dependency archives stay out of the
-product artifact. A missing bundle executable fails preparation.
-
-`windows-cross-mingw-x64` is a full application cross-check preset. It requires
-the target MinGW compiler/SDK and native dependency build tools; successful
-fixture builds do not prove that every full application dependency cross-builds.
-Use the same public-target regression on an idle Windows packed tree:
-
-```bash
-python tests/packed_build_target_test.py --build-dir build/windows-launcher-native --config Release --windows
-```
-
-On Linux/Wine append `--runner wine`. The check verifies PE identity, launcher
-ASLR/DEP/relocations and omitted debug data, application non-ASLR flags, recreation,
-regeneration, and stable unchanged output. Header checks and Wine cannot establish
-native UAC, console control, ACL/locking, antivirus, firewall or service-wrapper
-behavior, nor full runtime workers/TCP/TLS equivalence. Native application tests
-gate artifact publication; manual testing remains necessary for deployment-specific
-behavior.
 
 ### Build Rules
 
@@ -628,20 +97,6 @@ legacy files are not, so do not reformat untouched code wholesale: format and
 verify the changed ranges with `--lines=<start>:<end>` when a full-file pass would
 rewrite unrelated lines. If the command is unavailable, report what remains
 unformatted or unverified rather than silently skipping the check.
-
-### Build-Authority Modes
-
-The repository's Ninja authority model validates symlink-free graph traversal,
-the exact include/subninja closure, Ninja variable timing, and declared generated
-inputs. Its toolchain identities also include resolved symlink-target bytes.
-
-The current host-toolchain workflow is nevertheless **diagnostic**, not
-release-authoritative: the compiler, subordinate programs, headers, libraries,
-plugins, CRT objects, and sysroot are not yet executed from one immutable
-snapshot. `tests/tools/cmake_ci_step.py --mode integrity` therefore fails closed
-with an immutable-toolchain boundary error. Use `--mode diagnostic` for ordinary
-CI until a reviewed immutable toolchain image or snapshot is available; do not
-describe a diagnostic record as a hermetic or hostile-same-user guarantee.
 
 ## Testing
 
@@ -710,14 +165,20 @@ measurements were 46–48 seconds on a 4-CPU host; that optional work is outside
 the routine `all` total. Measure the current lane selection when estimating a
 complete run. Cloud CI runs native Release and Debug in parallel.
 
-Use the full functional lane for shared networking or tunnel behavior and the
-ordinary integration sequence for broad tunnel or harness work. Run routine
-production coverage, including applicable privileged tests, plus both native-unit
-configurations for shared-core contracts, lifecycle/concurrency work,
-multi-subsystem changes, or any change whose impact is difficult to bound.
-Speed and stress lanes are opt-in: run them when requested or when directly
-validating their workloads. Focused checks remain appropriate for narrow or
-non-behavioral edits.
+To check a TLS roundtrip, build the production executable and select the
+registered case from the repository root. Use its exact name so the selection
+stays narrow and an empty match fails.
+
+```bash
+cmake --preset linux
+cmake --build --preset linux --config Release --target Waterwall -j8
+ctest --preset linux --output-on-failure --no-tests=error -R '^waterwall\.tls_roundtrip$'
+```
+
+### Whole production lanes
+
+When the validation scope calls for a whole lane, choose the corresponding
+command below. Speed and stress are opt-in for their specific workloads.
 
 ```bash
 # Ordinary non-privileged production Release sequence across test lanes.
@@ -736,351 +197,30 @@ bash tests/run_test_lane.sh all build/linux Release
 # Optional throughput and longer traffic/churn workloads.
 bash tests/run_test_lane.sh speed build/linux Release
 bash tests/run_test_lane.sh stress build/linux Release
-
-# Complete native-unit suite: optimized Release plus asserted Debug behavior.
-cmake --preset linux-unit-tests
-cmake --build --preset linux-unit-release -j8
-ctest --preset linux-unit-release --output-on-failure
-cmake --build --preset linux-unit-debug -j8
-ctest --preset linux-unit-debug --output-on-failure
 ```
-
-### Trojan UDP size coverage
-
-`waterwall.trojan_udp_size_probe` carries IPv4 UDP through a WaterWall
-TrojanClient/TrojanServer pair over TLS/TCP. Its payloads include empty, 8191-,
-8192-, 8193-, 32768-, 65400- and 65507-byte datagrams; asymmetric request/reply
-sizes include a small request followed by a maximum-sized socket reply. Exact
-bytes and one-datagram delivery matter in both directions. Native client/server
-fixtures separately exercise the 65535-byte framing boundary and reject local
-65536-byte bodies; these codec checks do not attempt an impossible 65535-byte
-ordinary IPv4 UDP send. Carrier fragmentation must preserve the complete datagram.
-
-### Trojan and VLESS independent-peer coverage
-
-`waterwall.trojan_sing_box_{client,server}_{tcp,udp}` and
-`waterwall.vless_sing_box_{client,server}_{tcp,udp}` exercise both WaterWall roles
-against pinned sing-box 1.12.0. Each short case has a 25-second timeout and uses
-the namespace harness. Provision the shared peer with
-`cmake --build --preset linux --target waterwall_vmess_SING_BOX_reference`;
-this target also exists for enabled Trojan/VLESS cases when VMess is disabled.
-Run the eight cases with
-`ctest --preset linux --output-on-failure -j8 -R '^waterwall\.(trojan|vless)_sing_box_'`.
-
-Trojan uses TLS and VLESS uses native framing with empty flow and explicit empty
-packet encoding; multiplexing is disabled. The sing-box TLS client verifies the
-local fixture certificate. The WaterWall TLS client uses explicit `verify: false`
-because it has no custom local CA setting. TCP exchanges include 65536-byte
-payloads. UDP requires exact 8192-, 8193- and 15000-byte payloads and asymmetric
-request/reply sizes. Empty replies work in both roles; empty requests are checked
-only with WaterWall as client because the pinned direct sing-box ingress drops
-them. Readiness retries use a distinct token; measured packets are never retried.
-
-These are positive interoperability checks. sing-box's 16 KiB packet buffers
-reserve protocol headroom, so their usable payload is smaller and varies by
-path. The 15000-byte workload does not reduce WaterWall's limits or replace its
-near-65 KB pair/native coverage. The fixture and full topology are documented in
-`tests/cases/singbox_proxy_interop/README.md`.
-
-### VMess independent-client coverage
-
-When either VMess endpoint is included, provision the checksum-pinned official
-V2Ray 5.53.0, Xray 25.6.8 and sing-box 1.12.0 archives before entering test
-namespaces. The aggregate target provisions all three; tests never select a
-latest release or download inside a namespace:
-
-```bash
-cmake --build --preset linux --config Release --target waterwall_vmess_reference
-ctest --preset linux --output-on-failure -R vmess
-```
-
-`WATERWALL_VMESS_REFERENCE`, `WATERWALL_VMESS_XRAY_REFERENCE` and
-`WATERWALL_VMESS_SING_BOX_REFERENCE` can identify already provisioned executables.
-The fixture checks each executable's exact release version. Official archive
-names and SHA-256 digests live in `tests/provision_vmess_reference.py`; the small
-`tests/vmess_reference.py` adapter uses each peer's native configuration schema.
-Cases use only loopback destinations and local certificates. Missing peers or
-namespace privileges are unavailable validation, never passed interoperability.
-
-| Pinned peer | Selected body/transport coverage | packetaddr coverage and limits |
-| --- | --- | --- |
-| [V2Ray 5.53.0](https://github.com/v2fly/v2ray-core/releases/tag/v5.53.0) | Both directions: AES/ChaCha TCP/UDP, NONE/zero, framing profiles and existing TLS/WS/WSS compositions. | Both directions and IP families; peer client selects SOCKS `packetEncoding: "Packet"`. Its SOCKS inbound drops empty datagrams before wrapping, so that client cell is explicitly unsupported. Its server accepts empty packetaddr datagrams. Near-limit peer cases use 1940-byte payloads because its complete packet writer frame is bounded to 2048 bytes. This bound also affects native UDP; exact 8192-byte application datagrams cannot pass. |
-| [Xray 25.6.8](https://github.com/XTLS/Xray-core/releases/tag/v25.6.8) | Representative AES/ChaCha TCP/UDP in both directions and short IDs. `XRAY_CONE_DISABLED=true` explicitly selects native UDP instead of the peer's default XUDP conversion; explicit `experiments: "NoTerminationSignal"` tests transport-only closure. NONE/zero are outside this selected Xray matrix. Native UDP cannot carry an exact 8192-byte application datagram: the 8192-byte outgoing frame limit includes length, tag and padding. | Excluded: this release's XUDP is not the packetaddr envelope. |
-| [sing-box 1.12.0](https://github.com/SagerNet/sing-box/releases/tag/v1.12.0) | Representative AES/ChaCha TCP/UDP in both directions, outbound NONE/zero and short IDs. Exact 8192-byte application datagrams are supported with AES, using native UDP or packetaddr in both roles. | Both directions, IPv4/IPv6 and empty datagrams. Separate peer-limit cases use 14993/14981-byte IPv4/IPv6 payloads: pinned sing-vmess 0.2.6 chunks encrypted plaintext at 15000 bytes including the envelope. This peer cannot preserve 65400-byte datagrams: its writer splits them and its 16384-byte chunk reader refuses the opposite direction. |
-
-The exact-8-KiB cases measure **8192 application bytes**, excluding protocol
-headers. Positive WaterWall-pair and sing-box cases require complete matching
-request/reply datagrams. Negative Xray/V2Ray size-limit cases require a successful
-small control exchange before verifying that an intact oversized echo cannot
-complete; those passes record a known peer limit, not successful 8-KiB interop.
-The bounds come from the pinned [Xray authenticated writer](https://github.com/XTLS/Xray-core/blob/v25.6.8/common/crypto/auth.go#L249)
-and [V2Ray authenticated writer](https://github.com/v2fly/v2ray-core/blob/v5.53.0/common/crypto/auth.go#L251),
-whose full-frame buffer sizes are respectively [8192](https://github.com/XTLS/Xray-core/blob/v25.6.8/common/buf/buffer.go#L12)
-and [2048 bytes](https://github.com/v2fly/v2ray-core/blob/v5.53.0/common/buf/buffer.go#L10).
-These peer limits do not reduce WaterWall's codec capacity or describe TCP transfer
-limits. Never truncate or divide an application UDP datagram to hide a peer limit.
-
-`tests/cmake/integration/vmess.cmake` registers a direction only when its required
-targets exist. Existing local/managed WaterWall pairs retain admission, rotation,
-quota, replay, fallback, destination, local-DNS and transport regressions. Added
-cases cover auto selection, server security refusal before target/fallback Init,
-short-ID/canonical-UUID boundaries, termination choices and real registered stats
-through APIServer. Server packetaddr cases interleave two destination backends and
-reverse replies to verify address association. Native fixtures exercise exact
-codec maxima and bounded-map/reentry ownership independently of peer limitations. WaterWall-pair packetaddr coverage retains the 65400-byte workload.
-
-Long encrypted cases perform 65540 stop-and-wait nonempty request/echo exchanges
-on one persistent socket. Waiting for each echo before creating the next request
-forces more than 65536 records in both directions; a relay accepts one transport,
-so reconnection cannot make the case pass. AES and ChaCha cases include padded
-peer framing and authenticated-length profile 29. Strict cases verify 65535
-successful exchanges followed by closure before outgoing nonce reuse. The
-separate zero/TLS long transfer and NONE/TLS UDP cases configure the peer to verify
-the local certificate. Existing outbound TLS regressions keep their explicit
-verification setting; TlsClient has no local custom-trust setting for an additional
-locally verified outbound fixture.
-
-Long and strict interoperability cases use CTest `RUN_SERIAL` so their 65-second
-stop-and-wait workload does not compete with other tests in the same invocation.
-The record counts, one-transport requirement and 75-second outer timeout remain
-unchanged. Workload deadline diagnostics include completed exchanges and elapsed
-time. V2Ray UDP cases wait for the returned relay's UDP-listening log before
-sending: its SOCKS TCP listener starts before its UDP listener, so a successful
-UDP ASSOCIATE alone does not establish UDP readiness. Datagram timeouts identify
-the payload, receive stage, endpoints, sent requests and child exit statuses;
-the fixture does not retry lost datagrams.
-
-QUIC constructor validation runs client and server roles separately, with a
-360-second aggregate budget per role for their repeated packed application
-launches. Individual configuration startup and orderly-shutdown deadlines remain
-8 and 10 seconds respectively.
-
-Native `vmess_crypto_unit` and `vmess_parser_fuzz_unit` belong to VmessCommon and
-are registered when either endpoint exists. The bounded parser mutation fixture
-uses existing independent vectors, partial prefixes, malformed lengths, body/EOF
-tag mutations, both counter policies and packetaddr envelopes. Run it with the
-existing sanitizer preset; generated corpora/results belong under `build/`.
-`vmess_replay_unit` and `vmess_runtime_unit` retain server replay/authentication and
-ownership coverage; client configuration/runtime units exercise settings,
-bootstrap, incremental responses, reentry, budgets and owned-carrier lifecycle.
-Run focused coverage in both native configurations:
-
-```bash
-cmake --preset linux-unit-tests
-cmake --build --preset linux-unit-debug -j8
-ctest --preset linux-unit-debug --output-on-failure -R vmess
-cmake --build --preset linux-unit-release -j8
-ctest --preset linux-unit-release --output-on-failure -R vmess
-cmake --preset linux-software-crypto-sanitize-unit
-cmake --build --preset linux-software-crypto-sanitize-unit -j8
-ctest --preset linux-software-crypto-sanitize-unit --output-on-failure -R vmess
-```
-
-Independent Python-generated vectors include boundary checkpoints after preceding
-SHAKE consumption; real codec loops start at ordinal zero and cross two wraps.
-Keep failed/ended-context, strict exhaustion, authentication, managed accounting
-and lifecycle regressions. Classify retained-input admission refusal separately
-from protocol/identity failure. Native callbacks and parser mutation runs do not
-replace independent long-session or real transport evidence.
-
-`INCLUDE_VMESS_CLIENT` and `INCLUDE_VMESS_SERVER` independently select endpoints and
-share one direct OpenSSL streaming-SHAKE capability check in VmessCommon. OpenSSL 3.3
-or newer remains required if either endpoint exists; generic `WCRYPTO_BACKEND_OPENSSL`
-selection is independent. Validate both endpoints, each alone, generic software crypto
-with VMess, and OpenSSL-free builds with both endpoints disabled. To prove outbound
-dependency independence, disable AuthenticationClient/UserController along with unrelated
-nodes that legitimately require them; client-only closure must not contain those targets
-or VmessServer. After shared/runtime changes settle, run complete native Debug/Release,
-focused `linux-software-crypto-sanitize-unit` ASan/UBSan and routine production lanes on
-the final source revision. Speed/stress remain separately scoped.
-
-The optional `tests/vmess_scale.py` characterization fixes 100,000 managed accounts, worker and
-concurrency counts, ordering, sample durations and readiness deadlines before execution. Run it
-through the existing network-namespace wrapper and keep generated results under `build/`.
-Its CPU/RSS includes the co-located AuthenticationServer and AuthenticationClient. A failure to
-reach user-table readiness provides no VMess handshake-throughput measurement; preserve that
-outcome and do not extend the deadline or reduce account count to manufacture a result.
-
-### Registered API coverage
-
-`tests/cmake/native/api.cmake` registers APIServer envelope, session and reliable
-stream fixtures; `api_core.cmake` covers the registry/resolver and detached
-worker dispatcher. Private echo/binary/large-result operations belong only to
-these fixtures. Large reliable-stream coverage uses the actual KCP nodes
-with deterministic datagram loss and reordering, and requires one complete
-response above 65 KiB with one dispatch. It must not introduce a public diagnostic
-echo operation or randomized pass/fail impairment.
-
-`tests/cmake/integration/api.cmake` registers real AuthenticationClient status
-queries over TCP, HTTP/1.1 bodies and reconstructed KCP streams, plus
-qualified/ambiguous selectors across loaded configurations. HTTP probes dechunk
-before reading the API length and recognize replies without waiting for EOF.
-`waterwall.api_authentication_server_views` separately exercises the server's
-registered status, detail and paginated summaries through `TcpListener ->
-APIServer`, without requiring AuthenticationClient. Its private existing-protocol
-connection performs real authorized `UpdateUser` and `PushUserStats` setup: a
-configuration edit invalidates the cursor, while a usage batch and exact replay
-permit continuation with the current totals. The probe also checks exact large
-IDs, field allowlists, credential omission and status-only operation permissions.
-It additionally checks matching read edit tokens, explicitly permitted conditional
-edits, protocol/unrelated-account conflicts, sparse/accounting preservation and
-same-value revision increments. Its 1024-byte gateway accepts an acknowledgement
-with a maximally escaped allowed correlation ID. A discarded reply body requires
-a fresh read to establish committed state; reuse of the old token cannot commit
-the edit again. Provider/dispatcher fixtures separately prove precommit refusal,
-two-writer contention, late completion and shutdown abandonment. Do not claim an
-unavoidable postcommit envelope-size failure for this bounded acknowledgement.
-The generic codec fixture checks the absolute maximum acknowledgement envelope
-with UINT64_MAX account ID/revision, a canonical 48-character edit token and the
-maximally escaped allowed 64-byte correlation ID against that minimum cap.
-The same real gateway fixture checks independently permitted creator tokens,
-monitor/auditor/editor rejection of creation and producer-credential isolation.
-It creates default, empty-config and fully configured accounts, checks zero
-first-use/usage, normalization and public redaction, and refuses duplicate IDs,
-credentials, names and ranges without changing revisions or existing accounts.
-A creation ACK also traverses the 1024-byte endpoint with maximum correlation-ID
-escaping. Discarding a creation reply preserves its account, while repeating the
-same ID yields `id_exists`. Real protocol password lookup/add collision and
-native AuthenticationClient refresh/offline catch-up fixtures cover credential
-availability, revision ordering and preservation of existing pending usage.
-The existing maximum mutation-ACK codec proof covers the identical creation
-response schema; no second token format or duplicate envelope proof is needed.
-Run creation parser/ownership/growth coverage under Debug ASan/UBSan and
-creation/reader/duplicate races under Debug TSan with actual compile/link flags.
-
-Password coverage uses the real registered `change-user-password` handler and
-collection helpers. Provider/native cases exercise strict bounded input, typed
-backend/collision refusals, all credential lookups and UUID transitions, unchanged
-identity/accounting, contention, capacity/old-password bounds, deadline/budget
-refusals and revision exhaustion. The real namespace case grants a separate
-password administrator, denies monitors/editors/creators/producer credentials,
-looks up exact Unicode/whitespace passwords through the existing protocol, checks
-same-value revision and cursor invalidation, and replays a real usage ACK unchanged.
-Its discarded reply is followed by a redacted read and explicit fresh-token
-resubmission; the read alone does not establish the installed password. The same
-1024-byte endpoint and maximum-ACK codec check cover this identical response schema.
-The production support case `waterwall.api_example_client` runs the real example
-CLI with a deterministic transport seam: successful/node-failed/conflicting and
-unknown replies take one attempt, explain explicit recovery, and never print the
-password or operator token. It does not replace the real namespace transport case.
-
-The Python administration client adds `waterwall.api_admin_client` and the shared
-transport's `waterwall.api_transport_client` to the same support lane. They cover
-command validation, bounded pagination, explicit edit tokens, exact secret input,
-framing and response validation, and conservative write-outcome classification.
-The namespace case `waterwall.api_admin_cli` runs the actual CLI against a real
-AuthenticationServer/APIServer chain for account workflows. Its fixture and
-Python test files document the direct commands; no native C build is required for
-the isolated Python tests.
-
-Administrative audit coverage adds `waterwall.authenticationserver_audit_unit`
-for real registered mutation outcomes, secret omission, bounded queue overflow,
-writer failure isolation, producer save-failure rollback and shutdown drain. It gates the actual append boundary
-with a linker wrapper to fill the queue deterministically; no production test
-hook is required. Checked-writer units separately exercise file startup, append,
-rotation and native I/O failures. `waterwall.api_authentication_audit` uses two
-workers and private loopback to check API/producer outcomes, gateway identity,
-malformed-input redaction and a committed operation whose reply is discarded.
-Read-only status polling waits for output; no mutation is retried. The Python
-administration tests validate both healthy and degraded audit status without
-printing arbitrary native errors. Run the new native tests in Debug/Release and
-with concurrency/memory instrumentation; these checks do not establish
-transactional or crash-durable audit delivery.
-
-`waterwall.authentication_sync_unit` rotates through the real API with two clients
-on different reconnect schedules, a lost usage ACK and exact pending-batch replay,
-and separately a held pull with traffic produced in flight. Verify each client's
-old/new credential availability before/after its refresh, exact aggregate traffic,
-first-use evidence/ACK and expiry projection, reservations and release/accounting
-through an existing handle. Run the focused native selection in Debug and Release,
-plus parser/preparation/index/runtime ownership under real Debug ASan/UBSan and
-reader/password/duplicate races under real Debug TSan. Confirm actual compile/link
-instrumentation; an unsanitized optimized target is not sanitizer evidence. Build
-the normal production unity target as well: private helpers included in one unity
-translation unit must have unique identifiers. Do not disable unity to hide a
-collision or require byte-identical JSON object iteration order across builds.
-
-The probe runner accepts an optional `configs.txt` listing unique local JSON
-basenames in loading order; absent that manifest, it loads `config.json`.
-
-Run focused API and authentication selections in Debug and Release, and explicitly
-select added tests when sanitizer preset filters omit them. Envelope tests do
-not prove transport framing or worker lifetime; use the session/dispatcher and
-real-chain fixtures for those boundaries. Shared-core/lifecycle changes still
-require the broad lanes and complete native suites described above. Feature
-checks also build the core with APIServer disabled and the generic endpoint
-without AuthenticationClient; invalid allowlist references remain startup errors.
-
-The user-index regression includes forced probe chains beyond the compact STC
-distance field, displacement, wrapped erase, rehash, shifted identifiers and
-active-IP release/churn. Run it against the build-owned patched STC headers in
-both configurations; hashing changes alone do not establish collision correctness.
-Authentication coverage exercises bounded producer JSON, immutable snapshot
-continuation across edits, lease/resource refusal and cleanup, retained orphan
-debt, same-ID reattachment and verified missing-account no-commit responses.
-Malformed or unproved responses must preserve uncertain batches. Gateway session
-coverage also exhausts the anonymous-memory domain while an authenticated line
-continues dispatching and verifies immediate decoded-token clearing.
-
-### Synthetic integrity testers
-
-`TesterClient` owns its normal stream lines; `TesterServer` borrows incoming normal
-lines. In packet mode both use chain-owned worker packet lines. Preserve their external
-size, pattern, ordering and checksum checks when simplifying internal checks.
-The exact stream byte budget makes a second trailing-byte failure after complete,
-callback-free chunk consumption redundant; the entry budget check remains required.
-
-The first request payload byte selects the flow id; it does not exempt the rest
-of that chunk from pattern verification. UDP and ICMP chunks can contain more
-than one payload byte even at index zero. Checksum verification must preserve
-the received bytes, including on failure: stateless matching may retry the same
-packet with another candidate flow id, and must never accept a checksum repaired
-by an earlier attempt.
-
-For immediate packet startup, publish the client's one-time send admission before
-calling the next `Init`. A synchronous `Est` or `Resume` must not bypass the
-configured startup delay or schedule another sender. Retain normal `Est` marking, task-admission
-failure handling and callback-lifetime checks.
-
-### Shared checksum regression coverage
-
-`bufio_contract_unit` and its no-splice variant cover packet request reset/reuse,
-whole-copy independence and refusal, growth and byte-range limits. Packet-tunnel,
-affinity, bridge, Ping and IpManipulator fixtures cover buffer-local intent through
-reentry, worker delivery, drop, duplication and raw-byte handoffs, including
-ProtoSwap repair before encoding and intentional bad checksums left unrequested.
-Run the relevant fixtures and complete native suite in Debug and Release for
-shared buffer/packet contract changes. The external-node fixture rejects the
-immediately preceding ABI before its getter and accepts current-header nodes.
-
-
-`lwip_checksum_backend_test` exercises real lwIP checksum and copy entry points
-through a linker-wrapped adapter, checking results against an independent byte
-oracle. It covers unaligned and large spans, read-only guard pages, odd/empty
-pbuf fragments, IPv4/IPv6 pseudoheaders and partial coverage, TCP odd writes and
-retransmission, cascading payload/seed carries, corruption rejection, and
-protocol checksum-zero behavior. The carry-overflow vector is also checked
-through TCP output and standalone pre-initialization dispatch.
-`lwip_checksum_variants_test` runs the same cases through a private test-build
-dispatch instance for portable C and CPU-supported SSE3/AVX2 backends. Production
-exposes no mutable backend test switch. Both tests exercise pre-initialization
-portable behavior before selecting a backend.
-
-Run both in Debug and Release alongside `wchecksum_test`,
-`device_checksum_validity_test`, and `tun_linux_offload_test`. Comparisons between
-`calcGenericChecksum()` and lwIP alone are not independent correctness evidence:
-both now share the backend. `lwip_checksum_link_test` is a portable standalone
-archive link/startup check and participates in platform unit builds. A
-cross-compiled executable proves linking only; little-endian execution does not
-establish big-endian runtime coverage.
 
 ### Native Unit Tests
 
 Native unit tests have a dedicated multi-configuration tree with IPO/LTO disabled
-before any project target is created. Release preserves optimization and `NDEBUG`
-while avoiding mixed-LTO links; Debug activates assertions and other contract
-guardrails. Production Release remains IPO/LTO-enabled, so complete behavioral
-validation uses the production lane and both native-unit configurations:
+before any project target is created. Choose configurations by the behavior each
+exercises. Use `linux-unit-debug` for assertions and contract guardrails.
+Choose `linux-unit-release` for optimized or `NDEBUG` behavior. Run the same
+selection in both when each exercises a distinct path, such as an assertion
+in Debug and error handling in Release. Production Release keeps IPO/LTO enabled.
+
+For a change to HTTP chunk termination that affects both nodes, run the decoder
+fixture for split input and the client and server fixtures for how each handles
+the end of a body. One CTest filter selects all three.
+
+```bash
+cmake --preset linux-unit-tests
+ctest --preset linux-unit-debug --output-on-failure --no-tests=error \
+  -R '^waterwall\.(http_chunk_decoder|http(client|server)_chunked_terminator)_unit$'
+```
+
+Use `ctest --preset linux-unit-debug -N -R chunk` to discover related names.
+An unfiltered unit build preset builds the entire unit aggregate. If a selected
+fixture needs a cold prebuild, specify its CMake target with `--target`.
 
 Native unit-test executables intentionally disable inherited precompiled headers.
 The production library and tunnel targets retain their shared PCH, but applying it
@@ -1095,30 +235,6 @@ normal admission open until the scenario intentionally tests quiescence.
 `ww` directly depends on the C++ allocator object library so even pure-C consumers
 select the C++ linker and runtime. It also exports the allocator objects explicitly
 to keep the allocation overrides from being dropped by static archive extraction.
-
-```bash
-# Production Release: build the shipped binary plus the production-full suite.
-cmake --preset linux
-cmake --build --preset linux --config Release --target check_waterwall_tests -j8
-
-# Native units: optimized Release/no-LTO behavior.
-cmake --preset linux-unit-tests
-cmake --build --preset linux-unit-release -j8
-ctest --preset linux-unit-release --output-on-failure
-
-# Native units: assertions and Debug guardrails in the same no-LTO tree.
-cmake --build --preset linux-unit-debug -j8
-ctest --preset linux-unit-debug --output-on-failure
-```
-
-For focused behavioral work, prefer the relevant `linux-unit-debug` selection
-first: assertions usually identify a violated ownership, lifecycle, or state
-contract closer to its cause. Repeat that coverage with `linux-unit-release`
-before completion because optimization and `NDEBUG` can expose different behavior.
-Broad/shared changes run both complete presets. Debug is not a substitute for
-Release, AddressSanitizer, UndefinedBehaviorSanitizer, or ThreadSanitizer. Never
-build native unit tests in the production tree: it contains the LTO-enabled
-libraries used by `Waterwall`.
 
 Native source files live under `tests/unittests/{base,crypto,bufio,core,net,devices,lwip,tunnels}/`;
 the owning source documents its purpose, important cases, fixture and exact CTest
@@ -1276,15 +392,11 @@ second attestation system around the compiler, build tool, or verifier.
 
 Linux cloud CI runs the complete `linux-unit-release` and `linux-unit-debug`
 presets as independent parallel jobs, with source-only checks retained in the
-single Linux production support job. On macOS and Windows, CI builds
+single Linux production support job. To reproduce the full native Release job
+locally, configure the unit tree, run `cmake --build --preset linux-unit-release -j8`,
+then run `ctest --preset linux-unit-release --output-on-failure`. On macOS and Windows, CI builds
 `waterwall_platform_unit_tests`, runs the same direct no-LTO policy, and executes
 the registered platform unit tests in Release.
-
-Run one case by its registered name (use an anchored regex):
-
-```bash
-ctest --preset linux --output-on-failure -R '^waterwall\.tls_roundtrip$'
-```
 
 To run a single integration case directly while debugging — passing the binary,
 the case directory, and a timeout in seconds:
@@ -1341,303 +453,6 @@ Windows `tun_windows_reader_test` exercises native thread-pool waits,
 bounded drains, coalescing, rearm-versus-stop, refused activation, restart and late
 notification cleanup. Native Windows or Wine execution is distinct from merely
 cross-compiling these tests.
-
-### TUN TCP Chain Correctness And Throughput
-
-On native Linux, `waterwall.tundevice_tcp_chain` exercises the exact chain
-`TunDevice → PacketsToConnection → TcpConnector` with `gso` explicitly disabled
-and enabled, default multiqueue and explicit single-queue receive, and omitted
-(prefix), peer, spread and auto opaque settings. Native TCP stays on the shared
-worker policy in every opaque mode. Auto falls back to prefix at the direct PTC
-neighbour. The fixture checks requested/effective/reason and effective-mode/queue
-startup diagnostics. It verifies payload bytes in both directions,
-concurrent TCP connections, checksum-only framing with segmentation disabled,
-actual GSO activity when enabled and supported, and clean shutdown. The fixture
-checks virtio framing and actual checksum/TSO4 features separately.
-The test uses Python sockets and does not require iperf3. It belongs to the
-privileged lane. The runner creates fresh runtime and peer namespaces through the
-existing network namespace wrapper, after checking that isolation is available.
-Run it directly after building Release:
-
-```bash
-cmake --preset linux -DWATERWALL_ENABLE_PRIVILEGED_INTEGRATION_TESTS=ON
-cmake --build --preset linux -j8
-sudo -E ctest --test-dir build/linux -C Release --output-on-failure \
-  -R '^waterwall\.tundevice_tcp_chain$'
-```
-
-`waterwall.tundevice_gso_live` verifies both offload modes, including deferred
-ordinary TCP/UDP and kernel-normalized versus userspace GSO wire bytes.
-`waterwall.tundevice_trusted_checksum` covers direct and interposed checksum-only
-and GSO TCP/UDP chains, lazy trust activation, MTU boundaries and independent
-peer-byte checksums with controlled software egress. Kernels need not mark every
-live packet `NEEDS_CSUM`: `tun_linux_message_lifetime_unit` deterministically
-proves destination-worker completion for odd IPv4/plain IPv6 TCP/UDP, compact
-storage, FIFO order, capacity wakeup, stale discard and foreign cancellation in
-both modes. Its syscall seams also cover CSUM-first negotiation, upgrade rejection,
-raw fallback, common-resource rollback, safe GSO resource downgrade and named
-attachment policy. Run it in Debug and Release alongside offload, configuration,
-reader-session, affinity, checksum-validity, lifecycle and lwIP checksum/trust units.
-Raw lifecycle fixtures explicitly inject unavailable offload.
-
-The checksum fixture explicitly sets its private TUN queue to 16,384 entries so
-four concurrent 1 MiB uploads at MTU 576 do not spend the transfer deadline
-recovering from fixture-induced loss. This avoids dependence on the kernel's
-500-entry default or the selected profile's automatic startup queue target.
-
-The same runner, `tests/tun_tcp_chain.py`, provides the optional
-`waterwall.speedtest_tundevice_tcp_chain` iperf3 comparison. Enable it separately;
-`WATERWALL_ENABLE_TUN_TCP_SPEEDTEST` defaults to `OFF`, so ordinary test runs do
-not perform this longer benchmark:
-
-```bash
-cmake --preset linux -DWATERWALL_ENABLE_PRIVILEGED_INTEGRATION_TESTS=ON \
-  -DWATERWALL_ENABLE_TUN_TCP_SPEEDTEST=ON
-sudo -E ctest --test-dir build/linux -C Release --output-on-failure \
-  -R '^waterwall\.speedtest_tundevice_tcp_chain$'
-```
-
-The benchmark runs serially with four workers, the server RAM profile, and MTU 1500. For both one and four
-TCP streams it collects three GSO-off/on pairs, alternating order, with two seconds
-of warm-up followed by ten measured seconds per sample. Paired runs reuse the
-same flow tuples so worker assignment is repeatable. Results include each sample,
-throughput medians and ranges, CPU usage, and retransmits in JSON. CPU seconds
-cover the full client run, including warm-up. Successful
-execution and valid measurements determine pass/fail; there is no minimum
-throughput or requirement that GSO be faster. Host contention and run-to-run
-variation must be considered before drawing performance conclusions.
-
-Both modes require Linux TUN support and the privileges to configure their private
-network namespaces; the speed mode also requires iperf3. Missing runtime
-capabilities or dependencies are reported as skipped (exit 77), not passed. Speed
-runs always retain their run directory, including raw samples, generated settings,
-logs, `results.json`, and `summary.json`. Integration runs retain any created run
-directory on failure or skip; set `WATERWALL_TEST_KEEP_RUN_DIR=1` to retain it on
-success too. When enabled, the optional benchmark is selected by both the speed
-and privileged lane labels.
-
-CI's manual `extended_tests` input enables the speed and stress lanes in the
-`linux-gcc-x64` job. That selection also installs iperf3 and enables this benchmark.
-The unprivileged speed lane excludes privileged cases; the subsequent privileged
-lane runs it with `sudo`. Routine push/pull-request runs and other matrix entries
-leave the benchmark disabled.
-
-:::tip Write a test that would fail if direction were reversed
-The highest-value test for a flow or packet change is one that breaks if you swap
-upstream/downstream handling. For paired tunnels (client/server, encode/decode),
-that single assertion catches the most common regression in this codebase. See the
-direction rules in [Part 2](./part2-lines-and-callbacks.mdx) and
-[Part 4](./part4-packet-tunnels.mdx).
-:::
-
-### Kernel queue tuning coverage
-
-Run `device_kernel_queue_tuning_unit` and the focused TUN/Capture native and node
-configuration units in both Debug and Release for startup sizing changes. Check
-profile targets, automatic caps, final queue counts after fallback, explicit
-overrides, preserved larger values and strict input rejection even when disabled
-or on an inactive capture path. Native fixtures must exercise disabled tuning,
-request/readback failure, refused NFQUEUE ACKs, same-namespace socket probe
-failure and host-capped `SO_RCVBUF`. A failed probe or one that cannot confirm an
-increase must preserve the existing queue buffer and close its temporary socket,
-without turning a usable queue into a startup failure. Unknown kernel values must remain
-unknown in diagnostics; requested values are not evidence of accepted capacity.
-
-Use the private-namespace TUN and Capture integrations to check startup,
-single/multiqueue operation, exact packet delivery and cleanup. These correctness
-checks do not establish a throughput gain or loss-free operation at saturation.
-Any performance comparison must fix the workload, queue policy, MTU/offload,
-worker count, metrics and sample order before measuring, following the optional
-optimization policy below.
-
-## Choosing Validation And Regression Coverage
-
-Validation should answer the product question directly and remain proportional to
-risk:
-
-- Start with the smallest check that exercises the change: inspection, formatting,
-  a focused target, an existing focused test, or a direct integration case.
-- Expand to the functional lane for shared networking/tunnel behavior or changes
-  spanning cases. Use routine production lanes plus native units for shared-core,
-  lifecycle/concurrency, multi-subsystem, security-sensitive, or difficult-to-bound
-  changes.
-- Documentation, comments, and clearly non-behavioral mechanical changes may need
-  only inspection, link/diff checks, or a relevant policy check. Do not run a broad
-  lane merely because code changed or because the lane is available.
-- New observable behavior, meaningful edge cases, changed contracts, and
-  reproducible bugs likely to regress normally receive focused coverage. When
-  practical, a regression test should fail before the fix and pass afterward.
-- A new test is unnecessary when existing coverage already demonstrates the exact
-  behavior, reproduction is impractical, or the change has no meaningful behavior
-  to assert. State that reason instead of manufacturing a test or a new harness.
-- One direct check may establish a narrow deterministic invariant. Use repetition,
-  sanitizers, stress, fault injection, or broader tests when concurrency, timing,
-  security, or nondeterminism makes one observation insufficient.
-
-A validation failure or unavailable environment is evidence about the validation
-attempt, not a pass and not automatic proof that the product is wrong. Preserve the
-exact failure and distinguish **failed** from **inconclusive** evidence.
-
-## Syntax-Only Checks
-
-Do not hand-assemble compile commands. If you need a single-file or syntax-only
-compile, take the **exact** flags for that file from the generated
-`build/linux/compile_commands.json`.
-
-:::warning The `structure.h` collision trap
-Every tunnel has a tunnel-local header named `include/<Tunnel>/structure.h`. If you
-write a manual compile command that adds several tunnels' `include/` directories
-at once, the wrong `structure.h` can be picked up silently, producing confusing
-errors or — worse — a build that links the wrong layout. Validate one tunnel in
-isolation, or preserve the target's original include order from
-`compile_commands.json`. This is the single biggest reason to avoid hand-rolled
-compiles.
-:::
-
-Common manual-compile failure modes: missing generated dependency headers, wrong
-build-tree include roots, and the `structure.h` collision above.
-
-## When the Compiler Itself Crashes
-
-There is a known build-environment issue where an ad-hoc or non-preset build tree
-can trigger a GCC internal compiler error, for example:
-
-```text
-internal compiler error: Bus error
-```
-
-This often happens while compiling **core** files such as `ww/libc/wlibc.c` —
-before your edited tunnel is even reached.
-
-An ICE or bus error is **inconclusive**. It is often a stale/ad-hoc build-tree or
-host-resource failure, but it can also be a compiler defect exposed by the changed
-translation unit. It proves neither that the tunnel is wrong nor that it is
-correct. Reproduce first with a clean supported preset before deciding what to
-debug, and never report that lane as passed.
-
-### Fallback Strategy When Compilation Is Blocked
-
-Work down this list:
-
-1. `cmake --preset linux`
-2. `cmake --build --preset linux --target <ChangedTargets> -j8`
-3. `cmake --build --preset linux -j8`
-4. If the failure remains, try another supported project preset/toolchain when it
-   can answer the same question (for example, the corresponding Clang preset).
-5. Report the exact compiler failure and mark the affected validation
-   **inconclusive**.
-6. Continue with the strongest verification that still works:
-   - preset-based target builds,
-   - syntax-only checks using `build/linux/compile_commands.json`,
-   - focused code review against the contracts in this guide.
-
-Syntax-only checks and review are useful diagnostics, but they do not replace the
-missing link/runtime evidence for a behavioral change. State exactly what remains
-unverified.
-
-Summary of build priorities:
-
-- prefer the `linux` preset,
-- prefer preset target builds over the root `build/` tree,
-- prefer `build/linux/compile_commands.json` over guessed compile flags,
-- treat a GCC ICE / bus error as inconclusive until a clean supported build
-  establishes otherwise.
-
-## Optional Optimization And Evidence Review
-
-This section applies when an optional optimization candidate or the benchmark,
-parser, manifest, or evidence machinery used to decide it is in scope. It does not
-limit ordinary product review, and it does not limit a task that explicitly asks
-to repair reusable test or benchmark infrastructure. An explicit maintainer/user
-request for that infrastructure is the separate approval described below.
-
-Validation is support work, not a second product. It should catch a realistic
-regression or answer a predeclared engineering question without recursively trying
-to prove that every tool in the evidence chain is itself perfect.
-
-### Classify findings without suppressing them
-
-For optimization/evidence work, distinguish:
-
-1. **Production correctness** — a concrete contract, ownership, lifetime,
-   concurrency, security, portability, or user-visible defect in shipped code.
-2. **Direct regression coverage** — realistic missing coverage for changed product
-   behavior that is likely to regress.
-3. **Performance decision** — evidence that a specific production candidate meets,
-   misses, or cannot be measured against a frozen workload and gate.
-4. **Support-machinery quality** — a defect or hardening opportunity in a runner,
-   parser, manifest, test seam, artifact collector, or other evidence tool.
-
-This classification sets priority; it is never a reason to hide a valid finding.
-A support-tool defect blocks the current decision when it can skip relevant
-behavior, create a false pass/fail, corrupt the metric, or otherwise change that
-decision. Otherwise report it as non-blocking follow-up work instead of expanding
-the current candidate review. A production-review request does not authorize an
-unrelated benchmark-infrastructure redesign, and benchmark cleanup must not change
-production behavior merely to make evidence pass.
-
-### Force a terminal candidate decision
-
-Before collecting data, freeze the workload, metrics, thresholds, sample and order
-count, host requirements, and candidate boundaries. Then:
-
-- Give every isolated optional candidate one terminal disposition: **keep**,
-  **revert/defer**, or **inconclusive on this host**. Do not leave it indefinitely
-  pending while growing the acceptance system around it.
-- A measured regression or failure to earn the declared gain selects the simpler
-  baseline. An inconclusive result also defaults to the simpler production baseline;
-  the candidate may be deferred for a better benchmark host.
-- A host that cannot reliably execute the frozen workload is non-decision-capable.
-  Record that fact. Do not tune the workload after seeing results, retry until
-  favorable, weaken a gate, or create alternate harness identities to force a
-  decision.
-- By default, allow one bounded incidental harness-repair pass after the first
-  end-to-end attempt. Further repair belongs to an explicitly requested,
-  separately scoped infrastructure task.
-- Once direct correctness checks pass and the terminal disposition is recorded,
-  run broad product validation once on the final retained production set. Do not
-  repeatedly rerun it after every evidence-tool revision.
-
-When only non-blocking evidence-machinery limitations remain, report them with the
-terminal product disposition. Do not create another product implementation plan
-unless an independently reproducible production defect appears or reusable
-infrastructure was explicitly requested.
-
-### Do not create proofs of proofs
-
-Unless a separately scoped security, supply-chain, or reproducible-build threat
-model requires them, do not add or require:
-
-- verifier replay, validator self-validation, test-of-test mutation frameworks, or
-  attestations of the acceptance transaction;
-- binary/tool/source hashes, copied verifier source in every result directory,
-  child-process ancestry proofs, filesystem provenance, or CI-runner identity;
-- general shell/CMake command parsers whose purpose is only to prove that recorded
-  commands match recorded flags;
-- exhaustive fail-closed schemas for diagnostic fields that cannot change the
-  scoped correctness or keep/revert decision; or
-- a product setting, protocol field, runtime branch, counter, API, or lifecycle hook
-  added solely to make optional evidence easier to authenticate.
-
-A direct deterministic check is often enough for a narrow build option, path,
-ownership balance, timeout, or emitted metric. Timing, concurrency, security, and
-nondeterminism may require repeated or independent evidence; the rule forbids
-recursive meta-validation, not risk-appropriate testing.
-
-### Keep support code and artifacts subordinate
-
-- Prefer existing tests and small fixtures. If new evidence code materially exceeds
-  the production change or creates a framework, stop unless that infrastructure
-  scope was explicitly authorized.
-- Test seams and counters added solely for evidence must compile out of ordinary
-  production builds. A production API added only for a benchmark needs separate
-  product justification and approval.
-- Raw benchmark output, copied manifests, temporary state trees, and repeated runner
-  snapshots are generated artifacts. Keep one concise results summary in source and
-  bulky reproducibility bundles outside normal history unless requested.
-- If optional proof machinery becomes harder to trust than the direct check, prefer
-  simplifying, replacing, or removing it over adding another validator. Removal is
-  still a code change and follows the task's authorization boundary.
 
 ## Code Review Rules And Tunnel Checklist
 
@@ -1792,8 +607,8 @@ For a tunnel change, confirm every applicable item below:
   tool was reported explicitly).
 - Regression coverage was added where it materially protects behavior, or the
   reason existing coverage/non-test validation is sufficient is stated.
-- Validation scope is proportional: focused for narrow changes and broad/full for
-  shared, concurrent, security-sensitive, or difficult-to-bound work.
+- The selected checks cover the changed behavior and affected callers. Each
+  additional lane or configuration addresses an identified coverage gap.
 
 ## Common Pitfalls (Master List)
 
@@ -1843,253 +658,236 @@ source, tests, callers, and documentation and ask a focused maintainer question 
 the repository cannot decide it; do not treat an existing pattern as proof or
 invent a lifecycle concept as an incidental workaround.
 
+## Syntax-Only Checks
+
+Do not hand-assemble compile commands. If you need a single-file or syntax-only
+compile, take the **exact** flags for that file from the generated
+`build/linux/compile_commands.json`.
+
+:::warning The `structure.h` collision trap
+Every tunnel has a tunnel-local header named `include/<Tunnel>/structure.h`. If you
+write a manual compile command that adds several tunnels' `include/` directories
+at once, the wrong `structure.h` can be picked up silently, producing confusing
+errors or — worse — a build that links the wrong layout. Validate one tunnel in
+isolation, or preserve the target's original include order from
+`compile_commands.json`. This is the single biggest reason to avoid hand-rolled
+compiles.
+:::
+
+Common manual-compile failure modes: missing generated dependency headers, wrong
+build-tree include roots, and the `structure.h` collision above.
+
+## When the Compiler Itself Crashes
+
+There is a known build-environment issue where an ad-hoc or non-preset build tree
+can trigger a GCC internal compiler error, for example:
+
+```text
+internal compiler error: Bus error
+```
+
+This often happens while compiling **core** files such as `ww/libc/wlibc.c` —
+before your edited tunnel is even reached.
+
+An ICE or bus error is **inconclusive**. It is often a stale/ad-hoc build-tree or
+host-resource failure, but it can also be a compiler defect exposed by the changed
+translation unit. It proves neither that the tunnel is wrong nor that it is
+correct. Reproduce first with a clean supported preset before deciding what to
+debug, and never report that lane as passed.
+
+### Fallback Strategy When Compilation Is Blocked
+
+Work down this list:
+
+1. `cmake --preset linux`
+2. `cmake --build --preset linux --target <ChangedTargets> -j8`
+3. `cmake --build --preset linux -j8`
+4. If the failure remains, try another supported project preset/toolchain when it
+   can answer the same question (for example, the corresponding Clang preset).
+5. Report the exact compiler failure and mark the affected validation
+   **inconclusive**.
+6. Continue with the strongest verification that still works:
+   - preset-based target builds,
+   - syntax-only checks using `build/linux/compile_commands.json`,
+   - focused code review against the contracts in this guide.
+
+Syntax-only checks and review are useful diagnostics, but they do not replace the
+missing link/runtime evidence for a behavioral change. State exactly what remains
+unverified.
+
+Summary of build priorities:
+
+- prefer the `linux` preset,
+- prefer preset target builds over the root `build/` tree,
+- prefer `build/linux/compile_commands.json` over guessed compile flags,
+- treat a GCC ICE / bus error as inconclusive until a clean supported build
+  establishes otherwise.
+
+## Platform and dependency build reference
+
+Read the [platform and dependency build reference](./reference/platform-builds.mdx) for target-specific linking, dependencies and executable packaging.
+
+### Google QUICHE and the shared BoringSSL provider {#google-quiche-and-the-shared-boringssl-provider}
+
+See [Google QUICHE and the shared BoringSSL provider](./reference/platform-builds.mdx#google-quiche-and-the-shared-boringssl-provider).
+
+### Vendored XZ Embedded {#vendored-xz-embedded}
+
+See [Vendored XZ Embedded](./reference/platform-builds.mdx#vendored-xz-embedded).
+
+### Build-time XZ payload tools {#build-time-xz-payload-tools}
+
+See [Build-time XZ payload tools](./reference/platform-builds.mdx#build-time-xz-payload-tools).
+
+### Optional Linux packed executable {#optional-linux-packed-executable}
+
+See [Optional Linux packed executable](./reference/platform-builds.mdx#optional-linux-packed-executable).
+
+### Windows packed executable bootstrap {#windows-packed-executable-bootstrap}
+
+See [Windows packed executable bootstrap](./reference/platform-builds.mdx#windows-packed-executable-bootstrap).
+
+### Build-Authority Modes {#build-authority-modes}
+
+See [Build-Authority Modes](./reference/platform-builds.mdx#build-authority-modes).
+
+## Specialized validation reference
+
+Select relevant coverage from the [specialized validation reference](./reference/specialized-validation.mdx) after choosing the validation scope above.
+
+### Trojan UDP size coverage {#trojan-udp-size-coverage}
+
+See [Trojan UDP size coverage](./reference/specialized-validation.mdx#trojan-udp-size-coverage).
+
+### Trojan and VLESS independent-peer coverage {#trojan-and-vless-independent-peer-coverage}
+
+See [Trojan and VLESS independent-peer coverage](./reference/specialized-validation.mdx#trojan-and-vless-independent-peer-coverage).
+
+### VMess independent-client coverage {#vmess-independent-client-coverage}
+
+See [VMess independent-client coverage](./reference/specialized-validation.mdx#vmess-independent-client-coverage).
+
+### Registered API coverage {#registered-api-coverage}
+
+See [Registered API coverage](./reference/specialized-validation.mdx#registered-api-coverage).
+
+### Synthetic integrity testers {#synthetic-integrity-testers}
+
+See [Synthetic integrity testers](./reference/specialized-validation.mdx#synthetic-integrity-testers).
+
+### Shared checksum regression coverage {#shared-checksum-regression-coverage}
+
+See [Shared checksum regression coverage](./reference/specialized-validation.mdx#shared-checksum-regression-coverage).
+
+### TUN TCP Chain Correctness And Throughput {#tun-tcp-chain-correctness-and-throughput}
+
+See [TUN TCP Chain Correctness And Throughput](./reference/specialized-validation.mdx#tun-tcp-chain-correctness-and-throughput).
+
+### Kernel queue tuning coverage {#kernel-queue-tuning-coverage}
+
+See [Kernel queue tuning coverage](./reference/specialized-validation.mdx#kernel-queue-tuning-coverage).
+
+### Worker-engine lwIP validation {#worker-engine-lwip-validation}
+
+See [Worker-engine lwIP validation](./reference/specialized-validation.mdx#worker-engine-lwip-validation).
+
+## Optional Optimization And Evidence Review
+
+This section applies when an optional optimization candidate or the benchmark,
+parser, manifest, or evidence machinery used to decide it is in scope. It does not
+limit ordinary product review, and it does not limit a task that explicitly asks
+to repair reusable test or benchmark infrastructure. An explicit maintainer/user
+request for that infrastructure is the separate approval described below.
+
+Validation is support work, not a second product. It should catch a realistic
+regression or answer a predeclared engineering question without recursively trying
+to prove that every tool in the evidence chain is itself perfect.
+
+### Classify findings without suppressing them
+
+For optimization/evidence work, distinguish:
+
+1. **Production correctness** — a concrete contract, ownership, lifetime,
+   concurrency, security, portability, or user-visible defect in shipped code.
+2. **Direct regression coverage** — realistic missing coverage for changed product
+   behavior that is likely to regress.
+3. **Performance decision** — evidence that a specific production candidate meets,
+   misses, or cannot be measured against a frozen workload and gate.
+4. **Support-machinery quality** — a defect or hardening opportunity in a runner,
+   parser, manifest, test seam, artifact collector, or other evidence tool.
+
+This classification sets priority; it is never a reason to hide a valid finding.
+A support-tool defect blocks the current decision when it can skip relevant
+behavior, create a false pass/fail, corrupt the metric, or otherwise change that
+decision. Otherwise report it as non-blocking follow-up work instead of expanding
+the current candidate review. A production-review request does not authorize an
+unrelated benchmark-infrastructure redesign, and benchmark cleanup must not change
+production behavior merely to make evidence pass.
+
+### Force a terminal candidate decision
+
+Before collecting data, freeze the workload, metrics, thresholds, sample and order
+count, host requirements, and candidate boundaries. Then:
+
+- Give every isolated optional candidate one terminal disposition: **keep**,
+  **revert/defer**, or **inconclusive on this host**. Do not leave it indefinitely
+  pending while growing the acceptance system around it.
+- A measured regression or failure to earn the declared gain selects the simpler
+  baseline. An inconclusive result also defaults to the simpler production baseline;
+  the candidate may be deferred for a better benchmark host.
+- A host that cannot reliably execute the frozen workload is non-decision-capable.
+  Record that fact. Do not tune the workload after seeing results, retry until
+  favorable, weaken a gate, or create alternate harness identities to force a
+  decision.
+- By default, allow one bounded incidental harness-repair pass after the first
+  end-to-end attempt. Further repair belongs to an explicitly requested,
+  separately scoped infrastructure task.
+- Once the terminal disposition is recorded, apply the
+  [validation selection rule](#choosing-validation-and-regression-coverage) to the
+  retained production changes. Reuse passing results for the same revision.
+
+When only non-blocking evidence-machinery limitations remain, report them with the
+terminal product disposition. Do not create another product implementation plan
+unless an independently reproducible production defect appears or reusable
+infrastructure was explicitly requested.
+
+### Do not create proofs of proofs
+
+Unless a separately scoped security, supply-chain, or reproducible-build threat
+model requires them, do not add or require:
+
+- verifier replay, validator self-validation, test-of-test mutation frameworks, or
+  attestations of the acceptance transaction;
+- binary/tool/source hashes, copied verifier source in every result directory,
+  child-process ancestry proofs, filesystem provenance, or CI-runner identity;
+- general shell/CMake command parsers whose purpose is only to prove that recorded
+  commands match recorded flags;
+- exhaustive fail-closed schemas for diagnostic fields that cannot change the
+  scoped correctness or keep/revert decision; or
+- a product setting, protocol field, runtime branch, counter, API, or lifecycle hook
+  added solely to make optional evidence easier to authenticate.
+
+A direct deterministic check is often enough for a narrow build option, path,
+ownership balance, timeout, or emitted metric. Timing, concurrency, security, and
+nondeterminism may require repeated or independent evidence; the rule forbids
+recursive meta-validation, not risk-appropriate testing.
+
+### Keep support code and artifacts subordinate
+
+- Prefer existing tests and small fixtures. If new evidence code materially exceeds
+  the production change or creates a framework, stop unless that infrastructure
+  scope was explicitly authorized.
+- Test seams and counters added solely for evidence must compile out of ordinary
+  production builds. A production API added only for a benchmark needs separate
+  product justification and approval.
+- Raw benchmark output, copied manifests, temporary state trees, and repeated runner
+  snapshots are generated artifacts. Keep one concise results summary in source and
+  bulky reproducibility bundles outside normal history unless requested.
+- If optional proof machinery becomes harder to trust than the direct check, prefer
+  simplifying, replacing, or removing it over adding another validator. Removal is
+  still a code change and follows the task's authorization boundary.
+
+
 ---
 
 Continue to **[Part 7: Application Termination](./part7-shutdown-and-signals.mdx)**.
-
-## Worker-engine lwIP validation
-
-Production uses `NO_SYS=1`, raw APIs, no tcpip thread/core mutex, and explicit
-shared allocator protection. The pinned-source engine, pool, port, timer,
-lifecycle, checksum, ACK-batch, receive-budget and TCP timestamp patch recipes participate in the same
-regeneration stamp as the pretend patch. Canonical recipes live under `ww/lwip/`;
-`radkesvat_changes.txt` retains historical notes and points to those recipes.
-Generated `patched-deps` trees are never
-edit sources. Literal single-site edits require exactly one occurrence; intentional
-repeated edits declare their expected count and reject drift before writing.
-Engine token relocation retains both regex passes because consumed boundaries
-can hide adjacent matches on the first pass.
-
-`lwip_engine_isolation`, `lwip_engine_pools`, `lwip_engine_ports` and
-`lwip_engine_ids` use a private small-capacity raw build to reach shared limits
-and overlap real stack operations on two owners. `lwip_engine_runtime`,
-`lwip_ptc_engine`, `lwip_ctp_roundtrip` and `lwip_shutdown` cover actual event
-workers, timers, bridge routing and lifecycle. Existing checksum, netif, fragment,
-refusal and affinity fixtures retain their behavioral assertions. Logical-owner
-fixtures alone do not prove event-loop or shutdown behavior. `lwip_udp_reuse_unit`
-uses a private stack with both reuse options enabled to check fan-out eligibility,
-clone refusal/settlement and the ordinary UDP length contract; production reuse
-options remain disabled.
-
-`lwip_timestamp_boundaries_unit` uses a private timestamp-enabled stack while
-production timestamps remain disabled. Real TCP handshakes and captured output
-check unsigned timestamp decoding and echoing, small peer MSS and receive-window
-limits, exact payload delivery and fallback without timestamp negotiation.
-The timestamp recipe reserves the complete padded option before segmenting data
-and decodes network-order bytes with unsigned arithmetic. Run this fixture in
-Debug, Release and the ASan/UBSan preset, with `UBSAN_OPTIONS=halt_on_error=1` so
-undefined behavior fails the test.
-
-`lwip_ack_batch_unit` uses real IPv4/TCP handshakes and a recording netif to check
-cumulative ACK/window values, packet counts, receive-credit coalescing,
-zero-window reopening, recovery/control paths, piggyback suppression, queued PCB
-retirement, failed-output retry, recursive-input refusal and concurrent engine
-isolation. Its scaled-window case negotiates scale 7, fills the receive window
-through bounded batches and checks immediate reopening without a duplicate batch
-ACK. Split credit, scale-7 zero quantization, sequence wrap and failed/successful
-control and piggyback output verify the last successful wire advertisement. Run it in Debug and Release. The runtime fixture also checks that
-batch lookup preserves lazy engine creation, owner checks and quiescence. These
-checks establish protocol behavior, not application throughput.
-
-Standalone window-update coverage includes exact scaled/unscaled thresholds,
-short credit followed by ordinary ACK progress, near-closed and unknown windows,
-pending ACK/recovery state and output retry. `lwip_receive_budget_unit` covers
-shared advertised-window targets with real TCP handshakes, join/drain behavior,
-held credit, scaled and unscaled windows, failed output, membership retirement,
-owner-boundary reopening and engine isolation. Its batch-retirement case combines
-limited windows, a minimum-share transition, pending ACK retirement and reopening
-at batch end without returning receive credit. Run both in Debug and Release.
-
-`packetstoconnection_receive_batch_unit` also returns wide credit through actual
-deferred delivery and Resume paths, checking one final window advertisement for
-amounts above 65,535 bytes and a full scaled receive window. `lwip_sack_unit`
-checks active/passive permission negotiation and fallback, immediate gap ACKs
-inside receive batches, range merging and sequence wrap, bounded queue eviction,
-cleanup and allocation refusal. Run both in Debug and Release. SACK output must
-never claim a segment that bounded storage refused to retain.
-
-`connectiontopackets_schedule_rejection_unit` checks full-width credit through
-CTP Resume, including a full scaled window, sequence wrap, zero credit and a
-refused output followed by successful retry. It verifies the final wire window
-and one successful ACK per returned amount. Run it in Debug and Release.
-
-`connectiontopackets_handoff_unit` checks that queued egress transfers the same
-owned sbuf with complete chain padding and exact detached bytes from chained
-pbufs, including empty spans and a following packet. It verifies the complete
-packet-sized allocation charge, refusal, closed admission and foreign cancellation
-after tunnel destruction while an input pbuf still retains the shared budget.
-
-`lwip_tcp_output_tail_unit` checks the cached unacknowledged tail against the
-actual queue and verifies wire sequence order and payload through handshake,
-partial/full ACKs, appends, output failure, fast/RTO retransmission, busy-buffer
-refusal, purge, sequence wrap and independent PCBs. Run it in Debug and Release.
-
-`lwip_dynamic_pools_unit` exercises the production allocator past 65,535 TCP
-objects, exact object and allocation-byte refusal, recovery across size classes,
-custom RX registration across runtime lifetimes, cache reclamation, and concurrent
-owner allocation with foreign frees. The small static pool fixture remains a
-separate exhaustion/concurrency lane; it does not replace the production dynamic
-allocator checks. `lwip_capacity_api_unit` uses a real event worker and registered
-`stack-stats` operation to check current/peak/refusal values, port snapshots,
-request ownership, malformed bodies, deadlines and handler allowances. CTP
-handoff and PTC receive-batch units also exercise global retained-input admission,
-compact recovery ACK storage and exact settlement. The CTP fixture verifies that
-an actual ACK can free queued TCP output while ordinary capacity is exhausted;
-control reserve is not available to application writes. The port fixture covers more than 16,000 distinct tuple
-reservations, real scoped TCP/UDP PCBs sharing one source port, same-tuple
-exclusion, wildcard conflicts and TIME_WAIT release. These establish capacity
-and protocol behavior, not application throughput at a declared user count.
-
-The pool fixture also checks that warm TCP-segment, heap-class and RX-wrapper
-checkout/return does not enter shared allocator protection. Two owners compete
-for a small wrapper pool with payload verification, exercise global exhaustion
-and cross-worker frees, and settle cached reservations at engine destruction.
-
-Enumerate and run focused coverage in Debug and Release, then run the full native
-suite and routine production lanes for shared-core changes. The TSAN preset's explicit
-filter includes these concurrency/lifecycle fixtures; verify actual sanitizer
-compile/link flags rather than assuming a label enables instrumentation.
-
-```bash
-ctest --preset linux-unit-debug -N -R 'lwip|packetstoconnection|connectiontopackets'
-ctest --preset linux-unit-debug --output-on-failure -R 'lwip|packetstoconnection|connectiontopackets'
-ctest --preset linux-unit-release --output-on-failure -R 'lwip|packetstoconnection|connectiontopackets'
-cmake --preset linux-tsan-unit
-cmake --build --preset linux-tsan-unit -j8
-ctest --preset linux-tsan-unit --output-on-failure
-```
-
-Use the namespace integration lanes for CTP TCP/UDP/multiworker and TUN TCP GSO
-off/on correctness. The TUN TCP chain case exercises both default queue selection
-and explicit `multi-queue:false` with four processing workers. Its single-queue
-cases also verify the disabled native multiqueue flag and one RX/TX queue.
-Missing namespace privileges, unavailable platform execution
-or sanitizer-host failure are inconclusive. Removing a protocol mutex is not a
-measured speedup; report control overhead separately from shared pool capacities
-and actual RSS or throughput measurements.
-
-`lwip_packet_info_unit` checks the length-aware debug formatter against guarded
-packet storage, truncated and unaligned IPv4/IPv6 headers, long prefixes and
-literal formatting directives. Run it with ASan/UBSan for formatter changes.
-Native `tun_bsd_reader_unit` covers actual BSD constructor/reader bounded-FIFO
-wiring with inert syscalls and a stalled worker; it requires a BSD runtime.
-Generic reader-budget tests on Linux do not replace this platform check. Native
-Darwin/Windows fixtures cover recurring packet-warning limiter wiring.
-
-Trusted TUN/PTC checksum coverage extends `tun_linux_offload_unit`,
-`tun_linux_message_lifetime_unit`, `tundevice_gso_configuration_unit`, and the
-lwIP checksum backend/variant units. The checksum wrappers assert omission of
-trusted input header, transport and TCP copy checksum work while retaining IPv4
-output header generation. These fixtures cover metadata contradictions,
-corruption, source-route seeds, odd segmentation,
-private FIFO assurance, stale/canceled work, uncached TCP fallback and UDP/TCP
-fragmentation. TUN lifetime coverage also verifies ordinary TCP/UDP checksum
-completion on the destination worker, compact storage, mixed ordinary/GSO FIFO
-order, one-slot capacity wakeup, compact assured storage with exact charge and no
-segmentation allowance, scratch reuse, stale/foreign cancellation, and reader-side
-generic checksum/fragment fallback. `lwip_ptc_trusted_engine_unit` retains the ordinary engine fixture
-and additionally mixes active/ordinary PTC instances across two workers.
-`waterwall.tundevice_trusted_checksum` uses private namespaces for direct and
-interposed TCP/UDP chains in checksum-only and GSO modes. It disables and confirms
-egress TX checksum offload and checks captured peer bytes with independent
-fragment reassembly and checksums.
-It belongs to the privileged lane and reports unavailable host prerequisites as
-skipped. No speedup is inferred from these correctness checks.
-
-The bounded `ww_lwip_engine_test` library uses the selected Debug TSan or
-ASan/UBSan instrumentation as well as the bridge fixtures that link it. Check
-compile commands for the linked `ww_lwip`/`ww_lwip_engine_test` targets; the
-dependency also declares unused upstream archives that are not test evidence.
-
-PTC output regressions extend `packetstoconnection_schedule_rejection_unit` with
-single/chained/empty-span copies, packet-queue boundaries, exact sbuf identity,
-padding, immutable certified dispatch and owner/foreign cancellation. The offload
-unit independently reconstructs GSO segments and checks original payload pointers,
-metadata, header sums, pseudoheader seed, options, wrapping IDs/sequences and
-compatibility limits. TUN lifetime coverage captures deferred bounded batch writes,
-allocation-charge limits, EINTR, short/transient/fatal results, ordinary fallback,
-reader-only startup rollback, and stale flush settlement after stop/restart or
-device destruction. TUN writer units cover coalesced worker scheduling, FIFO and
-shared backlog limits, foreign cancellation, and stop racing an admitted write. The namespace checksum fixture confirms disabled forwarding
-TSO/GSO/checksum offload, MTU, complete TCP sequence coverage and wire checksums;
-packet-socket drops fail qualification rather than hiding missing coverage.
-
-
-Raw-output native units cover 512-packet Linux batches, exact original buffers,
-partial-prefix retirement, unsent FIFO retention across `EINTR`/`EAGAIN`,
-zero-timeout writable checks, packet-local discard accounting and terminal
-failure. Lifecycle coverage keeps NOTRACK installed while a native send is
-admitted, retries failed rule cleanup, and rejects stale work after stop/restart.
-Shared writer tests cover device-wide admission, worker-message cancellation and
-external completion notification. Windows overlapped coverage verifies native
-buffer lifetime through completion and stop. These checks establish correctness,
-not a throughput improvement; existing namespace RawSocket and packet-fragment
-integration cases retain native kernel coverage.
-
-Linux Capture receive coverage includes the worker-reader, message-lifetime,
-Netlink primitive, command-rule and steering units in Debug and Release. The
-reader fixture uses real event loops and datagram transport to check exact worker
-ownership, bounded reads, unsent-verdict retries/deadlines, capacity wakeups,
-watcher refusal, shutdown acceptance and stale-generation settlement. Nonzero
-padding cases cover coordinator scratch and shared reassembly. Two-device cases
-keep accepting for a quiesced device before its own cleanup hook, including while
-an unrelated supervised command waits. Lifecycle
-fixtures exercise queue setup, explicit single-queue mode, extra-queue/steering
-fallback, partial-rule cleanup and restart. The steering fixture executes its
-serialized classic BPF in the kernel against IP options, fragments, malformed
-lengths, reversed endpoints and varied ports between one address pair.
-
-`waterwall.capture_linux_queues_multi` and `_single` run in private namespaces.
-They run omitted, prefix, peer, spread and auto modes at a directly adjacent
-PingServer decoder. Unrelated injected traffic passes unchanged, while auto uses
-peer for the whole device and omission remains prefix. Fixed native port tuples
-and both stable and changing opaque prefixes (protocols 1, 49, 50 and 132) verify
-exact common32 kernel-queue and software processing counts. Stable receive keys
-retain delivery order on one carrier; spread retains approximate kernel/random
-or exact software-cursor distribution. Cases verify requested/effective/reason
-and queue diagnostics, exact bytes, zero queue drops, all four processing workers,
-no additional receive thread, deterministic-versus-random owned rule families,
-and rule/queue cleanup. The existing
-Capture tracked/bypass and protocol-exclusion cases continue to check host
-conntrack behavior and fragment policy. These are correctness checks, not
-throughput measurements.
-
-
-Consumer packet-affinity coverage includes `waterwall.packet_affinity_unit` and
-`waterwall.ipmanipulator_affinity_unit`. These exercise required worker handoff,
-same-worker/one-worker delivery, restored transport ports, preserved fragment
-association, checksum requests and cancellation. The shared dispatcher fixture
-checks bounded destination FIFOs, coalesced wakeups,
-local and reentrant ordering, fair drain quanta and queue cleanup. IpManipulator
-coverage includes native TCP/UDP arriving on an arbitrary worker, port restoration
-with and without ProtoSwap before stateful processing, and plain ProtoSwap
-encoding/restoration and stateless/opaque input remaining local. Ping, WireGuard
-and packet/stream bridge fixtures check decoded delivery on the arrival worker,
-including tuples hashing to another worker. Ping and ProtoSwap preserve fragment
-bytes without decoder staging; StreamToPackets still rejects a stale source
-generation. Tester packet-mode fixtures verify consumer-owned dispatch before
-verification when `worker-affine-flow` is enabled. PTC engine coverage verifies current-tuple ownership after an
-upstream transform, independently of the source worker; direct TUN checksum and
-inline-output fixtures retain their topology checks.
-
-`waterwall.ipmanipulator_echsni_delay_unit` also joins the real device reader
-distribution, consumer affinity and ECH capture paths. Three ordered ClientHello
-segments are admitted while one worker's queue is deliberately left undrained.
-The fixture checks native receive locality and a stable opaque-prefix variant.
-The opaque variant waits on its receive worker, restores the native protocol,
-then hands off to the independently chosen native consumer owner before any
-stateful input. Both preserve successful ECH capture and original segment order.
-Separate gap tests still verify
-the existing passthrough behavior for genuinely out-of-order input; neither
-receive locality nor consumer affinity performs TCP sequence reassembly.
-
-The privileged capture multi/single-queue cases also check exact delivery and
-consistent common32 queue/processing counts for same-IP opaque protocols under
-the prefix default, explicit prefix/peer, and auto resolved to peer. Changing
-prefixes distribute in prefix mode and remain grouped in peer; stable receive
-keys retain FIFO order. Explicit spread checks random multiqueue distribution
-with a frozen broad bound of 8..64 packets per lane for each 128-packet,
-four-lane batch, and single-reader session rotation with exact worker counts.
-Kernel TCP/UDP receive steering and consumer flow ownership remain separate checks.
-These correctness fixtures do not establish a throughput gain or repair packet
-order lost before affinity admission.

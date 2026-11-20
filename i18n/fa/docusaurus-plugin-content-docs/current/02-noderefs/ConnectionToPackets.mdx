@@ -6,32 +6,71 @@ description: "راهنمای node ConnectionToPackets در WaterWall."
 ---
 
 <!--
-Documentation version: 162
+Documentation version: 163
 -->
 
-# ConnectionToPackets
+# ConnectionToPackets {#connectiontopackets-node}
 
-`ConnectionToPackets` کار معکوس `PacketsToConnection` را با active-open انجام می‌دهد.
-یک connection line عادی WaterWall را می‌گیرد، flow متناظر TCP یا UDP را در stack
-lwIP داخل همان process باز می‌کند و packet‌های خام IPv4 را به سمت packet در chain
-می‌فرستد. packet‌های برگشتی دوباره به همان flow تزریق می‌شوند و دادهٔ آن‌ها به‌شکل
-payload در جهت downstream روی connection line اصلی برمی‌گردد.
+<span id="connectiontopackets"></span>
+
+## نمای کلی {#overview}
+
+`ConnectionToPackets` وارون active-open گره `PacketsToConnection` است. یک connection line عادی WaterWall را می‌گیرد، flow متناظر TCP یا UDP را در پشتهٔ lwIP درون فرایند باز می‌کند و بسته‌های خام IPv4 حاصل را روی سمت packet زنجیره صادر می‌کند. بسته‌های برگشتی این سمت به همان flow تزریق می‌شوند و داده به صورت payload عادی downstream روی connection اولیه خارج می‌شود.
 
 ```text
-normal connection -> ConnectionToPackets -> raw IPv4 TCP/UDP packets
-return IPv4 packets -> ConnectionToPackets -> original connection downstream
+ordinary WaterWall connection line
+        -> ConnectionToPackets
+        -> raw IPv4 TCP/UDP packets on the worker packet line
+
+return IPv4 packets
+        -> ConnectionToPackets
+        -> downstream data/events on the original connection line
 ```
 
-این node یک userspace transport bridge است، نه TUN شفاف سیستم‌عامل. به kernel TUN،
-raw socket یا دسترسی root نیاز ندارد. برنامه باید از adapter‌ای مثل
-`TcpListener`، ‏`UdpListener`، ‏`TcpUdpListener` یا `Socks5Server` وارد WaterWall
-شود؛ capture کردن socket‌های نامرتبط kernel بیرون از scope آن است.
+`mtu` یک بار هنگام ساخت تعیین و اعتبارسنجی می‌شود. هر نمونه MTU خود را نگه می‌دارد و override گره دیگر آن را تغییر نمی‌دهد. مقدار نامعتبر ارث‌رسیده از `misc.mtu` هسته به override صریح و پشتیبانی‌شدهٔ همان گره نیاز دارد.
 
-`mtu` یک بار هنگام ساخت تعیین و اعتبارسنجی می‌شود. هر نمونه MTU مستقل
-خود را نگه می‌دارد؛ تنظیم node‌های دیگر آن را تغییر نمی‌دهد. اگر مقدار به‌ارث‌رسیده از
-`misc.mtu` در core نامعتبر باشد، باید برای همان node یک مقدار معتبر تعیین کنید.
+### ماهیت گره {#what-it-is}
 
-## توپولوژی‌های معمول
+این یک bridge انتقال در فضای کاربر است، نه جایگزین شفاف رابط TUN سیستم‌عامل. به دستگاه TUN کرنل، raw socket یا دسترسی root نیاز ندارد.
+
+برنامهٔ محلی باید از آداپتور اتصال مانند `TcpListener`، `UdpListener`، `TcpUdpListener` یا `Socks5Server` وارد WaterWall شود. گرفتن ترافیک دلخواه از سوکت‌های نامرتبط کرنل بیرون از محدودهٔ این گره است و همچنان به مسیریابی سیستم‌عامل یا VPN نیاز دارد.
+
+### محدوده {#scope}
+
+پشتیبانی می‌شود:
+
+- TCP روی IPv4؛
+- UDP روی IPv4، از جمله datagram بزرگ‌تر از یک MTU؛
+- مقصد IP و مقصد domain از طریق `DomainResolver` داخلی؛
+- چند event worker.
+
+رد یا drop می‌شود:
+
+- IPv6، به‌صورت دائمی و عامدانه؛
+- ICMP و protocol‌های غیر TCP/UDP؛
+- UDP payload بالاتر از `65507` بایت؛
+- packet برگشتی بدون flow ثبت‌شده.
+
+تحویل ICMP error و حفظ source port اصلی application فعلاً پیاده‌سازی نشده‌اند.
+
+#### فقط IPv4، بر اساس طراحی {#ipv4-only-by-design}
+
+این گره فقط IPv4 صادر می‌کند. این تصمیم محصول است، نه قابلیت ناقص: هدف، اتصال یک connection به توپولوژی بسته‌ای است که سمت مقابلش پشتهٔ IPv4 دارد و بستهٔ IPv6 در آن مقصدی نخواهد داشت.
+
+این قرارداد در دو طرف اعمال می‌شود:
+
+- با resolve محلی فعال، `dns-behaviour.strategy` مؤثر باید `only-ipv4` باشد تا دامنهٔ فقط AAAA در DNS با پیامی شامل نام شکست بخورد، به جای آنکه آدرسی بدهد که گره سپس رد می‌کند؛
+- `target-address` صریح IPv6 خطای پیکربندی است؛
+- مقصدی که با این حال IPv6 باشد فقط همان line را با خطای صریح می‌بندد.
+
+پشتیبانی فعال IPv6 در lwIP تغییر نمی‌کند. گره‌های یک worker engine آن را به اشتراک می‌گذارند؛ این bridge همچنان فقط IPv4 می‌پذیرد.
+
+## جایگاه معمول در زنجیره {#typical-placement}
+
+
+<span id="توپولوژیهای-معمول"></span>
+
+### توپولوژی‌ها {#topologies}
 
 برای مقصد ثابت، `target-address` و `port` را در `ConnectionToPackets` تنظیم کنید:
 
@@ -55,15 +94,12 @@ TcpListener -> Socks5Server -> ConnectionToPackets
 یا روی WireGuard:
 
 ```text
-شاخه‌ی application محلی: TcpListener -> Socks5Server -> ConnectionToPackets -> Bridge A
-شاخه‌ی UDP محلی:         UdpStatelessSocket -> WireGuardDevice -> Bridge B
-سمت راه‌دور:              UdpStatelessSocket -> WireGuardDevice -> PacketsToConnection
-                          -> TcpUdpConnector -> destination
+TcpListener -> Socks5Server -> ConnectionToPackets -> WireGuardClient -> UdpConnector
+UdpListener -> WireGuardServer(mode=connection) -> TcpUdpConnector
 ```
 
-`Bridge A` و `Bridge B` را pair کنید تا شاخهٔ تبدیل connection به packet، به سمت
-packet در WireGuard وصل شود. `UdpStatelessSocket` فقط در ابتدای chain مجاز است؛ پس
-باید در ابتدای شاخه‌ی خودش بماند و پس از `WireGuardDevice` قرار نگیرد.
+WireGuardServer references a separately configured AuthenticationClient service.
+The client pins one UDP endpoint before Init and may contain datagram transforms.
 
 آدرس مجازی `source-ipv4` باید در توپولوژی packet مسیر برگشت داشته باشد. در WireGuard،
 سمت محلی معمولاً peer را با route مقصد `0.0.0.0/0` انتخاب می‌کند. peer سمت مقابل
@@ -71,79 +107,50 @@ packet در WireGuard وصل شود. `UdpStatelessSocket` فقط در ابتدا
 
 این نمودارها توپولوژی را نشان می‌دهند، نه config کامل nodeها. در ورودی SOCKS،
 `Socks5Server` را برای TCP CONNECT تنظیم و حالت احراز هویت آن را انتخاب کنید.
-برای اجرا بدون root از پورت بالای listener استفاده کنید. دو شاخهٔ محلی باید
-[Bridgeهای جفت و متقابل](./Bridge.mdx) داشته باشند؛ برای تنظیم UDP و کلیدها از
-[جفت WireGuard](./WireGuardDevice.mdx#example-pair) کمک بگیرید. WireGuard از مقصد
+برای اجرا بدون root از پورت بالای listener استفاده کنید. برای تنظیم UDP و کلیدها از
+[WireGuardClient](./WireGuardClient.mdx) کمک بگیرید. WireGuard از مقصد
 داخلی برای انتخاب peer استفاده می‌کند و peer راه‌دور باید source مجازی client
 را مجاز بداند. در سمت مقابل
 [TcpUdpConnector باید مقصد را حفظ کند](./PacketsToConnection.mdx#typical-placement)،
 مگر آنکه backend ثابت می‌خواهید. این توپولوژی socket-to-socket به TUN، forwarding
 IP میزبان یا NAT نیاز ندارد.
 
-## Scope
+## نمونهٔ کاربردی ساده {#minimal-practical-example}
 
-پشتیبانی می‌شود:
+این قطعهٔ گره است؛ همسایه‌ها و همتاهای اشاره‌شده را در همان استقرار تعریف کنید.
 
-- TCP روی IPv4؛
-- UDP روی IPv4، از جمله datagram بزرگ‌تر از یک MTU؛
-- مقصد IP و مقصد domain از طریق `DomainResolver` داخلی؛
-- چند event worker.
+آن را پس از گرهی مانند Socks5Server قرار دهید که مقصد و پورت IPv4 را فراهم می‌کند. `packet-side` را به عنوان توپولوژی بسته تعریف کنید و امکان مسیر برگشت به `10.90.0.1` را در آن برقرار کنید. این گره فقط IPv4 TCP/UDP را پشتیبانی می‌کند؛ MTU سازگار با آن توپولوژی انتخاب کنید.
 
-رد یا drop می‌شود:
+```json
+{
+  "name": "connection-to-packets",
+  "type": "ConnectionToPackets",
+  "settings": {
+    "source-ipv4": "10.90.0.1",
+    "mtu": 1420
+  },
+  "next": "packet-side"
+}
+```
 
-- IPv6، به‌صورت دائمی و عامدانه؛
-- ICMP و protocol‌های غیر TCP/UDP؛
-- UDP payload بالاتر از `65507` بایت؛
-- packet برگشتی بدون flow ثبت‌شده.
+برای پیش‌فرض‌ها و الزام‌های مشروط [پیکربندی](#configuration) و برای نمونه‌های کامل و محدودیت‌های عملیاتی [کاربرد و رفع اشکال](#usage-and-troubleshooting) را ببینید.
 
-تحویل ICMP error و حفظ source port اصلی application فعلاً پیاده‌سازی نشده‌اند.
-این node فقط IPv4 تولید می‌کند. هنگام فعال بودن resolve محلی، strategy مؤثر در
-`dns-behaviour` باید `only-ipv4` باشد؛ اگر
-domain فقط رکورد AAAA داشته باشد، DNS با پیامی شامل نام domain شکست می‌خورد.
-آدرس IPv6 صریح در `target-address` باعث رد config می‌شود؛ مقصد IPv6 در context
-نیز با بستن همان line رد می‌شود. این
-تصمیم، IPv6 سراسری lwIP را برای node‌های دیگر غیرفعال نمی‌کند.
+## پیکربندی {#configuration}
 
-## مرز نهایی‌سازی Checksum
 
-در ورودی مسیر برگشت، این node آخرین مصرف‌کنندهٔ درخواست محاسبهٔ مجدد checksum روی
-buffer همان packet است. node پیش از هر
-اعتبارسنجی یا drop، درخواست را می‌گیرد و پاک می‌کند. سپس packet را در حافظهٔ قابل
-تغییر با alignment مناسب قرار می‌دهد و checksum‌های پشتیبانی‌شده را پیش از تحویل
-به lwIP و پیش از صف‌گذاری اصلاح می‌کند؛ پیام بایتی صف دیگر به flag جداگانه نیاز
-ندارد. malformed بودن packet، دریافت IPv6، توقف node یا رد ورودی درخواست buffer
-دیگری را تغییر نمی‌دهد. برای TCP/UDP بدون fragmentation، header IPv4 و
-transport checksum اصلاح می‌شوند؛ برای fragment فقط checksum header IPv4 قابل
-محاسبه است و transport checksum ساختگی تولید نمی‌شود.
+<span id="تنظیمات"></span>
 
-## Fragmentation
-
-ورودی packet باید datagram کامل IPv4 باشد. packet دارای MF یا fragment offset
-غیرصفر پیش از تحویل به lwIP حذف می‌شود؛ DF به‌تنهایی مجاز است. این رد ورودی
-buffer و منابع موقت را آزاد می‌کند و packet line و اتصال‌های دیگر زنده می‌مانند.
-اولین drop هشدار می‌دهد و تعداد کل dropها هنگام تخریب node گزارش می‌شود.
-برای تحویل datagram تکه‌شده، پیش از این node reassembly انجام دهید.
-ساختار malformed همچنان از مسیر validation/drop معمول می‌گذرد.
-
-این الزام برای ورودی downstream است. خروجی UDP بزرگ‌تر از MTU همچنان به‌وسیلهٔ
-lwIP fragment می‌شود و MSS ارسال TCP از MTU به دست می‌آید. همهٔ fragment‌های
-خروجی یک flow به همان worker می‌روند. اگر مصرف‌کنندهٔ خروجی، stack دیگری است،
-باید پیش از تحویل به آن reassembly انجام شود. policy دستگاه فقط خواندن از همان
-دستگاه را کنترل می‌کند و packet‌های خروجی node دیگر را بازسازی نمی‌کند.
-
-کپی‌های handoff در هر دو جهت، برای هر instance مجموعاً به ۱۶ MiB و ۴۰۹۶ allocation محدودند؛ metadata و padding نیز محاسبه می‌شوند. سهم پیش از allocation رزرو و هنگام آزادسازی واقعی، حتی برای custom pbuf، آزاد می‌شود. اشباع خروجی `ERR_MEM` برمی‌گرداند و ورودی اضافه drop می‌شود. اولین refusal هشدار و مجموع هر جهت هنگام تخریب گزارش می‌شود.
-
-## تنظیمات
+### تنظیمات {#settings}
 
 | تنظیم | اجباری | پیش‌فرض | معنی |
 | --- | --- | --- | --- |
-| `source-ipv4` | بله | ندارد | source IPv4 مجازی netif/PCB‌ها؛ نباید wildcard، loopback، multicast یا broadcast باشد. |
+| `source-ipv4` | بله | ندارد | source IPv4 مجازی هر netif مربوط به worker و هر PCB بازشده به صورت فعال؛ عمداً پیش‌فرض ندارد، زیرا آدرس انتخاب‌شدهٔ خاموش ممکن است با آدرس واقعی تداخل کند. نباید `0.0.0.0`، loopback، multicast یا broadcast باشد. |
 | `target-address` | خیر | `dest_context->address` | آدرس IPv4 یا domain مقصد؛ رشتهٔ دقیق `dest_context->address` آدرس مقصد ورودی را نگه می‌دارد. آدرس تنظیم‌شده فقط بخش آدرس را جایگزین می‌کند. IPv6 صریح پذیرفته نمی‌شود. |
 | `port` | خیر | `dest_context->port` | عدد صحیح پورت مقصد در بازهٔ `1..65535`، یا رشتهٔ دقیق `dest_context->port` برای نگه‌داشتن پورت مقصد ورودی. |
 | `mtu` | خیر | `misc.mtu` سراسری | بازهٔ `576..9000`؛ MSS از آن مشتق و UDP بالاتر از آن fragment می‌شود. |
 | `dns-behaviour` | خیر | lookup بومی با `only-ipv4` | کنترل lookup محلی و انتقال DNS. resolve فعال به `only-ipv4` یا `core-settings` با همین مقدار در core نیاز دارد. |
-| `tcp-connect-timeout-ms` | خیر | `30000` | deadline اتصال TCP active-open. |
-| `max-pending-bytes` | خیر | `262144` | سقف دادهٔ application پیش از connect یا هنگام پُربودن send window؛ بازهٔ `1024..67108864`. |
+| `tcp-connect-timeout-ms` | خیر | `30000` | deadline اتصال TCP active-open؛ با انقضا line به سمت گره قبلی بسته می‌شود. |
+| `max-pending-bytes` | خیر | `262144` | سقف دادهٔ application پیش از connect یا هنگام پُربودن send window؛ بازهٔ `1024..67108864`. پذیرش یک headroom ثابت 1 MiB برای تحویل هم دارد؛ عبور از سقف مجموع همان flow را حذف می‌کند. |
 
 مقدار پیش‌فرض فقط وقتی استفاده می‌شود که فیلد نوشته نشده باشد. نوع اشتباه، عدد
 کسری یا مقدار خارج از بازه باعث رد config با ذکر نام فیلد می‌شود. MTU مربوط به
@@ -169,7 +176,9 @@ core پیش از تبدیل به نوع عددی کوچک‌تر، در بازه
 `packet-bridge` نام node مربوط به `Bridge A` است؛ جفت متقابل و شاخهٔ جداگانهٔ
 UDP/WireGuard را مطابق بخش توپولوژی تنظیم کنید.
 
-## رفتار DNS
+<span id="رفتار-dns"></span>
+
+### رفتار DNS {#dns-behaviour}
 
 resolve کردن نام دامنه یعنی پیدا کردن آدرس IPv4 لازم برای باز کردن flow مربوط
 به TCP یا UDP. این node ابتدا مقصد را از `target-address`، `port` یا مقصد ورودی
@@ -183,7 +192,14 @@ resolve شده باشد به lookup نیاز ندارد. IPv6 پشتیبانی �
 این lookup را با `settings.dns-behaviour` تنظیم کنید:
 
 ```json
-{"dns-behaviour": {"resolve": true, "mode": "direct", "strategy": "only-ipv4", "servers": ["203.0.113.53:53"]}}
+{
+  "dns-behaviour": {
+    "resolve": true,
+    "mode": "direct",
+    "strategy": "only-ipv4",
+    "servers": ["203.0.113.53:53"]
+  }
+}
 ```
 
 این IP نمونهٔ مستندات است؛ آن را با سرور خود جایگزین کنید.
@@ -219,100 +235,12 @@ TCP را پشتیبانی کند. این شاخه نباید از قبل به no
 
 مثال‌های native، direct و chain محافظت‌شده و محدودیت گزینه‌های core را در [DomainResolver](./DomainResolver.mdx) ببینید. این سیاست فقط lookupهای متعلق به همین node را کنترل می‌کند؛ fake DNS در PTC، DNS سیستم در TunDevice و همهٔ منابع DNS برنامه را تغییر نمی‌دهد.
 
-## انتخاب مقصد و Protocol
+## کاربرد و رفع اشکال {#usage-and-troubleshooting}
 
-قاعده دقیقاً با `TcpUdpConnector` یکسان است: protocol مشخص‌شده در destination context
-اولویت دارد؛ در غیر این صورت، protocol مشخص‌شده در source context استفاده می‌شود.
-اگر protocol موجود نباشد یا مبهم باشد، همان line رد می‌شود.
 
-`target-address` و `port` مستقل از هم مقصد را انتخاب می‌کنند. حذف هر فیلد یا
-استفاده از مقدار دقیق `dest_context->...` مربوط به آن، همان بخش از destination context
-ورودی را نگه می‌دارد. `source-ipv4` فقط مبدأ مجازی packet‌های خروجی است و مقصد را
-تعیین نمی‌کند.
+<span id="ظرفیت"></span>
 
-این تنظیمات مقصد یک بار و پیش از هر lookup اختیاری DNS اعمال می‌شوند. اگر resolve
-محلی فعال باشد، نام دامنهٔ resolve‌نشدهٔ انتخاب‌شده lookup می‌شود؛ چه از تنظیمات
-آمده باشد و چه از مقصد ورودی. node آدرس IPv4 حاصل را بدون اعمال دوبارهٔ تنظیمات
-مقصد استفاده می‌کند. پیش از بازشدن flow، مقصد
-باید آدرس و پورت غیرصفر داشته باشد. `TcpListener` عادی protocol مبدأ TCP را تأمین
-می‌کند؛ در نتیجه برای forwarding به مقصد ثابت نیازی به SOCKS نیست:
-
-```json
-{
-  "name": "connection-to-packets",
-  "type": "ConnectionToPackets",
-  "settings": {
-    "source-ipv4": "10.90.0.1",
-    "target-address": "example.com",
-    "port": 443
-  },
-  "next": "packets-to-connection"
-}
-```
-
-این تنظیمات node برای مسیر مستقیم بالا مناسب است. اگر مسیر packet به host دیگری
-می‌رود، `next` را به ورودی packet transport خود تغییر دهید.
-
-fake DNS وجود ندارد؛ حفظ domain اصلی در
-سمت مقابل به پروتکل جداگانه‌ای برای انتقال metadata نیاز دارد.
-
-## Flow Control
-
-TCP در هر دو جهت backpressure واقعی دارد. داده‌ای که lwIP هنوز نمی‌تواند بپذیرد،
-با بودجهٔ `max-pending-bytes` و حاشیهٔ ورودی توضیح‌داده‌شده در ادامه، در صف می‌ماند
-و سمت قبلی Pause می‌شود. دادهٔ دریافتی ابتدا downstream تحویل داده می‌شود؛ اگر
-در همان callback یک Pause به‌صورت re-entrant برسد، receive credit به lwIP برنمی‌گردد
-و receive window بسته می‌شود. هر flow علاوه بر سقف بایت‌ها، حداکثر `1024` ورودی
-در صف نگه می‌دارد؛ عبور از این سقف فقط همان flow را reset و بسته می‌کند. UDP صف
-stream ندارد و هنگام Pause، datagram‌ها را drop می‌کند.
-
-## Lifecycle
-
-- connection line از نوع **borrowed** است؛ node فقط state خودش را آزاد می‌کند و
-  هرگز `lineDestroy()` را فراخوانی نمی‌کند. packet line‌های هر worker متعلق به chain
-  هستند و در طول runtime زنده می‌مانند. دریافت `Finish` روی آن‌ها نقض قرارداد است
-  و باعث abort شدن process می‌شود.
-- پیش از callback نخست، آرایهٔ netif هر worker، ظرفیت اولیهٔ رجیستری flow و
-  tombstone ring ساخته می‌شوند. اتمام حافظهٔ heap خطای fatal است؛ سایر خطاهای
-  سازنده منابع آماده‌شده را آزاد می‌کنند. رجیستری fragment ورودی وجود ندارد.
-- چون chain ممکن است با L4 آغاز شود، packet side در `onStart()` با task جدا برای هر
-  worker مقداردهی اولیه می‌شود.
-- بسته‌شدن graceful اتصال TCP، یک tombstone برای مسیریابی به مدت `2 * TCP_MSL`
-  در ring ثابتی با `4096` ورودی نگه می‌دارد. ثبت مجدد همان tuple، tombstone را
-  جایگزین می‌کند.
-- flow متصل، حتی با صف خالی، به closer متعلق به node منتقل می‌شود. حساب بایت‌های
-  پذیرفته‌شده و receive credit دقیقاً یک بار تسویه می‌شود. closer ابتدا همهٔ بایت‌ها
-  را می‌نویسد و سپس با `tcp_shutdown(pcb, 0, 1)` فقط TX را می‌بندد. از `tcp_close()`
-  استفاده نمی‌شود، چون با وجود receive credit تسویه‌نشده ممکن است RST بفرستد و
-  باعث از دست رفتن داده شود.
-- deadline تحویل داده/FIN برابر `30` ثانیه و deadline بسته‌شدن peer برابر `60`
-  ثانیه است. closer‌ها در مجموع به `4096` object و `16 MiB` از دنبالهٔ کپی‌شدهٔ
-  داده محدودند. عبور از هر سقف، PCB را دقیقاً یک بار abort می‌کند. رسیدن به
-  `TIME_WAIT` پایان graceful است و مالکیت PCB با lwIP می‌ماند.
-- خطای `ERR_MEM` در write فقط تا وقتی نوشتن blocked است، از طریق `tcp_poll`
-  دوباره امتحان می‌شود؛ خطاهای دیگر flow را می‌بندند. deadline اتصال یک timer
-  قابل لغو روی worker مالک است که دقیقاً یک reference به line نگه می‌دارد.
-- generation مانع تزریق packet صف‌شدهٔ flow قدیمی به flow جدیدی با همان tuple
-  می‌شود. با این حال، packet دیررس شبکه generation ندارد؛ tombstone فقط بازه‌ای
-  را که ممکن است چنین ابهامی رخ دهد کوتاه‌تر می‌کند.
-- `onQuiesceRequest()` وضعیت stopping را منتشر می‌کند و پذیرش جدید را از طریق
-  gate‌های prev/next و classification/publication بدون انتظار می‌بندد. سپس
-  `onQuiesceWait()` بازگشت همهٔ callback‌های admitted را تضمین می‌کند. در lifecycle-v2،
-  message‌های emit، inject و packet-`Init` اولیه پیش از توقف و
-  آزادشدن component به پایان می‌رسند؛ بنابراین می‌توانند pointer تونل را مستقیم
-  حمل کنند. message لغوشده فقط منابع خودش را آزاد می‌کند. `onWorkerStop()` روی
-  worker مالک، همهٔ PCB‌ها، flow‌ها، deadline‌ها، drain‌ها و netif‌های محلی را detach
-  می‌کند و PCB‌ها را abort می‌کند. state و buffer و reference مربوط به borrowed line تا Finish
-  از source واقعی باقی می‌مانند، حتی اگر CTP زودتر drain شود. `onStop()` فقط پس از
-  barrier همهٔ worker‌ها رجیستری مشترک را آزاد می‌کند و PCB خارجی را پیمایش نمی‌کند.
-- داده‌ای که قبلاً پذیرفته نشده، از timer روی event loop همان worker مالک دوباره
-  تحویل داده می‌شود؛ callback تحویل همچنان در صف قرار می‌گیرد. اگر صف، یک کار
-  کنترلی ضروری را نپذیرد، ابتدا callback و route مربوط به PCB جدا می‌شوند و line
-  از نوع borrowed در terminal registry ازپیش‌تخصیص‌یافته ثبت می‌شود. درخواست
-  shutdown منظم برنامه، اقدام بعدی پس از این تحویل مسئولیت است. مالک واقعی
-  line در پایان آن را آزاد می‌کند.
-
-## ظرفیت
+### ظرفیت {#capacity}
 
 همه‌ی نمونه‌های `ConnectionToPackets` و `PacketsToConnection` در یک فرایند از
 allocator قابل‌رشد lwIP و سقف‌های مشترک استفاده می‌کنند. این فیلدها را زیر
@@ -377,7 +305,9 @@ flowهای زیادی داشته باشد. زنجیره‌ی `TunDevice -> Packe
 شریک‌اند. تمام‌شدن آن ساخت interface را رد می‌کند. ورودی بسته باید datagram
 کامل IPv4 باشد؛ افزایش pool پذیرش fragment یا سیاست reassembly را تغییر نمی‌دهد.
 
-### ظرفیت پورت مبدأ
+<span id="ظرفیت-پورت-مبدأ"></span>
+
+#### ظرفیت پورت مبدأ {#source-port-capacity}
 
 CTP پیش از اتصال TCP یا UDP، tuple کامل روی شبکه را رزرو می‌کند: پروتکل، آدرس
 و پورت مبدأ، آدرس و پورت مقصد. یک پورت مبدأ می‌تواند برای مقصدهای مختلف یا
@@ -393,11 +323,13 @@ CTP هنوز یک `source-ipv4` دارد و pool خودکار آدرس مبدأ 
 متنوع می‌توانند شماره‌ی پورت مشترک داشته باشند، ولی افزایش PCB یا بودجه‌ی حافظه
 سقف پورت برای tuple ثابت را حذف نمی‌کند.
 
-## API ظرفیت (`stack-stats`)
+<span id="api-ظرفیت-stack-stats"></span>
+
+### API ظرفیت (`stack-stats`) {#capacity-api-stack-stats}
 
 هر دو bridge عملیات فقط‌خواندنی `stack-stats` را ثبت می‌کنند. به client در
 APIServer مجوز دقیق config، node و operation بدهید و از client معمول API با
-framing استاندارد آن برای فرستادن درخواستی مانند نمونه‌ی زیر استفاده کنید:
+[قالب‌بندی معمول API](../05-devguides/api/protocol.mdx) برای فرستادن درخواستی مانند نمونه‌ی زیر استفاده کنید:
 
 ```json
 {
@@ -442,13 +374,117 @@ true است: `held` و `peak_held` اشیای آزاد رزروشده در cache
 داشته باشد. قبل از تغییر سقف، با شمارنده‌ی رد تعداد در هر pool، رد بودجه‌ی بایت
 و رد پورت، منبع محدودکننده را مشخص کنید.
 
-## Composition
+## رفتار پیشرفته {#advanced-behavior}
+
+
+<span id="مرز-نهاییسازی-checksum"></span>
+
+### مرز نهایی‌سازی checksum {#checksum-finalization-boundary}
+
+در ورودی بستهٔ سمت بازگشت، `ConnectionToPackets` مصرف‌کنندهٔ نهایی درخواست محاسبهٔ مجدد checksum بافر همان بسته است. پیش از هر اعتبارسنجی یا مسیر drop، درخواست را می‌گیرد و پاک می‌کند، بسته را در حافظهٔ پیام قابل تغییر و هم‌تراز قرار می‌دهد، سپس checksumهای پشتیبانی‌شده را پیش از صف‌گذاری بایت‌ها برای lwIP ترمیم می‌کند. بستهٔ malformed، IPv6، در حال توقف یا ردشده نمی‌تواند درخواست خود را به بستهٔ نامرتبط بعدی روی packet line آن worker منتقل کند.
+
+برای TCP یا UDP کامل IPv4، نهایی‌سازی checksum هدر IPv4 و transport را ترمیم می‌کند.
+
+ورودی packet فقط datagram کامل IPv4 می‌پذیرد. MF یا fragment offset غیرصفر پیش از تحویل به stack موجب drop محدود می‌شود؛ DF به‌تنهایی مجاز است. اگر باید datagram تکه‌شده تحویل شود، در ورودی دستگاه یا پیش از این گره reassembly کنید. نخستین drop fragment پشتیبانی‌نشده هشدار ثبت می‌کند؛ موارد بعدی شمارندهٔ instance را افزایش می‌دهند و مجموع هنگام تخریب ثبت می‌شود. رد، منابع ورودی را آزاد می‌کند و packet line و دیگر اتصال‌ها را زنده نگه می‌دارد. ساختار malformed از مسیر validation/drop موجود می‌گذرد.
+
+### Fragmentation {#fragmentation}
+
+دیتاگرام UDP بزرگ‌تر از MTU تنظیم‌شده به جای حذف، به صورت fragmentهای IPv4 صادر می‌شود. کل datagram به lwIP سپرده می‌شود و `ip4_frag()` آن را تقسیم می‌کند؛ پس identification، offsetها و پرچم `MF` متعلق به stack هستند، نه این گره.
+
+بسته‌های بازگشتی باید پیش از callback بستهٔ downstream این گره بازسازی شده باشند. گره fragment را در stack محلی نمی‌پذیرد. fragmentation خروجی UDP همچنان پشتیبانی می‌شود؛ مصرف‌کنندهٔ packet-to-stack متصل مستقیم باید بستهٔ کامل دریافت کند، پس مسیر این خروجی پیش از مصرف‌کننده به reassembly نیاز دارد. `fragment-policy` دستگاه فقط خواندن همان دستگاه را کنترل می‌کند و بسته‌های تولیدشده در جای دیگر زنجیره را بازسازی نمی‌کند.
+
+همهٔ بسته‌های خروجی یک flow، از جمله fragmentها، به همان packet worker فرستاده می‌شوند. MSS ارسال TCP از MTU تنظیم‌شده مشتق می‌شود. fragmentation خروجی و reassembly ورودی مسئولیت‌های جداگانه‌اند.
+
+کپی handoff بسته در هر دو جهت در هر instance سقف مشترک **16 MiB**، شامل metadata پیام و padding صریح alignment، و **4096 تخصیص** دارد. پذیرش پیش از تخصیص یا کپی، هر دو سهم و `lwip-memory-budget` سراسری فرایند را رزرو می‌کند. رد خروجی `ERR_MEM` به lwIP برمی‌گرداند؛ TCP رفتار retry پشته را حفظ و UDP از سیاست خطای ارسال/drop خود پیروی می‌کند. ورودی بازگشتی بیش از بودجه دور ریخته می‌شود تا TCP بتواند دوباره ارسال کند؛ بایت‌های stream برنامه که قبلاً پذیرفته شده‌اند هرگز با این کار دور ریخته نمی‌شوند. dispatch حتی روی همان worker در صف باقی می‌ماند. لغو، flow قدیمی، shutdown و تحویل هر charge را یک بار آزاد می‌کنند؛ custom pbuf تزریق‌شده تا آزادسازی واقعی charge را حفظ می‌کند و از فضای بودجه‌ای استفاده می‌کند که ممکن است بیش از تونل عمر کند. خروجی در یک بافر دارای padding، به اندازهٔ بسته و با padding زنجیرهٔ مالک engine کپی می‌شود و تمام تخصیص آن charge می‌شود. پیام صف‌شده همان بافر را منتقل می‌کند؛ پس از انتقال مالکیت به همسایه، دریافت‌کننده بودجهٔ نگه‌داری خود را اعمال می‌کند. نخستین رد هر جهت هشدار می‌دهد و هنگام تخریب شمارندهٔ تجمعی رد ورودی بازگشتی و خروجی ثبت می‌شود.
+
+<span id="انتخاب-مقصد-و-protocol"></span>
+
+### انتخاب مقصد و پروتکل {#destination-and-protocol-selection}
+
+قاعده دقیقاً با `TcpUdpConnector` یکسان است: protocol مشخص‌شده در destination context
+اولویت دارد؛ در غیر این صورت، protocol مشخص‌شده در source context استفاده می‌شود.
+اگر protocol موجود نباشد یا مبهم باشد، همان line رد می‌شود.
+
+`target-address` و `port` مستقل از هم مقصد را انتخاب می‌کنند. حذف هر فیلد یا
+استفاده از مقدار دقیق `dest_context->...` مربوط به آن، همان بخش از destination context
+ورودی را نگه می‌دارد. `source-ipv4` فقط مبدأ مجازی packet‌های خروجی است و مقصد را
+تعیین نمی‌کند.
+
+این تنظیمات مقصد یک بار و پیش از هر lookup اختیاری DNS اعمال می‌شوند. اگر resolve
+محلی فعال باشد، نام دامنهٔ resolve‌نشدهٔ انتخاب‌شده lookup می‌شود؛ چه از تنظیمات
+آمده باشد و چه از مقصد ورودی. node آدرس IPv4 حاصل را بدون اعمال دوبارهٔ تنظیمات
+مقصد استفاده می‌کند. پیش از بازشدن flow، مقصد
+باید آدرس و پورت غیرصفر داشته باشد. `TcpListener` عادی protocol مبدأ TCP را تأمین
+می‌کند؛ در نتیجه برای forwarding به مقصد ثابت نیازی به SOCKS نیست:
+
+```json
+{
+  "name": "connection-to-packets",
+  "type": "ConnectionToPackets",
+  "settings": {
+    "source-ipv4": "10.90.0.1",
+    "target-address": "example.com",
+    "port": 443
+  },
+  "next": "packets-to-connection"
+}
+```
+
+این تنظیمات node برای مسیر مستقیم بالا مناسب است. اگر مسیر packet به host دیگری
+می‌رود، `next` را به ورودی packet transport خود تغییر دهید.
+
+fake DNS وجود ندارد؛ حفظ domain اصلی در
+سمت مقابل به پروتکل جداگانه‌ای برای انتقال metadata نیاز دارد.
+
+<span id="composition"></span>
+
+### نکته‌های ترکیب {#composition-notes}
 
 - node قبلی باید layer 4 و node بعدی layer 3 باشد.
 - `next` اجباری و مقصد packetهاست.
 - حضور این node chain را packet chain می‌کند و packet line هر worker را می‌سازد.
 
-## متادیتای نود
+## جزئیات پیاده‌سازی {#implementation-details}
+
+
+### کنترل جریان {#flow-control}
+
+TCP در هر دو جهت backpressure واقعی اعمال می‌کند:
+
+- دادهٔ برنامه که lwIP هنوز نمی‌پذیرد با سقف `max-pending-bytes` به‌علاوهٔ headroom تحویل در صف می‌ماند و تا تخلیهٔ send window به گره قبلی `Pause` ارسال می‌شود؛
+- دادهٔ دریافتی ابتدا downstream تحویل می‌شود؛ اگر گره قبلی به صورت reentrant توقف دهد، receive credit تا Resume به lwIP برنمی‌گردد و پنجرهٔ TCP بسته می‌شود.
+
+سقف کل بایت معلق `P + L` است که در آن `P = max-pending-bytes` و `L` حاشیهٔ ثابت 1 MiB مستقل از اندازهٔ pool، پروفایل RAM و تنظیمات splice است. این سهم محدود ورودی‌ای را پوشش می‌دهد که پیش از اثر کردن Pause تحویل شده، از جمله تحویل 1 MiB با بودجهٔ پیش‌فرض 256 KiB. سقف entry یا زمان ارسال Pause/Resume تغییر نمی‌کند. پذیرش پیش از افزودن به صف بررسی می‌شود؛ ورودی اضافی فقط همان flow را می‌بندد و وارد تخلیهٔ graceful نمی‌شود.
+
+علاوه بر سقف بایت، هر flow TCP حداکثر 1,024 payload در صف نگه می‌دارد. این سقف داخلی ایمنی تخصیص در JSON قابل تنظیم نیست و سربار هر buffer/deque را حتی برای callbackهای یک‌بایتی محدود می‌کند. عبور از آن فقط flow متخلف TCP را reset و می‌بندد. UDP صف stream ندارد و از حساب entry یا فشار تخصیص صف اثر نمی‌گیرد.
+
+backpressure در UDP عمداً با اتلاف است: هنگام Pause گره قبلی، datagram دریافتی به جای صف نامحدود دور ریخته می‌شود.
+
+<span id="lifecycle"></span>
+
+### نکته‌های چرخهٔ عمر {#lifecycle-notes}
+
+- connection line از نوع **borrowed** است. این گره فقط state خود را مقداردهی و تخریب می‌کند و هرگز `lineDestroy()` فراخوانی نمی‌کند؛ listener یا آداپتور سازندهٔ line آن را تخریب می‌کند.
+- packet lineهای هر worker متعلق به زنجیره‌اند. هرگز به عنوان flow مقداردهی اولیه نمی‌شوند و در runtime تخریب نمی‌شوند. `Finish` روی packet line نقض قرارداد است و فرایند را abort می‌کند.
+- ساخت مرحله‌ای است: آرایهٔ اشاره‌گرهای netif و رجیستری flow هر یک پیش از تلاش برای مرحلهٔ بعد ثبت می‌شوند و هر شکست از مسیر واحد `onDestroy()` پاک‌سازی می‌شود. آن مسیر بر اساس state منتشرشده توسط هر مرحله تصمیم به آزادسازی می‌گیرد، نه صرفاً میزان پیشرفت ساخت. بنابراین پیمایش رجیستری تا زمان وجود آن no-op است. رجیستری مالک `flows_lock` است و قفل کردن قفلی که هرگز ساخته نشده یا rollback خود رجیستری پیش‌تر آن را تخریب کرده، رفتار تعریف‌نشده است، نه خطای قابل بازیابی.
+- چون زنجیره ممکن است با آداپتور لایهٔ ۴ شروع شود، سمت packet در `onStart()` با یک task صف‌شده برای هر worker مقداردهی می‌شود، نه با مقداردهی head لایهٔ ۳ توسط مدیر گره.
+- flow TCP که به‌نرمی بسته می‌شود یک tombstone در رجیستری باقی می‌گذارد تا FIN/ACK دیررس به worker و netif درست برسد. این مهلت مسیریابی `2 * TCP_MSL` است، نه مدل عمر PCB. closer متعلق به گره از `tcp_shutdown(pcb, 0, 1)` فقط برای TX استفاده می‌کند و PCB را در `FIN_WAIT_1`، `FIN_WAIT_2`، `CLOSING` یا `LAST_ACK` دنبال می‌کند؛ برای flow متصل `tcp_close()` به کار نمی‌برد. وقتی lwIP، PCB را به `TIME_WAIT` می‌برد، closer callbackهای برنامه را جدا و مدخل زندهٔ رجیستری را فوراً بازنشسته می‌کند؛ فقط lwIP مالک PCB در `TIME_WAIT` می‌ماند. tombstone مستقل ممکن است بیش از PCB عمر کند یا پیش از آن منقضی شود؛ هیچ‌یک flow زنده را از دست نمی‌دهد.
+- tombstoneها در حلقهٔ بازنشستگی ثابت با `4096` مدخل نگه‌داری می‌شوند، نه با timer جداگانهٔ worker برای هر یک؛ timer برای هر بستن باعث رشد صف timer و هزینهٔ shutdown با churn اتصال می‌شد. حلقه این سقف را قطعی می‌کند: ممکن است در یک مهلت بیش از تعداد قابل حذف با پیمایش مبتنی بر سن، flow بسته شود؛ پس پس از سقف، قدیمی‌ترین tombstone جای خود را واگذار می‌کند. انقضا هنگام lookup نیز رعایت می‌شود تا گرهی که ساکت شده و چیزی ثبت یا بازنشسته نمی‌کند نتواند برای tuple با مهلت منقضی پاسخ دهد.
+- ثبت جدید روی tombstone آن را جایگزین می‌کند. lwIP همان پورت محلی را پیش‌تر انتخاب کرده است؛ رد ثبت، ابهام پذیرفته‌شدهٔ بستهٔ دیررس را به شکست قابل مشاهدهٔ اتصال تبدیل می‌کرد.
+- `Finish` محلی یا half-close سالم سمت مقابل ابتدا بایت‌های TCP پذیرفته‌شده را تخلیه می‌کند. سپس PCB به closer متعلق به گره می‌رود؛ flow *متصل* حتی با صف خالی نیز همین مسیر را طی می‌کند، زیرا بایت‌های داخل lwIP ممکن است تأیید نشده باشند، همتا ممکن است همچنان بدون کسی برای بازگرداندن اعتبار دریافت ارسال کند و ACKهایش باید به همین worker مسیریابی شوند. در این انتقال، اعتبار همهٔ بایت‌های قبلاً کپی‌شده از lwIP که هنوز به `tcp_recved()` داده نشده‌اند، پیش از پاک‌شدن اشاره‌گر PCB در line بازگردانده می‌شود. این شامل taskهای مالک که هنوز در صف هستند و زیرمجموعهٔ pauseشده است؛ closer پنجرهٔ دریافت کاملاً باز را تحویل می‌گیرد و اعتبار هر بایت پذیرفته‌شده دقیقاً یک بار بازگردانده می‌شود.
+- closer تا دریافت همهٔ بایت‌های پذیرفته‌شده توسط همتا می‌نویسد، سپس shutdown فقط TX را درخواست می‌کند. tuple در وضعیت *draining*، نه فعال و نه tombstone، ثبت می‌ماند تا هنگام مالکیت PCB توسط این گره قابل بیرون‌راندن نباشد. مهلت `30` ثانیه هم تحویل بایت صف‌شده و هم FIN پذیرفته‌شده توسط lwIP که هنوز تخصیص نیافته را پوشش می‌دهد. در حالت دوم، `tcp_shutdown()` با `TF_CLOSEPEND` موفق برمی‌گردد؛ closer callbackها، مالکیت رجیستری و مهلت را حفظ و EOF همتا را بدون بازنشستگی ثبت می‌کند. گذار واقعی به `FIN_WAIT_1`، `FIN_WAIT_2`، `CLOSING` یا `LAST_ACK` با `TF_CLOSEPEND` پاک یعنی FIN صف شده است؛ این وضعیت پیش از اعمال مهلت FIN معلق بررسی می‌شود، پس گذار در همان تیک در برابری مهلت اولویت دارد. `TIME_WAIT` پایان graceful است و closer بدون abort PCB بازنشسته می‌شود. مهلت جداگانهٔ `60` ثانیه برای بسته‌شدن همتا حالت‌های فعال بستن را پوشش می‌دهد. closerها به بودجهٔ مشترک `16 MiB` و شمار `4096` object نیز محدودند؛ عبور از هر سقف PCB را دقیقاً یک بار abort می‌کند، به جای گزارش EOF سالم اما ناقص یا رها کردن PCB بدون پیگیری.
+- FIN با shutdown فقط TX فرستاده می‌شود، هرگز با `tcp_close()`. اجرای `tcp_close()` در `ESTABLISHED` یا `CLOSE_WAIT` با اعتبار دریافت باقی‌مانده، PCB را reset و آزاد می‌کند. این گره اعتبار را از task worker مالک برمی‌گرداند و هنگام Pause تونل قبلی آن را کامل نگه می‌دارد؛ پس این وضعیت معمول است. reset همهٔ بایت‌های خروجی تأییدنشده را نیز از بین می‌برد و closer دقیقاً برای جلوگیری از آن است. فقط flow که هرگز متصل نشده همچنان بسته می‌شود، جایی که این قاعده قابل اعمال نیست.
+- write ردشده با `ERR_MEM` از callback `tcp_poll` دوباره امتحان می‌شود؛ callback دقیقاً تا زمان blocked بودن write نصب است. `tcp_sent` به‌تنهایی کافی نبود: شکست نخستین write روی PCB بیکار هیچ بایت تأییدنشده‌ای باقی نمی‌گذارد، پس ACKی نمی‌رسد و line پس از رفع فشار همچنان pause می‌ماند. سایر خطاهای write نهایی‌اند و flow را یک بار می‌بندند، نه اینکه برای همیشه تکرار شوند.
+- deadline مربوط به active-open یک timer قابل لغو برای هر line است که event worker مالک آن است و دقیقاً یک reference line نگه می‌دارد. اتصال موفق آن را فوراً لغو می‌کند؛ task تأخیری fire-and-forget، پیام و تخصیص line را برای کل مهلت تنظیم‌شده، تا حدود 49.7 روز قابل نمایش با شمار میلی‌ثانیهٔ `uint32_t`، زنده نگه می‌داشت.
+- شمارندهٔ generation مانع تزریق packet *صف‌شده*ٔ flow قدیمی به flow جدیدی می‌شود که tuple را میان lookup و تحویل دوباره استفاده کرده است. پیش از تزریق، همان generation روی engine مالک اولیه همراه هویت دقیق netif دوباره اعتبارسنجی می‌شود. این سازوکار packet شبکه‌ای را که پس از بازنشستگی و استفادهٔ دوبارهٔ tuple می‌رسد تشخیص نمی‌دهد، زیرا IP generation حمل نمی‌کند. tombstone این بازه را کاهش می‌دهد ولی حذف نمی‌کند.
+- `onQuiesceRequest()` وضعیت stopping را منتشر، پذیرش جدید را از gateهای سمت قبل، سمت بعد و طبقه‌بندی/انتشار packet می‌بندد و بدون انتظار درخواست جداکردن callback می‌دهد. `onQuiesceWait()` بازگشت callbackهای قبلاً پذیرفته‌شده را اثبات می‌کند. `onWorkerStop()` در engine همان worker، callbackهای PCB، ثبت flow، deadline، drain و netif را جدا می‌کند. پاک‌سازی نهایی TCP، PCBها را abort می‌کند تا از رابط حذف‌شده بیشتر عمر نکنند. اشاره‌گرهای stack پیش از آزادسازی پاک می‌شوند. state، بافرهای معلق و referenceهای line قرضی تا Finish منبع واقعی باقی می‌مانند، حتی اگر CTP پیش از منبع drain شود. `onStop()` اصلی barrierهای تکمیل‌شدهٔ مالک را بررسی و رجیستری‌های مشترک را آزاد می‌کند و هرگز PCB خارجی را پیمایش نمی‌کند. انتشار `stopping` به‌تنهایی PCB را جدا نمی‌کند؛ close پاک‌سازی واقعی idempotent سمت مالک را انجام می‌دهد. هر task صف‌شده وارد gate مربوط می‌شود، پس task ردشده داده و رویداد چرخهٔ عمر به هر همسایه را سرکوب می‌کند، در حالی که مسیرهای close زنده می‌مانند تا مالکان بتوانند lineهای قرضی را آزاد کنند.
+- ساخت، آرایهٔ netif برای هر worker، ظرفیت اولیهٔ نقشهٔ flow و حلقهٔ ثابت tombstone را پیش از اجرای هر callback flow برقرار می‌کند. شکست تخصیص heap fatal است؛ سایر خطاهای سازنده منابع مقداردهی‌شده را آزاد می‌کنند.
+- lwIP دادهٔ دریافت ردشده را از timer حلقهٔ مالک بازپخش می‌کند. تحویل قرارداد موجود pbuf/credit و callback صف‌شده، از جمله بازپخش داده همراه FIN را حفظ می‌کند. رد enqueue کنترل ضروری ابتدا callbackها و route دقیق PCB را در engine مالک جدا می‌کند و line قرضی را در رجیستری نهایی ازپیش‌تخصیص‌یافتهٔ worker مالک منتشر می‌کند. درخواست خاموشی منظم فرایند تشدید بعد از این انتقال مسئولیت است؛ پاک‌سازی به صف ردشده یا یافتن مجدد flow در Stop وابسته نیست.
+- lineهای قرضی بعداً توسط مالکان واقعی خود Finish و تخریب می‌شوند.
+
+<span id="متادیتای-نود"></span>
+
+### فرادادهٔ گره {#node-metadata}
 
 metadata برگرفته از کد منبع:
 
@@ -462,17 +498,9 @@ metadata برگرفته از کد منبع:
 | `layer_group_next_node` | `kNodeLayer3` |
 | `required_padding_left` | `0` bytes |
 
-بودجهٔ صف TCP برابر `P = max-pending-bytes` است و یک حاشیهٔ محدود به اندازهٔ
-`L`، حاشیهٔ ثابت ۱ MiB مستقل از اندازهٔ pool، پروفایل حافظه و تنظیمات splice، برای ورودیِ قبلاً تحویل‌شده دارد. سقف
-کل بایت‌های pending برابر `P + L` است تا Pause فرصت اثرگذاری داشته باشد. سقف
-۱۰۲۴ entry و زمان ارسال Pause/Resume تغییر نمی‌کند؛ ورودیِ بیش از این سقف پیش
-از ورود به صف رد می‌شود و فقط همان flow را می‌بندد.
+<span id="منابع-engine-و-چرخهٔ-عمر"></span>
 
-نوشتن TCP همان سر FIFO را پس از هر write موفق حداکثر ۶۵۵۳۵ بایتی ادامه
-می‌دهد تا ظرفیت واقعی تمام شود یا `ERR_MEM` رخ دهد. پیشوند موفق حتی هنگام رد
-write بعدی ارسال می‌شود؛ دنباله در ابتدای صف می‌ماند و byteها تکرار نمی‌شوند.
-
-## منابع engine و چرخهٔ عمر
+### منابع engine و چرخهٔ عمر {#engine-resources-and-lifecycle}
 
 runtime برای هر event worker معمولی حداکثر یک engine خام lwIP را هنگام نخستین
 استفاده می‌سازد. همهٔ bridge‌های همان worker از آن استفاده می‌کنند؛ thread جداگانهٔ
@@ -487,17 +515,9 @@ poolهای قابل‌رشد flow/payload از سقف‌های سراسری با
 باقی می‌ماند؛ رزرو unconnected همچنان همان شماره‌ی پورت را محافظه‌کارانه کنار می‌گذارد. ID‌های تولیدی fragment در IPv4 و IPv6 هرکدام sequence مشترک جداگانه‌ای دارند
 و با همان عرض محدود قبلی wrap می‌شوند. drain list محلی هر worker است، ولی
 سقف هر node همچنان ۴۰۹۶ object و ۱۶ MiB است. lock مربوط به pool/quota هنگام پیمایش stack یا تولید خروجی
-آن نگه داشته نمی‌شود. Fake DNS در PTC یک mutex مشترک node برای transaction و کپی
-نام reverse دارد؛ هیچ pointer رکوردی بیرون lock باقی نمی‌ماند و output پس از unlock است.
+آن نگه داشته نمی‌شود.
 
 در quiesce، timer مربوط به engine پیش از توقف پذیرش کار عادی جدا می‌شود. node در drain همان
 owner ریشه‌های stack خود را آزاد می‌کند. runtime پس از تسویهٔ messageهای detached
 و پیش از نابودی loop و pool‌ها engine را آزاد می‌کند. pool‌ها و port accountهای مشترک
-و secret مربوط به ISN در سطح process فقط پس از خروج همهٔ worker‌ها نهایی می‌شوند. fragment ورودی هر
-دو bridge همچنان رد می‌شود و reassembly دستگاه پیش از انتخاب worker انجام می‌شود؛
-MTU و fragmentation خروجی تغییر نکرده‌اند.
-
-طول UDP عادی پیش از checksum و انتشار child بررسی می‌شود: حداقل ۸ بایت و حداکثر
-بایت‌های transport محدودشده توسط IP. بایت‌های اضافهٔ پس از طول معتبر UDP از pbuf
-حذف می‌شوند؛ فقط payload اعلام‌شده تحویل می‌شود. datagram با header تنها، یک
-callback با payload خالی دارد. حالت trusted نیز این بررسی ساختاری را حفظ می‌کند.
+و secret مربوط به ISN در سطح process فقط پس از خروج همهٔ worker‌ها نهایی می‌شوند.

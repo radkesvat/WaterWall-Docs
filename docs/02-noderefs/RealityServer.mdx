@@ -6,17 +6,19 @@ description: "Reference documentation for the RealityServer node."
 ---
 
 <!--
-Documentation version: 154
+Documentation version: 155
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/RealityServer/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/RealityServer.mdx, and all files must keep the same documentation version.
 -->
 
 # RealityServer
 
+## Overview
+
 `RealityServer` is the server-side Reality v2 tunnel. It starts every incoming line as ordinary visitor traffic, forwards that traffic to a configured `destination` branch, passively extracts the real TLS handshake binding, and only then tests client-to-server records with fresh per-connection session keys. TLS 1.3 requires an authenticated request/ack/confirm handoff before the visitor branch closes and the same WaterWall line switches to protected `next`; TLS 1.2 retains immediate profile-aware authorization.
 
 The server does not terminate TLS for visitors. It only sniffs enough TLS-like records to decide whether a peer is a Reality client or ordinary visitor traffic.
 
-## Typical Placement
+## Typical placement
 
 A destination-aware VLESS proxy over Reality uses two distinct server branches:
 
@@ -40,7 +42,22 @@ credential. The public listener accepts the Reality client's TCP connection;
 the visitor connector must reach the actual visitor site, not loop back into
 the public listener.
 
-## Basic Example
+
+Both peers must share `password`, `algorithm`, `salt`, and `kdf-iterations`,
+including their defaults, and use compatible handoff behavior. The visitor site
+must match the client SNI and certificate verification. Camouflage assumes a
+non-terminating on-path observer without the password or TLS traffic secrets
+and without control of the cover destination. It does not survive TLS termination
+or promise every browser timing or application behavior; read the
+[full security limits](#security-model-and-limitations) before deployment.
+
+## Minimal practical example
+
+The JSON below is a **node fragment**, not a complete config file.
+Replace the sample secret and transport/visitor node names, then complete
+the surrounding listener, peer, and application branches described above.
+
+### Basic Example
 
 The JSON below contains node fragments for this scenario, not a complete configuration. Add the listener and VLESS nodes described above; every named `next` must exist.
 
@@ -71,7 +88,10 @@ Visitor destination:
 }
 ```
 
-## Required Fields
+
+## Configuration
+
+### Required Fields
 
 | Field | Type | Description |
 |---|---|---|
@@ -81,7 +101,7 @@ Visitor destination:
 | `settings.destination` | string | Node name for visitor traffic. The node must exist and must not be `RealityServer` itself or its authorized `next` node. |
 | `settings.password` | string | Shared Reality secret containing 1 through 32 UTF-8 bytes. Must match the client. |
 
-## Settings
+### Settings
 
 | Field | Default | Description |
 |---|---|---|
@@ -99,7 +119,43 @@ Visitor destination:
 
 Credential limits are measured in UTF-8 bytes, not characters, using the same byte length supplied to BLAKE2s. Optional defaults apply only when a key is absent; a present key with the wrong JSON type is a startup error. Primary fields win over aliases even when malformed: `method` cannot rescue an invalid `algorithm`, and `sniffing-counter` cannot rescue an invalid `sniffing-attempts`.
 
-## Visitor And Protected Branches
+## Usage and troubleshooting
+
+### Operational Notes
+
+- `destination` is for ordinary visitor traffic. It should normally be a branch that can serve or proxy the same visitor domain used by `RealityClient.settings.sni`.
+- `next` is for authorized WaterWall traffic only.
+- `password`, `salt`, `kdf-iterations`, and `algorithm` must match `RealityClient`.
+- The authenticated TLS 1.3 handoff replaces the earlier unpublished main-handshake cutover. Upgrade both peers together; TLS 1.2 layouts and counters remain unchanged, the secure path never falls back to an older layout or v1, and obsolete `max-frame-size` remains a startup error.
+- The password-derived value is a root key for per-TLS-session directional material. Password rotation invalidates future sessions, and no server-side replay database is required.
+- This node is a stream tunnel, not a packet tunnel.
+
+## Advanced behavior
+
+### Visitor Fallback Rules
+
+The line becomes visitor traffic when:
+
+- the pending bytes are not a plausible TLS record
+- enough Reality candidate records fail authentication to reach `sniffing-attempts` after the bounded TLS 1.3 pre-request allowance, if applicable
+
+The public TLS record prefix is classified progressively without consuming it: an unsupported content type is decisive after byte one, an invalid legacy-version major after byte two, and a minor greater than `0x04` after byte three. A plausible one- through four-byte prefix remains Pending while the connection is open. If upstream `Finish` arrives in Pending mode, those exact buffered bytes are transferred to `destination` before the destination receives `Finish`.
+
+After a line switches to visitor mode, upstream payload is forwarded to the visitor `destination`, and downstream payload from that branch is forwarded back to the previous node. The protected `next` chain is not initialized for that line.
+
+Pending or Visitor failures never generate Reality alerts. A failed Pending candidate remains byte-for-byte owned by `destination`; any response is therefore the real cover endpoint's response rather than a Reality-specific oracle.
+
+### Security Model And Limitations
+
+The reviewed camouflage threat model is a non-terminating on-path observer. It may capture and reassemble the full bidirectional stream; inspect TLS record types, versions, lengths, directions, ordering, timing, visible nonces/IVs, and close behavior; manipulate bytes; and initiate probes while knowing the implementation. It is assumed not to know the Reality password or genuine TLS traffic secrets, not to terminate TLS, and not to control or collude with the configured cover destination. It also cannot alter a completed TLS handshake without failing TLS Finished verification.
+
+Per-session Reality material depends on the fresh client and server randoms from the genuine TLS handshake. There is no independent Reality server challenge dedicated to session freshness. Cross-connection replay protection therefore assumes that the observer cannot predict or control both handshake randoms. A malicious or colluding cover destination that deliberately helps reproduce a previously observed handshake binding is outside this model; defending that stronger model would require an independently authenticated server challenge.
+
+Reality camouflage reproduces selected public TLS record properties, including suite-specific record shapes, lengths, explicit nonces/IVs, controls, alerts, and close behavior. After takeover, however, the records contain Reality-AEAD ciphertext rather than genuine ciphertext under the cover connection's TLS traffic keys. Reality does not claim to survive TLS termination or to reproduce every Chrome timing distribution, write size, burst pattern, or higher-level application semantic. A TLS-terminating observer can test the real traffic keys against later records and is outside the reviewed camouflage boundary.
+
+## Implementation details
+
+### Visitor And Protected Branches
 
 On upstream `Init`, `RealityServer` initializes its line state and immediately initializes the visitor `destination` branch. The protected `next` chain is not initialized yet.
 
@@ -121,8 +177,11 @@ After a TLS 1.3 request authenticates, the server finishes forwarding only the a
 
 Pause and Resume are advisory and repeatable. RealityServer forwards them to the selected live branch:
 `destination` before authorization and protected `next` afterward. The handoff cutoff and Finish guards
-suppress callbacks toward a retired branch. Ready records do not wait for Resume. The node stays active:
-authorized traffic needs record cryptography and sequencing, while visitor traffic needs destination routing
+suppress callbacks toward a retired branch. Ready records do not wait for Resume. After sending the TLS 1.3
+handoff ACK, RealityServer releases any frontend read Pause left by the cover branch so the frontend can
+deliver CONFIRM. A Pause from protected `next` during reentrant initialization continues to hold frontend
+reads. The node stays active in both modes.
+Authorized traffic needs record cryptography and sequencing, while visitor traffic needs destination routing
 and branch cleanup, so neither mode can use permanent bypass.
 
 After authorization:
@@ -136,20 +195,7 @@ If upstream traffic is invalid after authorization, if a non-Reality TLS record 
 
 The server owns orderly Reality shutdown after authorization. A protected-side orderly `Finish` queues exactly one `close_notify`, then immediately finishes the wire side without waiting for a reply. RealityClient consumes that record without replying and closes its TCP side immediately, even if a later server FIN is withheld. Normal clients close with raw transport FIN and do not send `close_notify`. Received fatal alerts are not answered, and a raw wire `Finish` cannot be answered. Pending, Visitor, and both TLS 1.3 handoff phases close silently without synthetic Reality alerts because the client may still be interpreting downstream bytes as cover TLS.
 
-## Visitor Fallback Rules
-
-The line becomes visitor traffic when:
-
-- the pending bytes are not a plausible TLS record
-- enough Reality candidate records fail authentication to reach `sniffing-attempts` after the bounded TLS 1.3 pre-request allowance, if applicable
-
-The public TLS record prefix is classified progressively without consuming it: an unsupported content type is decisive after byte one, an invalid legacy-version major after byte two, and a minor greater than `0x04` after byte three. A plausible one- through four-byte prefix remains Pending while the connection is open. If upstream `Finish` arrives in Pending mode, those exact buffered bytes are transferred to `destination` before the destination receives `Finish`.
-
-After a line switches to visitor mode, upstream payload is forwarded to the visitor `destination`, and downstream payload from that branch is forwarded back to the previous node. The protected `next` chain is not initialized for that line.
-
-Pending or Visitor failures never generate Reality alerts. A failed Pending candidate remains byte-for-byte owned by `destination`; any response is therefore the real cover endpoint's response rather than a Reality-specific oracle.
-
-## Record Format
+### Record Format
 
 Authorized Reality traffic uses the profile selected from the real cover handshake:
 
@@ -189,7 +235,7 @@ For downstream TLS 1.2 GCM, `auto` selects `sequence` when observed cover nonces
 
 Each direction accepts exactly its next sequence number. Duplicate, deleted, reordered, reflected, and cross-connection records therefore fail. Authentication failure is fatal after authorization, and counters close before `UINT64_MAX` can be used.
 
-## Buffer And Lifecycle Notes
+### Buffer And Lifecycle Notes
 
 - `RealityServer` has per-line state for bounded hello parsing, the TLS binding, session ID, directional keys/IVs and counters, current mode, and branch-transition state.
 - It does not create or destroy the normal line. It destroys only its own line state before propagating finish callbacks.
@@ -199,24 +245,7 @@ Each direction accepts exactly its next sequence number. Duplicate, deleted, reo
 - During the authorized transition, downstream callbacks caused by closing the visitor branch are suppressed so they do not reflect back into the already-switching side.
 - Final alerts are transferred before `Finish`; terminal guards suppress synchronous Pause/Resume/Payload/Est reflection and abort further teardown if the line dies during the send or first finish.
 
-## Security Model And Limitations
-
-The reviewed camouflage threat model is a non-terminating on-path observer. It may capture and reassemble the full bidirectional stream; inspect TLS record types, versions, lengths, directions, ordering, timing, visible nonces/IVs, and close behavior; manipulate bytes; and initiate probes while knowing the implementation. It is assumed not to know the Reality password or genuine TLS traffic secrets, not to terminate TLS, and not to control or collude with the configured cover destination. It also cannot alter a completed TLS handshake without failing TLS Finished verification.
-
-Per-session Reality material depends on the fresh client and server randoms from the genuine TLS handshake. There is no independent Reality server challenge dedicated to session freshness. Cross-connection replay protection therefore assumes that the observer cannot predict or control both handshake randoms. A malicious or colluding cover destination that deliberately helps reproduce a previously observed handshake binding is outside this model; defending that stronger model would require an independently authenticated server challenge.
-
-Reality camouflage reproduces selected public TLS record properties, including suite-specific record shapes, lengths, explicit nonces/IVs, controls, alerts, and close behavior. After takeover, however, the records contain Reality-AEAD ciphertext rather than genuine ciphertext under the cover connection's TLS traffic keys. Reality does not claim to survive TLS termination or to reproduce every Chrome timing distribution, write size, burst pattern, or higher-level application semantic. A TLS-terminating observer can test the real traffic keys against later records and is outside the reviewed camouflage boundary.
-
-## Operational Notes
-
-- `destination` is for ordinary visitor traffic. It should normally be a branch that can serve or proxy the same visitor domain used by `RealityClient.settings.sni`.
-- `next` is for authorized WaterWall traffic only.
-- `password`, `salt`, `kdf-iterations`, and `algorithm` must match `RealityClient`.
-- The authenticated TLS 1.3 handoff replaces the earlier unpublished main-handshake cutover. Upgrade both peers together; TLS 1.2 layouts and counters remain unchanged, the secure path never falls back to an older layout or v1, and obsolete `max-frame-size` remains a startup error.
-- The password-derived value is a root key for per-TLS-session directional material. Password rotation invalidates future sessions, and no server-side replay database is required.
-- This node is a stream tunnel, not a packet tunnel.
-
-## Node Metadata
+### Node Metadata
 
 Source-backed metadata:
 

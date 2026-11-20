@@ -6,11 +6,13 @@ description: "Reference documentation for the HttpClient node."
 ---
 
 <!--
-Documentation version: 154
+Documentation version: 155
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/HttpClient/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/HttpClient.mdx, and all files must keep the same documentation version.
 -->
 
 # HttpClient
+
+## Overview
 
 `HttpClient` is a stream tunnel that wraps Waterwall payload inside an HTTP client request. On the forward path it creates HTTP request framing, and on the return path it removes HTTP response framing so the previous node receives only response-body bytes.
 
@@ -25,7 +27,7 @@ browsers or tools such as `curl`, use [`HttpProxyServer`](./HttpProxyServer.mdx)
 `HttpClient` instead takes application payload and adds its configured HTTP
 transport framing, usually paired with [`HttpServer`](./HttpServer.mdx).
 
-## Typical Placement
+## Typical placement
 
 A local SOCKS5 service can carry its selected destinations through VMess over
 HTTP/1.1 WebSocket and TLS:
@@ -53,7 +55,7 @@ has the fixed backend address/port. Add TlsClient before the client connector
 and TlsServer after the server listener for TLS, using HTTP/1.1 ALPN on both.
 HttpClient's `host`/`port` are HTTP metadata; they do not configure either socket.
 
-## TLS ALPN Compatibility
+### TLS ALPN Compatibility
 
 When `TlsClient` follows `HttpClient`, the configured HTTP version and the protocols offered through TLS ALPN must agree.
 `HttpClient` chooses its wire protocol from `http-version`. It does not receive the server's negotiated ALPN from
@@ -95,7 +97,108 @@ Re-check Cloudflare's current capabilities before depending on either behavior, 
 can change.
 :::
 
-## Basic Example
+## Minimal practical example
+
+Node fragment; define the referenced neighbors and peers in the same deployment.
+
+This HTTP/1.1 node fragment pairs with HttpServer using the same host, path and method. Define `tls-or-transport-node`; for the shown HTTPS scheme it must supply TLS, with `http/1.1` ALPN, before the transport. These nodes carry tunnel payload and do not implement a general HTTP forward proxy.
+
+```json
+{
+  "name": "http-client",
+  "type": "HttpClient",
+  "settings": {
+    "host": "example.com",
+    "path": "/api/upload",
+    "scheme": "https",
+    "port": 443,
+    "method": "POST",
+    "http-version": 1
+  },
+  "next": "tls-or-transport-node"
+}
+```
+
+See [Configuration](#configuration) for defaults and conditional requirements and [Usage and troubleshooting](#usage-and-troubleshooting) for complete examples and operational limits.
+
+## Configuration
+
+### Required Settings
+
+| Field | Type | Description |
+|---|---|---|
+| `host` | string | Required. Used as the HTTP/1.1 `Host` header and HTTP/2 `:authority` pseudo-header. |
+
+The top-level `settings` object must exist and must not be empty.
+
+### Optional Settings
+
+#### Protocol choice
+
+| Field | Default | Description |
+|---|---|---|
+| `http-version` | HTTP/2 | Protocol mode. Accepts numeric and string aliases. |
+
+#### HTTP metadata
+
+| Field | Default | Description |
+|---|---|---|
+| `path` | `/` | Request path. |
+| `scheme` | `https` | HTTP metadata scheme. This does not enable TLS by itself. |
+| `port` | `443` for `https`, otherwise `80` | HTTP metadata port. |
+| `method` | `POST` | Request method for non-WebSocket HTTP transport. |
+| `user-agent` | `WaterWall/1.x` | HTTP `User-Agent` value. |
+| `headers` | none | Extra request headers. Values must be strings. |
+| `content-type` | none | Emits a built-in Content-Type value when matched by Waterwall's internal table. |
+
+
+Supported HTTP method names include common methods such as `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `CONNECT`, `OPTIONS`, and the extended WebDAV-style methods supported by Waterwall's HTTP method table.
+
+`content-type` is selected from Waterwall's built-in content-type table. Common examples include `application/json`, `text/plain`, `application/octet-stream`, and `multipart/form-data`. For a custom value that is not in the table, set it through `headers` instead.
+
+#### Upgrade and WebSocket
+
+| Field | Default | Description |
+|---|---|---|
+| `upgrade` | `true` only when `http-version` is `both` | Starts with an HTTP/1.1 upgrade request when allowed. |
+| `upgrade-protocol` | `h2c` | HTTP/1.1 upgrade token. Non-`h2c` tokens switch to raw byte forwarding after `101`. |
+| `upgrade-request-headers` | none | Extra headers sent only on the upgrade request. |
+| `upgrade-response-headers` | none | Required headers that must be present in the `101` upgrade response. |
+| `websocket` | `false` | Uses HTTP for the opening handshake, then WebSocket frames for payload. |
+| `websocket-origin` | none | Optional `Origin` header for WebSocket. |
+| `websocket-subprotocol` | none | Optional requested WebSocket subprotocol. |
+| `websocket-extensions` | none | Optional extension header to send. Negotiated extensions are not implemented and are rejected. |
+
+#### Split requests
+
+| Field | Default | Description |
+|---|---|---|
+| `http1-mode` | `single` | HTTP/1.1 shape: `single` or `split`. The old boolean `http1-split` is also accepted. |
+| `split` | defaults described below | Settings for HTTP/1.1 split mode. |
+
+#### Closing and diagnostics
+
+| Field | Default | Description |
+|---|---|---|
+| `close-drain-timeout-ms` | `30000` | Fixed HTTP/2 upload-drain deadline after application Finish, including pending h2c and HTTP/2 WebSocket handshakes. Integer `1..86400000`; progress does not restart it. |
+| `stay-alive` | `false` | Boolean. Keeps an established HTTP/2 session open after application `Finish` and successful handoff of the final `END_STREAM`. |
+| `verbose` | `false` | Enables more protocol, handshake, and framing logs. |
+
+### HTTP Version Modes
+
+`http-version` accepts these values:
+
+| Value | Meaning |
+|---|---|
+| `1`, `1.1`, `http1`, `http1.1` | Force HTTP/1.1. |
+| `2`, `2.0`, `http2`, `h2` | Force direct HTTP/2. |
+| `both`, `any`, `auto`, `1.1+2` | Start in HTTP/1.1 and optionally upgrade to HTTP/2 cleartext with `h2c`. |
+
+Current default: direct HTTP/2.
+
+## Usage and troubleshooting
+
+### Basic Example
 
 ```json
 {
@@ -116,56 +219,20 @@ can change.
 }
 ```
 
-## Required Settings
+### Common Mistakes
 
-| Field | Type | Description |
-|---|---|---|
-| `host` | string | Required. Used as the HTTP/1.1 `Host` header and HTTP/2 `:authority` pseudo-header. |
+- Setting `scheme: "https"` without adding `TlsClient`. The scheme is HTTP metadata only.
+- Offering multiple ALPN protocols without knowing which one the target will select. A Chrome-like dual offer is valid,
+  but `HttpClient` must be configured for the known result because the ALPN selection is not passed back to this node.
+- Using `http-version: "both"` as if it were TLS protocol negotiation. It is an HTTP/1.1-to-`h2c` upgrade mode.
+- Using `http1-mode: "split"` with HTTP/2 or WebSocket. Split mode is HTTP/1.1 only.
+- Expecting `HttpClient` to expose HTTP headers to the previous node. It forwards body payload only.
+- Expecting this node to multiplex many HTTP/2 streams. Use `MuxClient` before HTTP if you need Waterwall-level multiplexing.
+- Sending custom WebSocket extensions and expecting the tunnel to implement them.
 
-The top-level `settings` object must exist and must not be empty.
+## Advanced behavior
 
-## Optional Settings
-
-| Field | Default | Description |
-|---|---|---|
-| `path` | `/` | Request path. |
-| `scheme` | `https` | HTTP metadata scheme. This does not enable TLS by itself. |
-| `port` | `443` for `https`, otherwise `80` | HTTP metadata port. |
-| `method` | `POST` | Request method for non-WebSocket HTTP transport. |
-| `user-agent` | `WaterWall/1.x` | HTTP `User-Agent` value. |
-| `http-version` | HTTP/2 | Protocol mode. Accepts numeric and string aliases. |
-| `close-drain-timeout-ms` | `30000` | Fixed HTTP/2 upload-drain deadline after application Finish, including pending h2c and HTTP/2 WebSocket handshakes. Integer `1..86400000`; progress does not restart it. |
-| `upgrade` | `true` only when `http-version` is `both` | Starts with an HTTP/1.1 upgrade request when allowed. |
-| `upgrade-protocol` | `h2c` | HTTP/1.1 upgrade token. Non-`h2c` tokens switch to raw byte forwarding after `101`. |
-| `upgrade-request-headers` | none | Extra headers sent only on the upgrade request. |
-| `upgrade-response-headers` | none | Required headers that must be present in the `101` upgrade response. |
-| `headers` | none | Extra request headers. Values must be strings. |
-| `content-type` | none | Emits a built-in Content-Type value when matched by Waterwall's internal table. |
-| `websocket` | `false` | Uses HTTP for the opening handshake, then WebSocket frames for payload. |
-| `websocket-origin` | none | Optional `Origin` header for WebSocket. |
-| `websocket-subprotocol` | none | Optional requested WebSocket subprotocol. |
-| `websocket-extensions` | none | Optional extension header to send. Negotiated extensions are not implemented and are rejected. |
-| `http1-mode` | `single` | HTTP/1.1 shape: `single` or `split`. The old boolean `http1-split` is also accepted. |
-| `split` | defaults described below | Settings for HTTP/1.1 split mode. |
-| `verbose` | `false` | Enables more protocol, handshake, and framing logs. |
-
-Supported HTTP method names include common methods such as `GET`, `POST`, `PUT`, `PATCH`, `DELETE`, `HEAD`, `CONNECT`, `OPTIONS`, and the extended WebDAV-style methods supported by Waterwall's HTTP method table.
-
-`content-type` is selected from Waterwall's built-in content-type table. Common examples include `application/json`, `text/plain`, `application/octet-stream`, and `multipart/form-data`. For a custom value that is not in the table, set it through `headers` instead.
-
-## HTTP Version Modes
-
-`http-version` accepts these values:
-
-| Value | Meaning |
-|---|---|
-| `1`, `1.1`, `http1`, `http1.1` | Force HTTP/1.1. |
-| `2`, `2.0`, `http2`, `h2` | Force direct HTTP/2. |
-| `both`, `any`, `auto`, `1.1+2` | Start in HTTP/1.1 and optionally upgrade to HTTP/2 cleartext with `h2c`. |
-
-Current default: direct HTTP/2.
-
-## HTTP/1.1 Single Mode
+### HTTP/1.1 Single Mode
 
 In `http1-mode: "single"`, one HTTP/1.1 connection carries both directions:
 
@@ -184,7 +251,7 @@ Incoming chunk bodies are forwarded as bytes arrive, without waiting for the com
 
 If the remote HTTP peer keeps the transport open after completing the response, for example with HTTP keep-alive, the Waterwall line also remains open until the peer closes it or the downstream transport's configured idle timeout expires. The matching Waterwall `HttpServer` normally closes after its single tunneled response.
 
-## HTTP/1.1 Split Mode
+### HTTP/1.1 Split Mode
 
 Split mode uses two HTTP/1.1 requests for one Waterwall line:
 
@@ -261,7 +328,7 @@ Split configuration can use either direct fields such as `upload-method` and `do
 Split mode requires `http-version = 1` and cannot be combined with `websocket`.
 :::
 
-## HTTP/2 Mode
+### HTTP/2 Mode
 
 In HTTP/2 mode, `HttpClient` opens one logical HTTP/2 request stream per Waterwall line. The current design is intentionally single-stream for each line; it is not a general multi-stream HTTP/2 multiplexer.
 
@@ -279,7 +346,7 @@ There is no delayed batching. These choices reduce specific record-boundary diff
 
 If you need many independent logical connections over one transport, use a Waterwall node such as `MuxClient` before `HttpClient` instead of expecting HTTP/2 stream multiplexing here.
 
-## Upgrade Behavior
+### Upgrade Behavior
 
 When `http-version` is `both` and `upgrade` is enabled, `HttpClient` starts with an HTTP/1.1 upgrade request.
 
@@ -301,7 +368,7 @@ Once the opening request and retained bytes in both directions have been sent, `
 HTTP/1.1 upgrade with a request body is not a safe shape for the current single-stream design. Do not rely on upgrade-with-body behavior.
 :::
 
-## WebSocket Mode
+### WebSocket Mode
 
 Incoming WebSocket data frames are decoded progressively in both HTTP/1.1 and HTTP/2. Ping, Pong and Close bodies remain complete control events with a maximum of 125 bytes. Unsupported frame lengths are rejected from the header before waiting for body bytes.
 
@@ -331,7 +398,9 @@ A Chrome-like offer containing both values is also valid when the target's selec
 `HttpClient` must be configured for that known result because it cannot observe the server's selection. Cloudflare
 WebSocket is the exception described above and must be forced to HTTP/1.1.
 
-## Finish And Lifecycle Behavior
+## Implementation details
+
+### Finish And Lifecycle Behavior
 
 `HttpClient` has to send protocol-final bytes before forwarding some Waterwall `Finish` events:
 
@@ -345,26 +414,24 @@ The first application `Finish` starts a fixed `close-drain-timeout-ms` deadline,
 
 HTTP/2 upload pressure pauses the application above **1 MiB** of pending body bytes and resumes below **256 KiB**, provided the next transport is also ready. The provider queue additionally has hard limits of **16 MiB pending payload** and **16 MiB retained allocation charge**; exceeding either closes that connection. Allocation charge remains counted until its buffer is released, even if part of that buffer has already been sent. These are queue limits, not total upload-size limits. The separate pre-handshake queue retains its **2 MiB payload / 8 MiB allocation-charge** limits.
 
-Successful HTTP/2 draining requests a bounded TCP close linger. On Linux, TcpConnector may retain the detached socket to flush writes already accepted by the adapter and discard unread response/control bytes, then wait for peer closure. HTTP state and the owned carrier line are already released. This socket phase is separate from `close-drain-timeout-ms`; handing bytes to the next tunnel does not acknowledge receipt by the remote application.
+By default, handing the final HTTP/2 frames to the next node finishes the carrier and normally leads to a full TCP close.
+The upload deadline covers local handoff. With `"stay-alive": true`, the timer stops at handoff and the HTTP/2 session stays open.
+This models the HTTP/2 session that Chrome can keep after a tab closes. `HttpClient` still answers peer `PING` frames and
+discards any remaining response body. Each later application connection gets a new session.
+Placing `MuxClient` before `HttpClient` lets its children share one HTTP/2 stream while the mux parent is open.
+
+The peer can close the retained session. A transport error, transport idle timeout, or WaterWall shutdown also releases it.
+`TcpConnector` expires after about 600 seconds of inactivity. Traffic such as `PING` refreshes that timeout.
+In plain HTTP/2 mode, WaterWall’s `HttpServer` records the request’s `END_STREAM` and forwards `Finish` to the backend when the carrier closes.
+A backend that reads until EOF can therefore wait until timeout. A backend that finishes first still triggers a carrier close after the response.
 
 On ordinary same-line connections, repeated `Pause`/`Resume` notifications pass through transparently and do not gate ready output. Split connections retain their mapping between the main line and the upload/download transports. HTTP framing, FIFO ordering and retained-input limits still apply.
 
-## Buffer Padding
+### Buffer Padding
 
 `HttpClient` advertises 16 bytes of left padding. That padding is used by the node's framing paths and must be preserved by surrounding tunnel composition.
 
-## Common Mistakes
-
-- Setting `scheme: "https"` without adding `TlsClient`. The scheme is HTTP metadata only.
-- Offering multiple ALPN protocols without knowing which one the target will select. A Chrome-like dual offer is valid,
-  but `HttpClient` must be configured for the known result because the ALPN selection is not passed back to this node.
-- Using `http-version: "both"` as if it were TLS protocol negotiation. It is an HTTP/1.1-to-`h2c` upgrade mode.
-- Using `http1-mode: "split"` with HTTP/2 or WebSocket. Split mode is HTTP/1.1 only.
-- Expecting `HttpClient` to expose HTTP headers to the previous node. It forwards body payload only.
-- Expecting this node to multiplex many HTTP/2 streams. Use `MuxClient` before HTTP if you need Waterwall-level multiplexing.
-- Sending custom WebSocket extensions and expecting the tunnel to implement them.
-
-## Node Metadata
+### Node Metadata
 
 Source-backed metadata:
 

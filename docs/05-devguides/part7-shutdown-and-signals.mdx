@@ -5,7 +5,7 @@ sidebar_label: "Part 7: Application Termination"
 description: "The shutdown controller, worker quiescence protocol, lifecycle-v2 component stages, task settlement, signals, devices, and destruction order."
 ---
 <!--
-Documentation version: 187
+Documentation version: 190
 -->
 
 # Part 7: Application Termination
@@ -28,6 +28,15 @@ A critical runtime invariant failure must emit `LOGF` and call `abortProgramNow(
 returning an ordinary failure or requesting asynchronous shutdown does not make
 unsafe continuation valid. Caller-only preconditions normally use Debug assertions
 instead; see [caller preconditions and failure handling](./part5-tunnel-anatomy.mdx#caller-preconditions-and-failure-handling).
+
+## Reading path
+
+- [Controller, worker handoff and lifecycle foundations](#1-process-shutdown-controller)
+- [Callback boundaries and task settlement](#4-normal-callback-boundaries)
+- [Ordered shutdown and line drain](#7-ordered-shutdown-sequence)
+- [Timers, devices and external callback roots](#9-timers-watchers-and-deferred-timer-reclamation)
+- [Choose a termination API](#11-choosing-a-termination-api)
+- [Validation](#12-validation)
 
 ## 1. Process shutdown controller
 
@@ -271,7 +280,7 @@ batches. The deque can grow with backlog and retains its capacity during normal
 message delivery. `workerMessagesInit()` has no recoverable allocation result;
 valid initial storage follows the fatal heap-allocation policy.
 
-Timed worker messages use `wtimerAdd()` and normal fail-fast allocation. Owner
+Timed worker messages use `wtimerAddDeadline()` and normal fail-fast allocation. Owner
 workers acquire timeout records from their existing generic pools backed by
 `GSTATE.masterpool_timers`, sized from `RAM_PROFILE` as described in
 [Part 2](./part2-lines-and-callbacks.mdx#what-the-result-proves). No recoverable
@@ -360,11 +369,11 @@ the central traversal already owns it.
 ### External nodes
 
 Lifecycle v2 intentionally changed the external `tunnel_t` layout and callback
-signatures. The complete external-node ABI is now version 7, covering packet-local sbuf checksum requests and removal
+signatures. The complete external-node ABI is now version 10, covering packet-local sbuf checksum requests and removal
 of the line checksum field/accessors, public line-task
 signatures, removal of generic buffer ownership callbacks, and the by-value
 `socket_filter_option_t` layout without `shared_balance_table`, the three-master
-buffer-pool constructor and the complete-buffer splice inventory APIs. A dynamic node
+buffer-pool constructor and the complete-buffer splice inventory APIs, plus capture/raw-device constructor signatures. A dynamic node
 library must export the historical descriptor symbol:
 
 ```c
@@ -792,13 +801,29 @@ owned normal line must still detach producers, destroy line state, and make the
 line logically dead before returning, even when it also requests process
 shutdown.
 
+### Detached paired-stream output
+
+ConnectionFisherClient, HalfDuplexClient, HalfDuplexServer and ReverseServer
+register detached startup or application drains on the worker that owns the
+surviving association. Their 30-second monotonic deadline begins with the
+first orderly source Finish. Transfer of the bounded HalfDuplex waiting upload
+to its service line preserves that deadline. Each node cancels its timers on
+worker quiescence and settles the surviving association during worker stop.
+The resource inventory contains the live destination and its retained buffers,
+without borrowing the finished sender's line state. A detached unmatched
+HalfDuplex upload holds only its validated rendezvous ID and retained bytes.
+
 ### UserController shaping settlement
 
-Quiescence closes shaping admission and rearming, removes owner-worker timers/continuations, and cancels fair-turn
-participation while AuthenticationClient user tables and locks still exist. The true line creator then drains its normal
-lines while controller state and pools remain alive. UserController borrows those lines and never calls `lineDestroy()`.
-Finish first discards retained/prepared buffers, releases user/client queue costs and tickets, and releases connection/IP
-reservations once, then propagates only away from the sender. Final destruction requires empty inventories and budgets.
+During orderly stream Finish, UserController borrows the sender's line until its handler returns.
+It cancels asynchronous output and hands queued, eligible bytes to the live neighbor on that line.
+The handler releases the connection and IP reservation once. A closing line has no later shaping timer or fair turn.
+
+During shutdown, quiescence closes shaping admission and detaches timers, continuations and fair turns
+on their owner workers while the AuthenticationClient tables and locks remain available. Line creators
+then drain their normal lines. The controller discards any remaining buffers and prepared slices,
+settles user and client queue charges, and releases its reservations. Final destruction requires empty
+inventories and budgets.
 
 A canceled line continuation is notification only: it may run synchronously, on a foreign thread, or after logical death.
 It must not access owner-only queues, restart a timer or emit callbacks. Owner-worker inventory settlement releases that
@@ -832,13 +857,25 @@ hook runs first.
 Final destruction requires no sessions, timers, owned lines or active driver
 references before shared configuration is released. Reentrant application Finish
 detaches that application immediately while an independently retained carrier
-may continue its bounded delivery. Reentrant carrier Finish aborts the session;
-an active driver frame defers C++ engine deletion until it returns safely. No
-callback or alarm may survive final retirement. A temporary line reference never
-substitutes for logical line ownership or keeps a finished borrowed application
-alive for ACK processing.
+may continue its bounded delivery. A local application Finish or peer FIN releases
+any application hold on carrier reads after detachment, while the live carrier can
+still dispatch normally. The driver holds a reference to that exact carrier during
+Resume, which may reenter to deliver input, finish the carrier or close admission.
+Reentrant carrier Finish aborts the session. An active driver frame defers C++
+engine deletion until it returns safely. No callback or alarm may survive final
+retirement. A temporary line reference never substitutes for logical line ownership
+or keeps a finished borrowed application alive for ACK processing.
 
 ## 9. Timers, watchers, and deferred timer reclamation
+
+Use `wtimerAddDeadline(loop, cb, delay_ms)` for a one-shot that must give its
+caller the full positive delay. It measures from a fresh monotonic clock reading
+when armed. A successful `wtimerReset()` on that timer measures from the reset
+call, retaining the minimum delay even inside a long callback. Dispatch may be
+late when the worker is busy. Timed worker messages and the TlsServer handshake
+deadline use this API. For maintenance work, `wtimerAdd()` retains its existing
+coalescing behavior. Intervals of at least one second divisible by 100 ms can
+become due up to 100 ms early.
 
 A due or overdue timer selects a zero-timeout poll whenever the loop has poll
 work, including outstanding IOCP operations. It must not bypass descriptor
@@ -1013,6 +1050,21 @@ clock domain. Keep timestamp writes and deadline comparisons in one domain.
 Tests that invoke callbacks without running the loop must advance its cached
 clock explicitly.
 
+`EnetCommon` passes the owner loop's monotonic milliseconds to the vendored
+ENet driver. Peer timeout and ping settings are limited to 43,200,000 ms
+(12 hours), half ENet's time-comparison window. WaterWall rejects larger JSON
+values; native ENet setters clamp them and preserve zero-as-default. The
+deadline for each outstanding reliable command starts at its first transmission.
+Each protocol service pass checks the oldest of those deadlines, including
+commands awaiting retransmission. Acknowledging another command preserves the
+original deadline. Empty input and carrier datagrams above 4,096 bytes are
+discarded before queue admission, preserving the armed service deadline.
+Active protocol work requests service every 10 ms. Idle peers wait for their
+ping deadline. Scheduling delay still
+applies, and these bounds do not support indefinitely suspended event loops.
+The session's server-connect and close-drain deadlines use separate 64-bit
+arithmetic; the close-drain setting retains its existing range.
+
 `wloopUpdateTime()` compares complete millisecond wall-clock timestamps and
 adjusts the wall-clock offset only when their difference reaches 1,000 ms in
 either direction. Crossing a second boundary alone does not trigger a correction.
@@ -1049,12 +1101,11 @@ roots.
 TrojanClient, VlessClient and VmessClient embed `first_payload_window_t` from
 `Internals/ProxyClientCommon`. Its timer and operations belong to the exact direct
 TCP or owned UDP carrier line's event worker; the helper owns no line and adds no
-line inventory. The node starts the window before forwarding the first transport
-Est, only when its request has not already been sent. `firstPayloadWindowStart()`
-records the absolute deadline using cached owner-loop microseconds; repeated Est
-does not extend it. After Est returns, the node revalidates line life and the
-association before arming. Existing line references, `est_notifying`, request
-commitment and association checks remain node-owned.
+line inventory. Hold temporary references across next Init and revalidate the
+exact line, the client state and any UDP association after it returns. If the
+request remains unsent, start and arm the window on that direct TCP or carrier
+line. `firstPayloadWindowStart()` records the absolute deadline using cached
+owner-loop microseconds. Est forwarding and mapping are independent of this window.
 
 `firstPayloadWindowArm()` returns due, armed or arm-failed without invoking the
 owner callback. An elapsed deadline, including zero timeout, latches due without
@@ -1111,8 +1162,7 @@ Quiesce-request closes admission; generic loop quiescence detaches timer roots,
 and HttpClient's owner-worker stop closes every retained carrier without waiting
 for the graceful upload deadline. Destroy cancels any retained timer handle before
 freeing HTTP state and removes the inventory entry before terminal callbacks.
-A real carrier Finish returns with its owned line dead. Detached TCP socket linger
-has separate ownership and does not retain that line or its protocol state.
+A real carrier Finish returns with its owned line dead.
 
 HttpServer's HTTP/2 response-drain deadline is one such per-line owner-loop timer.
 The first service-side Finish starts its fixed deadline; response progress never
@@ -1122,18 +1172,16 @@ Ordinary completion, carrier Finish and stream cancellation detach the timer
 before releasing HTTP state. Shutdown
 quiesces timer callbacks and source-owner drain aborts remaining HTTP output
 without waiting for the graceful deadline or preserving a borrowed line's life.
-The later TcpListener socket-only linger owns no HTTP state and remains a
-separate cleanup phase.
 
-Both TCP adapters delegate detached socket lingering to
-`Internals/TcpAdapterCommon`. Its context contains only the socket, the adapter's
+Only a confirmed fallback peer write shutdown permits a TCP adapter to start
+[detached socket linger](./reference/line-protocols.mdx#tcp-socket-close-lingering).
+Its context contains only the socket, the adapter's
 owner-worker idle table and its deadline state; it never retains a line or tunnel
 state. Do not start it after adapter stop or loop quiescence. The idle-table item
 keeps an accepted socket in the adapter's shutdown inventory. Owner-worker stop
 expires that item and frees the socket without waiting for graceful deadlines;
 the socket close callback removes any remaining item and frees the context before
-the idle table is destroyed. Reason flags on a line select this cleanup policy,
-but do not extend the line's logical lifetime or override shutdown admission.
+the idle table is destroyed.
 
 A due one-shot is marked for reclamation before its callback runs. A successful
 `wtimerReset()` revives it. If self-rearm is refused, the callback clears every
@@ -1153,6 +1201,12 @@ same reference before reclaiming or retaining the timer for owner cleanup.
 On IOCP, cancellation is not completion. Quiescence suppresses user callbacks,
 but kernel operation records remain alive until canceled completions retire.
 WIO memory is reclaimed only after those references have drained.
+
+For TCP producer backpressure, use `wioPauseTcpRead()` and resume with
+`wioRead()`. On IOCP the one outstanding receive can finish while paused.
+The WIO retains its bytes or EOF until Resume and delivers it through the
+owner loop before posting another receive. Destructive `wioReadStop()`,
+socket close and shutdown release that receive during teardown.
 
 ## 10. External devices and lwIP
 
@@ -1183,10 +1237,11 @@ packets follow ordinary ownership. The coordinator's scalar residual reads and
 the worker's batch reads share the same retained-record settlement path.
 
 Only after this handoff may supervised rule cleanup pump the queues. Remove
-NOTRACK before NFQUEUE, settle residual packets within the device packet/time
-bounds, then close descriptors. Pending rules retain their ownership ledger for
-retry; closed queues make remaining queue-bypass rules fail open, but cannot
-undo NOTRACK. A failed verdict or drain is reported and closes the queue rather
+owned NFQUEUE rules from raw PREROUTING, settle residual packets within the device packet/time
+bounds, then close descriptors. Capture owns no incoming NOTRACK rules. Pending
+queue rules retain their ownership ledger for retry; closed queues make remaining
+queue-bypass rules accept into later tables. Early accepted input can reach
+conntrack, while remaining rules in the queued table are skipped. A failed verdict or drain is reported and closes the queue rather
 than leaving a bound queue without a reader. Session/generation references make
 late worker notifications inert after stop, restart or device destruction.
 
@@ -1617,3 +1672,18 @@ close or wait on its own writer gate. A fatal native result marks the device
 failed, then requests shutdown only after the writer gate is released. The shared
 atomic GSO-refusal latch disables later aggregation for the device generation
 without changing published checksum capabilities; BringUp resets it.
+
+
+## WireGuard worker ownership and retirement
+
+WireGuardClient owns and drains one worker-0 normal carrier and its bounded
+initial packet FIFO. WireGuardServer borrows ingress lines from UdpListener;
+shutdown detaches each handle and requests Finish through the adapter owner.
+Both close dispatch admission before deleting timers. Queued task/cancel tokens
+settle while the tunnel state and chains remain allocated. Inserted PTC and
+UserController helpers receive stop from the central chain traversal exactly once.
+
+Connection-mode range retirement closes binding admission before all-worker PTC
+drains. Cancellation is notification only and leaves the range reserved. Only
+successful completion plus fresh account validation permits reuse. See
+[packet ownership and epochs](./part4-packet-tunnels.mdx#wireguard-authenticated-packet-to-connection-ownership).

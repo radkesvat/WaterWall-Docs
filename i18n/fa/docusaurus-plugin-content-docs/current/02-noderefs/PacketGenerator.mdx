@@ -6,10 +6,12 @@ description: "راهنمای node PacketGenerator در WaterWall."
 ---
 
 <!--
-Documentation version: 154
+Documentation version: 155
 -->
 
 # PacketGenerator
+
+## نمای کلی {#overview}
 
 `PacketGenerator` یک تولیدکننده packet لایه ۳ برای IPv4 است. این node هنگام startup، packet‌های خام IPv4 را از پیش می‌سازد و در مدت تعیین‌شده آن‌ها را روی worker packet line‌های WaterWall می‌فرستد.
 
@@ -19,7 +21,9 @@ Documentation version: 154
 این node را فقط روی شبکه‌ها و بازه‌های آدرسی به کار ببرید که مجوز آزمایش آن‌ها را دارید. نتیجه آزمایش source IP به شبکه سمت sender نیز وابسته است. اگر provider، مسیر kernel، backend مربوط به raw socket یا شبکه upstream آدرس‌های source غیرمحلی را مسدود کند، ممکن است packet‌های تولیدشده اصلاً از sender خارج نشوند.
 :::
 
-## جایگاه رایج
+## جایگاه معمول در زنجیره {#typical-placement}
+
+<a id="جایگاه-رایج"></a>
 
 خروجی raw IPv4:
 
@@ -36,13 +40,12 @@ PacketGenerator -> IpManipulator -> RawSocket
 packet transport شبیه WireGuard:
 
 ```text
-شاخه‌ی منبع Packet: PacketGenerator -> Bridge A
-شاخه‌ی UDP/WireGuard: UdpStatelessSocket -> WireGuardDevice -> Bridge B
+PacketGenerator -> WireGuardClient -> UdpConnector
+UdpListener -> WireGuardServer(mode=packet) -> PacketCounter
 ```
 
-`Bridge A` و `Bridge B` را با هم جفت کنید. هر دو `PacketGenerator` و
-`UdpStatelessSocket` فقط در ابتدای chain قرار می‌گیرند؛ بنابراین باید در
-شاخه‌های جداگانه باشند.
+WireGuardClient accepts generated IP packets directly and creates its own
+normal UDP carrier. UdpConnector follows the client in the same chain.
 
 سمت receiver متناظر:
 
@@ -52,7 +55,11 @@ RawSocket -> PacketCounter
 
 `PacketGenerator` یک adapter از نوع chain-head و singleton است. باید در ابتدای یک chain لایه ۳ قرار بگیرد و وجود `next` برای آن الزامی است.
 
-## بررسی محلی مسیر packet {#local-packet-path-check}
+## نمونهٔ کاربردی ساده {#minimal-practical-example}
+
+پیش از آزمایش حامل شبکه، با بررسی کامل درون‌فرایندی زیر شروع کنید.
+
+### بررسی محلی مسیر بسته {#local-packet-path-check}
 
 پیش از آزمودن carrier شبکه، یک chain مستقیم درون process، تولید و شمارش packet
 را بدون socket، TUN، route یا کلید peer بررسی می‌کند:
@@ -103,79 +110,15 @@ PacketGenerator -> PacketCounter
 
 برای آزمون شبکه، اتصال مستقیم را با شاخه‌های carrier بالا جایگزین کنید. گیرندهٔ
 RawSocket برابر `RawSocket -> PacketCounter` و گیرندهٔ WireGuard برابر
-`UdpStatelessSocket -> WireGuardDevice -> PacketCounter` است. در جفت WireGuard،
+`UdpListener -> WireGuardServer(mode=packet) -> PacketCounter` است. در جفت WireGuard،
 `allowedips` مربوط به peer فرستنده باید `dest-ipv4` را انتخاب کند و `allowedips`
 مربوط به peer گیرنده باید همهٔ source rangeهای داخلیِ آزمایش را مجاز بداند.
 
-## چه کاری انجام می‌دهد
+## پیکربندی {#configuration}
 
-- یک بازه CIDR برای source IPv4 یا آرایه‌ای از این بازه‌ها را می‌پذیرد.
-- یک آدرس IPv4 برای destination می‌پذیرد.
-- برای `TCP`، `UDP`، `ICMP` یا `ALL` packet خام IPv4 می‌سازد.
-- ارسال از هر source IP را به تعداد `packets-per-ip` تکرار می‌کند.
-- پیش از آغاز ارسال، کل packet store را در حافظه می‌سازد.
-- index‌های packet را میان worker‌ها تقسیم می‌کند.
-- با تعیین deadline برای هر packet، ارسال‌ها را در طول `duration-ms` پخش می‌کند.
-- پیش از هر ارسال، routing context روی packet line را به‌روزرسانی می‌کند.
-- پس از پایان ارسال، worker packet line‌ها را نمی‌بندد و برایشان `Finish` نمی‌فرستد.
-- اگر سمت downstream روی worker packet line مربوطه `Finish` بفرستد، timer و حلقه ارسال آن worker را متوقف می‌کند.
+### فیلدهای لازم {#required-fields}
 
-بازه‌های source به همان ترتیبی که در config آمده‌اند پردازش می‌شوند و ارسال آن‌ها با هم interleave نمی‌شود.
-
-## تست source-IP Allowlist {#تست-source-ip-allowlist}
-
-`PacketGenerator` و `PacketCounter` برای سناریوهایی مناسب‌اند که دسترسی به مسیر یا سرویس بر اساس source IP محدود شده است. روال معمول چنین است:
-
-1. `PacketGenerator` را با بازه‌های IP مبدأ مورد نظر در `source-ipv4-range` تنظیم کنید.
-2. `PacketCounter` را با همان range‌ها تنظیم کنید.
-3. packet‌ها را به سمت host یا packet chain گیرنده بفرستید.
-4. گزارش گیرنده را بخوانید.
-5. source IP‌هایی را که تحویل کامل یا نزدیک به کامل دارند به‌عنوان گزینه‌های بهتر در نظر بگیرید.
-
-در گیرنده، `PacketCounter.protocol-number` را برابر protocol‌های مورد انتظار و `PacketCounter.expected-packets-per-ip` را در همه حالت‌ها، از جمله `ALL`، برابر `PacketGenerator.packets-per-ip` بگذارید. گیرنده مجموع هر IP را خودش محاسبه می‌کند و protocol‌ها را جداگانه گزارش می‌دهد. برای چند protocol می‌توان از آرایه‌هایی مانند `[6, 17]` یا `["TCP", "UDP"]` استفاده کرد.
-
-## نمونه تنظیم
-
-ICMP probing:
-
-```json
-{
-  "name": "packet-generator",
-  "type": "PacketGenerator",
-  "settings": {
-    "source-ipv4-range": [
-      "198.51.100.0/24",
-      "203.0.113.0/24"
-    ],
-    "dest-ipv4": "203.0.113.20",
-    "protocol-number": "ICMP",
-    "duration-ms": 5000,
-    "packets-per-ip": 100
-  },
-  "next": "raw-ip"
-}
-```
-
-TCP-shaped probing:
-
-```json
-{
-  "name": "packet-generator",
-  "type": "PacketGenerator",
-  "settings": {
-    "source-ipv4-range": "198.51.100.0/24",
-    "dest-ipv4": "203.0.113.20",
-    "protocol-number": "TCP",
-    "duration-ms": 5000,
-    "packets-per-ip": 10,
-    "dest-port": 443,
-    "src-port": "random"
-  },
-  "next": "raw-ip"
-}
-```
-
-## فیلدهای ضروری
+<a id="فیلدهای-ضروری"></a>
 
 فیلدهای سطح بالا:
 
@@ -199,7 +142,9 @@ TCP-shaped probing:
 
 `dest-port` و `src-port` برای `ICMP` لازم نیستند.
 
-## تنظیمات اختیاری
+### تنظیمات اختیاری {#optional-settings}
+
+<a id="تنظیمات-اختیاری"></a>
 
 | گزینه | نوع | پیش‌فرض | توضیح |
 | --- | --- | --- | --- |
@@ -207,7 +152,92 @@ TCP-shaped probing:
 
 وقتی `src-port` برابر `"random"` باشد، پیاده‌سازی فعلی بر اساس source IP، destination IP و protocol یک port ثابت از بازه ephemeral یعنی `49152..65535` انتخاب می‌کند. این انتخاب برای شکل packet تولیدشده deterministic است و برای هر packet دوباره تصادفی نمی‌شود.
 
-## شکل packet‌های تولیدشده {#شکل-packetهای-تولیدشده}
+## کاربرد و رفع اشکال {#usage-and-troubleshooting}
+
+### آزمایش allowlist آدرس مبدأ {#source-ip-allowlist-testing}
+
+<a id="تست-source-ip-allowlist"></a>
+
+`PacketGenerator` و `PacketCounter` برای سناریوهایی مناسب‌اند که دسترسی به مسیر یا سرویس بر اساس source IP محدود شده است. روال معمول چنین است:
+
+1. `PacketGenerator` را با بازه‌های IP مبدأ مورد نظر در `source-ipv4-range` تنظیم کنید.
+2. `PacketCounter` را با همان range‌ها تنظیم کنید.
+3. packet‌ها را به سمت host یا packet chain گیرنده بفرستید.
+4. گزارش گیرنده را بخوانید.
+5. source IP‌هایی را که تحویل کامل یا نزدیک به کامل دارند به‌عنوان گزینه‌های بهتر در نظر بگیرید.
+
+در گیرنده، `PacketCounter.protocol-number` را برابر protocol‌های مورد انتظار و `PacketCounter.expected-packets-per-ip` را در همه حالت‌ها، از جمله `ALL`، برابر `PacketGenerator.packets-per-ip` بگذارید. گیرنده مجموع هر IP را خودش محاسبه می‌کند و protocol‌ها را جداگانه گزارش می‌دهد. برای چند protocol می‌توان از آرایه‌هایی مانند `[6, 17]` یا `["TCP", "UDP"]` استفاده کرد.
+
+### نمونهٔ پیکربندی {#configuration-example}
+
+<a id="نمونه-تنظیم"></a>
+
+آزمایش با ICMP:
+
+```json
+{
+  "name": "packet-generator",
+  "type": "PacketGenerator",
+  "settings": {
+    "source-ipv4-range": [
+      "198.51.100.0/24",
+      "203.0.113.0/24"
+    ],
+    "dest-ipv4": "203.0.113.20",
+    "protocol-number": "ICMP",
+    "duration-ms": 5000,
+    "packets-per-ip": 100
+  },
+  "next": "raw-ip"
+}
+```
+
+آزمایش با بسته‌های شبیه TCP:
+
+```json
+{
+  "name": "packet-generator",
+  "type": "PacketGenerator",
+  "settings": {
+    "source-ipv4-range": "198.51.100.0/24",
+    "dest-ipv4": "203.0.113.20",
+    "protocol-number": "TCP",
+    "duration-ms": 5000,
+    "packets-per-ip": 10,
+    "dest-port": 443,
+    "src-port": "random"
+  },
+  "next": "raw-ip"
+}
+```
+
+### محدودیت‌ها {#limits}
+
+<a id="محدودیتها"></a>
+
+- تعداد کل source IP‌ها باید داخل `uint32_t` جا شود.
+- تعداد کل packet‌ها باید داخل `uint64_t` جا شود.
+- مجموع اندازهٔ packet‌های ساخته‌شده در حافظه باید در `size_t` جا شود.
+- اندازهٔ packet store در حافظه به `8 GiB` محدود است.
+- `required_padding_left = 0`.
+
+بازه‌های بزرگ، حالت `ALL` و مقدارهای زیاد `packets-per-ip` مصرف حافظه را سریع بالا می‌برند. در صورت نیاز تست را با بازه‌های کوچک‌تر یا در چند اجرای جدا انجام دهید.
+
+### نکته‌های عملی {#practical-notes}
+
+<a id="نکتههای-عملی"></a>
+
+- در سمت مقصد از `PacketCounter` استفاده کنید تا تعداد packet‌های دریافتی از هر source IP را ببینید.
+- مقدار `report-after-ms` در `PacketCounter` را بیشتر از `duration-ms` فرستنده بگذارید و برای تأخیر شبکه و جابه‌جایی احتمالی ترتیب packet‌ها هم زمان در نظر بگیرید.
+- اگر شبکه اجازه می‌دهد، برای probe سادهٔ مسیر از `ICMP` استفاده کنید.
+- وقتی محیط محدودشده رفتار متفاوتی بر اساس protocol یا port دارد، از `TCP`، `UDP` یا `ALL` استفاده کنید.
+- اگر شبکه سمت sender اعتبارسنجی source address انجام دهد، ممکن است بازه‌های source جعلی یا غیرمحلی پیش از رسیدن به peer WaterWall فیلتر شوند.
+
+## رفتار پیشرفته {#advanced-behavior}
+
+### شکل بسته‌های تولیدشده {#generated-packet-shapes}
+
+<a id="شکل-packetهای-تولیدشده"></a>
 
 همه packet‌های تولیدشده IPv4 هستند و این ویژگی‌ها را دارند:
 
@@ -230,7 +260,28 @@ TCP-shaped probing:
 
 حالت `ALL` در هر تکرار برای `255` protocol مختلف packet تولید می‌کند، نه `256`.
 
-## زمان‌بندی و worker‌ها {#زمانبندی-و-workerها}
+## جزئیات پیاده‌سازی {#implementation-details}
+
+### کارکرد گره {#what-it-does}
+
+<a id="چه-کاری-انجام-میدهد"></a>
+
+- یک بازه CIDR برای source IPv4 یا آرایه‌ای از این بازه‌ها را می‌پذیرد.
+- یک آدرس IPv4 برای destination می‌پذیرد.
+- برای `TCP`، `UDP`، `ICMP` یا `ALL` packet خام IPv4 می‌سازد.
+- ارسال از هر source IP را به تعداد `packets-per-ip` تکرار می‌کند.
+- پیش از آغاز ارسال، کل packet store را در حافظه می‌سازد.
+- index‌های packet را میان worker‌ها تقسیم می‌کند.
+- با تعیین deadline برای هر packet، ارسال‌ها را در طول `duration-ms` پخش می‌کند.
+- پیش از هر ارسال، routing context روی packet line را به‌روزرسانی می‌کند.
+- پس از پایان ارسال، worker packet line‌ها را نمی‌بندد و برایشان `Finish` نمی‌فرستد.
+- اگر سمت downstream روی worker packet line مربوطه `Finish` بفرستد، timer و حلقه ارسال آن worker را متوقف می‌کند.
+
+بازه‌های source به همان ترتیبی که در config آمده‌اند پردازش می‌شوند و ارسال آن‌ها با هم interleave نمی‌شود.
+
+### زمان‌بندی و workerها {#scheduling-and-workers}
+
+<a id="زمانبندی-و-workerها"></a>
 
 پیش از شروع runtime، `PacketGenerator` همه packet‌ها را در یک packet store پیوسته می‌سازد. هنگام startup:
 
@@ -241,31 +292,17 @@ TCP-shaped probing:
 
 به این ترتیب packet‌ها در تمام مدت تعیین‌شده پخش می‌شوند و کل store یک‌باره به‌صورت burst ارسال نمی‌شود. اگر موعد چند packet هم‌زمان برسد، ممکن است یک worker آن‌ها را پشت سر هم بفرستد.
 
-## محدودیت‌ها
+### معناشناسی packet-line {#packet-line-semantics}
 
-- تعداد کل source IP‌ها باید داخل `uint32_t` جا شود.
-- تعداد کل packet‌ها باید داخل `uint64_t` جا شود.
-- مجموع اندازهٔ packet‌های ساخته‌شده در حافظه باید در `size_t` جا شود.
-- اندازهٔ packet store در حافظه به `8 GiB` محدود است.
-- `required_padding_left = 0`.
-
-بازه‌های بزرگ، حالت `ALL` و مقدارهای زیاد `packets-per-ip` مصرف حافظه را سریع بالا می‌برند. در صورت نیاز تست را با بازه‌های کوچک‌تر یا در چند اجرای جدا انجام دهید.
-
-## معناشناسی packet-line {#معناشناسی-packet-line}
+<a id="معناشناسی-packet-line"></a>
 
 `PacketGenerator` از worker packet line‌هایی استفاده می‌کند که chain ساخته است. این‌ها line‌های کمکی و پایدار هر worker هستند، نه line‌های جداگانه برای هر connection.
 
 `PacketGenerator` packet line‌ها را از بین نمی‌برد و `Finish` را نشانه تکمیل موفق نمی‌داند. یک `Finish` از سمت downstream، timer و حلقه ارسال worker مربوطه را برای همیشه متوقف می‌کند؛ در حالت تکمیل عادی، فقط زمانی در log ثبت می‌شود که همه packet‌های تخصیص‌یافته ارسال شده باشند.
 
-## نکته‌های عملی
+### فرادادهٔ گره {#node-metadata}
 
-- در سمت مقصد از `PacketCounter` استفاده کنید تا تعداد packet‌های دریافتی از هر source IP را ببینید.
-- مقدار `report-after-ms` در `PacketCounter` را بیشتر از `duration-ms` فرستنده بگذارید و برای تأخیر شبکه و جابه‌جایی احتمالی ترتیب packet‌ها هم زمان در نظر بگیرید.
-- اگر شبکه اجازه می‌دهد، برای probe سادهٔ مسیر از `ICMP` استفاده کنید.
-- وقتی محیط محدودشده رفتار متفاوتی بر اساس protocol یا port دارد، از `TCP`، `UDP` یا `ALL` استفاده کنید.
-- اگر شبکه سمت sender اعتبارسنجی source address انجام دهد، ممکن است بازه‌های source جعلی یا غیرمحلی پیش از رسیدن به peer WaterWall فیلتر شوند.
-
-## متادیتای node {#متادیتای-نود}
+<a id="متادیتای-نود"></a>
 
 متادیتای برگرفته از کد منبع:
 

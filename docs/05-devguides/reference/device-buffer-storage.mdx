@@ -1,0 +1,281 @@
+---
+sidebar_position: 4
+title: "Device and lwIP buffer storage"
+description: "Shared lwIP allocation, retained pbufs, packet handoff, and device writer ownership."
+---
+
+# Device and lwIP buffer storage
+
+Read [Part 3](../part3-buffers-and-padding.mdx) for buffer quantities and ownership, [Part 4](../part4-packet-tunnels.mdx) for packet boundaries, and [Part 7](../part7-shutdown-and-signals.mdx) for device retirement. These storage contracts apply to work in the corresponding engines and backends.
+
+## lwIP engine and shared buffer storage {#lwip-engine-and-shared-buffer-storage}
+
+Production lwIP uses a fixed 2 MiB TCP send capacity and a fixed 4 MiB receive
+window per PCB. Receive-window scale 7 represents the full window when the peer
+negotiates scaling; peers without scaling retain the unscaled limit. These are
+protocol ceilings, not per-flow memory reservations. Payload storage comes from
+bounded shared pools as data is retained, so allocation pressure can limit a
+flow before its byte ceiling. Increasing these ceilings does not multiply the
+shared heap or segment pools by the flow count. The ordinary receive-pbuf pool
+reserves enough payload capacity for one full receive window process-wide.
+
+PTC's default `max-pending-bytes` is also 2 MiB because it counts both queued
+payload and original deliveries awaiting full acknowledgement. Its fixed 1 MiB
+delivery headroom and separate 1,024-record limit still bound admission. CTP's
+pending budget counts only payload not yet accepted by lwIP; its default remains
+256 KiB independently of the stack's send capacity.
+
+PTC and CTP admit stream payload into a scaled TCP send buffer through successive
+16-bit `tcp_write()` calls. That API's 65,535-byte limit is not backpressure:
+admission and FIFO retry continue while send capacity and allocation permit.
+Each bridge keeps the uncopied suffix at the head of its write FIFO. PTC also
+retains the original payload's ACK record charge until acknowledgement. A
+retryable failure after a successful prefix still flushes that prefix so
+acknowledgement can restore progress.
+
+Worker engines share process-wide, demand-grown flow and payload pools, including
+PTC RX wrappers. Startup `misc.lwip-*` settings select the TCP/UDP PCB, listener,
+segment and RX-wrapper object limits plus a shared allocation-byte budget. Object
+counts and pool statistics use wide accounting; runtime flow targets are not
+multiplied into static arrays or a 16-bit segment inventory. Packet-buffer and
+malloc size classes grow under the byte budget. Reassembly quotas and fixed
+protocol inventories remain separate. `MEM_SIZE`, RAM profiles and TCP window
+ceilings do not enlarge this budget.
+
+Backing storage grows in slabs after reserving their complete requested size,
+including slab/item metadata and alignment. Returned objects and worker-cache
+reservations keep their slab charged until the slab is physically released.
+Before a byte refusal, reclaim published free cache lists and fully free slabs
+across size classes so a previous workload cannot permanently monopolize the
+budget. Live objects never move. A recovery partition of `min(1 MiB, budget / 16)`
+remains inside the same byte ceiling; ordinary storage cannot consume it. Separate
+recovery allocations never enter ordinary caches or feed ordinary payload writes.
+Exhausted bridge ingress may use compact, validated, header-only IPv4 TCP ACK/RST
+storage from this partition. SYN, FIN and payload input do not qualify; FIN can
+retain out-of-order state. PTC preserves its immediate trusted-TUN checksum
+boundary; other packets require valid checksums. Only narrow stack control-header
+allocation sites may use recovery memory. Never elevate an entire input scope:
+a TCP sent callback can synchronously flush pending application payload.
+For an RX-wrapper limit above one, reserve `min(256, max(1, limit / 16))`
+wrapper slots inside that total; a one-slot override has no recovery slot. The
+production CTP handoff allowance reserves 1 MiB and 256 entries within its
+16 MiB / 4096 totals. The private handoff helper only partitions inventories
+with at least sixteen bytes and sixteen entries. Ordinary admission is tried
+first; eligible recovery input/output can fall back without enlarging either
+ceiling. Recovery object and byte inventories remain bounded and may still
+refuse excess control traffic. Actual allocator OOM remains fatal; budget or object-limit
+refusal remains `NULL`/`ERR_MEM` with the existing protocol retry, backpressure
+and packet/flow refusal behavior.
+
+Each engine caches at most 256 free objects per TCP-segment, pooled-heap size
+class and PTC RX-wrapper pool. A cache miss refills up to eight objects from the
+shared backing storage. Warm checkout/return avoids shared allocator protection.
+Only atomically detached free storage may be reclaimed from another engine;
+never traverse its live PCBs or pbufs. Engine destruction unregisters and drains
+its caches under shared protection. An unscoped or foreign free uses shared
+allocation metadata without dereferencing its former engine. Allocator locks
+must not enclose custom destructors, neighbor calls or worker posts.
+
+CTP packet handoff reserves its full allocation charge against both its node
+budget and the shared lwIP byte budget before allocation. Delivery, refusal,
+cancellation and final custom-pbuf release settle both once. PTC additionally
+charges the full sbuf allocation retained by each input custom pbuf until that
+pbuf is freed, including when its sbuf transfers to receive staging. This charges
+retained input capacity and padding, not just packet length. The budget is not a
+process RSS limit: allocator-private overhead, engine/port control tables,
+worker-buffer caches, normal-line/application queues and storage after ownership
+passes beyond the charged lifetime remain outside it. Existing per-flow queue
+limits and receive-window adaptation continue to apply independently.
+
+The read-only `stack-stats` operation on either bridge reports the same shared
+capacity domain. Pool `held`/`peak_held` include cached free reservations as well
+as live objects; they must not be presented as active connection counts. Byte
+and entry refusal counters distinguish exhaustion causes. Snapshot rendering
+occurs after the shared metadata copy; handlers never traverse live protocol
+objects. Pool descriptors and custom registration metadata survive shared-runtime
+reinitialization; finalization releases all slabs only after engines and external
+reservations have settled. A second node must not reset an existing RX pool.
+
+The Unix `SYS_ARCH_PROTECT` guard uses the project's hybrid `wmutex_t`.
+Exclusive shared bootstrap initializes it before allocator use, and shared
+finalization destroys it after all engines and retained buffers have settled.
+Thread-local nesting acquires the mutex only on the outermost entry and releases
+it on the matching final exit. This does not add a TCP/IP protocol core lock.
+
+Each active engine separately owns 17 timeout records and its control tables.
+IPv4 and IPv6 reassembly retain separate process-wide pbuf allowances. PTC and
+CTP detached drain lists are worker-local, but each node retains its aggregate
+4,096-object and 16 MiB allowance with exact reservation rollback.
+
+Each TCP PCB caches its owner-local unacknowledged-segment tail, avoiding a list
+walk before ordinary output. The non-owning pointer is null exactly when that
+queue is empty. Appends update it, sorted recovery insertion preserves it, and
+ACK, retransmission and cleanup paths clear it when the final member leaves.
+It adds one pointer per PCB without changing payload capacity or TCP policy.
+
+Engine-owned pbuf chains remain on their owner until release. Cross-worker
+messages carry detached bytes and lookup identity, not permission to access
+foreign pbufs, PCBs or worker pools. Retained custom pbufs must settle before
+owner buffer pools disappear. Foreign cancellation destroys detached storage;
+it does not recycle into another worker's local pool.
+
+PTC stages accepted TCP receive bytes in one owner-held sbuf while its deferred
+normal-line delivery is pending. The first receive can reuse a single, uniquely
+referenced PTC custom pbuf's sbuf from the same owner worker and pool. Its accepted
+payload range must lie inside that sbuf, both its original padding reservation
+and remaining headroom must satisfy the onward pool requirement, and its payload
+allocation must be no larger than the smallest fitting copy destination. An
+oversized pool tier retains the bounded copy fallback. Other inputs are copied;
+new allocations use the smallest fitting tier. Growth is geometric and staging
+is bounded by `TCP_WND`, including a dedicated fallback when a custom pool tier
+exceeds that bound. Growth briefly
+owns both old and new storage. The task owns a line reference, not this buffer;
+owner teardown releases staging after cancellation. Delivery detaches the sbuf
+before calling the next tunnel, preserving reentrant input and Finish ordering.
+One aggregated Payload retains the existing accepted-input Pause tolerance and
+returns or withholds exactly its byte count as TCP receive credit. Both PTC and
+CTP return each complete delivery or Resume credit amount in one owner-engine
+operation, including amounts above 65,535 bytes; artificial 16-bit chunks must
+not emit intermediate window updates. Refused PTC task
+submission releases copied staging and rolls back credit without consuming
+lwIP's pbuf. A reusable input remains unchanged until the owner task is admitted;
+then its sbuf transfers to staging and only the custom pbuf wrapper is freed.
+Stripping packet headers does not replace the original padding reservation.
+
+PTC receive copies use `pbufLargeCopyToPtr()`, which copies at most the first
+packet's `tot_len`, skips empty spans, and stops before a queued next packet.
+The caller supplies nonoverlapping destination storage for that length. Each
+span below 64 bytes uses ordinary copying; larger spans use `memoryCopyLarge()`.
+Receive-buffer growth uses the same cutoff. Neither path assumes the TCP payload
+or append position retains the original IP packet's alignment.
+
+PTC netif output copies exactly one packet's `tot_len` from its pbuf spans into
+one best-fit sbuf on the route owner worker, preserving chain padding. Empty
+spans are legal; a following packet in a pbuf queue is excluded. Delivery transfers
+that same sbuf. Deferred refusal/cancellation calls `sbufDestroy()` without tunnel,
+line, engine or pool access; accepted owner delivery may recycle a stopped output.
+No pbuf storage crosses the device callback boundary.
+
+CTP netif output likewise copies one packet into one owned sbuf, sized to the
+packet with the engine owner's complete chain padding. This detached allocation
+avoids retaining a whole pool tier for a queued ACK or small packet. Its force-queued
+message transfers that same sbuf to the selected packet worker. The shared
+handoff budget reserves the complete sbuf allocation before creation and releases
+it before onward delivery. Refusal or foreign cancellation destroys the sbuf and
+releases the independently retained budget without touching a worker pool,
+tunnel or engine. No second packet copy or retained lwIP storage is needed.
+
+TUN output has one FIFO per event worker and uses that worker's existing buffer
+pool; there is no device writer pool. The device-wide packet allowance covers
+both queued buffers and the active flush batches across all workers. The queue
+limit is separate from the flush quantum: each deferred callback removes at most
+64 packets and 256 KiB of allocation charge, leaving the next packet queued when
+it would exceed the quantum. A singleton exceeding that charge target still
+progresses ordinarily. No timer waits for more packets; remaining output schedules
+another deferred flush.
+
+Linux trusted GSO records copy only a private IPv4/TCP header; iovecs borrow
+original payload spans until the complete write attempt and EINTR retries finish.
+No aggregate payload allocation/copy occurs. Every native batch callback settles
+all of its buffers through its event worker's pool. Cancellation marks the queue
+for discard; lifecycle queue drain destroys retained buffers without borrowing a
+worker pool. A refused `tundeviceWrite()` leaves the buffer with its caller;
+acceptance transfers it to writer settlement. Generation references keep late
+flush-token cleanup safe after device destruction; see
+[Part 7](../part7-shutdown-and-signals.mdx#10-external-devices-and-lwip).
+
+
+Raw-device output also uses per-worker FIFOs and the existing worker buffer pools,
+with device-wide allowances of 131,072 packets on Linux and 256 on Windows,
+covering queued and active buffers.
+A native callback consumes only the prefix it reports; the helper retains the
+unsent suffix ahead of later FIFO entries, including across partial sends,
+interruptions and writable retries. Linux keeps up to 512 original buffers in an
+active batch. Each callback performs at most one nonblocking `sendmmsg()`; no
+aggregate payload allocation is introduced. Invalid or oversized input at a
+later position waits until the earlier valid prefix settles before it is dropped.
+
+Windows overlapped output may borrow the first unsent packet while the kernel
+operation is pending. Neither completion notification nor foreign cancellation
+may recycle that buffer. The owner worker settles completed output through its
+own pool. During stop, native cancellation/completion and notification quiescence
+must finish before any retained packet is destroyed. Refused `rawdeviceWrite()`
+keeps caller ownership; accepted output settles through the writer even when a
+later retry is cancelled.
+
+## Device receive dispatch storage
+
+Linux RawSocket capture uses the same nonblocking worker FIFO admission as
+Linux TUN, with a shared 8 MiB allocation-charge and 512-packet budget. Each queue
+worker owns receive scratch and a bounded fragment-release batch outside that
+budget. A received record remains private until its Netlink verdict succeeds;
+only NF_DROP can lead to chain publication. On capacity refusal, keep the
+unadmitted output and disable reads until credit notification. Shared fragment
+storage uses detached allocations, never a different worker's buffer pool.
+Inactive startup/cleanup service uses coordinator-owned storage and NF_ACCEPT;
+it never dispatches into the session FIFO. Once capture activates, coordinator
+service during the remaining worker startup gate uses detached storage and
+NF_DROP, then admits packets through the same bounded FIFO. Capacity refusal
+retains the current output and stops that lane's reads. No tunnel callback runs
+on the coordinator; worker delivery begins after packet Init.
+
+Windows, macOS and BSD TUN readers configure the session's byte/packet budget and
+worker FIFO before producer startup: 8 MiB of buffer allocation charge and
+1,024 packets. `deviceReaderDistributeBatchDroppingOverflow()` distributes complete
+visible native TCP/UDP packets by flow and other complete packets using a
+session-local sequence. It retains preserved-fragment association and groups
+packets in stable worker order to fit both limits before nonblocking
+admission. A capacity refusal drops and recycles the unadmitted remainder;
+worker 0 and the external macOS/BSD readers never wait for another worker. An
+individual allocation larger than the budget is dropped too. Accepted work retains its
+reservation through delivery or cancellation, including closed generations.
+Reader staging is bounded by one batch plus the existing fragment limits.
+Windows/macOS batches contain at most 128 packets. BSD uses
+`min(RAM_PROFILE, kMaxReadDistributeQueueSize)` with a 512-packet internal cap;
+supported profiles allow at most 256 packets (`server`). Message metadata is
+bounded separately by the packet limit. These
+limits bound receive dispatch, not total process memory or downstream retention.
+
+Linux TUN offload work reserves storage before transferring an aggregate,
+an assured complete ordinary TCP/UDP record, or ordinary checksum work to its
+selected receive-processing worker in either offload mode. Single-reader native
+TCP/UDP uses the same flow worker as ordinary input. The destination is retained
+across capacity retries and all segments of that record. Both modes
+prepare receive scratch, the capacity notifier and ordered worker queues before
+producer startup. Their session budget is 8 MiB of allocation charge and 512
+packet slots; common setup must admit the largest retained ordinary work item.
+Each GSO work item charges its actual aggregate buffer allocation, its
+work context, and one maximum output-buffer allocation allowance; it reserves
+two packet slots for the retained aggregate and active output. The worker
+allocates and delivers one independent segment at a time, or delivers an assured
+aggregate intact on an eligible trusted pair. The output allowance
+stays reserved through every segment's required checksum work and TunDevice
+delivery, so the worker never waits for reader budget capacity. Downstream
+retention follows ordinary packet-chain ownership after delivery.
+
+All non-segment ordinary work, including assured `DATA_VALID` and matching
+`NEEDS_CSUM` records, reserves one packet slot, its compact
+packet buffer's predicted allocation charge, and its private work context before
+allocation and copying from reader scratch. It needs no segmentation output
+allowance. Its reservation remains held through worker checksum completion and
+delivery (omitting checksum completion when assured), or settles on refusal,
+cancellation or stale generation. Scratch remains reader-owned and reusable for
+the next read.
+
+Before allocating each segment, the worker checks the current ordinary best-fit
+charge against its prepaid allowance. If custom ordinary pool geometry no longer
+fits that allowance, it creates an exact-sized
+ordinary buffer with this chain's original sufficient padding instead.
+
+Ordinary batches use the same per-worker FIFO and reserve their actual buffer
+allocation charges and packet slots before posting. Reader drain staging and
+fragment storage retain their separate existing bounds; session and FIFO-message
+metadata are bounded separately by the packet limit. The 8 MiB admission charge
+is not a total process-memory limit. Budget exhaustion makes
+the reader wait, retaining at most one unadmitted record in its current
+scratch buffer. Successful GSO admission transfers that buffer itself and
+replaces reader scratch without copying the aggregate payload. Non-segment
+admission copies the exact IP bytes and reuses reader scratch.
+Release each work reservation exactly once after completion, refusal,
+cancellation, or stale-generation discard. Posting a work item is not
+settlement, and cancellation must not borrow a device or worker buffer pool.

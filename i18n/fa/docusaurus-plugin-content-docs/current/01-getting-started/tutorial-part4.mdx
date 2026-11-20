@@ -33,7 +33,7 @@ TcpListener -> MuxClient -> VlessClient -> TlsClient -> TcpConnector
 برای packet‌ها:
 
 ```text
-UdpStatelessSocket -> WireGuardDevice -> TunDevice
+UdpListener -> WireGuardServer(mode=packet) -> TunDevice
 ```
 
 ## adapter‌های ورودی و خروجی
@@ -200,7 +200,7 @@ node‌های packet رایج:
 | --- | --- |
 | `TunDevice` | ساخت یا استفاده از interface نوع TUN برای IP packet‌ها. |
 | `RawSocket` | فرستادن و دریافت raw IP packet‌ها. |
-| `WireGuardDevice` | پیاده‌سازی رمزنگاری WireGuard و مدیریت peer درون chain WaterWall. |
+| `WireGuardServer` | پیاده‌سازی رمزنگاری WireGuard و مدیریت peer درون chain WaterWall. |
 | `IpOverrider` | override کردن آدرس مبدأ یا مقصد packet. |
 | `IpManipulator` | اعمال تغییرات سطح packet برای مسیریابی ویژه یا سناریوهای تست. |
 | [FakeTcpHeaderClient](02-noderefs/FakeTcpHeaderClient.mdx) / [FakeTcpHeaderServer](02-noderefs/FakeTcpHeaderServer.mdx) | افزودن و حذف header جعلی TCP روی packet‌های موجود IPv4 برای انتقال raw packet؛ این کار یک اتصال TCP برقرار نمی‌کند. |
@@ -248,33 +248,27 @@ server B: TcpListener -> TlsServer -> StreamToPackets -> TunDevice
 در نمای کلی بالا استفاده از node‌های TLS اختیاری است، اما در استفاده‌ی واقعی معمولاً
 اطراف مسیر stream، رمزنگاری، authentication یا camouflage اضافه می‌شود.
 
-## WireGuard درون WaterWall
+## WireGuard inside WaterWall
 
-`WireGuardDevice` رمزنگاری WireGuard و state مربوط به peer را مدیریت می‌کند، اما
-خودش socket نوع UDP را باز نمی‌کند و interface نوع WireGuard در سیستم‌عامل
-نمی‌سازد.
-
-توپولوژی معمول چنین است:
+`WireGuardClient` accepts inner packets on `prev` and emits encrypted datagrams
+on `next`. `WireGuardServer` accepts encrypted datagrams on `prev`; its explicit
+`mode` selects packet output or authenticated TCP/UDP connections. Both roles
+carry return traffic through reverse callbacks.
 
 ```text
-UdpStatelessSocket -> WireGuardDevice -> TunDevice
+TunDevice -> WireGuardClient -> JunkDatagramSender (optional) -> UdpConnector
+UdpListener -> WireGuardServer(mode=packet) -> TunDevice
+UdpListener -> WireGuardServer(mode=connection) -> TcpUdpConnector
 ```
 
-`UdpStatelessSocket` فقط در ابتدای chain مجاز است. آن را پیش از
-`WireGuardDevice` قرار دهید؛ این socket نمی‌تواند پس از WireGuard باشد. solver
-لایه همچنان مشخص می‌کند کدام سمت مجاور packet‌های L3 و کدام سمت انتقال L4 را حمل
-می‌کند.
-
-تقسیم وظایف:
-
-| node | مسئولیت |
-| --- | --- |
-| `TunDevice` | interface مربوط به IP packet‌های داخلی. |
-| `WireGuardDevice` | handshake، رمزنگاری، state مربوط به peer، مسیریابی allowed IP و keepalive در WireGuard. |
-| `UdpStatelessSocket` | socket بیرونی UDP برای فرستادن و دریافت packet‌های WireGuard. |
-
-این تفکیک مهم است: آدرس و پورت bind مربوط به UDP را روی `UdpStatelessSocket` و
-key‌ها و peer‌های WireGuard را روی `WireGuardDevice` تنظیم کنید.
+The client uses its peer endpoint as the initial destination before carrier Init.
+Later nodes may override that destination through their normal settings.
+The server learns endpoints only from authenticated traffic. Connection mode
+references a separate AuthenticationClient service and inserts PTC, account
+binding and UserController internally. Limits count inner connections, payload
+and active inner source IPs. Neither node creates OS interfaces or routes.
+See [WireGuardClient](../02-noderefs/WireGuardClient.mdx) and
+[WireGuardServer](../02-noderefs/WireGuardServer.mdx) for settings and complete examples.
 
 ## راهنمای عملی انتخاب node
 
@@ -333,14 +327,11 @@ packet side B: TcpListener -> StreamToPackets -> TunDevice
 برای یک مسیر IPv4 و بدون نیاز به root، از SOCKS CONNECT به packet:
 
 ```text
-شاخه‌ی application محلی: TcpListener -> Socks5Server -> ConnectionToPackets -> Bridge A
-شاخه‌ی UDP محلی:          UdpStatelessSocket -> WireGuardDevice -> Bridge B
-سمت راه‌دور:               UdpStatelessSocket -> WireGuardDevice -> PacketsToConnection -> TcpUdpConnector
+local:  TcpListener -> Socks5Server -> ConnectionToPackets -> WireGuardClient -> UdpConnector
+remote: UdpListener -> WireGuardServer(mode=connection) -> TcpUdpConnector
 ```
 
-`Bridge A` و `Bridge B` را به هم pair کنید تا شاخه‌ی connection-to-packet به
-سمت packet وایرگارد وصل شود. هر `UdpStatelessSocket` در ابتدای chain خودش
-می‌ماند.
+The remote server references its named AuthenticationClient service.
 
 `Socks5Server` مقصد درخواستی را برای `ConnectionToPackets` فراهم می‌کند.
 `source-ipv4` آن را به‌صورت یک آدرس مجازی یکتا تنظیم کنید که peer راه‌دور آن را
@@ -351,7 +342,7 @@ packet side B: TcpListener -> StreamToPackets -> TunDevice
 برای WireGuard:
 
 ```text
-UdpStatelessSocket -> WireGuardDevice -> TunDevice
+UdpListener -> WireGuardServer(mode=packet) -> TunDevice
 ```
 
 پس از انتخاب شکل کلی chain، صفحه‌ی مرجع تک‌تک node‌های به‌کاررفته را بخوانید.

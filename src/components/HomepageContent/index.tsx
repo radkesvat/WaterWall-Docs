@@ -150,7 +150,7 @@ const families = [
       message:
         "Connect TUN interfaces, use WireGuard, or bridge packets into connection flows.",
     },
-    nodes: ["TunDevice", "WireGuardDevice", "PacketsToConnection"],
+    nodes: ["TunDevice", "WireGuardServer", "PacketsToConnection"],
   },
   {
     icon: "layers",

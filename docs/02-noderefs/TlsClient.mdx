@@ -6,11 +6,13 @@ description: "Reference documentation for the TlsClient node."
 ---
 
 <!--
-Documentation version: 160
+Documentation version: 161
 Sync note: Any change to this file must also be applied to WaterWall/tunnels/TlsClient/description.md and WaterWall-Docs/i18n/fa/docusaurus-plugin-content-docs/current/02-noderefs/TlsClient.mdx, and all files must keep the same documentation version.
 -->
 
 # TlsClient
+
+## Overview
 
 `TlsClient` is the client-side TLS wrapper for WaterWall. It is built on the bundled BoringSSL code in the repository.
 It receives cleartext from the previous tunnel, encrypts it into TLS records for the next tunnel, and decrypts downstream
@@ -20,7 +22,7 @@ This node performs a real TLS client handshake. Its handshake is shaped to stay 
 Chrome-like ALPN defaults, ALPS, GREASE, extension permutation, certificate compression support, and the optional
 `X25519MLKEM768` hybrid group.
 
-## Typical Placement
+## Typical placement
 
 HTTPS-style client chain:
 
@@ -38,7 +40,233 @@ VlessClient -> TlsClient -> TcpConnector
 `TlsClient` does not open sockets by itself. Put a transport such as `TcpConnector` after it. The connector carries the
 encrypted TLS bytes to the remote server.
 
-## Local HTTP application through a TLS endpoint {#tls-http-client}
+## Minimal practical example
+
+Node fragment; define the referenced neighbors and peers in the same deployment.
+
+Replace `example.com` with the name on the peer certificate and define `tcp-connector` with the actual remote address. This fragment offers HTTP/1.1; the application and peer must use that protocol. Certificate verification stays enabled.
+
+```json
+{
+  "name": "tls-client",
+  "type": "TlsClient",
+  "settings": {
+    "sni": "example.com",
+    "alpns": [
+      "http/1.1"
+    ],
+    "verify": true
+  },
+  "next": "tcp-connector"
+}
+```
+
+See [Configuration](#configuration) for defaults and conditional requirements and [Usage and troubleshooting](#usage-and-troubleshooting) for complete examples and operational limits.
+
+## Configuration
+
+### Required Fields
+
+Top-level fields:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `name` | string | User-chosen node name. Must be unique inside the config file. |
+| `type` | string | Must be exactly `"TlsClient"`. |
+| `settings` | object | TLS client settings. |
+| `next` | string | Stream-facing node that carries encrypted TLS records. Required in normal use. |
+
+Required `settings` field:
+
+| Field | Type | Description |
+| --- | --- | --- |
+| `sni` | string | TLS Server Name Indication containing between 1 and 255 bytes. |
+
+`sni` is also the hostname used by BoringSSL for certificate verification when `verify` is enabled.
+
+### Optional Settings
+
+| Field | Default | Description |
+| --- | --- | --- |
+| `alpns` | `["h2", "http/1.1"]` | Ordered ALPN protocol offer. The JSON order is preserved in the ClientHello. |
+| `verify` | `true` | Enables BoringSSL peer certificate verification. |
+| `x25519mlkem768` | `true` | Advertises the `X25519MLKEM768` hybrid key-agreement group; does not change signature algorithms. |
+| `fragment` | absent | Optional private StreamFragmenter settings for outgoing TLS bytes. |
+| `tls13-record-shaping` | absent | Experimental sender-side TLS 1.3 padding and delay configuration. |
+| `ech-config-list` | absent | Standard Base64 ECHConfigList for [required real ECH](#configured-ech). |
+| `verbose` | `false` | Enables extra TLS state logging. |
+
+When `verify` is `true`, `TlsClient` loads the built-in CA bundle from `utils/cacert.h` into the BoringSSL context. When
+`verify` is `false`, the TLS handshake is still real, but certificate-chain verification is disabled for this tunnel
+instance.
+
+Optional defaults apply only when their keys are absent. A present `alpns` value must be an array of strings. Each name
+must contain between 1 and 255 bytes, duplicate names are rejected, and the encoded list may not exceed 65,533 bytes.
+Present `verify`, `x25519mlkem768`, and `verbose` values must be JSON booleans. A wrong type is a startup error rather
+than a request to use the default.
+
+`x25519mlkem768` should usually stay enabled. Disabling it makes the ClientHello smaller, but also makes it less close to
+current Chrome behavior.
+
+### Configured ECH
+
+`ech-config-list` accepts a nonempty standard Base64 string containing a serialized ECHConfigList for the destination.
+The configuration is fixed for the node's lifetime. Startup rejects malformed Base64, an invalid ECHConfigList, or a
+list with no supported configuration. `ech-config-list` and `ech-sni-trick` cannot be used together.
+
+Ordinary connections encrypt `settings.sni` in ClientHelloInner. The visible ClientHelloOuter uses the selected
+ECHConfig's `public_name`; users do not configure a second SNI. With this setting absent, the existing ECH GREASE
+behavior remains unchanged.
+
+Configured ECH must be accepted for the connection to succeed. Rejection closes the connection without releasing
+application data, retrying the transport, or falling back to a cleartext SNI or GREASE. TlsClient does not discover
+configurations through HTTPS DNS records, refresh them, or apply server retry configurations.
+
+Normal certificate verification still applies to the configured inner SNI. `verify: false` remains an explicit
+server-authentication opt-out; it does not permit ECH rejection or enable an authenticated retry path. 0-RTT remains
+disabled. TLS 1.3 resumption can use the existing session cache, with the PSK offer encrypted inside ClientHelloInner;
+TLS 1.2 sessions are not offered with real ECH.
+
+The `generateTlsHello:<sni>` API remains a fresh, arbitrary-hostname GREASE generator. It does not apply the node's
+fixed-origin `ech-config-list` or consume cached sessions. Startup preflight measures the actual configured outer
+ClientHello flight so its size checks also cover real ECH.
+
+### TLS Stream Fragmentation
+
+An optional `fragment` object creates a private StreamFragmenter immediately after
+TlsClient:
+
+```text
+previous -> TlsClient -> internal StreamFragmenter -> configured next
+```
+
+```json
+"fragment": {
+  "mode": "counter",
+  "count": 1,
+  "tls-hello-fragment": true,
+  "tls-hello-timeout-ms": 1000,
+  "cuts": [[250, 2, 100], [300, 5, 100]]
+}
+```
+
+The object uses StreamFragmenter's settings and strict validation: `mode`,
+`count` or `duration-ms`, `cuts`, optional `bypass_chance`, `wait-for-est`,
+`tls-hello-fragment`, and `tls-hello-timeout-ms`. Omit `fragment` to omit the
+helper. A present value must be a valid object; `null`, booleans, empty objects,
+and duplicate keys are rejected.
+
+With `tls-hello-fragment` absent or false, cuts split selected outgoing TLS
+Payload callbacks at raw byte offsets. Every TLS byte, including record headers,
+stays unchanged. TlsClient's complete initial TLS flight enters the helper as
+one Payload, so `count: 1` selects that first flight in this mode.
+
+With `tls-hello-fragment: true`, cuts count ClientHello handshake bytes, including
+the four-byte handshake header and excluding each five-byte TLS record header.
+Only the initial ClientHello is eligible. Selected cuts create valid, smaller
+handshake records while preserving the complete handshake message, original
+record boundaries, and record versions. Record headers change; encrypted records
+and downstream TLS input do not. The complete message is capped at 64 KiB.
+Non-TLS or unsupported framing, an oversized hello, bypass, and an incomplete
+hello reaching `tls-hello-timeout-ms` pass the original wire bytes unchanged and
+end detection for that line. The timeout starts on the first eligible non-empty
+input, including time waiting for Est. Finish discards an incomplete
+candidate instead of replaying it. The option does not infer SNI-relative cuts
+or provide independent TLS and TCP cut profiles.
+
+`wait-for-est` defaults to true: output waits until transport Est has been
+forwarded, then fragment delays start. The TLS assembly deadline may run before
+Est or during advisory Pause; a completed rewrite is no longer subject to that
+deadline. Received Pause/Resume combine with the helper's local source pressure;
+ready output does not wait for Resume.
+Timed eligibility starts at the first Est by default. Explicit `wait-for-est:
+false` permits output scheduling before Est. Later buffering may combine writes
+or change spacing on the wire; neither mode promises TCP packet boundaries.
+
+The helper borrows the same line and uses its own bounded FIFO: 8 MiB logical
+bytes, 8 MiB capacity charge, and 1,024 jobs. Reentry, Finish, and shutdown use
+StreamFragmenter's normal ordering and cleanup. When configured, StreamFragmenter receives the final
+TLS ciphertext as a separate handoff. StreamFragmenter discards fragments still in its queue when it
+receives Finish. The helper releases its own
+pressure at its low watermarks, and combines it with the latest received pressure before resuming its source. When
+shaping and the startup wait have finished and retained work has drained, it
+destroys its line state and permanently bypasses itself. TlsClient remains active
+for TLS processing. This budget is separate from TLS plaintext and
+ciphertext-shaping storage. TlsClient still blocks whole-chain splice eligibility.
+
+`tls13-record-shaping` can be used with `fragment`: its record padding and
+delays run first, followed by StreamFragmenter. The raw ClientHello-generation
+API returns its normal buffer without entering this per-line helper.
+
+### Experimental TLS 1.3 Record Shaping
+
+`tls13-record-shaping` optionally pads and delays the first locally sent TLS 1.3 application records. It is disabled
+when absent. It never changes received ciphertext, handshake records, alerts, empty application records, fallback bytes,
+or TLS 1.2 records. Configure the local `TlsClient` and remote `TlsServer` separately when both sending directions should
+be shaped.
+
+Custom form:
+
+```json
+"tls13-record-shaping": {
+  "scope": {"first-application-records": 8},
+  "outcomes": [
+    {
+      "probability": 50,
+      "padding-bytes": [100, 200],
+      "delay": {"probability": 75, "ms": [10, 20]}
+    },
+    {"probability": 10, "padding-bytes": [400, 600]}
+  ]
+}
+```
+
+`padding-bytes` and `delay.ms` accept either an integer or an inclusive `[minimum, maximum]` integer range. There may be
+1 through 16 outcomes; `first-application-records` is 1 through 1024, padding is 1 through 4096 bytes, and delay is 0
+through 1000 milliseconds. Outcome probabilities are cumulative, mutually exclusive percentages whose sum may not exceed
+100. One roll selects at most one outcome; the unused percentage is an unchanged record. An outcome's delay probability
+is rolled only after that outcome is selected. Unknown keys and non-integer or out-of-range values are startup errors.
+Every eligible record consumes one scope position even when its roll selects no outcome.
+
+Only the custom `scope` plus `outcomes` form is currently accepted. The `profile` key is rejected until representative
+capture, overhead, connection-success, and classifier measurements justify publishing a versioned preset.
+
+Padding is standard zero-valued TLS 1.3 `TLSInnerPlaintext` padding and adds the selected number of bytes to ciphertext,
+subject to the remaining legal TLS record capacity. Delay starts after encryption and adds up to the selected latency.
+Records stay in wire order with `release_at = max(now + delay, previous_release_at)`. Queued ciphertext is bounded to 8
+MiB per line, with local producer pressure set at 6 MiB and cleared at 3 MiB. The producer remains paused while
+local pressure or the latest received Pause is active. A received Resume cannot release local pressure, and clearing
+local pressure cannot release a received Pause. Repeated received notifications still pass through when no local hold
+blocks them. Due ciphertext drains keep their existing timing and FIFO order without
+waiting for Resume; Pause leaves the release timer active. After a completed handshake, cleartext `Finish`
+cancels the timer and drains older ciphertext first. TlsClient then encrypts and forwards the accepted plaintext
+remainder and FIFO in record-sized steps, including during advisory Pause. It releases TLS state and forwards
+`Finish` before returning. In ordinary TLS, BoringSSL can complete the handshake while TlsClient is handing
+its final handshake flight to the transport. A cleartext `Finish` during that handoff sends the rest of the flight
+before draining accepted plaintext. An incomplete handshake cancels the retained plaintext.
+
+After the configured application-record scope is consumed, the current shaping queue first drains completely so no later
+TLS record can overtake delayed ciphertext. While that ordering barrier is active, the node retains its local shaping
+hold even below the normal low watermark; received Resume does not release it. At an empty queue and complete write-BIO boundary, the timer and per-line shaping
+queue are released; later TLS output is forwarded directly without record parsing or shaping metadata, including during
+advisory Pause. The 8 MiB limit and 6/3 MiB watermarks therefore bound only the finite active shaping window. TLS record
+encryption and decryption remain active, so shaping retirement does not permanently bypass the tunnel.
+
+During this synchronous final drain, downstream Payload, Est, Pause and Resume are discarded; none of those callbacks
+is forwarded toward the finished cleartext owner. A wire-side finish
+cancels and discards queued output. If cleartext is still open, it receives Finish. Timer allocation failure
+drains immediately in order.
+
+Delay shaping is rejected for internal handshake-takeover users such as `RealityClient`, because raw takeover cannot
+inherit a pending delayed TLS record. Padding-only shaping remains compatible when the takeover boundary is empty.
+
+Record shaping can make early sizes and timings less deterministic, but it cannot remove an inner handshake round trip,
+make a burst smaller, or hide every direction and timing feature. Combine it with `MuxClient`/`MuxServer` when
+multiplexing fits the deployment.
+
+## Usage and troubleshooting
+
+### Local HTTP application through a TLS endpoint {#tls-http-client}
 
 This complete node file pairs with the [TlsServer HTTP frontend](./TlsServer.mdx#tls-http-frontend).
 It gives local applications a plaintext port while encrypting the connection to
@@ -98,201 +326,30 @@ To carry VMess over WebSocket and TLS, use the complete
 [VMess client example](./VmessClient.mdx#socks5-websocket-tls-client), where
 HttpClient supplies the WebSocket layer before TlsClient.
 
-## Required Fields
+### Unsupported Features
 
-Top-level fields:
+This implementation does not support:
 
-| Field | Type | Description |
-| --- | --- | --- |
-| `name` | string | User-chosen node name. Must be unique inside the config file. |
-| `type` | string | Must be exactly `"TlsClient"`. |
-| `settings` | object | TLS client settings. |
-| `next` | string | Stream-facing node that carries encrypted TLS records. Required in normal use. |
+- server-side TLS termination
+- dynamic certificate selection
+- TLS over packet lines
+- non-TLS transport wrapping such as WebSocket or HTTP by itself
 
-Required `settings` field:
+Use separate WaterWall nodes for those layers.
 
-| Field | Type | Description |
-| --- | --- | --- |
-| `sni` | string | TLS Server Name Indication containing between 1 and 255 bytes. |
+### Common Mistakes
 
-`sni` is also the hostname used by BoringSSL for certificate verification when `verify` is enabled.
+- Do not expect `TlsClient` to connect to the remote server by itself; put a connector after it.
+- Do not assume WaterWall `Est` means the TLS handshake has completed.
+- Do not use the singular `alpn` key; configure the ordered `alpns` array.
+- When offering multiple application protocols, know the target server's stable selection and configure the preceding
+  node for it. `TlsClient` does not communicate the server's ALPN choice back to that node.
+- Do not disable `verify` for public connections unless you intentionally want to skip certificate validation.
+- Do not disable `x25519mlkem768` if your goal is the closest current Chrome-like handshake.
 
-## Optional Settings
+## Advanced behavior
 
-| Field | Default | Description |
-| --- | --- | --- |
-| `alpns` | `["h2", "http/1.1"]` | Ordered ALPN protocol offer. The JSON order is preserved in the ClientHello. |
-| `verify` | `true` | Enables BoringSSL peer certificate verification. |
-| `x25519mlkem768` | `true` | Advertises the `X25519MLKEM768` hybrid key-agreement group; does not change signature algorithms. |
-| `fragment` | absent | Optional private StreamFragmenter settings for outgoing TLS bytes. |
-| `tls13-record-shaping` | absent | Experimental sender-side TLS 1.3 padding and delay configuration. |
-| `ech-config-list` | absent | Standard Base64 ECHConfigList for [required real ECH](#configured-ech). |
-| `verbose` | `false` | Enables extra TLS state logging. |
-
-When `verify` is `true`, `TlsClient` loads the built-in CA bundle from `utils/cacert.h` into the BoringSSL context. When
-`verify` is `false`, the TLS handshake is still real, but certificate-chain verification is disabled for this tunnel
-instance.
-
-Optional defaults apply only when their keys are absent. A present `alpns` value must be an array of strings. Each name
-must contain between 1 and 255 bytes, duplicate names are rejected, and the encoded list may not exceed 65,533 bytes.
-Present `verify`, `x25519mlkem768`, and `verbose` values must be JSON booleans. A wrong type is a startup error rather
-than a request to use the default.
-
-`x25519mlkem768` should usually stay enabled. Disabling it makes the ClientHello smaller, but also makes it less close to
-current Chrome behavior.
-
-## Configured ECH
-
-`ech-config-list` accepts a nonempty standard Base64 string containing a serialized ECHConfigList for the destination.
-The configuration is fixed for the node's lifetime. Startup rejects malformed Base64, an invalid ECHConfigList, or a
-list with no supported configuration. `ech-config-list` and `ech-sni-trick` cannot be used together.
-
-Ordinary connections encrypt `settings.sni` in ClientHelloInner. The visible ClientHelloOuter uses the selected
-ECHConfig's `public_name`; users do not configure a second SNI. With this setting absent, the existing ECH GREASE
-behavior remains unchanged.
-
-Configured ECH must be accepted for the connection to succeed. Rejection closes the connection without releasing
-application data, retrying the transport, or falling back to a cleartext SNI or GREASE. TlsClient does not discover
-configurations through HTTPS DNS records, refresh them, or apply server retry configurations.
-
-Normal certificate verification still applies to the configured inner SNI. `verify: false` remains an explicit
-server-authentication opt-out; it does not permit ECH rejection or enable an authenticated retry path. 0-RTT remains
-disabled. TLS 1.3 resumption can use the existing session cache, with the PSK offer encrypted inside ClientHelloInner;
-TLS 1.2 sessions are not offered with real ECH.
-
-The `generateTlsHello:<sni>` API remains a fresh, arbitrary-hostname GREASE generator. It does not apply the node's
-fixed-origin `ech-config-list` or consume cached sessions. Startup preflight measures the actual configured outer
-ClientHello flight so its size checks also cover real ECH.
-
-## TLS Stream Fragmentation
-
-An optional `fragment` object creates a private StreamFragmenter immediately after
-TlsClient:
-
-```text
-previous -> TlsClient -> internal StreamFragmenter -> configured next
-```
-
-```json
-"fragment": {
-  "mode": "counter",
-  "count": 1,
-  "tls-hello-fragment": true,
-  "tls-hello-timeout-ms": 1000,
-  "cuts": [[250, 2, 100], [300, 5, 100]]
-}
-```
-
-The object uses StreamFragmenter's settings and strict validation: `mode`,
-`count` or `duration-ms`, `cuts`, optional `bypass_chance`, `wait-for-est`,
-`tls-hello-fragment`, and `tls-hello-timeout-ms`. Omit `fragment` to omit the
-helper. A present value must be a valid object; `null`, booleans, empty objects,
-and duplicate keys are rejected.
-
-With `tls-hello-fragment` absent or false, cuts split selected outgoing TLS
-Payload callbacks at raw byte offsets. Every TLS byte, including record headers,
-stays unchanged. TlsClient's complete initial TLS flight enters the helper as
-one Payload, so `count: 1` selects that first flight in this mode.
-
-With `tls-hello-fragment: true`, cuts count ClientHello handshake bytes, including
-the four-byte handshake header and excluding each five-byte TLS record header.
-Only the initial ClientHello is eligible. Selected cuts create valid, smaller
-handshake records while preserving the complete handshake message, original
-record boundaries, and record versions. Record headers change; encrypted records
-and downstream TLS input do not. The complete message is capped at 64 KiB.
-Non-TLS or unsupported framing, an oversized hello, bypass, and an incomplete
-hello reaching `tls-hello-timeout-ms` pass the original wire bytes unchanged and
-end detection for that line. The timeout starts on the first eligible non-empty
-input, including time waiting for Est. Finish discards an incomplete
-candidate instead of replaying it. The option does not infer SNI-relative cuts
-or provide independent TLS and TCP cut profiles.
-
-`wait-for-est` defaults to true: output waits until transport Est has been
-forwarded, then fragment delays start. The TLS assembly deadline may run before
-Est or during advisory Pause; a completed rewrite is no longer subject to that
-deadline. Received Pause/Resume combine with the helper's local source pressure;
-ready output does not wait for Resume.
-Timed eligibility starts at the first Est by default. Explicit `wait-for-est:
-false` permits output scheduling before Est. Later buffering may combine writes
-or change spacing on the wire; neither mode promises TCP packet boundaries.
-
-The helper borrows the same line and uses its own bounded FIFO: 8 MiB logical
-bytes, 8 MiB capacity charge, and 1,024 jobs. Reentry, Finish, and shutdown use
-StreamFragmenter's normal ordering and cleanup. The helper releases its own
-pressure at its low watermarks, and combines it with the latest received pressure before resuming its source. When
-shaping and the startup wait have finished and retained work has drained, it
-destroys its line state and permanently bypasses itself. TlsClient remains active
-for TLS processing. This budget is separate from TLS plaintext and
-ciphertext-shaping storage. TlsClient still blocks whole-chain splice eligibility.
-
-`tls13-record-shaping` can be used with `fragment`: its record padding and
-delays run first, followed by StreamFragmenter. The raw ClientHello-generation
-API returns its normal buffer without entering this per-line helper.
-
-## Experimental TLS 1.3 Record Shaping
-
-`tls13-record-shaping` optionally pads and delays the first locally sent TLS 1.3 application records. It is disabled
-when absent. It never changes received ciphertext, handshake records, alerts, empty application records, fallback bytes,
-or TLS 1.2 records. Configure the local `TlsClient` and remote `TlsServer` separately when both sending directions should
-be shaped.
-
-Custom form:
-
-```json
-"tls13-record-shaping": {
-  "scope": {"first-application-records": 8},
-  "outcomes": [
-    {
-      "probability": 50,
-      "padding-bytes": [100, 200],
-      "delay": {"probability": 75, "ms": [10, 20]}
-    },
-    {"probability": 10, "padding-bytes": [400, 600]}
-  ]
-}
-```
-
-`padding-bytes` and `delay.ms` accept either an integer or an inclusive `[minimum, maximum]` integer range. There may be
-1 through 16 outcomes; `first-application-records` is 1 through 1024, padding is 1 through 4096 bytes, and delay is 0
-through 1000 milliseconds. Outcome probabilities are cumulative, mutually exclusive percentages whose sum may not exceed
-100. One roll selects at most one outcome; the unused percentage is an unchanged record. An outcome's delay probability
-is rolled only after that outcome is selected. Unknown keys and non-integer or out-of-range values are startup errors.
-Every eligible record consumes one scope position even when its roll selects no outcome.
-
-Only the custom `scope` plus `outcomes` form is currently accepted. The `profile` key is rejected until representative
-capture, overhead, connection-success, and classifier measurements justify publishing a versioned preset.
-
-Padding is standard zero-valued TLS 1.3 `TLSInnerPlaintext` padding and adds the selected number of bytes to ciphertext,
-subject to the remaining legal TLS record capacity. Delay starts after encryption and adds up to the selected latency.
-Records stay in wire order with `release_at = max(now + delay, previous_release_at)`. Queued ciphertext is bounded to 8
-MiB per line, with local producer pressure set at 6 MiB and cleared at 3 MiB. The producer remains paused while
-local pressure or the latest received Pause is active. A received Resume cannot release local pressure, and clearing
-local pressure cannot release a received Pause. Repeated received notifications still pass through when no local hold
-blocks them. Due ciphertext drains keep their existing timing and FIFO order without
-waiting for Resume; Pause does not cancel the release timer. If the cleartext side finishes, the timer is canceled and queued client ciphertext is synchronously
-released in FIFO order, including during advisory Pause. Local state and upstream `Finish` are completed before the
-callback returns.
-
-After the configured application-record scope is consumed, the current shaping queue first drains completely so no later
-TLS record can overtake delayed ciphertext. While that ordering barrier is active, the node retains its local shaping
-hold even below the normal low watermark; received Resume does not release it. At an empty queue and complete write-BIO boundary, the timer and per-line shaping
-queue are released; later TLS output is forwarded directly without record parsing or shaping metadata, including during
-advisory Pause. The 8 MiB limit and 6/3 MiB watermarks therefore bound only the finite active shaping window. TLS record
-encryption and decryption remain active, so shaping retirement does not permanently bypass the tunnel.
-
-During this synchronous final drain, downstream Payload, Est, Pause and Resume are discarded; none of those callbacks
-is forwarded toward the finished cleartext owner. A wire-side finish
-cancels and discards queued output and is propagated only toward cleartext. Timer allocation failure drains immediately
-in order.
-
-Delay shaping is rejected for internal handshake-takeover users such as `RealityClient`, because raw takeover cannot
-inherit a pending delayed TLS record. Padding-only shaping remains compatible when the takeover boundary is empty.
-
-Record shaping can make early sizes and timings less deterministic, but it cannot remove an inner handshake round trip,
-make a burst smaller, or hide every direction and timing feature. Combine it with `MuxClient`/`MuxServer` when
-multiplexing fits the deployment.
-
-## Ordered ALPN And Application-Protocol Responsibility
+### Ordered ALPN And Application-Protocol Responsibility
 
 `alpns` controls the ordered ALPN offer in the TLS ClientHello. For example:
 
@@ -400,7 +457,7 @@ TLS connections and the raw ClientHello generator use the same context configura
 fields does not establish complete Chrome fingerprint equivalence. The bundled BoringSSL copy also preserves local
 handshake shaping for cipher ordering and ClientHello layout.
 
-## ALPS Handling
+### ALPS Handling
 
 `TlsClient` registers ALPS only for `h2`, and only when `h2` is in `alpns`. The registered client application settings
 are empty, matching Chrome's HTTP/2 registration. `http/1.1` and custom ALPN protocols have no ALPS registration;
@@ -416,7 +473,7 @@ application-settings value in the encrypted handshake. Do not substitute a proto
 configuration shapes the TLS exchange visible to a passive observer; it does not implement Chrome's HTTP/2 response
 to server settings or make the connection indistinguishable from Chrome to the server.
 
-## Trust Anchor IDs
+### Trust Anchor IDs
 
 `TlsClient` advertises the 28 Trust Anchor IDs captured from Chrome `154.0.8037.97`, using Chrome Root Store 39.
 BoringSSL encodes them in extension `0xca34`. The IDs identify 13 roots already present in WaterWall's built-in CA
@@ -432,7 +489,7 @@ The ID advertisement also remains present with `verify: false`; that setting sti
 The ID list and intermediate cache are a paired, pinned profile. Update them together against their source mappings
 and the verifier's supported roots.
 
-## ClientHello Reference Comparison
+### ClientHello Reference Comparison
 
 `waterwall.tlsclient_alpn_unit` compares the complete initial ClientHello with the checked-in capture of Google Chrome
 `154.0.8037.97` on Linux x86-64 with AES hardware. The reference case uses a fresh TCP connection, SNI
@@ -445,7 +502,7 @@ Key-share lengths and the permitted ECH GREASE framing and payload sizes are als
 comparison for that profile; it does not establish resumption, real ECH, later record sizes or timing, or application
 behavior matching Chrome.
 
-## Session Resumption
+### Session Resumption
 
 Each `TlsClient` node keeps a separate, two-session cache in each worker's SSL context. The context fixes the configured
 SNI, ALPN and verification policy. Runtime connections check their SNI and verification mode before using the cache;
@@ -475,7 +532,33 @@ Tickets are collected as TLS input is processed, including tickets encountered d
 drain. Takeover does not wait for a ticket, so resumption is opportunistic. 0-RTT remains disabled and application data
 waits for the handshake to complete.
 
-## Bundled TLS Library
+### Advanced: ECH SNI Trick
+
+:::caution Advanced, specialized behavior
+This feature is not part of ordinary TLS configuration or the normal responsibility of `TlsClient`. Use it only when a
+deployment deliberately coordinates TLS ClientHello construction with compatible packet-level manipulation.
+:::
+
+The optional `ech-sni-trick` setting is incompatible with `ech-config-list`. It accepts a hostname string containing
+between 1 and 255 bytes:
+
+```json
+"ech-sni-trick": "example.net"
+```
+
+When configured, `TlsClient` creates a second, fake ClientHello using that hostname and embeds its bytes as the GREASE
+`encrypted_client_hello` payload of the real outer ClientHello. The outer cleartext SNI remains `settings.sni`.
+
+The embedded fake ClientHello uses the configured `alpns` list in the same order, but disables `x25519mlkem768` to keep
+the payload smaller. This behavior is intended to coordinate with packet-side mechanisms such as `IpManipulator`'s
+packet-splitting trick, keeping the ClientHello bytes hashed by BoringSSL consistent with the bytes placed on the wire.
+
+The value must be a JSON string containing between 1 and 255 bytes; a value outside that range or another JSON type is a
+startup error. The `generateTlsHello:<sni>` tunnel API also applies this setting when it is configured.
+
+## Implementation details
+
+### Bundled TLS Library
 
 The bundled BoringSSL revision is `ac39ea6853833c1f18fd23614091d11855e71752`, selected by Chromium `154.0.8037.97`.
 This dependency pin does not imply complete Chrome fingerprint or application behavior equivalence. Local patches
@@ -487,7 +570,7 @@ prefix-header patch adds the custom SSL APIs. Normal builds do not need Go or Py
 When updating the dependency, port the record-padding patch before the direct-output patch, apply the public prefix
 patch after all API patches, and retain the TLS/Reality and buffer-ownership regression coverage.
 
-## Runtime Behavior
+### Runtime Behavior
 
 On upstream `Init`, `TlsClient`:
 
@@ -502,7 +585,7 @@ On upstream `Init`, `TlsClient`:
 This is why `TlsClient` works naturally before `TcpConnector`: the connector can buffer the ClientHello until the real
 socket connection completes.
 
-## Establishment Semantics
+### Establishment Semantics
 
 WaterWall `Est` is transport establishment, not TLS readiness.
 
@@ -522,7 +605,7 @@ Takeover registers a dedicated owner completion callback with `tlsclientTunnelEn
 leaving later records outside the SSL object. It publishes completion before invoking the callback, retains the exact line,
 and rechecks life and TLS state afterwards. Neither completion nor later Reality activation emits another `Est`.
 
-## Payload Flow
+### Payload Flow
 
 Upstream cleartext:
 
@@ -544,7 +627,7 @@ buffers. Handshakes, pending control flights, write retries and declined reserva
 This is automatic and adds no JSON setting. Buffer ownership and the reservation contract are described in
 [Developer Guide Part 3](../05-devguides/part3-buffers-and-padding.mdx#protocol-storage-and-admitted-batches).
 
-## Tunnel API
+### Tunnel API
 
 `TlsClient` exposes a small API for generating a raw ClientHello buffer:
 
@@ -556,7 +639,7 @@ The generated ClientHello follows the configured `alpns` and `x25519mlkem768` se
 1 and 255 bytes. It always starts fresh, does not consume cached sessions, and retains GREASE behavior rather than
 applying the fixed-origin `ech-config-list`.
 
-## Handshake Takeover API
+### Handshake Takeover API
 
 Internal WaterWall code can use `TlsClient` in handshake-takeover mode:
 
@@ -578,7 +661,7 @@ output share the same upstream transport path and retain callback order.
 This is an internal integration path with no JSON setting. In normal configuration usage, `TlsClient` remains a TLS
 wrapper for the whole line.
 
-## Finish Behavior
+### Finish Behavior
 
 `TlsClient` destroys its own per-line TLS state before propagating `Finish`.
 
@@ -606,7 +689,7 @@ as a truncated TLS shutdown.
 In handshake-takeover mode, `tlsclientTunnelDeinitAfterHandshake()` releases TLS state without closing the WaterWall line
 and the line then continues as raw passthrough.
 
-## Padding
+### Padding
 
 `TlsClient` does not prepend WaterWall payload bytes directly, so it advertises:
 
@@ -616,52 +699,7 @@ required_padding_left = 0
 
 TLS record construction uses the owned output BIO's pooled buffers, preserving the chain's reserved left padding.
 
-## Unsupported Features
-
-This implementation does not support:
-
-- server-side TLS termination
-- dynamic certificate selection
-- TLS over packet lines
-- non-TLS transport wrapping such as WebSocket or HTTP by itself
-
-Use separate WaterWall nodes for those layers.
-
-## Common Mistakes
-
-- Do not expect `TlsClient` to connect to the remote server by itself; put a connector after it.
-- Do not assume WaterWall `Est` means the TLS handshake has completed.
-- Do not use the singular `alpn` key; configure the ordered `alpns` array.
-- When offering multiple application protocols, know the target server's stable selection and configure the preceding
-  node for it. `TlsClient` does not communicate the server's ALPN choice back to that node.
-- Do not disable `verify` for public connections unless you intentionally want to skip certificate validation.
-- Do not disable `x25519mlkem768` if your goal is the closest current Chrome-like handshake.
-
-## Advanced: ECH SNI Trick
-
-:::caution Advanced, specialized behavior
-This feature is not part of ordinary TLS configuration or the normal responsibility of `TlsClient`. Use it only when a
-deployment deliberately coordinates TLS ClientHello construction with compatible packet-level manipulation.
-:::
-
-The optional `ech-sni-trick` setting is incompatible with `ech-config-list`. It accepts a hostname string containing
-between 1 and 255 bytes:
-
-```json
-"ech-sni-trick": "example.net"
-```
-
-When configured, `TlsClient` creates a second, fake ClientHello using that hostname and embeds its bytes as the GREASE
-`encrypted_client_hello` payload of the real outer ClientHello. The outer cleartext SNI remains `settings.sni`.
-
-The embedded fake ClientHello uses the configured `alpns` list in the same order, but disables `x25519mlkem768` to keep
-the payload smaller. This behavior is intended to coordinate with packet-side mechanisms such as `IpManipulator`'s
-packet-splitting trick, keeping the ClientHello bytes hashed by BoringSSL consistent with the bytes placed on the wire.
-
-The value must be a JSON string containing between 1 and 255 bytes; a value outside that range or another JSON type is a
-startup error. The `generateTlsHello:<sni>` tunnel API also applies this setting when it is configured.
-
-## Node Metadata
+### Node Metadata
 
 Source-backed metadata:
 
@@ -678,7 +716,7 @@ This node explicitly disables splice for the entire chain through
 | `layer_group_next_node` | `kNodeLayer4` |
 | `required_padding_left` | `0` bytes |
 
-## Acknowledgements
+### Acknowledgements
 
 WaterWall's fragmentation features draw inspiration from:
 
