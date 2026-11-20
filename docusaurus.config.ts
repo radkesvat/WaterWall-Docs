@@ -15,6 +15,17 @@ if (assistantApiUrl) {
   }
 }
 
+function nodeReferenceSortName(name: string, nodeNames: ReadonlySet<string>): string {
+  if (name === "all-nodes") {
+    return "";
+  }
+
+  const family = name.replace(/(?:Client|Server)$/, "");
+  return nodeNames.has(`${family}Client`) && nodeNames.has(`${family}Server`)
+    ? family
+    : name;
+}
+
 const config: Config = {
   customFields: { assistantApiUrl },
   future: {
@@ -72,6 +83,28 @@ const config: Config = {
       {
         docs: {
           sidebarPath: "./sidebars.ts",
+          sidebarItemsGenerator: ({ defaultSidebarItemsGenerator, docs, ...args }) => {
+            // Use stable node names so English and Persian share the same order.
+            const nodes = docs
+              .filter(({ sourceDirName }) => sourceDirName === "02-noderefs")
+              .map(({ id }) => ({ id, name: id.slice(id.lastIndexOf("/") + 1) }));
+            const nodeNames = new Set(nodes.map(({ name }) => name));
+            const alphabet = new Intl.Collator("en", { sensitivity: "base", numeric: true });
+            const positions = new Map(
+              nodes
+                .map((node) => ({ ...node, family: nodeReferenceSortName(node.name, nodeNames) }))
+                .sort((a, b) => alphabet.compare(a.family, b.family) || alphabet.compare(a.name, b.name))
+                .map(({ id }, index) => [id, index]),
+            );
+
+            return defaultSidebarItemsGenerator({
+              ...args,
+              docs: docs.map((doc) => {
+                const sidebarPosition = positions.get(doc.id);
+                return sidebarPosition === undefined ? doc : { ...doc, sidebarPosition };
+              }),
+            });
+          },
           // Please change this to your repo.
           // Remove this to remove the "edit this page" links.
 
