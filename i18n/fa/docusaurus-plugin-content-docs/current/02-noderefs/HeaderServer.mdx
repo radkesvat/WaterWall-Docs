@@ -19,12 +19,12 @@ Documentation version: 154
 گره چهار کار مختلف انجام می‌دهد:
 
 - header دوبایتی port مخصوص WaterWall را از `HeaderClient` می‌خواند و در `dest_context->port` می‌نویسد.
-- header تک‌بایتی TCP/UDP مخصوص WaterWall را می‌خواند و فقط `dest_context->protocol` را جایگزین می‌کند.
+- header تک‌بایتی TCP/UDP مخصوص WaterWall را می‌خواند و پروتکل مقصد را روی TCP یا UDP اعلام‌شده تنظیم می‌کند.
 - HAProxy PROXY protocol v1 یا v2 را می‌خواند و IPv4 و port اعلام‌شدهٔ کلاینت را در `src_context` می‌نویسد.
 - هنگام `Init` در upstream یک destination port ثابت تنظیم می‌کند.
 
-این گره یک تونل عادی جریان در لایه ۴ است. socket باز نمی‌کند، line بسته‌ای
-نمی‌سازد و `line_t` ایجاد نمی‌کند.
+حالت‌های خواندن header از جریان بایت می‌خوانند. هدر پروتکل، انتقال مقصد خروجی را انتخاب می‌کند. حالت پورت ثابت، جریان بایت و دیتاگرام کامل
+را در هر دو جهت حفظ می‌کند.
 
 <a id="جایگاه-رایج"></a>
 
@@ -108,7 +108,7 @@ TcpListener -> HeaderServer -> TcpConnector
 | `name` | string | نام دلخواه گره که باید در فایل پیکربندی یکتا باشد. |
 | `type` | string | باید دقیقاً `"HeaderServer"` باشد. |
 | `settings` | object | اجباری است و باید `override` داشته باشد. |
-| `next` | string | اجباری است. گره جریان بعدی در لایه ۴ که line مسیریابی‌شده را می‌گیرد. |
+| `next` | string | اجباری است. گره بعدی در لایهٔ ۴ باید نوع payload خروجی این حالت را بپذیرد. |
 
 فیلد لازم داخل `settings`:
 
@@ -126,8 +126,9 @@ TcpListener -> HeaderServer -> TcpConnector
 | --- | --- |
 | `"dest_context->port"` | header دو بایتی upstream مخصوص WaterWall خوانده می‌شود و `dest_ctx.port` تنظیم می‌شود. |
 | `"line->dest_ctx->port"` | نام مستعار سازگار با `"dest_context->port"`. |
-| `"dest_context->protocol"` | header تک‌بایتی TCP/UDP مخصوص WaterWall خوانده می‌شود و فقط `dest_ctx.protocol` جایگزین می‌شود. |
+| `"dest_context->protocol"` | header تک‌بایتی TCP/UDP مخصوص WaterWall خوانده می‌شود و پروتکل مقصد روی TCP یا UDP اعلام‌شده تنظیم می‌شود. |
 | `"line->dest_ctx->protocol"` | نام مستعار `"dest_context->protocol"`. |
+| `"line-mark"` | ۱۶ بایت خام را می‌خواند و پیش از `Init` بعدی، نشان خط را ثبت می‌کند. |
 | `"proxy-protocol->source-fields"` | PROXY protocol v1 یا v2 خوانده می‌شود و `src_ctx.ip` و `src_ctx.port` تنظیم می‌شوند. |
 | `1` تا `65535` | این destination port ثابت در upstream `Init` تنظیم می‌شود. |
 
@@ -161,7 +162,9 @@ TcpListener -> HeaderServer -> TcpConnector
 
 برای transport مقصد مورد نظر فرستنده، آن را با `HeaderClient.data = "dest_context->protocol"` جفت کنید؛ برای transport مبدأ پذیرفته‌شده، از `"src_context->protocol"` استفاده کنید. سرور پیش از مقداردهی اولیهٔ `next` نشانگر را اعمال می‌کند، بدون اینکه آدرس، port یا metadata مبدأ را تغییر دهد.
 
-برای حمل UDP روی TCP همچنان به framing جداگانهٔ datagram، مانند جفت `UdpOverTcp`، نیاز دارید.
+برای مثال، اگر گره بعدی `TcpUdpConnector` باشد، بایت `17` باعث می‌شود سوکت UDP را انتخاب کند. این بایت مشخص نمی‌کند هر دیتاگرام کجا تمام می‌شود.
+
+اگر فقط می‌خواهید `Router` یک شاخه را انتخاب کند، `line-mark` انتخاب مطمئن‌تری است. قانون Router می‌تواند نشان را تطبیق دهد و جریان TCP را به `UdpOverTcpServer` بفرستد تا دیتاگرام‌ها را بازسازی کند. اگر فقط برای انتخاب همین شاخه، پروتکل مقصد را UDP کنید، این گره اتصال را می‌بندد، چون ورودی TCP می‌خواهد.
 
 <a id="خواندن-source-ip-و-port-از-proxy-protocol"></a>
 
@@ -281,15 +284,11 @@ port‌های decodeشده کمتر از `10` رد می‌شوند تا رفتا
 
 ### حالت سربرگ پروتکل WaterWall {#waterwall-protocol-header-mode}
 
-وقتی `override` برابر `"dest_context->protocol"` یا `"line->dest_ctx->protocol"` باشد، `HeaderServer` منتظر یک بایت upstream می‌ماند. مقدار `6` را به‌عنوان TCP و `17` را به‌عنوان UDP می‌خواند و فقط فیلد زیر را جایگزین می‌کند:
+با تنظیم `"override": "dest_context->protocol"` یا نام معادل `"line->dest_ctx->protocol"`، سرور بایت `6` را TCP و بایت `17` را UDP می‌خواند و همان انتقال دقیق را پیش از `Init` بعدی در مقصد ثبت می‌کند. اطلاعات مبدأ، نشانی و پورت مقصد و سایر فراداده‌ها حفظ می‌شوند. هدر پروتکل طول دیتاگرام را حمل نمی‌کند. بایت نامعتبر خط را پیش از `Init` بعدی می‌بندد.
 
-```text
-addresscontextSetOnlyProtocol(lineGetDestinationAddressContext(line), protocol)
-```
+### هدر نشان خط
 
-این نشانگر فقط یک بار برای هر line عادی لایه ۴ خوانده می‌شود. همهٔ metadata مبدأ و آدرس و port مقصد حفظ می‌شوند. سرور پیش از فراخوانی Init بعدی پروتکل را اعمال می‌کند و سپس payload باقی‌مانده را به‌ترتیب عبور می‌دهد. callbackهای payload خالی header را کامل نمی‌کنند. هر مقدار بایت دیگری، line را بدون مقداردهی اولیهٔ `next` می‌بندد.
-
-این header فقط metadata داخلی مسیریابی است و آدرس IP، port یا فیلدهای PROXY protocol ندارد. مرز datagramهای UDP را نیز encode نمی‌کند.
+برای دریافت نشان، `"settings": {"override": "line-mark"}` را با `HeaderClient` دارای `"data": "line-mark"` جفت کنید. سرور ورود همهٔ ۱۶ بایت خام، از جمله بایت صفر، را حتی طی چند تحویل منتظر می‌ماند. سپس پیش از `Init` بعدی نشان خط را تنظیم می‌کند و بایت‌های بعد از هدر را به ترتیب تحویل می‌دهد. حامل TCP می‌ماند. Router می‌تواند با نشان خط جریان قاب‌بندی‌شده را به رمزگشای آن بفرستد.
 
 <a id="حالت-proxy-protocol-source-fields"></a>
 
@@ -420,6 +419,6 @@ callback‌های `UpStreamEst` و `DownStreamInit` برای این گره غی�
 | `can_have_prev` | `true` |
 | `can_have_next` | `true` |
 | `layer_group` | `kNodeLayer4` |
-| `layer_group_prev_node` | `kNodeLayer4` |
-| `layer_group_next_node` | `kNodeLayer4` |
+| `layer_group_prev_node` | در حالت پورت ثابت `kNodeLayer4` و در سایر حالت‌ها `kNodeLayer4Stream` |
+| `layer_group_next_node` | در حالت پورت ثابت یا بازنویسی پروتکل `kNodeLayer4` و در سایر حالت‌ها `kNodeLayer4Stream` |
 | `required_padding_left` | `0` bytes |

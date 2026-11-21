@@ -163,6 +163,7 @@ Unknown fields inside a rule are ignored with a warning. A rule with only
 | `destination-port-range` | two-integer array | Inclusive destination port range. |
 | `destination-domain` | string or array | Destination domain, including sniffed HTTP Host/:authority or TLS/QUIC SNI when root `sniffing` is enabled and domain sniffing is allowed for the line. Supports exact, wildcard, `*`, and `geosite:<list>`. |
 | `network` | string or array | Destination transport flags: `tcp`, `udp`, `icmp`, `packet`. Comma-combined strings like `"tcp,udp"` are accepted. |
+| `line-mark` | string | Exact match against the normal line’s 16-byte routing mark, written as 32 hex digits. |
 | `resolver-dns` | boolean | Resolver-generated logical DNS traffic (`true`) or lines without that marker (`false`); available at Init without sniffing. |
 | `protocol` | string or array | Protocol detected from first payload: `http1`, `tls`, `bittorrent`. |
 | `attributes` | non-empty array | Sniffed boolean attributes. Currently supports `http_upgrade_present`. |
@@ -335,6 +336,30 @@ or the default route permits either transport. An exact offer stays exact,
 including pinned UDP relay and DNS endpoints. The selected branch receives the
 chosen transport in `Init`. The `protocol` condition matches application bytes.
 
+#### `line-mark`
+
+`line-mark` compares the normal line's 16-byte mark with one string of exactly
+32 hexadecimal digits. Uppercase and lowercase digits represent the same bytes.
+An unmarked line skips the rule. A mark of 16 zero bytes is a valid value and
+matches only a line explicitly carrying that value. Router reads the mark during
+routing and leaves it available to later Routers on the same line.
+
+For example, configure HeaderClient with `data: "line-mark"` and the value below
+in `mark`. Configure HeaderServer with `override: "line-mark"` on the receiving
+TCP stream. This rule selects the datagram decoder during `Init` when
+root `sniffing` is disabled and earlier rules permit selection.
+
+```json
+{
+  "line-mark": "0123456789abcdef0123456789abcdef",
+  "network": "tcp",
+  "target": "decode_datagrams"
+}
+```
+
+Here `decode_datagrams` names a configured `UdpOverTcpServer`. It receives the
+length-prefixed TCP stream and publishes UDP to its next node.
+
 #### `resolver-dns`
 
 `resolver-dns` matches the origin marker on UDP and TCP DNS lines created by a
@@ -376,8 +401,7 @@ does not encrypt traffic.
 With no root `sniffing`, the leading DNS rule commits during Init, even though
 the later `protocol: "tls"` rule needs payload. A non-DNS line fails the first
 rule and waits at the TLS rule. Moving the TLS rule above the DNS rule also
-defers DNS branch selection. Router evaluates an earlier payload-dependent rule
-before reaching a later metadata match. A rule combining `resolver-dns` with
+defers DNS branch selection. An earlier payload-dependent rule can defer the decision when its network and line-mark conditions permit a match. A rule combining `resolver-dns` with
 `protocol` or `attributes` also needs payload. Explicit root `sniffing` still
 defers classification so its domain observation or rewrite can run. TCP DNS
 can supply query bytes while Router is waiting to select a branch.
@@ -1095,9 +1119,8 @@ to. Use it for multiport listener routing.
 
 With no root `sniffing`, a matching rule in the leading metadata-only prefix
 initializes its branch during `Init`, even if later rules inspect payload.
-Place the server-first rule in that prefix. An earlier `protocol`/`attributes`
-rule, or explicit root `sniffing`, still waits for upstream bytes and cannot
-establish that path before the client sends.
+Place the server-first rule in that prefix. An earlier eligible `protocol` or
+`attributes` rule, or explicit root `sniffing`, waits for upstream bytes.
 
 ## Advanced behavior
 
@@ -1110,9 +1133,10 @@ selector when it must inspect bytes:
   during `Init`. It skips nonmatches and initializes the first matching branch,
   even if later rules need payload inspection. If every rule is metadata-only
   and none matches, it uses the default `next` immediately.
-- Reaching the first rule containing `protocol` or `attributes` stops this
-  initial scan. Router does not skip it to reach a later metadata match. A rule
-  combining metadata and those conditions still waits for payload.
+- A rule containing `protocol` or `attributes` waits for payload only if
+   its `network` and `line-mark` conditions permit a match. If either condition
+   fails, Router considers the next rule during Init. A metadata-evaluation error
+   closes the line.
 - Explicit root `sniffing` preserves payload-based classification so domain
   observation or rewriting happens before branch Init. Deferred lines buffer
   upstream bytes while deciding.
