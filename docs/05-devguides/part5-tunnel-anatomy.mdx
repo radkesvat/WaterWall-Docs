@@ -451,8 +451,8 @@ shape is correct.
 
 ## `node.c`: Declaring the Node
 
-`node.c` is where a tunnel announces itself to the runtime. Here is
-`TcpListener`'s, which is a good template for an adapter:
+`node.c` declares where a tunnel can appear in a chain. For example,
+`TcpListener` starts a chain and sends a byte stream to its successor.
 
 ```c
 node_t nodeTcpListenerGet(void)
@@ -463,13 +463,13 @@ node_t nodeTcpListenerGet(void)
         .hash_type             = calcHashBytes(type_name, stringLength(type_name)),
         .version               = 0001,
         .createHandle          = tcplistenerTunnelCreate,
-        .flags                 = kNodeFlagChainHead,
+        .flags                 = kNodeFlagChainHead | kNodeFlagSupportsSplice,
         .required_padding_left = 0,
         .layer_group           = kNodeLayer4,
-        .layer_group_next_node = kNodeLayerAnything,
-        .layer_group_prev_node = kNodeLayerAnything,
+        .layer_group_next_node = kNodeLayer4Stream,
+        .layer_group_prev_node = kNodeLayerNone,
         .can_have_next         = true,
-        .can_have_prev         = true,
+        .can_have_prev         = false,
     };
     return node;
 }
@@ -483,8 +483,8 @@ The fields you will set most often (all defined in `ww/objects/node.h`):
 | `createHandle` | The `TunnelCreateHandle` that builds the instance. |
 | `flags` | One or more `node_flags`: `kNodeFlagChainHead`, `kNodeFlagChainEnd`, `kNodeFlagNoChain`, `kNodeFlagSingleton`, `kNodeFlagSupportsSplice`, `kNodeFlagBlocksSplice`. |
 | `required_padding_left` | Left-padding budget this tunnel may prepend into (see [Part 3](./part3-buffers-and-padding.mdx)). |
-| `layer_group` | The layer category this node operates on: `kNodeLayer3` (packet), `kNodeLayer4` (stream), `kNodeLayerAnything` (supports both), or `kNodeLayerNone`. (Note: `kNodeLayerSameAsNext`, `kNodeLayerSameAsPrev`, `kNodeLayerOppositeNext`, and `kNodeLayerOppositePrev` are forbidden for `layer_group` and only allowed in `layer_group_next_node` / `layer_group_prev_node`). |
-| `layer_group_next_node` / `layer_group_prev_node` | Required layer group for next/previous neighbor (`kNodeLayer3`, `kNodeLayer4`, `kNodeLayerAnything`, `kNodeLayerSameAsNext`, `kNodeLayerSameAsPrev`, `kNodeLayerOppositeNext`, `kNodeLayerOppositePrev`, or `kNodeLayerNone`). Note: Opposite flags must be combined with a base layer group (e.g. `kNodeLayerAnything | kNodeLayerOppositePrev`) and cannot appear alone. |
+| `layer_group` | The layer category this node operates on: `kNodeLayer3` (packet), `kNodeLayer4` (stream or datagram), `kNodeLayerAnything` (supports both), or `kNodeLayerNone`. (Note: `kNodeLayerSameAsNext`, `kNodeLayerSameAsPrev`, `kNodeLayerOppositeNext`, and `kNodeLayerOppositePrev` are forbidden for `layer_group` and only allowed in `layer_group_next_node` / `layer_group_prev_node`). |
+| `layer_group_next_node` / `layer_group_prev_node` | Required layer group for next/previous neighbor (`kNodeLayer3`, `kNodeLayer4`, `kNodeLayerAnything`, `kNodeLayerSameAsNext`, `kNodeLayerSameAsPrev`, `kNodeLayerOppositeNext`, `kNodeLayerOppositePrev`, or `kNodeLayerNone`). An L4 side can use `kNodeLayer4Stream` or `kNodeLayer4Datagram`. Opposite flags must be combined with a base layer group (e.g. `kNodeLayerAnything | kNodeLayerOppositePrev`) and cannot appear alone. |
 | `can_have_next` / `can_have_prev` | Whether a neighbor is permitted on each side (`true`/`false`). |
 
 ### Layer Groups & Strict Topology Validation
@@ -492,7 +492,10 @@ The fields you will set most often (all defined in `ww/objects/node.h`):
 During chain startup, `NodeManager` strictly enforces node capabilities and layer rules via `validateTunnelChains` and the bounded monotonic layer constraint solver (`nodeLayerSolveChain`):
 
 - **Capability constraints:** If a node specifies `.can_have_next = false` (or `.can_have_prev = false`), having an adjacent neighbor on that side results in immediate startup failure. Unchained nodes marked with `kNodeFlagNoChain` must not have adjacent neighbors.
-- **Metadata shape validation:** `layer_group` must be concrete (`kNodeLayerNone`, `kNodeLayer3`, `kNodeLayer4`, `kNodeLayerAnything`). Forward relative flags (`kNodeLayerSameAsNext`, `kNodeLayerOppositeNext`) are allowed only in `layer_group_prev_node`, and backward relative flags (`kNodeLayerSameAsPrev`, `kNodeLayerOppositePrev`) are allowed only in `layer_group_next_node`. Opposite flags must always include a base layer group (e.g. `kNodeLayerAnything | kNodeLayerOppositePrev`).
+- **Metadata shape validation:** `layer_group` declares the concrete layer
+  capability. This can be `kNodeLayerNone`, `kNodeLayer3`, `kNodeLayer4`,
+  or `kNodeLayerAnything`, with an optional qualifier on its L4 face.
+  Forward relative flags (`kNodeLayerSameAsNext`, `kNodeLayerOppositeNext`) are allowed only in `layer_group_prev_node`, and backward relative flags (`kNodeLayerSameAsPrev`, `kNodeLayerOppositePrev`) are allowed only in `layer_group_next_node`. Opposite flags must always include a base layer group (e.g. `kNodeLayerAnything | kNodeLayerOppositePrev`).
 - **Edge-domain constraint propagation:** The runtime constructs a directed edge graph representing callback connections between adjacent tunnels, seeds each edge domain (`{L3}`, `{L4}`, or `{L3, L4}`) from participating node and neighbor layer requirements, and propagates `SameAs` and `Opposite` relations monotonically to a fixed point. Any edge domain converging to `{}` immediately fails startup with a clear diagnostic identifying both nodes and sides.
 - **Conditional SameAs vs Strict Opposite:** `SameAs` relative constraints (`kNodeLayerSameAsPrev`, `kNodeLayerSameAsNext`) are conditional: when the referenced side is absent, no equality relation is added, and the node's placement flags (`kNodeFlagChainHead`, `kNodeFlagChainEnd`, `kNodeFlagNoChain`) determine whether boundary placement is permitted. In contrast, `Opposite` constraints (`kNodeLayerOppositePrev`, `kNodeLayerOppositeNext`) are strict and always require both participating sides to be present.
 - **State-held cross-tunnel relations:** For nodes whose callback targets are established dynamically at runtime (such as paired `Bridge` tunnels), tunnels register logical layer relations directly on the chain via `tunnelchainRegisterLayerRelation()`. Registered relations couple the participating edge domains (e.g. equating Bridge A prev edge with Bridge B prev edge, and Bridge A next edge with Bridge B next edge) during solver execution and persist across chain combinations (`tunnelchainCombine()`).
@@ -500,9 +503,58 @@ During chain startup, `NodeManager` strictly enforces node capabilities and laye
   layer requirements on their adjacent edges rather than claiming
   `kNodeLayerAnything`. `ConnectionToPackets` is L4 on `prev` and L3 on `next`;
   `PacketsToConnection` is L3 on `prev` and L4 on `next`; `StreamToPackets` is L4
-  on `prev` and L3 on `next`. `WireGuardClient` fixes L3 on `prev` and L4 on `next`; `WireGuardServer` fixes L4 on `prev` and L3 on its real `next` edge. Connection mode inserts PTC, user binding and UserController before final indexing.
+  on `prev` and L3 on `next`. `WireGuardClient` fixes L3 on `prev` and L4 datagrams on `next`; `WireGuardServer` takes L4 datagrams on `prev` and fixes L3 on its real `next` edge. Connection mode inserts PTC, user binding and UserController before final indexing.
+- **Layer 4 payload kinds:** `kNodeLayer4Stream` carries a byte stream with
+  arbitrary callback boundaries. `kNodeLayer4Datagram` carries one complete
+  datagram per Payload. A side uses the same contract for requests and replies.
+  Bare `kNodeLayer4` allows either and is the canonical spelling for the union.
+  A dual-layer adapter can use `kNodeLayer3 | kNodeLayer4Datagram` for a datagram
+  requirement on its L4 face. A qualifier requires the L4 bit and a present
+  side. A qualified side can retain its coarse `SameAs` relation, for example
+  `kNodeLayer3 | kNodeLayer4Stream | kNodeLayerSameAsPrev` on `next`.
+  In a mixed transform, keep `layer_group` coarse and qualify each side.
+- **Configured L4 neighbors:** Declare the effective side capabilities after
+  parsing settings. A converter declares the input and output kinds separately.
+  After topology expansion, each configured Layer 4 `next` link must have a
+  shared payload kind between the source's `next` side and the target's `prev`
+  side. The check uses the configured endpoints even when a connector inserts
+  a private resolver. A diagnostic identifies the incompatible nodes, sides
+  and kinds. `SameAs`, `Opposite` and registered layer relations still relate
+  the coarse L3/L4 domains. The configuration author chooses compatible
+  framing and datagram sizes across the full path.
+- **External nodes:** Descriptors keep their layout and existing coarse layer
+  values. Bare L4 permits either payload kind.
+
 - **Packet chain classification & bootstrap:** A chain allocates worker packet lines and sets `contains_packet_node = true` only when at least one edge is forced to `{L3}`, a node or edge requirement is fixed to `L3`, or an `Opposite` relation exists. Persistent packet line `Init` messages are queued at runtime only when the chain head's next edge is resolved to `{L3}`.
 - **Failure semantics:** Any validation or solver failure logs a fatal diagnostic (`LOGF`) and records a startup failure (`startupFailureRecord(1)`), causing WaterWall to reject the configuration and perform a clean startup rollback.
+
+#### Choosing an L4 payload kind at Init {#choosing-an-l4-payload-kind}
+
+The destination offer describes what the next stage can receive on this normal
+line. The source protocol records the ingress observation. Before calling out,
+identify which of these jobs your node performs on this particular line.
+
+| Role | What the node must do | Example in the code |
+| --- | --- | --- |
+| Creator | Publish the offer before the first outward `Init`, in either direction. Offer both only when each delivery is a complete datagram and their concatenation is a usable byte stream. | `tcplistenerOnInboundConnected()` publishes exact TCP on every accepted line. |
+| Transparent forwarder | Preserve the offer. While UDP is possible, retain each queued delivery separately, including empty ones. | `domainresolverTunnelUpStreamInit()` leaves a flexible application offer for the next selector. |
+| Selector | Intersect the offer with the allowed kinds, publish the exact choice, and save any mode needed by later callbacks before calling the neighbor. | `encryptionclientTunnelUpStreamInit()` saves the chosen record mode in the line state. |
+| Converter | Validate the incoming kind and publish the kind the output actually produces. Preserve the borrowed line's ingress identity. | `udpovertcpclientTunnelUpStreamInit()` accepts UDP and publishes TCP. Its payload callback supplies the length prefix. |
+| Companion-line creator | Prepare the borrowed line and each owned line independently. Set the companion's offer before its own first `Init`, even if you copied context or allocated it for another worker. | `kcpclientSessionCreate()` selects TCP on the application line and publishes UDP on its new carrier. |
+
+`addresscontextGetTransportOffer()` reads the offer.
+`addresscontextSelectTransport()` returns an eligible kind, preferring TCP on a tie,
+or zero if the intersection is empty. Refuse that line through the initialized
+side before starting incompatible I/O. `addresscontextSetTransportOffer()`
+publishes the result. An assertion immediately before handoff can check a known
+producer's output. A consumer can legitimately receive an incompatible offer.
+
+For example, `PacketsToStream → EncryptionClient → UdpConnector` passes the
+startup check because each adjacent pair shares at least one kind. With
+`PacketsToStream` at its default, it offers both on the live line. Encryption
+chooses TCP and the UDP connector refuses that line. With `"protocol": "udp"`
+on `PacketsToStream`, Encryption produces one record per datagram and the UDP
+connector can send it. See [context handoff](./part2-lines-and-callbacks.mdx#resolve-context-before-propagating-init).
 
 ### Portable profile input hints
 
