@@ -713,6 +713,12 @@ payload cannot overtake them.
 
 ### Shared fallback replay {#shared-fallback-replay}
 
+TlsServer, TrojanServer, VlessServer and VmessServer replay raw fallback on the
+borrowed input line. They preserve its established destination decision and
+source identity. A raw-stream handoff with an unset destination uses TCP.
+HttpProxyServer owns a fresh fallback child. It publishes TCP before branch
+Init, and the branch supplies its backend address and port.
+
 TrojanServer, VlessServer, VmessServer and TlsServer use
 `Internals/FallbackReplay` for retained replay, batch assembly and delayed delivery
 on their borrowed normal client line. The node still selects the branch,
@@ -1417,6 +1423,13 @@ for configuration and concrete cut examples.
 
 ### Client destination preparation before DNS {#client-destination-preparation-before-dns}
 
+TcpConnector and UdpConnector check the incoming offer for their fixed
+transport before replacing the address or port in their private resolver's
+prepare hook. TcpUdpConnector commits the selected transport before calling the
+real entry of its chosen child. A mismatch closes the borrowed line before
+DNS, socket creation or child Init. An exact pin still bypasses the configured
+address and port once.
+
 TcpConnector selects its destination once before DNS and retains that
 destination's socket options and outbound IP range in the resolver's prepare-hook
 storage. Its own Init initializes the ordinary connector line state and consumes
@@ -1446,10 +1459,12 @@ retain input.
 
 When local DNS is enabled, each client wrapper applies its
 configured DNS strategy after selection.
-VmessClient first validates the selected command's security/framing combination,
-address and port, and rejects embedded-NUL or reserved packetaddr domains before
-DNS. Its packetaddr IP-only check remains in Init after DNS can resolve an
-ordinary domain.
+VmessClient restricts the destination offer to the commands supported by its
+configured security and framing before selecting the transport. A flexible
+offer selects UDP when only UDP is usable. A pinned endpoint must supply an
+exact, supported transport. The client validates the address and port and
+rejects embedded-NUL or reserved packetaddr domains before DNS. Its packetaddr
+IP-only check remains in Init after DNS can resolve an ordinary domain.
 
 DNS resolution replaces the destination address while preserving the selected
 protocol flags. When Init reaches the client, read those flags from the prepared
@@ -1458,26 +1473,23 @@ in Init and then reads the same flags. Target preparation leaves exactly one of
 TCP or UDP selected; this is a debug invariant at the client entry, not another
 runtime configuration check.
 
-Do not apply the target settings a second time after DNS: a configured domain
-could overwrite the resolved destination. Protocol-selection warnings and the
-existing TCP fallback for an invalid incoming `dest_context->protocol` belong
-to target preparation and occur there once.
+Apply the target settings once, before DNS, to preserve the resolved address.
+Fixed proxy modes select their transport from the incoming offer. Context mode
+can use either transport and prefers TCP. Exact, pinned logical destinations
+bypass those configured preferences for the first designated consumer.
 
 HttpProxyClient also prepares its configured/dynamic origin in a client-owned
 DomainResolver hook when local resolution is enabled for CONNECT. It is TCP-only:
-validate and reject explicit UDP/ICMP/packet inputs before replacing context;
-an unspecified protocol becomes TCP. Copy dynamic address and port before any
-setter resets their storage. Do not apply the other clients' protocol fallback
-rules here. After DNS, format the numeric origin without reapplying settings,
-before the following connector replaces context with the proxy endpoint.
+select TCP from the incoming offer before replacing context. Copy dynamic
+address and port before any setter resets their storage. After DNS, format the
+numeric origin before the following connector selects its proxy endpoint.
 
 ConnectionToPackets also prepares its destination in its internal DomainResolver
 hook before DNS. Its optional `target-address` and `port` independently replace
 the corresponding incoming fields; omission or their exact `dest_context->...`
 selectors preserve those fields. Preserve the destination protocol during address
-replacement: an exact destination TCP/UDP protocol wins, otherwise infer it from
-the source context. The resolver stores the selected protocol for the bridge's
-Init and uses `only-ipv4`. A configured literal IPv6 address fails configuration;
+replacement. A flexible offer selects TCP. The resolver stores the selected
+protocol for the bridge's Init and uses `only-ipv4`. A configured literal IPv6 address fails configuration;
 an unusable dynamic destination fails only its line. Consume the resolved address
 in Init without applying the configured target again. `source-ipv4` selects the
 virtual packet source, independently of this destination preparation.
@@ -1537,6 +1549,15 @@ state before clearing the active bit. A source-pressure or Est callback may fini
 setup reentrantly; suspended continuations check the active bit before using that
 state again. UDP application, control and relay lines remain active for protocol
 framing, signal mapping and owned-line cleanup.
+
+With UDP enabled, Socks5Server requires a dynamic UDP provider on its preceding
+path. The configuration must route both the TCP control stream and the UDP
+relay datagrams to this server, including in UDP-only service mode. The server
+uses the exact source protocol to identify the role of each normal ingress line.
+Before entering the control parser or checking a UDP relay association, it
+requires the destination offer to include that protocol and publishes the exact
+choice. An incompatible offer finishes the incoming line. The UDP role still
+requires a live dynamic endpoint association.
 
 Socks5Server publishes the requested destination, then dispatches next Init for
 a valid TCP CONNECT request. Once next Init returns and startup pressure replay
