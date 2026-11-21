@@ -1,0 +1,315 @@
+---
+sidebar_position: 9
+title: "SOCKS5 proxy with striped RTMP upload and Reality download"
+sidebar_label: "Striped RTMP and Reality"
+description: "Send SOCKS5 TCP and UDP traffic through a remote Trojan exit, with Mux shared across eight RTMP upload connections and one Reality download connection per active worker."
+---
+
+import Tabs from '@theme/Tabs';
+import TabItem from '@theme/TabItem';
+
+# SOCKS5 proxy with striped RTMP upload and Reality download
+
+Point a local application at the unauthenticated SOCKS5 proxy on
+`127.0.0.1:1080`. The remote WaterWall server opens TCP connections or sends
+UDP datagrams to the destinations requested by the application. Client-to-server
+payload travels over eight striped RTMP connections per Mux parent.
+Server-to-client payload returns over one Reality connection.
+
+```text
+Client
+  TcpUdpListener → Socks5Server → TrojanClient → MuxClient → HalfDuplexClient
+    up   → ConnectionStripeClient → ObfuscatorClient → RtmpClient → TcpConnector (:1935)
+    down → RealityClient → TcpConnector (:8443)
+
+Server
+  TcpListener (:1935) → RtmpServer → ObfuscatorServer → ConnectionStripeServer
+    → HalfDuplexServer (up) → MuxServer → TrojanServer → TcpUdpConnector
+  TcpListener (:8443) → RealityServer → HalfDuplexServer (down, pair: up)
+    Reality cover → TcpConnector ($reality_sni$:443)
+```
+
+The client dials both paths. Their names describe application payload direction.
+Each path also carries its own handshake and control traffic, and the download
+path sends a pairing intro from client to server.
+
+The upload path uses plain RTMP and reversible XOR. An observer on that link
+can recover the tunneled bytes, including the Trojan credential digest. Use
+this configuration on a trusted link. Reality protects the download path.
+
+## Before starting
+
+Install WaterWall with the nodes shown above on both hosts. Use the
+[common `core.json`](./overview.mdx#create-corejson) on each host and save
+the matching tab below as `config.json`. The node configs use
+[WaterWall variables](../../getting-started/tutorial-part3#variables).
+Each unquoted `$name$` inserts the whole JSON value from `variables`.
+
+- On the client, set `server_address` to the remote WaterWall server's
+  reachable address. Set the host and port in `rtmp_url` to match the RTMP
+  endpoint, retaining the `/waterwall` application path.
+- Allow inbound TCP `1935` for RTMP and TCP `8443` for Reality on the server.
+  These TCP carriers also carry the proxied UDP traffic.
+- Set the same `reality_sni` on both hosts. The example uses `example.com`.
+  The server must resolve that name and reach its HTTPS service on TCP `443`.
+  The cover site's certificate must be trusted by the client and valid for
+  that hostname. The client opens its Reality connection to the WaterWall
+  server on `8443`.
+- Replace `trojan_password` and `reality_password` with two separate secrets.
+  Match each secret across the two hosts. Run `openssl rand -hex 24` for
+  Trojan and `openssl rand -hex 16` for Reality, which accepts up to 32
+  UTF-8 bytes.
+
+## Client and server
+
+<Tabs groupId="proxy-side" defaultValue="client">
+<TabItem value="client" label="Client">
+
+```json title="config.json — client"
+{
+  "name": "socks5-rtmp-reality-client",
+  "variables": {
+    "socks_address": "127.0.0.1",
+    "socks_port": 1080,
+    "server_address": "198.51.100.20",
+    "rtmp_port": 1935,
+    "rtmp_url": "rtmp://198.51.100.20:1935/waterwall",
+    "reality_port": 8443,
+    "reality_sni": "example.com",
+    "reality_password": "replace-with-reality-secret",
+    "trojan_password": "replace-with-trojan-password",
+    "mux_connections_per_worker": 1,
+    "stripe_connections": 8,
+    "obfuscator_key": 90
+  },
+  "nodes": [
+    {
+      "name": "socks-listener",
+      "type": "TcpUdpListener",
+      "settings": {"address": $socks_address$, "port": $socks_port$, "nodelay": true},
+      "next": "socks"
+    },
+    {
+      "name": "socks",
+      "type": "Socks5Server",
+      "settings": {"no-auth": true, "connect": true, "udp": true, "ipv4": $socks_address$},
+      "next": "trojan"
+    },
+    {
+      "name": "trojan",
+      "type": "TrojanClient",
+      "settings": {
+        "password": $trojan_password$,
+        "address": "dest_context->address",
+        "port": "dest_context->port",
+        "protocol": "dest_context->protocol"
+      },
+      "next": "mux"
+    },
+    {
+      "name": "mux",
+      "type": "MuxClient",
+      "settings": {
+        "mode": "fixed-connections-count",
+        "per-worker-connections-count": $mux_connections_per_worker$
+      },
+      "next": "half-duplex"
+    },
+    {
+      "name": "half-duplex",
+      "type": "HalfDuplexClient",
+      "settings": {"upload": "up", "download": "down"}
+    },
+    {
+      "name": "up",
+      "type": "ConnectionStripeClient",
+      "settings": {"connections": $stripe_connections$},
+      "next": "obfuscator"
+    },
+    {
+      "name": "obfuscator",
+      "type": "ObfuscatorClient",
+      "settings": {"method": "xor", "xor_key": $obfuscator_key$},
+      "next": "rtmp"
+    },
+    {
+      "name": "rtmp",
+      "type": "RtmpClient",
+      "settings": {"tc-url": $rtmp_url$},
+      "next": "rtmp-connector"
+    },
+    {
+      "name": "rtmp-connector",
+      "type": "TcpConnector",
+      "settings": {"address": $server_address$, "port": $rtmp_port$, "nodelay": true, "fastopen": false}
+    },
+    {
+      "name": "down",
+      "type": "RealityClient",
+      "settings": {"sni": $reality_sni$, "password": $reality_password$, "verify": true},
+      "next": "reality-connector"
+    },
+    {
+      "name": "reality-connector",
+      "type": "TcpConnector",
+      "settings": {"address": $server_address$, "port": $reality_port$, "nodelay": true, "fastopen": false}
+    }
+  ]
+}
+```
+
+</TabItem>
+<TabItem value="server" label="Server">
+
+```json title="config.json — server"
+{
+  "name": "socks5-rtmp-reality-server",
+  "variables": {
+    "listen_address": "0.0.0.0",
+    "rtmp_port": 1935,
+    "reality_port": 8443,
+    "reality_sni": "example.com",
+    "reality_password": "replace-with-reality-secret",
+    "trojan_password": "replace-with-trojan-password",
+    "stripe_connections": 8,
+    "obfuscator_key": 90
+  },
+  "nodes": [
+    {
+      "name": "rtmp-listener",
+      "type": "TcpListener",
+      "settings": {"address": $listen_address$, "port": $rtmp_port$, "nodelay": true},
+      "next": "rtmp"
+    },
+    {
+      "name": "rtmp",
+      "type": "RtmpServer",
+      "next": "obfuscator"
+    },
+    {
+      "name": "obfuscator",
+      "type": "ObfuscatorServer",
+      "settings": {"method": "xor", "xor_key": $obfuscator_key$},
+      "next": "stripe"
+    },
+    {
+      "name": "stripe",
+      "type": "ConnectionStripeServer",
+      "settings": {"max-connections": $stripe_connections$},
+      "next": "up"
+    },
+    {
+      "name": "up",
+      "type": "HalfDuplexServer",
+      "next": "mux"
+    },
+    {
+      "name": "reality-listener",
+      "type": "TcpListener",
+      "settings": {"address": $listen_address$, "port": $reality_port$, "nodelay": true},
+      "next": "reality"
+    },
+    {
+      "name": "reality",
+      "type": "RealityServer",
+      "settings": {"destination": "cover-connector", "password": $reality_password$},
+      "next": "down"
+    },
+    {
+      "name": "down",
+      "type": "HalfDuplexServer",
+      "settings": {"pair": "up"}
+    },
+    {
+      "name": "mux",
+      "type": "MuxServer",
+      "next": "trojan"
+    },
+    {
+      "name": "trojan",
+      "type": "TrojanServer",
+      "settings": {"password": $trojan_password$, "connect": true, "udp": true},
+      "next": "outbound"
+    },
+    {
+      "name": "outbound",
+      "type": "TcpUdpConnector",
+      "settings": {
+        "address": "dest_context->address",
+        "port": "dest_context->port",
+        "nodelay": true,
+        "fastopen": false
+      }
+    },
+    {
+      "name": "cover-connector",
+      "type": "TcpConnector",
+      "settings": {"address": $reality_sni$, "port": 443, "nodelay": true, "fastopen": false}
+    }
+  ]
+}
+```
+
+</TabItem>
+</Tabs>
+
+## How the paths fit together
+
+With SOCKS5 `CONNECT`, Trojan encodes the requested host and port before the
+TCP payload. With `UDP ASSOCIATE`, SOCKS5 returns a local UDP relay and
+Trojan frames the datagrams for carriage over a stream. Placing Trojan before
+Mux keeps each child's destination independent. On the server, `MuxServer`
+separates the children, `TrojanServer` restores their destination context, and
+`TcpUdpConnector` uses that context to select TCP or UDP and reach the target.
+
+`MuxClient` shares one healthy parent per active worker across the worker's
+proxy streams. `HalfDuplexClient` splits each parent into `up` and `down`.
+On `up`, `ConnectionStripeClient` spreads the stream across eight independent
+RTMP sessions. `ObfuscatorClient` applies XOR to each carrier's Stripe frames,
+including JOIN and other control frames, before RTMP wraps them.
+`ObfuscatorServer` uses the same key to restore those frames before
+`ConnectionStripeServer` parses them. All eight sessions for a parent must
+reach the same Stripe server instance before it can deliver the reassembled
+stream.
+
+On `down`, the Reality client verifies the TLS handshake with the cover site
+through `RealityServer`. The server forwards the cover handshake to
+`cover-connector` on TCP `443` and sends authenticated Reality traffic
+through its protected `next`. The two `HalfDuplexServer` nodes share a
+pairing group because `down` names `up` in `settings.pair`. Once both halves
+arrive, `up` feeds the reconstructed Mux stream to `MuxServer` and replies
+return through `down`.
+
+With both workers from the common `core.json` active, expect two healthy Mux
+parents to use 16 RTMP connections and two Reality connections in total.
+
+## Run and check
+
+Start WaterWall on the server and then on the client using the
+[common startup command](./overview.mdx#start-and-test). To verify the remote
+TCP exit, start a temporary HTTP service in a separate terminal on the
+**server**.
+
+```bash
+python3 -m http.server 8080 --bind 127.0.0.1 --directory "$(mktemp -d)"
+```
+
+On the **client**, request that service through SOCKS5.
+
+```bash
+curl --head --noproxy '' --socks5-hostname 127.0.0.1:1080 http://127.0.0.1:8080/
+```
+
+Expect `HTTP/1.0 200 OK` and a `HEAD /` entry in the server's Python log.
+Curl reaches the SOCKS port on client loopback and asks the exit to dial
+port `8080` on server loopback. Stop the temporary HTTP service with Ctrl+C.
+
+For UDP, run the [SOCKS5 UDP echo check](./overview.mdx#check-socks5-udp)
+with the echo service on the server. The client should print
+`SOCKS5 UDP echo received`.
+
+If the SOCKS connection opens but the target stays silent, check both
+carrier paths. Verify the RTMP port, the Stripe connection count and matching
+XOR key on the upload side. On the download side, verify the Reality
+listener, matching Reality secret, and the server's DNS and TLS reachability
+to the cover on `443`. Both paths must reach the same server pairing group.
