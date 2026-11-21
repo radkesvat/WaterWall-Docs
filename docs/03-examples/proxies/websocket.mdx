@@ -2,7 +2,7 @@
 sidebar_position: 7
 title: "VMess over WebSocket and TLS"
 sidebar_label: "WebSocket + TLS"
-description: "Carry a local SOCKS5 proxy through VMess over HTTP/1.1 WebSocket and verified TLS, with complete configurations for both ends."
+description: "Proxy TCP connections and UDP datagrams through VMess over HTTP/1.1 WebSocket and verified TLS, with complete configurations for both ends."
 ---
 
 import Tabs from '@theme/Tabs';
@@ -15,13 +15,14 @@ with TLS. It is useful when you want an HTTP/1.1 WebSocket carrier for a proxy
 connection. WaterWall handles both ends directly.
 
 ```text
-Client: TcpListener -> Socks5Server -> VmessClient -> HttpClient -> TlsClient -> TcpConnector
-Server: TcpListener -> TlsServer -> HttpServer -> VmessServer -> TcpConnector
+Client: TcpUdpListener -> Socks5Server -> VmessClient -> HttpClient -> TlsClient -> TcpConnector
+Server: TcpListener -> TlsServer -> HttpServer -> VmessServer -> TcpUdpConnector
 ```
 
-The application still sees a local SOCKS5 proxy. VMess carries the destination
-and authenticates the user; the HTTP nodes provide WebSocket framing; the TLS
-nodes secure the carrier.
+The application can use SOCKS5 `CONNECT` for TCP or `UDP ASSOCIATE` for UDP.
+VMess authenticates the user and carries the requested destination. For UDP it
+frames each datagram before it enters WebSocket. The remote server decodes
+those frames and sends the datagrams to the destination.
 
 ## Before starting
 
@@ -62,7 +63,7 @@ Save as `config.json` on the client:
   "nodes": [
     {
       "name": "local-socks",
-      "type": "TcpListener",
+      "type": "TcpUdpListener",
       "next": "socks",
       "settings": {
         "address": "127.0.0.1",
@@ -76,7 +77,8 @@ Save as `config.json` on the client:
       "settings": {
         "no-auth": true,
         "connect": true,
-        "udp": false
+        "udp": true,
+        "ipv4": "127.0.0.1"
       }
     },
     {
@@ -87,7 +89,7 @@ Save as `config.json` on the client:
         "uuid": "11111111-2222-4333-8444-555555555555",
         "address": "dest_context->address",
         "port": "dest_context->port",
-        "protocol": "tcp",
+        "protocol": "dest_context->protocol",
         "security": "aes-128-gcm",
         "dns-behaviour": {"resolve": false}
       }
@@ -177,12 +179,12 @@ Save as `config.json` on the server:
       "settings": {
         "uuid": "11111111-2222-4333-8444-555555555555",
         "connect": true,
-        "udp": false
+        "udp": true
       }
     },
     {
       "name": "destination",
-      "type": "TcpConnector",
+      "type": "TcpUdpConnector",
       "settings": {
         "address": "dest_context->address",
         "port": "dest_context->port",
@@ -198,37 +200,38 @@ Save as `config.json` on the server:
 
 ## Use the proxy
 
-Point your application at SOCKS5 `127.0.0.1:1080`, or try:
+Point your application at SOCKS5 `127.0.0.1:1080`. To check TCP, run:
 
 ```bash
-curl --socks5-hostname 127.0.0.1:1080 https://example.com/
+curl --noproxy '' --socks5-hostname 127.0.0.1:1080 https://example.com/
 ```
 
-This example supports TCP CONNECT only. The local SOCKS port is bound to
-loopback, and UDP is disabled on both proxy nodes. The requested destination
-travels in VMess; the WebSocket Host/path and TLS SNI describe the tunnel
-service.
+To check UDP, run the [SOCKS5 UDP echo check](./overview.mdx#check-socks5-udp)
+with the echo service on the remote server. The application negotiates a relay
+port on the client’s loopback interface. VMess carries the requested destination
+over the same WebSocket service on TCP 443.
 
 A compatible external VMess client should use AEAD authentication
 (`alterId: 0`), your UUID, `aes-128-gcm`, WebSocket transport with host
 `tunnel.example.com` and path `/vmess`, and TLS with certificate verification
 enabled. Select HTTP/1.1 WebSocket and disable extra multiplexing extensions.
+For UDP, select native VMess datagram framing (`packet-encoding: "none"` in
+WaterWall).
 
 ## Where Mux would go
 
-For a WaterWall-only pair carrying many TCP connections, the matching placement
-is:
+To share WebSocket connections between requests on a WaterWall-only pair, insert
+Mux around the VMess streams:
 
 ```text
 Client: Socks5Server -> VmessClient -> MuxClient -> HttpClient -> TlsClient -> TcpConnector
-Server: TcpListener -> TlsServer -> HttpServer -> MuxServer -> VmessServer -> TcpConnector
+Server: TcpListener -> TlsServer -> HttpServer -> MuxServer -> VmessServer -> TcpUdpConnector
 ```
 
-Mux then combines VMess streams into shared WebSocket/TLS carriers. Configure
-both ends together; an external VMess client without WaterWall's Mux framing
-cannot use that modified endpoint. Start with the complete
-[SOCKS routing and Mux example](./socks-mux.mdx) for the Mux settings and the
-Router split required when SOCKS also accepts direct UDP.
+VMess frames UDP before Mux, so both TCP and UDP can use the remote exit.
+Configure the matching Mux nodes on both WaterWall hosts. For Mux settings
+and an alternative that routes UDP directly from the client, see the
+[SOCKS routing and Mux example](./socks-mux.mdx).
 
 See [HttpClient](../../noderefs/HttpClient), [HttpServer](../../noderefs/HttpServer),
 [TlsClient](../../noderefs/TlsClient), and [TlsServer](../../noderefs/TlsServer)

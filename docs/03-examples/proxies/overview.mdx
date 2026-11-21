@@ -17,23 +17,19 @@ by local applications. Each tab contains a complete `config.json` for that role.
 
 ## Choose an example
 
-| Example | What it teaches | Application traffic |
+| Example | What it teaches | Where application traffic exits |
 | --- | --- | --- |
-| [Local SOCKS5 and HTTP proxies](./local-proxies.mdx) | Start with a local proxy and connect to the requested destinations. | SOCKS5 TCP/UDP; HTTP proxy TCP |
-| [SOCKS5 routing with Mux](./socks-mux.mdx) | Put a Router after SOCKS5, send TCP through VLESS + Mux + TLS, and keep UDP on a direct branch. | TCP through the remote server; UDP exits locally |
-| [VLESS, VMess, and Trojan over TLS](./protocol-proxies.mdx) | Choose a proxy protocol, credentials, and a verified TLS transport. | TCP |
-| [Proxy over QUIC](./quic.mdx) | Carry VLESS + Mux through WaterWall's encrypted QUIC stream over UDP. | TCP |
-| [Proxy over KCP](./kcp.mdx) | Carry VLESS + Mux + TLS through KCP's reliable stream over UDP. | TCP |
-| [VMess over WebSocket and TLS](./websocket.mdx) | Add WebSocket framing between VMess and TLS. | TCP |
-| [SOCKS5 proxy over RTMPS](./rtmp.mdx) | Carry each VLESS request over its own verified RTMPS connection. Optional Mux shares the carrier across requests. | TCP CONNECT |
+| [Local SOCKS5 and HTTP proxies](./local-proxies.mdx) | Connect directly to the requested destinations. | Local machine (SOCKS5 TCP and UDP, HTTP proxy TCP) |
+| [SOCKS5 routing with Mux](./socks-mux.mdx) | Use a Router to choose the exit by protocol. | TCP from the remote server, UDP from the client |
+| [VLESS, VMess, and Trojan over TLS](./protocol-proxies.mdx) | Choose a proxy protocol, credentials, and a verified TLS transport. | TCP and UDP from the remote server |
+| [Proxy over QUIC](./quic.mdx) | Carry VLESS + Mux through WaterWall's encrypted QUIC stream over UDP. | TCP and UDP from the remote server |
+| [Proxy over KCP](./kcp.mdx) | Carry VLESS + Mux + TLS through KCP's reliable stream over UDP. | TCP and UDP from the remote server |
+| [VMess over WebSocket and TLS](./websocket.mdx) | Add WebSocket framing between VMess and TLS. | TCP and UDP from the remote server |
+| [SOCKS5 proxy over RTMPS](./rtmp.mdx) | Carry VLESS through verified RTMPS, optionally sharing the carrier with Mux. | TCP and UDP from the remote server |
 
 Use one example at a time: several use the same local SOCKS port `1080` and
 remote port `443`. For fixed destination forwarding and reverse connections,
 see [Tunnel Examples](../tunnels/overview.mdx).
-
-For mixed SOCKS5 TCP and UDP, use the Router example: raw UDP datagrams need
-a separate branch from the ordered stream carried by Mux. See the
-[layering and UDP explanation](#keep-the-layers-in-order) below for details.
 
 ## Prepare the configuration
 
@@ -121,18 +117,76 @@ reach that listener.
 For a local SOCKS5 TCP frontend, make a request to a destination you control:
 
 ```bash
-curl --socks5-hostname 127.0.0.1:1080 https://your-origin.example/
+curl --noproxy '' --socks5-hostname 127.0.0.1:1080 https://your-origin.example/
 ```
 
 Replace `your-origin.example` with the real destination. `--socks5-hostname`
-passes the destination hostname to the proxy. This checks TCP; testing SOCKS UDP
-requires a client that supports `UDP ASSOCIATE`. The local-proxy page also shows
-HTTP proxy requests.
+passes the destination hostname to the proxy. This checks SOCKS5 TCP `CONNECT`.
+For HTTP proxy requests, see the [local proxy example](./local-proxies.mdx).
 
 If a connection fails, compare both selected configurations, credentials,
 certificate/SNI, listener transport and port, and final destination reachability.
 Choose QUIC, KCP, or TCP/TLS based on measurements on your path; none is fastest
 on every network.
+
+### Check SOCKS5 UDP
+
+Run this one-shot Python 3 echo service on **the machine where UDP should exit**.
+For the remote proxy recipes, use the server. For the local proxy or the
+Router/Mux split, use the client. The service listens on loopback, so port
+`19090` can stay closed to the network.
+
+```bash
+python3 - <<'PY'
+import socket
+
+with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as echo:
+    echo.bind(("127.0.0.1", 19090))
+    print("Waiting for one UDP datagram", flush=True)
+    payload, peer = echo.recvfrom(65535)
+    echo.sendto(payload, peer)
+PY
+```
+
+Then run this on **the client** with WaterWall running. It uses the examples'
+unauthenticated IPv4 SOCKS5 listener. The TCP connection stays open while the
+client sends a datagram to the relay address and port returned by `UDP ASSOCIATE`.
+The destination inside that datagram, `127.0.0.1:19090`, refers to loopback on
+the exit machine.
+
+```bash
+python3 - <<'PY'
+import socket
+import struct
+
+proxy = ("127.0.0.1", 1080)
+with socket.create_connection(proxy, timeout=5) as control, control.makefile("rb") as replies:
+    control.sendall(bytes.fromhex("05 01 00"))  # SOCKS5, one method, no authentication
+    if replies.read(2) != bytes.fromhex("05 00"):
+        raise SystemExit("SOCKS5 refused unauthenticated access")
+    control.sendall(bytes.fromhex("05 03 00 01 00 00 00 00 00 00"))  # UDP ASSOCIATE
+    reply = replies.read(10)
+    if len(reply) != 10 or reply[:4] != bytes.fromhex("05 00 00 01"):
+        raise SystemExit("Expected a successful IPv4 relay reply")
+    relay = (socket.inet_ntoa(reply[4:8]), int.from_bytes(reply[8:10], "big"))
+
+    # SOCKS UDP header: reserved, fragment number 0, IPv4 address type, target.
+    target = socket.inet_aton("127.0.0.1") + struct.pack("!H", 19090)
+    packet = bytes.fromhex("00 00 00 01") + target + b"WaterWall UDP echo"
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as udp:
+        udp.settimeout(5)
+        udp.connect(relay)
+        udp.send(packet)
+        if udp.recv(65535) != packet:
+            raise SystemExit("Unexpected UDP echo source or payload")
+    print("SOCKS5 UDP echo received")
+PY
+```
+
+The client prints `SOCKS5 UDP echo received` when the datagram makes the round
+trip. On separate machines, starting the echo service only on the expected exit
+also checks which machine sent the UDP request.
+
 ## Keep the layers in order
 
 Each node has a separate job:
@@ -166,8 +220,15 @@ transport options.
 
 ### SOCKS UDP needs its own decision
 
-`Socks5Server` can emit TCP streams and UDP datagrams. When both are enabled,
-place `Router` after SOCKS5 and before the Mux branch:
+For a **remote UDP exit**, the proxy client takes the requested protocol from
+`dest_context->protocol`. VLESS, VMess, or Trojan frames each UDP datagram before
+passing it to the stream transport. On the server, the matching protocol node
+recovers the datagram and `TcpUdpConnector` sends it to the requested UDP
+destination. This also works with Mux between the protocol and transport nodes,
+as in the [QUIC](./quic.mdx) and [KCP](./kcp.mdx) examples.
+
+For a **local UDP exit with remote TCP**, the [routing example](./socks-mux.mdx)
+places `Router` after SOCKS5. Only its TCP branch enters VLESS and Mux:
 
 ```mermaid
 flowchart LR
@@ -179,16 +240,6 @@ flowchart LR
     Router -->|UDP| Direct[UdpConnector: requested destination]
 ```
 
-UDP datagrams can be lost or reordered. Mux carries ordered byte streams and
-does not preserve raw UDP message boundaries, so connecting raw SOCKS UDP
-straight to Mux is not a substitute for a UDP transport. The
-[routing example](./socks-mux.mdx) keeps UDP direct; it leaves from the client
-machine and does not pass through the remote server or its encrypted transport.
-
-To carry application UDP through a stream instead, use an explicit protocol
-that encodes datagrams and a matching decoder. For example, WaterWall's
-[VLESS UDP mode](../../noderefs/VlessClient) supplies that framing; a fixed-target
-UDP tunnel can use [UdpOverTcpClient](../../noderefs/UdpOverTcpClient) and
-[UdpOverTcpServer](../../noderefs/UdpOverTcpServer). Those require their own
-matching topology. The TCP-only QUIC/KCP examples here do not enable SOCKS UDP
-simply because their outer transport uses UDP.
+Mux expects ordered byte streams. Feeding it raw SOCKS datagrams loses their
+boundaries. For a fixed-target UDP tunnel, [UdpOverTcpClient](../../noderefs/UdpOverTcpClient)
+and [UdpOverTcpServer](../../noderefs/UdpOverTcpServer) provide paired datagram framing.

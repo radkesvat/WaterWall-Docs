@@ -2,7 +2,7 @@
 sidebar_position: 5
 title: "Proxy over QUIC"
 sidebar_label: "QUIC transport"
-description: "A local SOCKS5 proxy carried through VLESS, Mux and encrypted QUIC over UDP, with complete client and server configurations."
+description: "Proxy SOCKS5 TCP connections and UDP datagrams through a remote VLESS server using Mux and encrypted QUIC, with complete client and server configurations."
 ---
 
 import Tabs from '@theme/Tabs';
@@ -10,14 +10,15 @@ import TabItem from '@theme/TabItem';
 
 # Proxy over QUIC
 
-Give local applications a SOCKS5 proxy while carrying their TCP connections to
-your server over UDP. VLESS carries each requested destination and authenticates
-the proxy user; Mux shares QUIC transports across those requests. QUIC supplies
-encryption, reliable delivery and congestion control.
+Give local applications a SOCKS5 proxy for TCP connections and UDP datagrams.
+Both reach their requested destinations from the remote WaterWall server. VLESS
+carries each destination and authenticates the proxy user. Mux shares QUIC
+transports across those requests. QUIC supplies encryption, reliable delivery
+and congestion control between the two WaterWall hosts.
 
 ```text
-Client: TcpListener → Socks5Server → VlessClient → MuxClient → QuicClient → UdpConnector
-Server: UdpListener → QuicServer → MuxServer → VlessServer → TcpConnector → requested destination
+Client: TcpUdpListener → Socks5Server → VlessClient → MuxClient → QuicClient → UdpConnector
+Server: UdpListener → QuicServer → MuxServer → VlessServer → TcpUdpConnector → requested destination
 ```
 
 Use the [common setup](./overview.mdx), then save the matching configuration
@@ -27,9 +28,9 @@ certificate and matching private key. The certificate must cover
 `tunnel.example.com`, and its issuer must be trusted by the client. Allow incoming
 **UDP 4433** on the server.
 
-The local SOCKS5 listener accepts TCP `CONNECT` only and binds to `127.0.0.1:1080`.
-Applications use that local proxy; only WaterWall's QUIC traffic crosses the UDP
-transport. This example does not enable SOCKS5 `UDP ASSOCIATE`.
+Applications connect to `127.0.0.1:1080` for SOCKS5 `CONNECT` or `UDP ASSOCIATE`.
+For UDP, the application keeps its TCP control connection open and sends its
+datagrams to the loopback relay port returned by SOCKS5.
 
 ## Client and server
 
@@ -42,7 +43,7 @@ transport. This example does not enable SOCKS5 `UDP ASSOCIATE`.
   "nodes": [
     {
       "name": "local-socks",
-      "type": "TcpListener",
+      "type": "TcpUdpListener",
       "settings": {
         "address": "127.0.0.1",
         "port": 1080,
@@ -56,7 +57,8 @@ transport. This example does not enable SOCKS5 `UDP ASSOCIATE`.
       "settings": {
         "no-auth": true,
         "connect": true,
-        "udp": false
+        "udp": true,
+        "ipv4": "127.0.0.1"
       },
       "next": "vless"
     },
@@ -67,7 +69,7 @@ transport. This example does not enable SOCKS5 `UDP ASSOCIATE`.
         "uuid": "11111111-2222-4333-8444-555555555555",
         "address": "dest_context->address",
         "port": "dest_context->port",
-        "protocol": "tcp",
+        "protocol": "dest_context->protocol",
         "dns-behaviour": {"resolve": false}
       },
       "next": "mux"
@@ -143,13 +145,13 @@ transport. This example does not enable SOCKS5 `UDP ASSOCIATE`.
       "settings": {
         "uuid": "11111111-2222-4333-8444-555555555555",
         "connect": true,
-        "udp": false
+        "udp": true
       },
       "next": "destination"
     },
     {
       "name": "destination",
-      "type": "TcpConnector",
+      "type": "TcpUdpConnector",
       "settings": {
         "address": "dest_context->address",
         "port": "dest_context->port",
@@ -169,10 +171,9 @@ Start the server first, then the client, following the [common startup
 instructions](./overview.mdx#start-and-test) with each machine's own `core.json`
 and `config.json`.
 
-Point a SOCKS5-capable application at `127.0.0.1:1080` on the client. Use the
-[TCP request check](./overview.mdx#start-and-test) with a destination you control
-and confirm the request completes before changing transport or Mux settings.
-This checks SOCKS5 TCP; the example does not enable application UDP.
+Run the [TCP request check](./overview.mdx#start-and-test) from the client.
+Then run the [SOCKS5 UDP check](./overview.mdx#check-socks5-udp) to send a
+datagram through the same QUIC tunnel and receive the reply.
 
 ## Why Mux goes before QUIC
 
@@ -187,9 +188,10 @@ two-worker setup, that means up to four active QUIC parent connections. Children
 on one parent share its ordered stream and loss recovery; this is not one native
 QUIC stream per proxy request.
 
-Do not move Mux onto the raw UDP side of QUIC. Mux needs an ordered, reliable
-stream, while UDP can lose or reorder packets. Here QUIC provides that stream
-before Mux consumes it. For SOCKS5 application UDP, see the
+For SOCKS5 UDP, VLESS prefixes each application datagram with its length before
+Mux puts it on the reliable QUIC stream. The remote VLESS server reads those
+lengths and forwards individual datagrams to the UDP destination. For a
+configuration where UDP exits on the client machine, see the
 [SOCKS5 and Router example](./socks-mux.mdx).
 
 ## Certificates, packet size and compatibility

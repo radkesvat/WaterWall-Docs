@@ -2,7 +2,7 @@
 sidebar_position: 6
 title: "Proxy over KCP and TLS"
 sidebar_label: "KCP transport"
-description: "Complete SOCKS5-to-VLESS proxy configurations with Mux, verified TLS and KCP over UDP, including optional FEC."
+description: "Proxy SOCKS5 TCP connections and UDP datagrams through a remote VLESS server using Mux, verified TLS and KCP, with optional FEC."
 ---
 
 import Tabs from '@theme/Tabs';
@@ -15,8 +15,8 @@ over that stream, then uses Mux to share it across VLESS proxy requests. Your
 applications connect to a local SOCKS5 port and select their own destinations.
 
 ```text
-Client: TcpListener → Socks5Server → VlessClient → MuxClient → TlsClient → KcpClient → UdpConnector
-Server: UdpListener → KcpServer → TlsServer → MuxServer → VlessServer → TcpConnector → requested destination
+Client: TcpUdpListener → Socks5Server → VlessClient → MuxClient → TlsClient → KcpClient → UdpConnector
+Server: UdpListener → KcpServer → TlsServer → MuxServer → VlessServer → TcpUdpConnector → requested destination
 ```
 
 Use the [common setup](./overview.mdx). Save each side as `config.json`, replace
@@ -24,9 +24,10 @@ Use the [common setup](./overview.mdx). Save each side as `config.json`, replace
 Install a trusted certificate for `tunnel.example.com` and its matching private
 key on the server. Allow incoming **UDP 4000**.
 
-The local listener binds to `127.0.0.1:1080` and supports SOCKS5 TCP `CONNECT`.
-Application UDP is disabled. The UDP packets between the WaterWall processes
-carry KCP; they are separate from SOCKS5 `UDP ASSOCIATE` traffic.
+Applications connect to `127.0.0.1:1080` for SOCKS5 `CONNECT` or `UDP ASSOCIATE`.
+For UDP, the application keeps its TCP control connection open and sends
+datagrams to the loopback relay port returned by SOCKS5. The remote WaterWall
+server opens the TCP connection or sends the UDP datagrams to the destination.
 
 ## Client and server
 
@@ -39,7 +40,7 @@ carry KCP; they are separate from SOCKS5 `UDP ASSOCIATE` traffic.
   "nodes": [
     {
       "name": "local-socks",
-      "type": "TcpListener",
+      "type": "TcpUdpListener",
       "settings": {
         "address": "127.0.0.1",
         "port": 1080,
@@ -53,7 +54,8 @@ carry KCP; they are separate from SOCKS5 `UDP ASSOCIATE` traffic.
       "settings": {
         "no-auth": true,
         "connect": true,
-        "udp": false
+        "udp": true,
+        "ipv4": "127.0.0.1"
       },
       "next": "vless"
     },
@@ -64,7 +66,7 @@ carry KCP; they are separate from SOCKS5 `UDP ASSOCIATE` traffic.
         "uuid": "11111111-2222-4333-8444-555555555555",
         "address": "dest_context->address",
         "port": "dest_context->port",
-        "protocol": "tcp",
+        "protocol": "dest_context->protocol",
         "dns-behaviour": {"resolve": false}
       },
       "next": "mux"
@@ -158,13 +160,13 @@ carry KCP; they are separate from SOCKS5 `UDP ASSOCIATE` traffic.
       "settings": {
         "uuid": "11111111-2222-4333-8444-555555555555",
         "connect": true,
-        "udp": false
+        "udp": true
       },
       "next": "destination"
     },
     {
       "name": "destination",
-      "type": "TcpConnector",
+      "type": "TcpUdpConnector",
       "settings": {
         "address": "dest_context->address",
         "port": "dest_context->port",
@@ -184,17 +186,17 @@ Start the server first, then the client, following the [common startup
 instructions](./overview.mdx#start-and-test) with each machine's own `core.json`
 and `config.json`.
 
-Point a SOCKS5-capable application at `127.0.0.1:1080` on the client. Use the
-[TCP request check](./overview.mdx#start-and-test) with a destination you control
-and confirm the request completes before changing transport or Mux settings.
-This checks SOCKS5 TCP; the example does not enable application UDP.
+Run the [TCP request check](./overview.mdx#start-and-test) from the client.
+Then run the [SOCKS5 UDP check](./overview.mdx#check-socks5-udp) to send a
+datagram through the same KCP tunnel and receive the reply.
 
 ## Why this order matters
 
-VLESS encodes the requested destination separately for each Mux child. Mux
-combines those streams; TLS encrypts the combined bytes; KCP carries the TLS
-records reliably over UDP. The server reverses that sequence before making
-one outbound TCP connection for each requested destination.
+VLESS encodes the destination and protocol for each Mux child. For a UDP
+destination, it also prefixes each datagram with its length. Mux combines the
+streams, TLS encrypts the combined bytes, and KCP carries the TLS records
+reliably over UDP. On the server, VLESS recovers each datagram before the
+connector sends it to the requested UDP destination.
 
 KCP provides no encryption or server authentication. Keep the TLS nodes and
 `verify: true` to protect the proxy credentials and payload. TLS needs KCP's
@@ -205,9 +207,8 @@ both peers; it does not turn the enclosed proxy traffic into HTTP.
 Mux also needs reliable, ordered bytes. Its two parent connections per worker
 share the TLS/KCP setup across child requests. Children on the same parent share
 that ordered stream, so loss can delay them together. With the common two-worker
-setup there can be up to four active parent transports. For application UDP from
-SOCKS5, follow the [Router example](./socks-mux.mdx) instead of sending raw datagrams
-into Mux.
+setup there can be up to four active parent transports. For a configuration
+where UDP exits on the client machine, see the [Router example](./socks-mux.mdx).
 
 ## Packet size and optional FEC
 
