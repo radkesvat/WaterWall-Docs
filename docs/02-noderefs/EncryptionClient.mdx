@@ -14,19 +14,20 @@ Sync note: Any change to this file must also be applied to WaterWall/tunnels/Enc
 
 ## Overview
 
-The default is stream mode. Set `packet-mode: true` for complete IPv4 TCP/UDP
-packets; that profile encrypts only the transport payload and has no TLS-like header.
+Normal lines carry a byte stream or complete datagrams. Set `packet-mode: true`
+for complete IPv4 TCP/UDP packets. That profile encrypts only the transport
+payload and uses its own wire format.
 
 `EncryptionClient` is the client-side peer for `EncryptionServer`. It encrypts
 upstream payloads into TLS-like application-data records and decrypts downstream
 records back into plain WaterWall payloads.
 
-Use it when you want AEAD protection inside a WaterWall stream chain without
+Use it when you want AEAD protection inside a WaterWall Layer 4 chain without
 using a full TLS handshake.
 
 :::warning
 `EncryptionClient` is not `TlsClient`. It does not perform a TLS handshake, does
-not verify certificates, and does not provide SNI or ALPN. In stream mode it uses a
+not verify certificates, and does not provide SNI or ALPN. On normal lines it uses a
 TLS-like record shape for encrypted payload framing.
 :::
 
@@ -45,8 +46,12 @@ client side: TcpListener -> EncryptionClient -> TcpConnector
 server side: TcpListener -> EncryptionServer -> TcpConnector
 ```
 
-The client and server settings must match. Any stream tunnels between them must
-preserve the encrypted record bytes end to end.
+The client and server settings must match. Any tunnels between them must
+preserve the encrypted record bytes end to end. Datagram carriers preserve one
+complete record per payload callback. Each normal line selects its framing from the
+destination offer at `Init`. TCP selects the stream codec, UDP selects the
+datagram codec, and an offer of both selects TCP. The node publishes the
+selection before calling its neighbor.
 
 ## Minimal practical example
 
@@ -96,14 +101,14 @@ Top-level fields:
 | --- | --- | --- |
 | `name` | string | User-chosen node name. Must be unique inside the config file. |
 | `type` | string | Must be exactly `"EncryptionClient"`. |
-| `next` | string | Required. The next stream node receives encrypted records. |
+| `next` | string | Required. The next node receives encrypted records. |
 | `settings` | object | Required. Must contain at least `password`. |
 
 Required `settings` fields:
 
 | Field | Type | Description |
 | --- | --- | --- |
-| `password` | non-empty string | Shared secret used to derive the AEAD key. In stream mode with more than one KDF iteration, it must be at most 32 bytes. Must match `EncryptionServer`. |
+| `password` | non-empty string | Shared secret used to derive the AEAD key. On normal lines with more than one KDF iteration, it must be at most 32 bytes. Must match `EncryptionServer`. |
 
 `EncryptionClient` must also have a previous node in the chain. It is not a
 chain head or chain end.
@@ -113,12 +118,12 @@ chain head or chain end.
 | Setting | Type | Default | Description |
 | --- | --- | --- | --- |
 | `packet-mode` | boolean | `false` | Select complete IPv4 TCP/UDP payload encryption, described below. |
-| `algorithm` | string or numeric enum | `chacha20-poly1305` in stream mode; `xchacha20-poly1305` in packet mode | AEAD algorithm. `method` is accepted as a compatibility alias when `algorithm` is absent. |
+| `algorithm` | string or numeric enum | `chacha20-poly1305` on normal lines, `xchacha20-poly1305` in packet mode | AEAD algorithm. `method` is accepted as a compatibility alias when `algorithm` is absent. |
 | `salt` | string | `waterwall-encryption` | Salt input of at most 32 bytes in either mode. Must match `EncryptionServer`. |
 | `kdf-iterations` | integer | `12000` | Key derivation rounds. Must be in range `1` through `1000000`. |
 | `max-frame-size` | integer | `16356` | Maximum plaintext bytes per encrypted record. Must be in range `1` through `16356`. |
 
-Accepted stream algorithm strings:
+Accepted algorithm strings on normal lines:
 
 | Algorithm | Accepted values |
 | --- | --- |
@@ -147,9 +152,28 @@ startup fails.
 `required_padding_left` is `17`, enough for the 5-byte header and 12-byte nonce
 that are prepended before encryption.
 
-If an upstream plaintext payload is larger than `max-frame-size`, the client
+On a stream line, if an upstream plaintext payload is larger than `max-frame-size`, the client
 splits it into multiple encrypted records. Zero-length payload buffers are
 recycled and not forwarded.
+
+### Datagram records
+
+On a datagram line, each admitted plaintext datagram produces one complete
+authenticated record in one carrier payload. An empty datagram produces one
+33-byte record. The plaintext limit is `max-frame-size`. The default limit
+of 16,356 bytes produces a record of at most 16,389 bytes. Budget 33 bytes
+of record overhead when setting the limit for a smaller carrier. The sender
+drops an oversized datagram whole and
+can still send the next valid datagram on the same line.
+
+When stacking encryption layers, size each outer layer for the full record it
+receives from the inner layer. A 1,200-byte datagram produces a 1,233-byte
+inner record, so set the outer layer’s `max-frame-size` to at least `1233`.
+With a smaller setting the chain can start, but the outer layer drops that datagram.
+
+The receiver validates the header, exact record length and authentication tag
+before handing off one plaintext datagram. A truncated record, extra bytes,
+multiple records in one delivery or failed authentication closes that line.
 
 ### Notes and Caveats
 
@@ -168,7 +192,7 @@ recycled and not forwarded.
 Set `"packet-mode": true` explicitly when the node receives complete IPv4
 packets. This selects Layer-3 metadata and a stateless packet transform instead
 of the stream record reader. It is not selected merely because a different part
-of the chain has a packet adapter. The default remains `false` for stream use.
+of the chain has a packet adapter. The default `false` selects normal-line use.
 
 ```json
 {
@@ -179,8 +203,8 @@ of the chain has a packet adapter. The default remains `false` for stream use.
 ```
 
 Packet mode accepts only XChaCha20-Poly1305, which is also its default when
-`algorithm` is omitted. Stream mode continues to use ChaCha20-Poly1305 or
-AES-GCM and rejects XChaCha20-Poly1305. `max-frame-size` belongs to stream mode
+`algorithm` is omitted. Normal lines use ChaCha20-Poly1305 or
+AES-GCM. `max-frame-size` belongs to normal-line mode
 and is rejected in packet mode; packet data is never split into records.
 `password`, `salt` and `kdf-iterations` still select the shared base key. Packet
 mode hashes the password with SHA-256 for its repeated BLAKE2s KDF key, allowing
@@ -281,8 +305,7 @@ sent in the record header; it must be configured consistently on both peers.
 
 ### What It Does
 
-The default is stream mode. `packet-mode: true` selects the separate packet
-profile below; this list describes the default stream behavior.
+This list describes the stream behavior on normal lines.
 
 - Derives one 32-byte AEAD key from `password`, `salt`, and `kdf-iterations`.
 - Encrypts upstream payloads.
@@ -342,7 +365,7 @@ This node explicitly disables splice for the entire chain through
 | node flags | `kNodeFlagBlocksSplice` |
 | `can_have_prev` | `true` |
 | `can_have_next` | `true` |
-| `layer_group` | `kNodeLayer4` in stream mode; `kNodeLayer3` in packet mode |
-| `layer_group_prev_node` | `kNodeLayer4` in stream mode; `kNodeLayer3` in packet mode |
-| `layer_group_next_node` | `kNodeLayer4` in stream mode; `kNodeLayer3` in packet mode |
-| `required_padding_left` | `17` bytes in stream mode; `24` bytes in packet mode |
+| `layer_group` | `kNodeLayer4` on normal lines, `kNodeLayer3` in packet mode |
+| `layer_group_prev_node` | `kNodeLayer4` on normal lines, `kNodeLayer3` in packet mode |
+| `layer_group_next_node` | `kNodeLayer4` on normal lines, `kNodeLayer3` in packet mode |
+| `required_padding_left` | `17` bytes on normal lines, `24` bytes in packet mode |
