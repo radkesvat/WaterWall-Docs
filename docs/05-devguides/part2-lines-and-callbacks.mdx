@@ -701,9 +701,9 @@ reason, on **any** later event for that `line_t`.
 PipeTunnel may dispatch a worker message that was queued before its exact
 destination side sent `Finish` and detached. On an otherwise live pair it
 consumes that message locally, releasing its payload and references without a
-callback. The surviving side still receives its admitted payloads followed by
-the ordered `Finish`. Queue refusal, quiescence and worker shutdown still
-reconcile the entire pair.
+callback. An orderly Finish follows the admitted payloads on the surviving side.
+If that side is paused, apply the [PipeTunnel drain rules](#pipetunnel-worker-handoff).
+Worker-message refusal, quiescence and worker shutdown reconcile the pair.
 
 Also remember the destruction direction: a downstream `Finish` that reaches the
 adapter which created the line will lead to `lineDestroy()`. So after you
@@ -1117,8 +1117,9 @@ before outward callbacks, then obey the ordinary reference and logical-life rule
 
 Preserving pressure does not guarantee an instantaneous stop. A receiver can
 receive both in-flight data and later scheduled output after requesting Pause.
-Each buffering node must enforce its own limits, with bounded retention and
-closure or its documented datagram-drop policy on refusal; an adapter cannot bound
+Except for the [PipeTunnel worker handoff](#pipetunnel-worker-handoff), each
+buffering node must enforce its own limits, with bounded retention and closure
+or its documented datagram-drop policy on refusal. An adapter cannot bound
 data still held inside another node. Limits are node-specific, not a universal
 2 MiB allowance, and several upstream queues may converge on one receiver.
 
@@ -1137,6 +1138,32 @@ The [reverse activation prefix](./reference/protocol-buffers.mdx#reverse-activat
 has a narrow startup exception: ReverseServer hands off that single bounded
 control buffer through Pause to open the destination. It never attaches retained
 application bytes to the exception; their independent drain still waits for Resume.
+
+#### PipeTunnel worker handoff
+
+For a cross-worker pair, each receiving worker records its consumer's Pause
+before relaying it to the producer. Pair creation preserves an outstanding
+Pause from the physical transport on the borrowed line. The new companion's
+consumer establishes pressure independently during or after Init.
+While submitting a payload, the sending
+worker can observe that pressure and pause its producer immediately. On the
+receiving worker, each later payload for that direction joins a FIFO, including
+payload posted before Pause. The FIFO owns each buffer until delivery or cleanup
+and preserves its ordinary or splice-backed representation.
+
+On the consumer's Resume, replay the FIFO in order. A new Pause during replay
+stops further handoffs. Relay Resume to the producer once the FIFO is empty and
+the consumer is ready. Messages still in the worker inbox check the same state
+when they run. The opposite direction has an independent FIFO and pause state.
+
+These handoff FIFOs have no configured per-pair or aggregate retention limit.
+A slow receiving worker can accumulate a burst before the producer observes
+Pause. Already-admitted batches can continue to arrive during Pause. If
+BufferQueue cannot represent an insertion, close the affected pair. An orderly
+Finish behind parked payload keeps that payload on the surviving receiver for
+delivery under its own Pause. Finish that side after replay completes, or close
+it at the 30-second drain deadline if replay stalls. If the receiver itself
+finishes or its worker stops, release the remaining buffers on that worker.
 
 #### Completing an admitted input batch
 
@@ -1164,10 +1191,11 @@ the Resume that allows its producer to complete it.
 
 #### Receiver tolerance and FIFO ownership
 
-A receiver requesting Pause must retain finite admission headroom and tolerate
-further delivery up to its hard limits. Pause does not guarantee that scheduled
-middle-node output stops. Specify the supported batch envelope, transformation
-expansion, queue high/low watermarks, hard limits and overflow policy. Count retained bytes
+Except for the PipeTunnel FIFO described above, a receiver requesting Pause
+must retain finite admission headroom and tolerate further delivery up to its
+hard limits. Pause does not guarantee that scheduled middle-node output stops.
+Specify the supported batch envelope, transformation expansion, queue high/low
+watermarks, hard limits and overflow policy. Count retained bytes
 and entries or allocation charge; tiny and empty datagrams must consume a finite
 budget. One coalesced stream input can decode into many datagrams, so a payload-byte
 limit alone is not a complete resource bound.
