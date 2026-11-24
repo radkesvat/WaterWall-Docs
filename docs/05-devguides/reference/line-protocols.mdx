@@ -605,14 +605,15 @@ still destroys its line; HttpServer must never retain dirty state until a later
 callback on a logically dead line.
 
 After response DATA and END_STREAM reach the previous tunnel, destroy HTTP
-state and propagate Finish. The TCP adapter follows the
-[TCP close policy](#tcp-socket-close-lingering).
+state and propagate Finish.
 
 The first service-side Finish starts a fixed `close-drain-timeout-ms` deadline
 (default 30000, integer range 1..86400000) on the line's owner worker. Incoming
 traffic, flow-control credit and response progress never refresh it. Expiry
 discards remaining HTTP output, destroys local state and finishes only the
 still-live carrier direction; the finished service receives no more callbacks.
+On handoff or expiry, the TCP adapter applies the
+[TCP close policy](#tcp-socket-close-lingering) to the writes it has accepted.
 Response completion, carrier closure, peer stream cancellation and owner shutdown
 cancel this wait and detach its timer. Do not wait to emit END_STREAM on a
 canceled stream. The deadline applies to ordinary and WebSocket HTTP/2, including
@@ -772,34 +773,54 @@ and then trust the adapter to flush. Do **not** keep protocol state alive just t
 
 ### TCP socket close lingering {#tcp-socket-close-lingering}
 
-On `Finish`, both `TcpListener` and `TcpConnector` must use ordinary full TCP
-close by default, regardless of chain composition, protocol or read pressure.
-The adapter hands accepted writes to WIO, which can finish pending writes before
-closing the socket. On Linux, unread peer data at close can cause a reset and
-truncate outgoing data that the kernel has accepted.
+On Linux, closing a TCP socket with unread or late input can send a reset and
+truncate output that the kernel already accepted. This can happen during an
+HTTP/2 download when the client sends late `WINDOW_UPDATE` frames, and it can
+also happen on a plain TCP tunnel. Bounded linger reduces this risk by sending
+FIN after the accepted writes and briefly discarding peer input. Each detached
+socket temporarily uses a file descriptor, kernel buffers and worker I/O.
+See [RFC 9293, TCP closing](https://www.rfc-editor.org/rfc/rfc9293.html#section-3.6.1)
+and [RFC 9113, HTTP/2 WINDOW_UPDATE](https://www.rfc-editor.org/rfc/rfc9113.html#section-6.9).
 
-**Only a positively detected fallback peer write shutdown may request bounded
-socket linger.** On clean EOF from a fallback connection, `TcpConnector` uses
-Linux TCP diagnostics to check the peer socket in its own network namespace.
-If the peer has shut down only its write side, the connector marks the exact
-line with `kLineCloseLingerPeerWriteShutdown` before propagating Finish.
-Without that evidence, including on platforms without this diagnostic, the
-default applies. A node mapping the same fallback connection onto a companion
-line may explicitly propagate the existing marker there. A node reusing a
-fallback line for a protected branch must clear the marker first.
+`TcpListener` and `TcpConnector` each read the JSON boolean
+`settings.linger-on-normal-close` once per node. The setting defaults to `true`
+and controls only that node's sockets. In `TcpConnector` it applies across all
+destinations. Apply this policy when the adapter receives `Finish` on a healthy,
+established socket and the owner worker can still admit a detached drain,
+including when reads were paused for flow control.
 
-Protocol nodes can complete their own bounded work before forwarding Finish.
-For example, HTTP/2 can wait for flow-control credit and hand off its final
-`END_STREAM` frame. The TCP adapter still applies the rule above when it
-receives Finish. If a late `WINDOW_UPDATE` is unread at socket close, the
-remote peer can receive a truncated upload or response even after this handoff.
+| Exact line at the closing adapter | Omitted or `true` | `false` |
+| --- | --- | --- |
+| Ordinary connection | Bounded linger | Ordinary TCP close |
+| Confirmed fallback peer write shutdown, including a propagated marker | Bounded linger | Bounded linger |
+| Fallback with a full close or without positive half-close evidence | Ordinary TCP close | Ordinary TCP close |
 
-For the marked line, `Internals/TcpAdapterCommon` can detach the socket on its
-owner worker while normal dispatch is open. It allows up to
-`WIO_DEFAULT_CLOSE_TIMEOUT` (60000 ms) for accepted writes, then shuts down
-writes and reads and discards peer input until EOF, 5000 ms of inactivity or
-30000 ms total after write shutdown. Errors and worker shutdown can end this
-sooner. Only the socket and its idle-table entry survive the line's retirement.
+Ordinary TCP close uses WIO, which can flush accepted writes. Bounded linger is
+available on Linux. Other platforms accept the setting and use ordinary close.
+A pending connect, socket EOF or error stays on its existing close path. After
+backend EOF, a still-live client-facing socket applies the table independently.
+
+The Linux diagnostic for fallback is narrower than Linux linger support. On
+clean fallback EOF, `TcpConnector` can confirm that the peer shut down only its
+write side by inspecting the peer socket in the same network namespace. A FIN
+alone cannot distinguish this from a full peer close. The connector sets
+`kLineCloseLingerPeerWriteShutdown` on the exact line before propagating
+`Finish`. A node mapping that fallback connection to a companion line may
+propagate the marker. Clear it when the fallback branch is retired and the line
+is reused for another branch.
+
+The adapter detaches callbacks from line state and hands accepted writes to WIO
+before offering the socket to `Internals/TcpAdapterCommon`. On `Finish`,
+`TcpListener` destroys its owned line and `TcpConnector` retires its state on
+the borrowed line. The detached drain holds no line reference and discards late
+input locally without tunnel callbacks. It gives accepted writes up to
+`WIO_DEFAULT_CLOSE_TIMEOUT` (60 seconds) to flush. If the queue drains in time,
+it calls `shutdown(SHUT_WR)`. The peer can see EOF before the descriptor is
+released. After write shutdown, the socket closes after 5 seconds without input
+or after 30 seconds total even if input continues. Peer EOF, socket errors and
+worker stop can end the drain early. Worker quiescence closes admission to new
+drains, and owner-worker stop disposes of existing drains through the idle table
+without waiting for their deadlines.
 
 ### TCP adapter idle deadlines {#tcp-adapter-idle-deadlines}
 
@@ -1025,8 +1046,9 @@ A full application Finish removes its association link immediately. The server
 destroys its service line before returning. If the carrier survives with normal
 admission open, release the detached application's carrier read hold so ACKs
 for already accepted bytes can arrive. Preserve any independent holds. Carrier
-Finish aborts the session and ends that drain. TCP close linger is limited to
-confirmed fallback half-closes. See [GNS port admission and shutdown](../part7-shutdown-and-signals.mdx#gns-port-admission-and-shutdown).
+Finish aborts the session and ends that drain. A TCP carrier adapter handles its
+accepted writes under the [TCP close policy](#tcp-socket-close-lingering).
+See [GNS port admission and shutdown](../part7-shutdown-and-signals.mdx#gns-port-admission-and-shutdown).
 
 ### KCP node ownership, sessions and pressure {#kcp-node-ownership-sessions-and-pressure}
 
@@ -1226,7 +1248,7 @@ Handoff of the final chunk releases that local hold, subject to received pressur
 for the same producer. A direct TCP source can then report EOF. Each carrier
 node owns the output it accepts. When RTMP hands a chunk to TLS, TLS owns its
 ciphertext until handoff to the next node. A TCP adapter handles its accepted
-writes under its [ordinary close policy](#tcp-socket-close-lingering).
+writes under its [TCP close policy](#tcp-socket-close-lingering).
 
 An application consumer's Pause holds decoded output in the bounded receive
 queue. Active carrier reads can remain paused while reverse writes fit their
@@ -2005,6 +2027,14 @@ Finish; helper insertion must not be bypassed. Detach the child, branch entry an
 worker inventory before closing it, and destroy that exact owned line before
 returning from its Finish handler. Retain the session and exact lines across
 reentrant calls; physical references do not keep associations logically alive.
+
+When first-request authentication selects fallback, mark the borrowed client line
+as fallback immediately. Mark the owned fallback child before calling branch
+`Init` so its TCP connector can check for peer write shutdown. When that child
+sends `Finish` with `kLineCloseLingerPeerWriteShutdown`, copy the marker to the
+client line before destroying the child. The marker survives any pause while the
+proxy drains accepted response bytes. Once `Finish` reaches the client-facing
+adapter, it applies the [TCP fallback close policy](#tcp-socket-close-lingering).
 
 For an admitted CONNECT request, queue one `200 Connection Established` after
 child Init returns on the live association. Reconcile startup pressure before
