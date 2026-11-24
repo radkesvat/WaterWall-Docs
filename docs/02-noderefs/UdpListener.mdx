@@ -14,9 +14,9 @@ Sync note: Any change to this file must also be applied to WaterWall/tunnels/Udp
 
 ## Overview
 
-`UdpListener` is a UDP server adapter. It binds a local UDP address and port,
-receives inbound datagrams, groups them by remote peer, creates one WaterWall
-line for each peer, and sends payloads upstream to the next node.
+`UdpListener` is a UDP server adapter. It receives datagrams on a local address
+and port. A static listener groups them by the remote and local endpoints and
+forwards each line's payloads upstream to the next node.
 
 
 This node is normally used as the beginning of a UDP stream-style chain.
@@ -321,28 +321,31 @@ ordinary socket-manager peer table.
 - Receives inbound UDP datagrams through WaterWall's socket manager.
 - Applies optional listener filters such as `whitelist`, `blacklist`, and
   balance groups.
-- Creates one WaterWall line per remote peer address and port.
+- Tracks static lines by the remote and local endpoint pair in the selected tunnel.
 - Sends inbound datagrams upstream as payloads to the next node.
 - Sends downstream payloads back to the remembered peer address.
 - Tracks peer lines with UDP idle timeouts.
 
-UDP itself is connectionless, but `UdpListener` gives the rest of the chain a
-stable line abstraction per peer.
+### Static Listener Lines {#per-peer-line-model}
 
-### Per-Peer Line Model
+The first accepted datagram creates a line in the selected tunnel. It records
+the peer IP and source port, local destination IP and logical listener port.
+Datagrams with the same endpoint pair and reply source reuse that line until
+it expires. A client sending from one socket to two unicast
+addresses on a wildcard listener gets two lines. Each replies from the address
+the client contacted.
 
-UDP has no transport connection, so `UdpListener` builds a pseudo-connection
-model for the chain.
+For broadcast or multicast, listener selection and routing use the packet's
+destination, and replies use a local unicast source. If datagrams between the
+same endpoints have different preferred reply IPs, the listener keeps separate
+lines so a delayed reply retains its source. An IPv4 datagram received through
+a dual-stack `::` listener has an IPv4 destination in `dest_ctx`, so IPv4 Router
+rules can match it.
 
-For each unique remote peer address and port on a listening socket:
-
-1. A new WaterWall line is created on the first accepted datagram.
-2. The peer address is stored in listener line state.
-3. Later datagrams from the same peer reuse the same line until it expires.
-4. Downstream payloads on that line are sent back to the remembered peer.
-
-This lets later stream-style nodes work with UDP traffic using normal WaterWall
-line callbacks.
+The `iptables` port-range backend can rewrite the destination IP before the
+socket receives the packet. WaterWall uses the delivered IP and attempts to
+recover the original destination port as the logical listener port. If that
+lookup fails, it uses the socket's bound port.
 
 ### Data Flow
 
@@ -358,8 +361,9 @@ Chain to peer:
 previous downstream payload -> UdpListener -> UDP send to remembered peer
 ```
 
-The line source context is filled from the peer socket address and marked as
-UDP.
+On a static line, the UDP source context carries the peer IP and logical
+listener port. The peer's actual source port is in `routing_context.peer_source_port`.
+The UDP destination context carries the local destination IP and logical listener port.
 
 ### Establishment Semantics
 
