@@ -4,138 +4,185 @@ title: WireGuardServer
 
 # WireGuardServer
 
-WireGuardServer authenticates encrypted datagrams from `prev`. Required `mode`
-selects raw inner packets or individually managed connections toward `next`.
-سرور هنگام `Init`، UDP را از پیشنهاد انتقال مقصد ورودی انتخاب می‌کند.
-The UDP ingress is an ordinary UdpListener; endpoints are learned only from
-cryptographically authenticated handshake/data messages.
+`WireGuardServer` دیتاگرام‌های رمزگذاری‌شدهٔ WireGuard را احراز هویت
+می‌کند و پاسخ‌های رمزگذاری‌شده را از همان مسیر ورودی فعال برمی‌گرداند.
+تنظیم الزامی `mode` تعیین می‌کند چه نوع ترافیکی به گره بعدی تحویل داده شود.
+
+## انتخاب حالت {#choose-a-mode}
+
+| | `packet` | `connection` |
+| --- | --- | --- |
+| کاربرد | تحویل بسته‌های IP داخلی به رابط TUN یا گره دیگری در لایهٔ ۳. | باز کردن اتصال‌های TCP و نشست‌های UDP خروجی برای حساب‌های احراز هویت‌شده. |
+| پیکربندی همتا | یک تا ۳۲ همتای ثابت با محدوده‌های مجاز بدون هم‌پوشانی. کلید از پیش مشترک اختیاری است. | حساب‌ها از یک گره نام‌دار `AuthenticationClient` تأمین می‌شوند. همتای ثابت و کلید از پیش مشترک پذیرفته نمی‌شوند. |
+| ترافیک داخلی | بسته‌های خام IP. نمونه از IPv4 همراه با `TunDevice` استفاده می‌کند. | TCP و UDP روی IPv4 بدون قطعه‌قطعه‌شدن. IPv6، ‏ICMP و سرهم‌کردن قطعه‌ها پشتیبانی نمی‌شوند. |
+| شبکهٔ میزبان | در صورت استفاده از رابط TUN، مسیرها، انتقال بسته‌ها و NAT لازم را سیستم‌عامل مدیریت می‌کند. | گره خروجی برای هر جریان سوکت باز می‌کند. این مسیر در سمت سرور به TUN یا NAT نیاز ندارد. |
+
+## جایگاه معمول {#typical-placement}
 
 ```text
-UdpListener -> WireGuardServer(mode=packet) -> TunDevice
-UdpListener -> WireGuardServer(mode=connection) -> TcpUdpConnector
+Packet mode     UdpListener -> WireGuardServer(mode=packet) -> TunDevice
+Connection mode UdpListener -> WireGuardServer(mode=connection) -> TcpUdpConnector
 ```
 
-Both paths carry traffic in both directions. The packet consumer may be any
-compatible L3 node; the connection consumer may be a compatible router/transform
-leading to an outbound adapter. The node never changes host routes or NAT.
+در هر دو مسیر، پاسخ‌ها در جهت معکوس حرکت می‌کنند. سرور هنگام مقداردهی
+اولیه UDP را از پروتکل‌های پیشنهادی مسیر ورودی انتخاب می‌کند و آدرس و
+درگاه بیرونی همتا را از ترافیک احراز هویت‌شدهٔ WireGuard می‌آموزد. در
+حالت بسته، هر گره سازگار لایهٔ ۳ می‌تواند بسته‌ها را دریافت کند. در حالت
+اتصال، می‌توان یک مسیریاب یا گره تبدیل سازگار را پیش از گره خروجی قرار
+داد. برای اتصال به مقصد درخواستی، آدرس و درگاه گره خروجی را روی
+`dest_context->address` و `dest_context->port` تنظیم کنید.
 
-Packet mode uses static peers, at most 32 active peers. Peer objects require
-`publickey` and `allowedips` and accept optional `presharedkey` and
-`persistentkeepalive` as on WireGuardClient. Omit peer endpoints: authenticated
-traffic supplies the return carrier. All peer ranges must be non-overlapping.
-Decrypted source addresses must belong to the authenticated peer's allowed
-range. Return destinations select the matching peer.
+## نمونهٔ عملی حداقلی {#minimal-practical-example}
 
-In either mode, outbound traffic can restart an expired session while the
-authenticated peer's carrier is live. During the handshake the server holds
-the first inner packet for up to 90 seconds, with a 128 KiB allocation limit
-per peer. Further packets for that peer can be lost while it waits. If the
-binding and carrier remain current, the server sends the held packet once it
-has a usable key.
+### حالت بسته {#packet-mode}
+
+این گره را بعد از یک `UdpListener` قرار دهید که `next` آن `vpn` است.
+گره `tun` را به‌صورت یک [TunDevice](./TunDevice.mdx) با نشانی IP داخلی
+تعریف کنید. برای استقرار، کلیدهای نمونه را جایگزین و محدودهٔ مجاز هر همتا
+را تنظیم کنید.
 
 ```json
 {
-  "nodes": [
-    {"name":"udp","type":"UdpListener","settings":{"address":"0.0.0.0","port":51820},"next":"vpn"},
-    {"name":"vpn","type":"WireGuardServer","settings":{
-      "mode":"packet","privatekey":"EBJOHctLU2w8uteyTE+WU0hruB09Ub0vwVS+Gt9wAls=",
-      "peers":[{"publickey":"dDUfRvZSDy8jZBsB4kQflTO+iwlLbR+jgb840fumqUM=","allowedips":"10.50.0.4/30"}]
-    },"next":"tun"},
-    {"name":"tun","type":"TunDevice","settings":{"device-name":"wg-inner","device-ip":"10.50.0.1/24"}}
-  ]
+  "name": "vpn",
+  "type": "WireGuardServer",
+  "settings": {
+    "mode": "packet",
+    "privatekey": "EBJOHctLU2w8uteyTE+WU0hruB09Ub0vwVS+Gt9wAls=",
+    "peers": [
+      {
+        "publickey": "dDUfRvZSDy8jZBsB4kQflTO+iwlLbR+jgb840fumqUM=",
+        "allowedips": "10.50.0.4/30"
+      }
+    ]
+  },
+  "next": "tun"
 }
 ```
 
-Configure the TunDevice platform settings as described in its node reference.
-Install forwarding, OS routes and any required NAT for the inner subnet using
-your deployment's normal network administration. Such host changes are separate
-from the WireGuard node.
+برای فایل‌های کامل، مسیریابی میزبان و آزمون ارتباط، راهنمای
+[تونل بسته‌ای WireGuard بین دو سمت](../03-examples/tunnels/wireguard.mdx)
+را ببینید.
 
-Connection mode requires `auth-client-node-name`, referencing a separately
-configured AuthenticationClient service. Static `peers` and PSK settings are
-rejected in this mode. Account WireGuard public keys follow AuthenticationClient's existing credential
-convention: the private key is the 32-byte SHA-256 digest of the account password,
-and the public key is its X25519 public key. Encode the digest in Base64 for the
-client's `privatekey`. `wireguard-allowed-ips` contains the account's unique CIDR; account ids are durable and
-nonzero. Authenticated mode supports IPv4 accounts. The account collection
-rejects overlapping ranges before publication.
+### حالت اتصال {#connection-mode}
+
+این گره را بعد از یک `UdpListener` قرار دهید که `next` آن `vpn` است.
+در همان پیکربندی، `outbound` را به‌صورت `TcpUdpConnector` و `accounts`
+را به‌صورت [AuthenticationClient](./AuthenticationClient.mdx) تعریف کنید.
+کلاینت احراز هویت با نام سرویس و رمز خودش به
+[AuthenticationServer](./AuthenticationServer.mdx) متصل می‌شود. جست‌وجوی
+حساب از طریق سرویسی مستقل از مسیر ترافیک انجام می‌شود.
 
 ```json
 {
-  "name":"vpn","type":"WireGuardServer","settings":{
-    "mode":"connection",
-    "privatekey":"EBJOHctLU2w8uteyTE+WU0hruB09Ub0vwVS+Gt9wAls=",
-    "auth-client-node-name":"accounts"
-  },"next":"outbound"
+  "name": "vpn",
+  "type": "WireGuardServer",
+  "settings": {
+    "mode": "connection",
+    "privatekey": "EBJOHctLU2w8uteyTE+WU0hruB09Ub0vwVS+Gt9wAls=",
+    "auth-client-node-name": "accounts"
+  },
+  "next": "outbound"
 }
 ```
 
-Configure `accounts` as an AuthenticationClient with its ordinary named-service
-credentials and transport to AuthenticationServer. `outbound` is a
-TcpUdpConnector with destination context settings. The private payload pipeline
-is built automatically before indexing:
+برای هر حساب یک شناسهٔ پایدار و غیرصفر و یک CIDR یکتای IPv4 در
+`wireguard-allowed-ips` تعیین کنید. کلاینت برای کلید خصوصی WireGuard
+از کدگذاری Base64 چکیدهٔ خام ۳۲ بایتی SHA-256 گذرواژهٔ حساب استفاده
+می‌کند. سرویس احراز هویت کلید عمومی متناظر X25519 را به دست می‌آورد.
+پایگاه حساب‌ها محدوده‌های هم‌پوشان را رد می‌کند. نمونهٔ دو سمت و فایل حساب
+در [راهنمای WireGuard با احراز هویت](../03-examples/tunnels/wireguard-connection.mdx)
+آمده است.
 
-```text
-WireGuardServer -> PacketsToConnection -> user binding -> UserController -> outbound
-```
+## تنظیمات {#settings}
 
-The real server-to-PTC edge is L3. AuthenticationClient is a service reference,
-not part of this payload path. Inner TCP connections and UDP associations receive
-the resolved stable account handle and owned profile before outbound Init.
-Unknown, stale, disabled or expired identities cannot pass anonymously.
-PTC supports unfragmented IPv4 TCP/UDP here; IPv6, ICMP and fragment reassembly
-are not connection-mode features.
+هر دو حالت به یک `next` نام‌دار نیاز دارند. کلیدهای خصوصی، عمومی و از
+پیش مشترک با قالب استاندارد Base64 برای ۳۲ بایت نوشته می‌شوند. این قالب
+۴۴ نویسه دارد و به یک `=` ختم می‌شود.
 
-UserController applies connection limits, shared account bandwidth, traffic
-quotas, expiry/disable and first-use accounting to inner payload. TCP uses stream
-shaping and UDP preserves datagrams. WireGuard handshakes, carrier lines,
-keepalives and encrypted overhead consume no inner connection or traffic quota.
+| تنظیم | حالت | کاربرد |
+| --- | --- | --- |
+| `mode` | هر دو | الزامی است. مقدار `"packet"` یا `"connection"` را انتخاب کنید. |
+| `privatekey` | هر دو | کلید خصوصی محلی WireGuard، الزامی. |
+| `peers` | بسته | آرایهٔ الزامی با ۱ تا ۳۲ همتا. در حالت اتصال آن را حذف کنید. |
+| `auth-client-node-name` | اتصال | نام الزامی گره `AuthenticationClient`. در حالت بسته آن را حذف کنید. |
+| `udp-idle-timeout-ms` | اتصال | مهلت بیکاری نشست UDP داخلی. محدودهٔ ۱ تا ۴۲۹۴۹۶۷۲۹۵ میلی‌ثانیه، با پیش‌فرض ۳۰۰۰۰۰ میلی‌ثانیه. |
+| `mtu` و تنظیم‌های حجم دادهٔ در انتظار | اتصال | تابع [تنظیمات PacketsToConnection](./PacketsToConnection.mdx) هستند. |
 
-An IP limit counts distinct **inner client source IPs with active admitted
-connections/associations**, per account across workers. Allowed ranges specify
-which sources may be used; unused allowed addresses consume no slots. Many flows
-from one source share one IP slot. A second source is denied at IP limit 1 until
-the first source's last flow closes/expires. Server/destination IPs and outer
-endpoints do not count. Authenticated external roaming preserves the saved inner
-IP reservations.
+هر همتای ثابت به `publickey` و `allowedips` نیاز دارد. مقدار
+`allowedips` رشته‌ای از حداکثر ۱۶ محدودهٔ CIDR است که با ویرگول جدا
+می‌شوند. این محدوده‌ها نشانی‌های مبدأ مجاز بسته‌های ورودی رمزگشایی‌شده را
+تعیین می‌کنند و برای انتخاب همتای مقصد پاسخ نیز به کار می‌روند. محدوده‌های
+همتاهای متفاوت باید جدا از هم باشند. همتا می‌تواند `presharedkey` و
+`persistentkeepalive` را مطابق مرجع [WireGuardClient](./WireGuardClient.mdx)
+تنظیم کند. `endpoint` را برای همتای سمت سرور وارد نکنید، چون ترافیک ورودی
+احراز هویت‌شده مسیر پاسخ را تعیین می‌کند.
 
-Admission is on demand after candidate-key recovery and full protocol proof.
-There are at most 32 active/provisional/retiring bindings. Capacity refusal drops
-the new handshake without displacing established sessions or truncating the
-account table. Candidate failures release their slot immediately.
+در ساخت سفارشی با `INCLUDE_WIREGUARD_SERVER`، گره‌های
+`AuthenticationClient`، ‏`UserController` و `PacketsToConnection`
+نیز باید فعال باشند.
 
-One owner-worker timer checks installed account generations every 400 ms and
-revalidates all active bindings (at most 32 per tick). The next tick observes a
-change within 400 ms plus ordinary owner-loop queueing time. Handshakes and new flows
-also revalidate. Unchanged refreshes preserve identity continuity, including queued datagrams.
-A queued handshake cannot publish credentials whose continuity began after its
-intake generation. Usable RAM
-cache admission follows AuthenticationClient's outage policy. Key/range changes,
-removal/recreation and durable-owner reassignment close affected admission.
-Per-worker retirement closes TCP/UDP lines, pre-line protocol state and TCP
-closers before range reuse. Deferred input, reverse output and carrier sends
-carry non-reusable epochs. A changed range remains reserved until every owner
-acknowledges retirement and a fresh handshake validates current authorization.
-A failed retirement acknowledgment leaves the affected range closed until node
-shutdown; unrelated bindings continue.
+## استفاده و عیب‌یابی {#usage-and-troubleshooting}
 
-Protocol state and timers run on worker 0. UDP ingress lines are borrowed from
-UdpListener on their original workers, retaining their exact source and local
-endpoint; replies use the same live carrier. Finish detaches it without
-reflecting callbacks to its sender. Node shutdown closes admission and timers,
-settles queued work, drains borrowed handles via their adapter owners, then
-releases keys/helpers. Each node bounds cross-worker packet work to 512 messages
-and 8 MiB; excess input/output drops. Packet mode does not apply connection-mode
-account management to persistent packet lines.
+- **دست‌دهی برقرار نمی‌شود.** دسترسی کلاینت به `UdpListener` بیرونی و
+  درستی کلید عمومی هر طرف برای طرف مقابل را بررسی کنید. در حالت بسته، اگر
+  کلید از پیش مشترک تنظیم شده است، مقدارش باید در دو سمت یکسان باشد. در
+  حالت اتصال، سرویس نام‌دار احراز هویت، وضعیت حساب و روش ساخت کلید را
+  بررسی کنید.
+- **دست‌دهی در حالت بسته برقرار می‌شود، ولی ترافیک عبور نمی‌کند.** نشانی
+  مبدأ داخلی کلاینت باید در `allowedips` سمت سرور باشد و کلاینت نیز باید
+  نشانی مبدأ داخلی سرور را مجاز بداند. مسیرهای میزبان باید ترافیک داخلی را
+  از TUN عبور دهند. برای دسترسی به شبکه‌های دیگر، انتقال بسته‌ها، مسیر
+  برگشت و NAT را بررسی کنید.
+- **دست‌دهی در حالت اتصال برقرار می‌شود، ولی جریان کار نمی‌کند.** یک
+  سرویس TCP یا UDP روی IPv4 را که سرور به آن دسترسی دارد امتحان کنید.
+  `wireguard-allowed-ips`، محدودیت‌ها و زمان انقضای حساب را بررسی کنید و
+  مطمئن شوید گره خروجی از مقصد درخواستی استفاده می‌کند.
+- **سقف IP در حالت اتصال پر شده است.** برای هر حساب، مبدأهای IP داخلی
+  متمایز که جریان پذیرفته‌شدهٔ فعال دارند در همهٔ workerها شمارش می‌شوند.
+  چند جریان از یک مبدأ، یک سهم مشترک دارند. اگر سقف IP برابر یک باشد،
+  مبدأ دوم باید منتظر بسته‌شدن یا انقضای آخرین اتصال یا نشست مبدأ اول
+  بماند. نشانی مجاز بدون جریان فعال سهمی مصرف نمی‌کند. تغییر نقطهٔ پایانی
+  بیرونی رزرو نشانی‌های داخلی را حفظ می‌کند.
 
-The server admits at most 1024 live borrowed UDP ingress handles. Excess carrier
-Init is refused through its adapter owner. In connection mode,
-`udp-idle-timeout-ms` configures association expiry (1–4294967295 ms; default
-300000), and the PTC `mtu`/pending-byte settings retain their normal contracts.
-Building WireGuardServer requires AuthenticationClient, UserController and
-PacketsToConnection. WireGuardClient links WireGuardCommon and supports compatible
-datagram-preserving carrier chains, including `UdpOverTcpClient -> TcpConnector`.
+## رفتار پیشرفته {#advanced-behavior}
 
+در حالت اتصال، سرور زنجیرهٔ
+`PacketsToConnection -> account binding -> UserController` را پیش از
+گره بعدی اضافه می‌کند. پیش از مقداردهی اولیهٔ گره خروجی، حساب به هر جریان
+داخلی اختصاص داده می‌شود. حساب ناشناخته، نامعتبر، غیرفعال یا منقضی
+دسترسی ناشناس نمی‌گیرد. محدودیت‌ها برای اتصال‌های TCP، نشست‌های UDP و
+دادهٔ داخلی اعمال می‌شوند و شامل پهنای باند حساب، سهمیهٔ ترافیک، انقضا
+و ثبت نخستین استفاده هستند. دست‌دهی، پیام‌های زنده‌نگه‌دارنده و سربار
+رمزگذاری از این سهمیه‌ها کم نمی‌کنند. حالت بسته از مجوز همتاهای ثابت
+استفاده می‌کند و محدودیت حساب روی آن اعمال نمی‌شود.
 
-Complete runnable core/config pairs are available in the
-[WireGuard examples](https://github.com/radkesvat/WaterWall/tree/main/tunnels/WireGuardClient/examples).
+پذیرش همتا در حالت اتصال به دست‌دهی معتبر برای یک حساب مجاز نیاز دارد.
+مجموع پیوندهای فعال، موقت و در حال جمع‌آوری حداکثر ۳۲ است. رد شدن به
+دلیل پر بودن ظرفیت، نشست‌های فعلی یا جدول حساب‌ها را تغییر نمی‌دهد.
+سرور با توجه به نوبت اجرای حلقهٔ worker مالک، هر ۴۰۰ میلی‌ثانیه به‌روزرسانی
+حساب‌ها را بررسی می‌کند و هنگام دست‌دهی و آغاز جریان نیز مجوز را دوباره
+می‌سنجد. دریافت مجدد حساب بدون تغییر، پیوند موجود را حفظ می‌کند. تغییر
+کلید، محدوده یا مالک حساب، پذیرش مورد مربوط را می‌بندد. محدودهٔ قدیمی
+تا پایان جمع‌آوری و تأیید حساب فعلی با دست‌دهی تازه رزرو می‌ماند. اگر
+جمع‌آوری موفق نشود، محدوده تا توقف گره بسته می‌ماند.
+
+هنگام رد صریح احراز هویت مسیر کنترل، همتاهای احراز هویت‌شدهٔ فعلی
+می‌توانند با تنظیمات ذخیره‌شدهٔ حساب به کار ادامه دهند و کلید نشست را
+تازه کنند. همتای تازه و جریان تازه، از جمله جریانی که مقداردهی اولیهٔ
+آن به تأخیر افتاده است، به مجوز تازه نیاز دارند. رد یک جریان تازه
+جریان‌های موجود و مجاز را حفظ می‌کند. غیرفعال‌سازی، انقضا، سهمیه و لغو
+کلید یا محدوده همچنان اعمال می‌شوند.
+
+در هر دو حالت، اگر مسیر ورودی همتای احراز هویت‌شده همچنان فعال باشد،
+ترافیک خروجی می‌تواند نشست منقضی‌شده را دوباره برقرار کند. سرور می‌تواند
+اولین بستهٔ داخلی را با سقف تخصیص ۱۲۸ کیبی‌بایت برای هر همتا تا ۹۰ ثانیه
+نگه دارد. بسته‌های بعدی ممکن است در این فاصله حذف شوند. با فراهم شدن
+کلید قابل استفاده، به شرط معتبر ماندن پیوند و مسیر ورودی، بستهٔ نگه‌داشته‌شده
+ارسال می‌شود.
+
+سرور حداکثر ۱۰۲۴ مسیر ورودی UDP فعال می‌پذیرد. کار بسته‌ها بین workerها
+به ۵۱۲ پیام و ۸ مِبی‌بایت حافظهٔ نگه‌داشته‌شده در هر گره محدود است.
+ورودی یا خروجی مازاد حذف می‌شود. برای جزئیات پیاده‌سازی،
+[مالکیت بسته‌ها](../05-devguides/part4-packet-tunnels.mdx#wireguard-authenticated-packet-to-connection-ownership)
+و [مالکیت worker و جمع‌آوری پیوندها](../05-devguides/part7-shutdown-and-signals.mdx#wireguard-worker-ownership-and-retirement)
+را ببینید.

@@ -1,0 +1,110 @@
+---
+sidebar_position: 20
+title: "WireGuard with account authentication"
+sidebar_label: "WireGuard connection mode"
+description: "Use authenticated WireGuard connection mode to reach an IPv4 service through the server's TCP/UDP sockets."
+---
+
+# WireGuard with account authentication
+
+Use a WireGuard account to reach an IPv4 TCP or UDP service through WaterWall.
+The client sends IP packets from a TUN interface. The server authenticates the
+account and opens a socket for each admitted flow. The server needs neither a
+TUN interface nor IP forwarding. For routing raw packets, including ICMP, use
+[WireGuard over UDP in packet mode](./wireguard.mdx).
+
+```text
+Client: TunDevice -> WireGuardClient -> UdpConnector
+Server: UdpListener -> WireGuardServer (mode=connection) -> TcpUdpConnector
+```
+
+The server references a named `AuthenticationClient` service. The sample
+connects this service to an `AuthenticationServer` in the same process, which
+loads the WireGuard account from `users.json`. WaterWall inserts the
+packet-to-connection and account enforcement nodes automatically.
+
+## Prepare the hosts
+
+Use two Linux hosts on an isolated test network with WaterWall installed. The
+client needs permission to create a TUN interface. Allow the client to reach
+UDP port `51820` on the server. The examples below use `10.50.0.0/24` for the
+client TUN and the test service. Choose an unused subnet if it overlaps with
+an existing route.
+
+## Configure each side
+
+Save the files below beside `Waterwall` on the corresponding host and run
+WaterWall from that directory. Keep `users.json` with the server configuration.
+
+| Host | Files | Source |
+| --- | --- | --- |
+| Client | `core.json`, `config.json` | [client](https://github.com/radkesvat/WaterWall/tree/main/tunnels/WireGuardClient/examples/client) |
+| Server | `core.json`, `config.json`, `users.json` | [connection-server](https://github.com/radkesvat/WaterWall/tree/main/tunnels/WireGuardClient/examples/connection-server) |
+
+1. On the client, set `WireGuardClient.settings.peers[0].endpoint` to the
+   server's reachable IPv4 address and UDP port in place of `127.0.0.1:51820`.
+   Set the peer's `allowedips` to `10.50.0.1/32` for the test service below.
+2. On the server, keep `WireGuardServer.settings.mode` set to `connection` and
+   `auth-client-node-name` set to `accounts`, the configuration name of the
+   `AuthenticationClient` node. Keep the `TcpUdpConnector` destination settings
+   on `dest_context->address` and `dest_context->port` so it uses the destination
+   carried by each inner flow.
+3. In `users.json`, the sample account's `wireguard-allowed-ips` is
+   `10.50.0.4/30`, which includes the client TUN address `10.50.0.5`. The sample's
+   client private key already matches that account. Use the sample credentials
+   only on the isolated test network.
+
+For deployment, replace the server key pair, the account password, and the
+shared secret used by the authentication service. Set the client peer's public
+key to the new server public key. Set the client's `privatekey` to the Base64
+encoding of the SHA-256 digest of the new account password. The server derives
+the corresponding public key from the account. Match the control secret in
+`AuthenticationClient.settings.secret` and the corresponding entry in
+`AuthenticationServer.settings.auth-clients`. [WireGuardServer settings](../../02-noderefs/WireGuardServer.mdx#settings)
+
+## Run and check
+
+On the server, give the test HTTP service a local address in the client TUN
+subnet. Serve a separate directory so the test exposes only its own file. This
+example uses `10.50.0.1` on the server's loopback interface as the inner address
+and uses the server's ordinary network address for the outer UDP endpoint.
+
+```bash
+sudo ip addr add 10.50.0.1/32 dev lo
+test_dir=$(mktemp -d)
+printf '%s\n' 'WireGuard connection mode is working.' > "$test_dir/index.html"
+python3 -m http.server 8080 --bind 10.50.0.1 --directory "$test_dir"
+```
+
+In another terminal, start WaterWall on the server from its configuration
+directory. Then start the client from its own configuration directory.
+
+```bash title="Server"
+./Waterwall --config:core.json
+```
+
+```bash title="Client"
+sudo ./Waterwall --config:core.json
+```
+
+From the client, check the route and request the file.
+
+```bash
+ip -4 route get 10.50.0.1
+curl --noproxy '*' --fail http://10.50.0.1:8080/
+```
+
+The route should use `ww-client`, and the response should be
+`WireGuard connection mode is working.` If the request fails, check that the
+account is enabled, that its allowed range covers the client TUN address, and
+that the server can reach the HTTP service. Use a TCP or UDP check because this
+mode handles unfragmented IPv4 TCP and UDP flows.
+
+After the test, stop the HTTP service and remove its temporary loopback address.
+
+```bash
+sudo ip addr del 10.50.0.1/32 dev lo
+```
+
+For a SOCKS5 client that uses an in-process packet bridge in place of a TUN
+interface, see [ConnectionToPackets](../../02-noderefs/ConnectionToPackets.mdx#typical-placement).
