@@ -496,28 +496,28 @@ installing master callbacks. Cache widths and counts retain their bounded
 `uint32_t` representation. This is separate from buffer-tier sizes and the
 16-bit headroom reservation.
 
-For ordinary runtime buffers, do not `malloc`. Use the worker-local buffer pool so
-allocations are recycled and correctly padded. The pool is reachable from any
-line:
+Use the worker-local pool for ordinary runtime buffers. In a callback running on
+a line's worker, the line gives access to that worker's pool and its configured
+headroom.
 
 ```c
-buffer_pool_t *pool = lineGetBufferPool(line);     // this line's worker pool
-
-sbuf_t *big   = bufferpoolGetLargeBuffer(pool);    // large ordinary read/working buffer
-sbuf_t *medium = bufferpoolGetMediumBuffer(pool); // 32 KiB in S1/S2, 64 KiB in higher profiles
-sbuf_t *small = bufferpoolGetSmallBuffer(pool);    // small working buffer
-sbuf_t *splice_buf = bufferpoolGetSpliceBuffer(pool); // leased private pipe, or NULL when exhausted
-
-// ... use the buffer ...
-
-bufferpoolReuseBuffer(pool, buf);                  // return it to the pool
-lineReuseBuffer(line, buf);                        // convenience: pool of line's worker
+sbuf_t *buf = bufferpoolGetSmallBuffer(lineGetBufferPool(line));
+// ... use buf locally ...
+lineReuseBuffer(line, buf);
 ```
 
-Pools are **per worker**. A line belongs to exactly one worker (`lineGetWID`), so
-always use that line's pool — never a different worker's. Buffers from a pool
-already carry the chain's reserved left padding, so a pooled buffer is the correct
-place to build a payload you intend to prepend onto.
+An ordinary buffer can cross workers while each worker accesses only its own
+pool. For example, worker 1 can send a packet to worker 0. Once worker 0 owns
+that packet, it can forward it or call `reuseBuffer(buf)` to release it into
+its own pool. Forwarding transfers ownership again. The receiving pool caches
+ordinary allocations whose capacity and initial headroom match a local tier and
+frees other sizes. Shared master pools move idle buffers between worker caches
+in batches, so the sender can refill its cache when traffic flows one way.
+
+Use `sbufDestroy(buf)` when cleanup owns the buffer and can run without a live
+event-worker pool. This includes worker-message cancellation that can run on an
+unbound thread. For [scheduled line tasks](#buffers-transferred-to-scheduled-line-tasks),
+the scheduler owns the submitted buffer and releases it on cancellation.
 
 Pool metadata and ordinary buffer allocation follow the
 [fatal heap-allocation policy](./part5-tunnel-anatomy.mdx#heap-allocation-failure).
