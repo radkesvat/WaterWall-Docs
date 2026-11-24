@@ -2371,13 +2371,50 @@ listener port. Server cookies bind to that actual remote IP/port, and only
 authenticated proof/data updates a peer's learned endpoint. Server replies retain
 the exact ingress handle.
 
+Both engines track one-way traffic for each peer independently of
+`persistentkeepalive`. Sending the first unanswered nonempty data packet starts
+a 15-second wait for authenticated input. Further sends leave this deadline in
+place. Receiving nonempty data starts a 10-second wait for an authenticated
+reply. An empty transport packet can satisfy either wait without starting
+another one. When the send-side wait expires, the peer initiates a handshake.
+An outstanding initiation retries with a fresh handshake after five seconds,
+even while the previous key can still carry traffic. The initiation timers add
+up to 333 ms of jitter and run on the next protocol tick. A passive peer's
+handshake attempt expires after 90 seconds. Fresh local demand can start
+another attempt. Key age requests rekey once per key. A delayed cookie for an
+expired initiation cannot renew its attempt. An active client continues trying
+to connect while keyless.
+
+Traffic timers use the owner loop's cached monotonic time to schedule keepalives
+and detect unanswered data. The client samples fresh monotonic time for its
+400-ms carrier retry limit. The engine uses fresh time to space ordinary
+handshake initiations and enforce the 90-second retry window. A timely cookie
+can trigger an immediate retransmission within that window. The server also
+samples fresh time when it holds a packet and before releasing it for
+encryption. Transport key rejection and session-secret erasure check fresh
+time. Generating a cookie secret during construction uses a thread-independent
+clock, and the on-wire TAI64N timestamp uses wall time.
+
+An already paused carrier or refused worker handoff leaves a due keepalive
+pending for the next protocol tick. A datagram admitted before Pause can finish
+its handoff on the live, authorized carrier.
+
+In either server mode, an inner packet for a previously authenticated peer
+with a live carrier can trigger a handshake when its send key is unavailable.
+The server may retain the first packet on that binding for up to 90 seconds.
+Each of the 32 peer slots retains at most one existing buffer with an allocation
+charge of at most 128 KiB. Further packets while that slot is occupied are
+dropped. A usable send key releases the held packet to the same authorized
+binding and carrier. Expiry, loss of the carrier, binding retirement and
+shutdown release the held buffer.
+
 Session-secret erasure is armed independently of current-key validity. The first
 unfinished handshake arms cleanup, and successful session derivation resets its
 540-second deadline, including responder next-only sessions. Ordinary data and
 retries do not extend it. Erasure securely clears all session slots and unfinished
 handshake state while preserving static peer configuration and the greatest
-authenticated initiation timestamp. Persistent keepalive scheduling is separate
-from the fixed 165-second receive rekey deadline and five-second initiation retry.
+authenticated initiation timestamp. The fixed 165-second receive rekey deadline
+also runs independently of persistent keepalive scheduling.
 Current, previous and next keypairs are also zeroed individually when each reaches
 180 seconds or its local sending-message limit. This leaves the independent
 handshake cleanup deadline armed. Session installation passes the new keypair by
