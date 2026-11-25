@@ -142,10 +142,9 @@ line‌های عادی باشد و آن‌ها را به‌شکل معمول ب�
 - callback‌های downstream با `tunnelPrevDownStream*` ادامه می‌یابند؛
 - callback دریافت‌شده هرگز به‌سمت فرستندهٔ خود بازتابانده نمی‌شود.
 
-`PingClient` این callback‌های عبوری چرخهٔ عمر را از `packettunnelCreate()` به ارث
-می‌برد؛ `PingServer` نیز forwarding صریح و معادل آن‌ها را تنظیم می‌کند. پشتیبانی
-از payload قرارداد جداگانه‌ای است: هر دو سر Ping v2 برای مالکیت buffer و
-اعتبارسنجی worker به packet line دقیق همان worker در chain نیاز دارند. ترتیب‌های
+هر دو گره `PingClient` و `PingServer` callbackهای عبوری چرخهٔ عمر را از
+`packettunnelCreate()` به ارث می‌برند. هر دو payload handler برای مالکیت buffer
+و بررسی worker به خط بستهٔ دقیق همان worker در زنجیره نیاز دارند. ترتیب‌های
 پشتیبانی‌شده در لبه‌های آن‌ها چنین است:
 
 ```text
@@ -154,7 +153,7 @@ RawSocket -> PingServer -> TunDevice
 ```
 
 بنابراین یک توپولوژی معمولیِ line عادی مانند
-`UdpListener <-> PingServer <-> UdpConnector` ترکیب پشتیبانی‌شده‌ای برای Ping v2
+`UdpListener <-> PingServer <-> UdpConnector` ترکیب پشتیبانی‌شده‌ای برای Ping
 نیست. `packettunnelCreate()` همچنان callback‌های عبوری استاندارد چرخهٔ عمر را نگه
 می‌دارد، اما handler پیاده‌سازی‌شدهٔ payload ممکن است نقش محدودتر و دقیق‌تری برای
 packet line الزام کند.
@@ -503,40 +502,50 @@ void streamtopacketsTunnelOnStart(tunnel_t *t)
 
 ## جهت تونل‌های جفت: قاعده‌ی PingClient / PingServer
 
-نقش transform و جهت forward شدن callback دو تصمیم جدا هستند. Ping wire v2 دو
-نشست مستقل Echo دارد:
+نقش transform و جهت callback دو مفهوم جدا هستند. `PingClient` در upstream و
+`PingServer` در downstream بستهٔ بومی را کپسوله می‌کنند. هر گره در جهت مخالف
+بسته را بازیابی و در همان جهت callback تحویل می‌دهد. دادهٔ هر جهت در حامل‌های
+مستقل فرستاده می‌شود.
 
 ```text
-دادهٔ Client: PingClient -- Echo Request --> PingServer
-              PingClient <-- Echo Reply دقیق -- PingServer
-
-دادهٔ Server: PingClient <-- Echo Request -- PingServer
-              PingClient -- Echo Reply دقیق --> PingServer
+[existing IPv4 header H][ICMP header 8][native payload B][saved protocol 1][sender role 1]
 ```
 
-- مسیر upstream در `PingClient` و مسیر downstream در `PingServer`، دادهٔ محلی
-  خود را در Echo request نوع `8` قرار می‌دهند. همتای آن‌ها request را در callback
-  متناظر decode می‌کند و packet داخلی را در همان جهت callback ادامه می‌دهد.
-- Reply نوع `0` مربوط به request دریافت‌شده، پیش از تحویل request اصلی به فرستنده
-  بازمی‌گردد. Reply فقط نقش تأیید را دارد؛ فرستنده Reply منطبق را مصرف می‌کند و
-  payload آن را تحویل نمی‌دهد.
-- correlation و جلوگیری از replay بر عهدهٔ یک tracker همگام‌شده و دارای ظرفیت
-  محدود برای هر node از نوع Ping است. flow affinity دستگاه تعیین می‌کند کدام
-  packet line یک callback را اجرا کند؛ WID آن line هویت correlation میان request
-  و Reply نیست.
-- دریافت‌کنندهٔ request دو buffer مجزا منتشر می‌کند. clone ساخته‌شده برای Reply
-  به‌سمت فرستندهٔ request برمی‌گردد، درحالی‌که نسخهٔ اصلی decode‌شده در همان جهتی
-  ادامه می‌یابد که request از آن دریافت شده بود.
-- بنابراین handler مربوط به request در upstream در `PingServer`، ‏clone مربوط به
-  Reply را با `tunnelPrevDownStreamPayload()` و نسخهٔ اصلی decode‌شده را با
-  `tunnelNextUpStreamPayload()` می‌فرستد. handler مربوط به request در downstream
-  در `PingClient`، ‏clone را با `tunnelNextUpStreamPayload()` و نسخهٔ اصلی
-  decode‌شده را با `tunnelPrevDownStreamPayload()` می‌فرستد.
+سربرگ IPv4 شامل گزینه‌هاست و طول آن بین ۲۰ و ۶۰ بایت است. فرستنده پروتکل IPv4
+را به `1` و طول کل را به اندازهٔ حامل تغییر می‌دهد. `icmp-type` و `icmp-code`
+تنظیم‌های ارسال با پیش‌فرض ۸ و صفرند. چهار بایت آخر سربرگ ICMP هنگام ارسال
+صفرند. checksum همهٔ `B + 10` بایت پیام ICMP را می‌پوشاند. بایت ماقبل آخر
+پروتکل ذخیره‌شدهٔ IPv4 (از جمله صفر) و بایت آخر نقش فرستنده را دارد (کلاینت
+`1` و سرور `2`).
 
-بازگرداندن **خود request دریافت‌شده** به‌سمت فرستنده، بازتابی نامعتبر است. ارسال
-Echo Reply دقیق و جداگانه‌ای که در جهت مخالف ساخته شده، الزام wire protocol است.
-به همین ترتیب، encapsulateکردن نسخهٔ اصلی در callback مربوط به upstream در
-`PingServer` باعث می‌شود داده دو بار transform شود.
+گیرنده طول دقیق IPv4، پروتکل `1`، حداقل ده بایت برای ICMP، شکل بدنهٔ بومی،
+checksumهای حامل و نقش طرف مقابل را بررسی می‌کند. بررسی نقش بازتاب بستهٔ خود
+گره را حذف می‌کند. پیام نامرتبط ICMP هم ممکن است از این بررسی‌ها عبور کند، پس
+آدرس مبدأ همتای موردنظر را روی شبکه همراه با پروتکل `1` در capture انتخاب کنید.
+هر حامل پذیرفته‌شده، از جمله حامل تکراری، یک بسته روی worker دریافت‌کننده تحویل
+می‌دهد.
+
+در سقف حامل ۱۵۰۰ بایتی، حداکثر بستهٔ بومی ۱۴۹۰ بایت است. هر گره ده بایت فضای
+سمت چپ رزرو می‌کند. کپسوله‌سازی به فضای آزاد انتهای بافر نیاز ندارد. قطعه‌ها
+را در آداپتورها سرهم کنید. گره بسته با MF یا offset غیرصفر را رد می‌کند.
+گیرنده پروتکل و طول بومی را روی سربرگ IPv4 دریافتی بازیابی می‌کند.
+
+فرستنده سهم آدرس‌ها را از checksum بسته‌های TCP و UDP کم می‌کند و گیرنده سهم
+آدرس‌های دریافتی را اضافه می‌کند. در کپسوله‌سازی عادی و هنگام بازنویسی آدرس‌ها،
+checksum غیرفعال UDP در IPv4 صفر می‌ماند. اگر برای بستهٔ بومی UDP درخواست صریح
+ترمیم وجود داشته باشد، Ping پیش از کپسوله‌سازی checksum آن را محاسبه و فعال می‌کند.
+ترمیم حامل فقط checksumهای قابل‌مشاهدهٔ IPv4 و ICMP را پوشش می‌دهد
+و checksum نامعتبر لایهٔ انتقال بستهٔ بومی بدون درخواست ترمیم همچنان نامعتبر می‌ماند.
+در جفت مستقیم همان آدرس‌های
+بومی روی شبکه قرار می‌گیرند. برای ترجمهٔ آدرس‌ها می‌توان IpOverrider را در هر
+سمت Ping قرار داد. نگاشت معکوس ثابت می‌تواند یک جفت آدرس معلوم را بازیابی کند.
+اگر چند مقصد بومی به یک آدرس حامل نگاشت شوند، آدرس‌های اولیه در قاب ذخیره
+نمی‌شوند و قابل بازیابی نیستند. وقتی IpOverrider بین RawSocket و decoder قرار
+دارد، برای انتخاب worker
+بر اساس همتا `"opaque-flow-mode": "peer"` را صریح تنظیم کنید.
+
+گره‌های Ping6 قالب Echo مستقل خود را دارند و در صورت تنظیم می‌توانند یک Echo
+Reply جداگانه در جهت مخالف بفرستند.
 
 روش کار برای هر تونل packet:
 
@@ -561,12 +570,10 @@ TesterClient(packet-mode=true)
     -> TesterServer(packet-mode=true)
 ```
 
-درخواست upstream باید ابتدا Reply دقیق بگیرد و سپس پیش از رسیدن به
-`TesterServer` بازیابی شود. دادهٔ جهت معکوس باید Echo request جداگانه باشد، Reply
-دقیق بگیرد و پیش از رسیدن به `TesterClient` بازیابی شود. پوشش تستی‌ای اضافه
-کنید که اگر `PingServer` در upstream به‌جای decode دوباره encapsulate کند، یک Reply
-دو بار تحویل شود یا دادهٔ server در Reply مربوط به request اصلی قرار گیرد،
-با شکست روبه‌رو شود.
+تست باید نوع و کد ارسالی متفاوت در دو جهت، بایت‌های دقیق حامل و بازیابی
+بستهٔ بومی را بررسی کند. بازتاب، نقش نامعتبر، طول ناسازگار و checksum نامعتبر
+باید رد شوند. تغییر آدرس حامل را هم با جفت آدرس دریافتی متفاوت از جفت اصلی
+آزمایش کنید.
 
 قرارداد `Finish` در packet line پوشش تستی جداگانه‌ای دارد و هر handler جدید
 در سمت packet باید به آن افزوده شود:

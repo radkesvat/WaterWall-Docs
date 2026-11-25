@@ -547,31 +547,88 @@ to close admission and join the reader before reclaiming its reachable state.
 
 ## Paired Tunnel Direction (the PingClient / PingServer Rule)
 
-Transform role and callback forwarding direction are separate decisions. Ping
-and Ping6 each use two independent Echo request sessions:
+Transform role and callback forwarding direction are separate decisions. Both
+pairs encode upstream at the client and downstream at the server. They decode
+downstream at the client and upstream at the server. An accepted native
+packet always proceeds in the callback direction in which it arrived.
+
+### Ping ICMPv4 framing
+
+`PingClient` and `PingServer` exchange independent data packets in each
+direction. Each accepted carrier yields one native packet on the arrival
+worker, including repeated carriers.
 
 ```text
-client data: Client -- Echo Request --> Server
-             Client <-- optional exact Echo Reply -- Server
-server data: Client <-- Echo Request -- Server
-             Client -- optional exact Echo Reply --> Server
+[existing IPv4 header H][ICMP header 8][native payload B][saved protocol 1][sender role 1]
 ```
 
-Client upstream and server downstream encode; client downstream and server
-upstream decode. Each accepted original continues in its received callback
-direction. The independent optional reply clone travels back toward the sender:
-PingServer/Ping6Server use `tunnelPrevDownStreamPayload()` for the clone and
-`tunnelNextUpStreamPayload()` for native delivery; PingClient/Ping6Client use
-`tunnelNextUpStreamPayload()` for the clone and `tunnelPrevDownStreamPayload()`
-for native delivery. Reflecting the original request would violate the contract.
+`H` includes IPv4 options and ranges from 20 to 60 bytes. Encode retains the
+IPv4 addresses, TTL, DSCP/ECN, ID, DF and options, sets protocol 1 and updates
+the total length. The eight-byte ICMP header contains the configured type and
+code, the ICMP checksum, and four zero bytes. The checksum covers all `B + 10`
+ICMP bytes. The penultimate byte holds the saved IPv4 protocol, including
+protocol 0. The final byte holds the sender role (client 1, server 2).
+The transmit defaults are type 8 and code 0, and both settings accept byte
+values or supported names. Code names resolve within the selected type.
 
-Ordinary Ping and direct Ping6 use `[existing IPv4 H][Echo 8][native body B][P 1]`.
+Decode validates the exact IPv4 length, IPv4 protocol 1, minimum ten-byte
+ICMP message, opposite role, and native transport geometry. TCP data offset,
+UDP length (with IP padding allowed), and minimum ICMP size are checked.
+Other native protocols allow an empty opaque payload. Verify the IPv4 and
+ICMP checksums or complete a pending carrier repair. Receive accepts the
+peer's type, code, and checksummed bytes 4–7. The role check rejects reflected
+Echo payloads from the local node. Unrelated ICMP that passes the same checks
+can be delivered, so select the intended peer at capture.
+
+The 1,500-byte carrier ceiling leaves 1,490 bytes for the native packet.
+Both nodes reserve ten bytes of left padding for in-place encode, which
+also works with zero tailroom. Decode restores the native protocol and
+length using the IPv4 header as received. Reassemble fragments at the
+packet adapters. The transform rejects MF or a nonzero fragment offset on
+both paths and accepts DF alone.
+
+Encode completes an explicit native checksum repair before framing. For UDP,
+this computes and enables the checksum even if it was zero. Encode then removes
+the source and destination address contribution from TCP and UDP checksums.
+Decode adds the contribution of the received addresses and recomputes the
+IPv4 header checksum. Without native repair, a zero UDP checksum stays zero
+during framing and address rewriting, and corrupt native transport checksums
+retain their residual. A carrier repair covers only the visible IPv4 and ICMP
+checksums. ICMPv4 has no address pseudo-header.
+
+```text
+TunDevice -> PingClient -> RawSocket
+RawSocket -> PingServer -> TunDevice
+```
+
+A direct pair carries the native addresses on the wire. When native and wire
+addresses differ, configure IpOverrider on either side of Ping as required.
+On the native side it sees native protocols and updates TCP and UDP checksums
+for its address rewrites. On the carrier side it sees ICMP and rewrites the
+shared IPv4 header. A fixed inverse mapping can restore a known address pair.
+If several native destinations map to one carrier address, the frame carries
+no original address from which to recover them.
+Protocols that protect the IP addresses themselves need their own policy.
+Capture the peer's wire source address and protocol 1. With IpOverrider
+between RawSocket and the decoder, set `"opaque-flow-mode": "peer"` explicitly
+if peer-based placement is desired.
+
+### Ping6 Echo framing
+
+Ping6 uses two independent Echo Request sessions. When replies are enabled,
+the exact reply clone travels back toward the sender before the native
+packet continues in its received direction. Ping6Server sends the clone
+with `tunnelPrevDownStreamPayload()` and delivers the native packet with
+`tunnelNextUpStreamPayload()`. Ping6Client uses `tunnelNextUpStreamPayload()`
+for the clone and `tunnelPrevDownStreamPayload()` for native delivery.
+
+Direct Ping6 uses `[existing IPv4 H][Echo 8][native body B][P 1]`.
 Ping6 `ipv6-in-ipv4` uses `[existing IPv4 H][IPv6 40][Echo 8][native body B][P 1]`.
-Actual H = 20..60 includes options, and P = 0..255 is the original protocol in the
-**final declared IP byte**. There is no second IPv4 header. Visible protocols are
-1 (Ping), 58 (direct Ping6) and 41 (IPv6-in-IPv4 Ping6); request/reply types are
-8/0 or 128/129, code zero. Framing F is 9 or 49, total length is N+F and tracked
-Echo payload length is B+1. Both inputs and decoded outputs remain native IPv4.
+Actual H = 20..60 includes options, and P = 0..255 is the original protocol in
+the final declared IP byte. Visible IPv4 protocols are 58 in direct mode and
+41 in IPv6-in-IPv4 mode. Echo Request is type 128, Echo Reply is type 129,
+and both use code zero. Framing F is 9 or 49, total length is N+F and tracked
+Echo payload length is B+1. Both inputs and decoded outputs are native IPv4.
 
 Ping6 mode omission selects `direct`; only exact `direct` and `ipv6-in-ipv4`
 strings are accepted. Direct forbids either IPv6 address key by presence and uses
@@ -613,17 +670,17 @@ Each node's correlation scope is one logical carrier peer, selected by the chain
 Preserve source/destination, options, ID, DF, TTL and TOS/DSCP/ECN locally. Only
 protocol, length and IPv4 checksum change for framing. Transit changes survive;
 no original header copy exists. No `local-ipv4`, `peer-ipv4`, `ttl` or `tos`
-settings remain; unknown settings are rejected. Keep identifier, sequence-start
-and send-replies, plus Ping6's mode-dependent address settings above. Empty
-or omitted settings select direct mode. Address rewriting/restoration belongs
-to the chain:
+settings are accepted. Configure `identifier`, `sequence-start`, and
+`send-replies` alongside Ping6's mode-dependent settings above. Empty or
+omitted settings select direct mode. Address rewriting and restoration belong
+to the chain.
 
 ```text
-TunDevice -> PingClient/Ping6Client -> IpOverrider -> RawSocket
-RawSocket -> IpOverrider -> PingServer/Ping6Server -> TunDevice
+TunDevice -> Ping6Client -> IpOverrider -> RawSocket
+RawSocket -> IpOverrider -> Ping6Server -> TunDevice
 ```
 
-Capture the peer's network address and protocol 1/58/41 according to the mode.
+Capture the peer's network address and protocol 58 or 41 according to the mode.
 An intervening IpOverrider
 breaks direct decoder discovery, so examples intending carrier locality use
 explicit `opaque-flow-mode: "peer"`. Do not change automatic-neighbour discovery.
@@ -652,9 +709,8 @@ either repair-flag value, before native parsing or mutation. DF alone is accepte
 and preserved. Reassemble native fragments before encoding and fragmented
 carriers before decoding; preserve-fragments does not make them admissible.
 Inner IPv6 Fragment headers are rejected rather than reassembled here.
-The 1500-byte final ceiling permits at most 1491 bytes of **complete native IP**
-for ordinary Ping/direct Ping6 or 1451 for IPv6-in-IPv4 Ping6, not application
-payload. The user budgets all chain overhead and actual path MTU through TunDevice device-mtu, applicable CTP/PTC mtu and core misc.mtu in
+The 1,500-byte final ceiling permits at most 1,491 bytes of **complete native IP**
+for direct Ping6 or 1,451 for IPv6-in-IPv4 Ping6. The user budgets all chain overhead and actual path MTU through TunDevice device-mtu, applicable CTP/PTC mtu and core misc.mtu in
 both directions. Larger core/device MTUs do not waive the ceiling. No PMTU,
 negotiation, MSS, segmentation, fragmentation or automatic MTU configuration is
 added. Drops retain the shared five-second ERROR limiter and report geometry,
@@ -751,12 +807,15 @@ refuse and pass unchanged must preflight and preserve bytes and intent on refusa
 TunDevice, RawSocket and packet/connection bridges consume the actual packet's
 request. Aligned copies retain intent locally until finalization; raw-byte
 ConnectionToPackets messages complete repair before queueing. Packet/stream
-bridges finish repair before serialization; no local flag is serialized. Ping/Ping6
-preflight native geometry, fragment/size/headroom refusal and requested native
-repair before sequence admission. Carrier repair affects only the visible
-IPv4/Echo checksums; decode restores native address contributions without
-repairing hidden corruption. Unrelated protocols retain bytes and pending intent.
-Generated replies, originals and duplicates own independent requests.
+bridges finish repair before serialization; no local flag is serialized. Ping
+preflights geometry, fragmentation, size and headroom before native repair and
+framing. Its receive repair covers the visible carrier. The decoder restores
+the native TCP and UDP address contributions while preserving unmarked transport
+checksum corruption. Ping6 performs native repair
+before sequence admission and carrier repair before decoding. Its decoder
+restores native address contributions without repairing hidden corruption.
+Unrelated protocols retain bytes and pending intent in Ping6, and generated
+replies, originals and duplicates own independent requests.
 
 Mark the surviving allocation after replacement and each generated packet
 according to existing repair behavior. Incremental IpOverrider/ProtoSwap address
@@ -956,7 +1015,7 @@ checksums merely to select a worker, or read trailing buffer bytes as a prefix.
 A stable prefix keeps a visible flow together; fixed XOR may preserve stability,
 while changing masks and arbitrary encryption need not. Peer groups all opaque
 traffic sharing addresses and protocol, concentrating hidden flows on one worker.
-Ping can pass unrelated traffic through, so automatic peer also groups unrelated
+Ping6 can pass unrelated traffic through, so automatic peer also groups unrelated
 opaque traffic; mixed traffic may need an explicit setting. These receive keys
 are locality choices; a stateful consumer still selects its owner after decoding
 or tuple rewriting.
@@ -1739,7 +1798,7 @@ upstream entry boundary only for `first-sni`, `smuggle-sni`, `overlap-sni`,
 `synfin-sni`, `ech-sni-trick` or `smuggle-fin`; downstream it dispatches after
 protocol/port restoration and before stateful processing. Plain ProtoSwap
 encoding and decoding stay on the arrival worker; protocol/checksum conversion
-does not require a flow owner. PingClient/PingServer forward decoded inner packets on their arrival worker.
+does not require a flow owner. PingClient/PingServer forward decoded native packets on their arrival worker.
 WireGuard wrappers marshal protocol work to worker 0 and publish decoded packets
 on that worker's persistent packet line; PTC then establishes its flow ownership. PacketsToStream and
 StreamToPackets map decoded packets to the receiving stream worker's packet
@@ -2318,15 +2377,13 @@ TesterClient(packet-mode=true)
     -> TesterServer(packet-mode=true)
 ```
 
-The upstream request must be restored before TesterServer sees it; reverse data
-must become a separate Echo Request and be restored before TesterClient sees
-it. Exercise omitted/false and true `send-replies` settings at both endpoints,
-including asymmetric settings. Enabled replies must precede inner delivery and
-be consumed by the originator; disabled replies must cause no clone or reply
-output. Add coverage that would fail if PingServer upstream encapsulated instead
-of decoding, if an inner request were delivered twice, if reply consumption or
-deduplication depended on local reply generation, or if server data were put
-into the original request's reply.
+Exercise asymmetric transmit types and codes. The server must deliver the
+decoded native packet upstream and encode return data downstream. Exercise
+the inverse at the client. Cover repeated delivery, exact wire bytes, reflected
+frames, and malformed lengths, checksums, and sender roles. Exercise checksum
+adjustment with carrier address rewriting, including a received tuple that
+differs from the original. Ping6 Echo reply and duplicate handling belong to
+the Ping6 frame tests.
 
 The packet-line `Finish` contract has its own coverage, and a new packet-side
 handler belongs in it:
